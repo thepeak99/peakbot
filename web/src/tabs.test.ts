@@ -1,11 +1,15 @@
-// Tests for the Layer-E tab-visibility contract (profiles feature).
+// Tests for the tab-visibility contract.
 //
-// Backend now computes `visible_tabs: string[]` on the AppState snapshot —
-// the server-side subset of the canonical drawer-tab order
-// ["session","todo","files","tasks","bash","agents","profile"]. The SPA
-// must narrow App.tsx's `tabs` array to that subset (in CANONICAL order,
-// not the order the server happened to list them in) and, separately,
-// relocate an open drawer tab that just got hidden.
+// The backend computes `visible_tabs: string[]` on the AppState snapshot —
+// a server-side subset of the canonical drawer-tab order
+// ["session","todo","files","tasks","bash","agents"]. The SPA must narrow
+// App.tsx's `tabs` array to that subset (in CANONICAL order, not the order
+// the server happened to list them in) and, separately, relocate an open
+// drawer tab that just got hidden.
+//
+// The 0.24 cutover dropped the "profile" tab (ProfilePanel is gone; the
+// (profile, agent) selection UI arrives in a later task) — see the
+// `tabs_has_no_profile` lock below.
 //
 // Two pure functions carry this logic (no component/DOM needed — plain
 // `node` environment, matching adapt.test.ts/transcriptRows.test.ts):
@@ -38,8 +42,9 @@ interface Tab {
   label: string;
 }
 
-// Mirrors App.tsx's canonical tab order after the Profile tab is added
-// (E5): session, todo, files, tasks, bash, agents, profile.
+// Mirrors App.tsx's canonical tab order (0.24): session, todo, files,
+// tasks, bash, agents. No "profile" — ProfilePanel is gone with the
+// pipeline/profile selection UI.
 const CANONICAL: Tab[] = [
   { id: "session", label: "Session" },
   { id: "todo", label: "Todo" },
@@ -47,8 +52,18 @@ const CANONICAL: Tab[] = [
   { id: "tasks", label: "Tasks" },
   { id: "bash", label: "Bash" },
   { id: "agents", label: "Agents" },
-  { id: "profile", label: "Profile" },
 ];
+
+describe("tabs_has_no_profile", () => {
+  it("the canonical tab list contains no 'profile' tab (0.24 cutover)", () => {
+    expect(CANONICAL.map((t) => t.id)).not.toContain("profile");
+  });
+
+  it("a visible_tabs carrying a stale 'profile' id fabricates no tab", () => {
+    const shown = filterTabs(CANONICAL, ["session", "profile", "agents"]);
+    expect(shown.map((t) => t.id)).toEqual(["session", "agents"]);
+  });
+});
 
 describe("filterTabs", () => {
   it("returns every tab unchanged, in canonical order, when visible is undefined (legacy server)", () => {
@@ -61,11 +76,11 @@ describe("filterTabs", () => {
   });
 
   it("preserves CANONICAL order, not the order given in `visible` (decision lock)", () => {
-    // `visible` deliberately lists profile before session — the output must
+    // `visible` deliberately lists agents before session — the output must
     // still put session first, because App's own tab order governs display,
     // not whatever order the wire array happens to list ids in.
-    const result = filterTabs(CANONICAL, ["profile", "session"]);
-    expect(result.map((t) => t.id)).toEqual(["session", "profile"]);
+    const result = filterTabs(CANONICAL, ["agents", "session"]);
+    expect(result.map((t) => t.id)).toEqual(["session", "agents"]);
   });
 
   it("returns an empty array when visible is an empty list", () => {
@@ -147,13 +162,12 @@ describe("resolveActiveTab", () => {
 
   it("integration: filterTabs + resolveActiveTab relocate an open drawer off a tab the server just hid", () => {
     // Mirrors the intended App.tsx wiring: canonical tabs → filterTabs
-    // (visible_tabs) → ids → resolveActiveTab(drawerTab, ids). A profile
-    // pin (or no configured profiles) hides "profile"; a user who had it
-    // open lands on the first still-visible tab instead of a blank panel.
-    const visibleTabs = ["session", "todo", "agents"]; // files/tasks/bash/profile hidden
+    // (visible_tabs) → ids → resolveActiveTab(drawerTab, ids). A bound
+    // profile whose `tabs` hides a drawer tab (e.g. "files") drops it out
+    // from under the user; they land on the first still-visible tab instead
+    // of a blank panel.
+    const visibleTabs = ["session", "todo", "agents"]; // files/tasks/bash hidden
     const shown = filterTabs(CANONICAL, visibleTabs);
-    expect(resolveActiveTab("profile", shown.map((t) => t.id))).toBe(
-      "session",
-    );
+    expect(resolveActiveTab("files", shown.map((t) => t.id))).toBe("session");
   });
 });

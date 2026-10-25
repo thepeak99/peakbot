@@ -1,7 +1,0 @@
-{
-  "$schema": "../gen/schemas/desktop-schema.json",
-  "identifier": "settings-page",
-  "description": "Bundled local settings window only. No remote origins, ever.",
-  "windows": ["settings"],
-  "permissions": ["allow-settings-get", "allow-settings-set", "allow-act"]
-}

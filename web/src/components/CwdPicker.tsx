@@ -1,13 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import type { DirListing, InboundMessage } from "../state";
 
-// The working-directory chip + directory browser in the top bar, modelled on
-// ModelSwitcher. The chip shows the current cwd (basename prominent, full path
-// on hover); clicking it opens a folder picker.
+// The working-directory chip + directory browser in the top bar. The chip
+// shows the current cwd (basename prominent, full path on hover); clicking
+// it opens a folder picker.
 //
 // Committing a new cwd sends `switch_cwd`, which the backend resolves and
 // validates, then resets the session (same seam as `/cd` / `/model`). So a
-// non-empty transcript is confirmed first, exactly like ModelSwitcher.
+// non-empty transcript is confirmed first.
 //
 // The picker is purely state-frame-driven: the displayed cwd comes from the
 // AppState `welcome.cwd`, and browsing rides the `list_dir` → `dir_listing`
@@ -91,7 +91,7 @@ export function CwdPicker({
 
   const commit = (path: string) => {
     setOpen(false);
-    if (path === cwd) return; // no-op (mirrors ModelSwitcher's alias check)
+    if (path === cwd) return; // no-op when already current
     if (
       hasTranscript &&
       !window.confirm(

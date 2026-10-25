@@ -1,6 +1,7 @@
 mod bash;
 mod doc_index;
 mod doc_search;
+pub mod env;
 mod fetch_page;
 mod fetch_url;
 pub mod file_edit;

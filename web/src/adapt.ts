@@ -12,11 +12,14 @@ import type {
 import type {
   BashPanel,
   BgProcess,
+  CatalogAgent,
+  CatalogProfile,
   ChatMessage,
   ContextUsage,
   FileEdit,
   LaneStat,
   MessageRole,
+  Selection,
   SessionStats,
   SubAgentRun,
   TodoItem,
@@ -158,6 +161,62 @@ export function adaptBg(s: AppState): BgProcess[] {
  * `#[serde(default)]`) to null so callers get one shape. */
 export function adaptSubAgent(s: AppState): SubAgentRun | null {
   return s.sub_agent ?? null;
+}
+
+/** The catalog (profiles → agents → sub-agents) this install declares,
+ * mapped from the wire's snake_case to the view's camelCase. An absent
+ * field (old snapshot) normalises to `[]`, the safe default. */
+export function adaptCatalog(s: AppState): CatalogProfile[] {
+  return (s.catalog ?? []).map((p) => ({
+    name: p.name,
+    origin: p.origin,
+    overridesGlobal: p.overrides_global,
+    agents: p.agents.map((a) => ({
+      name: a.name,
+      model: a.model,
+      subagents: a.subagents.map((sa) => ({
+        name: sa.name,
+        model: sa.model,
+        inherited: sa.inherited,
+      })),
+    })),
+  }));
+}
+
+/** The (profile, agent) this conversation is bound to, or null when the wire
+ * field is absent (old snapshot) — one shape for callers, like adaptSubAgent.
+ * `subagent_models` normalises absent to `{}` and copies a present map, so
+ * view code never sees undefined overrides. */
+export function adaptSelection(s: AppState): Selection | null {
+  return s.selection
+    ? {
+        profile: s.selection.profile,
+        agent: s.selection.agent,
+        subagentModels: { ...s.selection.subagent_models },
+      }
+    : null;
+}
+
+/** True once the conversation has a user or agent message. Mirrors
+ * `StateManager::conversation_has_turns`, which is what the server uses to
+ * refuse `select`: system notices (welcome, restart warnings, the
+ * `Profile: …` confirmation itself) must not lock the selection chip. */
+export function conversationHasTurns(messages: WireChatMessage[]): boolean {
+  return messages.some((m) => m.role === "user" || m.role === "agent");
+}
+
+/** Resolve a selection to its catalog agent (the roster the Agents panel and
+ * the Agents chip render), or null when nothing is bound / it isn't listed. */
+export function boundAgentOf(
+  catalog: CatalogProfile[] | undefined,
+  selection: Selection | null | undefined,
+): CatalogAgent | null {
+  if (!selection) return null;
+  return (
+    catalog
+      ?.find((p) => p.name === selection.profile)
+      ?.agents.find((a) => a.name === selection.agent) ?? null
+  );
 }
 
 // File tools whose `path` arg we surface in the Files tab. Writes (create /

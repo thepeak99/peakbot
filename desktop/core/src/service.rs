@@ -1,12 +1,11 @@
 //! Service state, launch planning, dialogs (DESIGN §3.4/§4.4/§5.2).
 
-use std::path::{Path, PathBuf};
+use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use semver::Version;
 
-use crate::consts::SERVICE_PORT;
 use crate::phase::Dialog;
-use crate::settings::{Protocol, Settings};
 use crate::sys::RunOutput;
 use crate::version::{DeclinedReplace, InstalledVersion};
 
@@ -69,19 +68,11 @@ pub fn status_args() -> [&'static str; 2] {
     ["service", "status"]
 }
 
-/// `["service","install","--bind","{host}:7823"]` + `["--tls"]` when
-/// https. The token never appears in argv (I7).
-pub fn service_install_args(s: Settings) -> Vec<String> {
-    let mut args = vec![
-        "service".to_string(),
-        "install".to_string(),
-        "--bind".to_string(),
-        format!("{}:{}", s.bind_host(), SERVICE_PORT),
-    ];
-    if s.protocol() == Protocol::Https {
-        args.push("--tls".to_string());
-    }
-    args
+/// `["service","install"]` — bare, no `--bind`, no `--tls` (spec §8.4:
+/// the unit reads `general.web` at every start, so a Settings edit plus
+/// a restart applies). The token never appears in argv (I7).
+pub fn service_install_args() -> Vec<String> {
+    vec!["service".to_string(), "install".to_string()]
 }
 
 pub fn service_uninstall_args() -> [&'static str; 2] {
@@ -178,26 +169,6 @@ pub fn plan_launch(
     LaunchPlan::AskReplace { installed }
 }
 
-/// The settings that reproduce the RUNNING service for a silent replace
-/// (A4). Protocol from the `TLS:` line (I3); Remote only if saved is
-/// Remote AND the service runs TLS (I1). The loopback `token` flag is
-/// carried from `saved` but is not used by `service_install_args`. The
-/// token itself lives in `web-token`, which the silent path never
-/// touches.
-pub fn running_settings(saved: Settings, tls: bool) -> Settings {
-    match (saved, tls) {
-        (Settings::Remote, true) => Settings::Remote,
-        (Settings::Remote, false) => Settings::Loopback {
-            protocol: Protocol::Http,
-            token: true,
-        },
-        (Settings::Loopback { token, .. }, tls) => Settings::Loopback {
-            protocol: if tls { Protocol::Https } else { Protocol::Http },
-            token,
-        },
-    }
-}
-
 pub fn replace_dialog(installed: &InstalledVersion, bundled: &Version) -> Dialog {
     let i = match installed {
         InstalledVersion::Known(v) => v.to_string(),
@@ -259,46 +230,15 @@ pub fn finish_setup_dialog() -> Dialog {
     }
 }
 
-pub fn port_busy_dialog() -> Dialog {
+/// The service would bind `general.web.bind` (spec §8.4), which another
+/// program holds.
+pub fn port_busy_dialog(bind: SocketAddr) -> Dialog {
     Dialog {
-        title: "Port 7823 is busy".into(),
-        body: "Another program (maybe a PeakBot started from a terminal) is using \
-               127.0.0.1:7823. Stop it and try again."
-            .into(),
-        ok: "OK".into(),
-        cancel: None,
-    }
-}
-
-/// `Action::SaveSettings` confirm — session mode (design #377 §5.1).
-pub fn settings_relaunch_dialog() -> Dialog {
-    Dialog {
-        title: "Apply settings?".into(),
-        body: "PeakBot will restart with the new settings. \
-               Conversations that are running now will be interrupted."
-            .into(),
-        ok: "Restart".into(),
-        cancel: Some("Cancel".into()),
-    }
-}
-
-/// `Action::SaveSettings` confirm — service mode (design #377 §5.1).
-pub fn settings_reinstall_dialog() -> Dialog {
-    Dialog {
-        title: "Apply settings?".into(),
-        body: "The background service will be reinstalled with the new settings \
-               and restarted. Conversations that are running now will be interrupted."
-            .into(),
-        ok: "Reinstall".into(),
-        cancel: Some("Cancel".into()),
-    }
-}
-
-/// The settings file write failed (design #377 §5.1); nothing was applied.
-pub fn save_failed_dialog(path: &Path, err: &str) -> Dialog {
-    Dialog {
-        title: "Couldn't save settings".into(),
-        body: format!("{}\n{}", path.display(), err),
+        title: format!("Port {} is busy", bind.port()),
+        body: format!(
+            "Another program (maybe a PeakBot started from a terminal) is using \
+             {bind}. Stop it and try again."
+        ),
         ok: "OK".into(),
         cancel: None,
     }
@@ -329,7 +269,6 @@ pub fn service_log_hint() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     fn run_out(code: Option<i32>, stdout: &str, stderr: &str) -> RunOutput {
         RunOutput {
@@ -946,95 +885,6 @@ mod tests {
         );
     }
 
-    // Design auto-replace §7.1: `running_settings` reproduces the
-    // RUNNING service for a silent replace (A4/SC6): the protocol comes
-    // from the TLS line, and Remote only survives when the service runs
-    // TLS (I1: Remote ⇒ HTTPS).
-    #[test]
-    fn t106_running_settings_reproduces_service() {
-        let cases: [(Settings, bool, Settings); 4] = [
-            (
-                Settings::Loopback {
-                    protocol: Protocol::Http,
-                    token: true,
-                },
-                true,
-                Settings::Loopback {
-                    protocol: Protocol::Https,
-                    token: true,
-                },
-            ),
-            (
-                Settings::Loopback {
-                    protocol: Protocol::Https,
-                    token: false,
-                },
-                false,
-                Settings::Loopback {
-                    protocol: Protocol::Http,
-                    token: false,
-                },
-            ),
-            (Settings::Remote, true, Settings::Remote),
-            (
-                Settings::Remote,
-                false,
-                Settings::Loopback {
-                    protocol: Protocol::Http,
-                    token: true,
-                },
-            ),
-        ];
-        for (saved, tls, expected) in cases {
-            assert_eq!(
-                running_settings(saved, tls),
-                expected,
-                "saved {saved:?}, tls {tls}"
-            );
-        }
-        // And the `service install` argv of each result (SC6): the
-        // protocol flag follows the TLS line, the bind per A4, and the
-        // token never appears in argv (I7).
-        assert_eq!(
-            service_install_args(cases[0].2),
-            vec![
-                "service".to_string(),
-                "install".to_string(),
-                "--bind".to_string(),
-                "127.0.0.1:7823".to_string(),
-                "--tls".to_string(),
-            ]
-        );
-        assert_eq!(
-            service_install_args(cases[1].2),
-            vec![
-                "service".to_string(),
-                "install".to_string(),
-                "--bind".to_string(),
-                "127.0.0.1:7823".to_string(),
-            ]
-        );
-        assert_eq!(
-            service_install_args(cases[2].2),
-            vec![
-                "service".to_string(),
-                "install".to_string(),
-                "--bind".to_string(),
-                "0.0.0.0:7823".to_string(),
-                "--tls".to_string(),
-            ]
-        );
-        assert_eq!(
-            service_install_args(cases[3].2),
-            vec![
-                "service".to_string(),
-                "install".to_string(),
-                "--bind".to_string(),
-                "127.0.0.1:7823".to_string(),
-            ]
-        );
-    }
-
     // §9.1 case 15.
     #[test]
     fn t15_replace_dialog_variants() {
@@ -1070,46 +920,28 @@ mod tests {
         assert_eq!(d.cancel.as_deref(), Some("Keep current"));
     }
 
-    // §9.1 case 16 (updated for #377: `service_install_args` takes the
-    // settings — 3 exact variants).
+    // §9.1 case 16 (T15a: `service_install_args` is now bare — see
+    // `service_install_args_bare`).
     #[test]
     fn t16_arg_builders_are_exact() {
-        use crate::settings::{Protocol, Settings};
         assert_eq!(status_args(), ["service", "status"]);
-        assert_eq!(
-            service_install_args(Settings::default()),
-            vec![
-                "service".to_string(),
-                "install".to_string(),
-                "--bind".to_string(),
-                "127.0.0.1:7823".to_string()
-            ]
-        );
-        assert_eq!(
-            service_install_args(Settings::Loopback {
-                protocol: Protocol::Https,
-                token: true
-            }),
-            vec![
-                "service".to_string(),
-                "install".to_string(),
-                "--bind".to_string(),
-                "127.0.0.1:7823".to_string(),
-                "--tls".to_string()
-            ]
-        );
-        assert_eq!(
-            service_install_args(Settings::Remote),
-            vec![
-                "service".to_string(),
-                "install".to_string(),
-                "--bind".to_string(),
-                "0.0.0.0:7823".to_string(),
-                "--tls".to_string()
-            ]
-        );
         assert_eq!(service_uninstall_args(), ["service", "uninstall"]);
         assert_eq!(install_args(), ["install"]);
+    }
+
+    // T15a (0.24 config, spec §8.4): `service install` with NO web flags —
+    // no `--bind`, no `--tls`. The unit reads `general.web` at every start,
+    // so a Settings edit plus a restart applies. The token never appears in
+    // argv (I7). ASSUMED new signature:
+    // `pub fn service_install_args() -> Vec<String>` (the old `Settings`
+    // form is deleted by T15b).
+    #[test]
+    fn service_install_args_bare() {
+        assert_eq!(
+            service_install_args(),
+            vec!["service".to_string(), "install".to_string()],
+            "bare `service install`; no --bind/--tls, token never in argv"
+        );
     }
 
     // Design #377 t71: the `TLS:` status line (added by #375) is the
@@ -1156,35 +988,5 @@ mod tests {
             }),
             "missing TLS line ⇒ tls: false"
         );
-    }
-
-    // Design #377 t72: the three new SaveSettings dialogs, verbatim.
-    #[test]
-    fn t72_settings_dialog_strings_are_exact() {
-        let d = settings_relaunch_dialog();
-        assert_eq!(d.title, "Apply settings?");
-        assert_eq!(
-            d.body,
-            "PeakBot will restart with the new settings. \
-             Conversations that are running now will be interrupted."
-        );
-        assert_eq!(d.ok, "Restart");
-        assert_eq!(d.cancel.as_deref(), Some("Cancel"));
-
-        let d = settings_reinstall_dialog();
-        assert_eq!(d.title, "Apply settings?");
-        assert_eq!(
-            d.body,
-            "The background service will be reinstalled with the new settings \
-             and restarted. Conversations that are running now will be interrupted."
-        );
-        assert_eq!(d.ok, "Reinstall");
-        assert_eq!(d.cancel.as_deref(), Some("Cancel"));
-
-        let d = save_failed_dialog(Path::new("/data/settings.json"), "disk full");
-        assert_eq!(d.title, "Couldn't save settings");
-        assert_eq!(d.body, "/data/settings.json\ndisk full");
-        assert_eq!(d.ok, "OK");
-        assert_eq!(d.cancel, None, "info dialog (no cancel)");
     }
 }

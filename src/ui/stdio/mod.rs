@@ -221,12 +221,21 @@ fn dispatch_stdin_line(
         Ok(InboundMessage::SwitchCwd { path }) => {
             action_sender.send(UiAction::ChangeCwd(path)).is_ok()
         }
-        Ok(InboundMessage::SelectPipeline { name }) => {
-            action_sender.send(UiAction::SelectPipeline(name)).is_ok()
-        }
-        Ok(InboundMessage::SelectProfile { name }) => {
-            action_sender.send(UiAction::SelectProfile(name)).is_ok()
-        }
+        Ok(InboundMessage::Select {
+            profile,
+            agent,
+            model,
+            subagent_models,
+        }) => action_sender
+            .send(UiAction::Select {
+                selection: crate::config::resolve::Selection {
+                    profile,
+                    agent,
+                    subagent_models,
+                },
+                model,
+            })
+            .is_ok(),
         Ok(InboundMessage::ListDir { path }) => out_tx.send(build_dir_listing(&path)).is_ok(),
         Ok(InboundMessage::RequestConversations) => {
             // stdio is single-session with no registry — no conversation
@@ -350,6 +359,31 @@ mod tests {
         let kept = dispatch_stdin_line(r#"{"type":"stop"}"#, &tx, &out_tx, &sm);
         assert!(kept);
         assert!(matches!(rx.try_recv().unwrap(), UiAction::RequestStop));
+    }
+
+    /// Selection-models plan §9.1/26: the extended select line must surface
+    /// with BOTH new legs on `UiAction::Select`.
+    #[test]
+    fn dispatch_select_frame_carries_models() {
+        let (tx, mut rx, out_tx, sm) = fixture();
+        let kept = dispatch_stdin_line(
+            r#"{"type":"select","profile":"dev","agent":"team","model":"opus","subagent_models":{"tester":"haiku"}}"#,
+            &tx,
+            &out_tx,
+            &sm,
+        );
+        assert!(kept, "select line must keep the stdin loop alive");
+        match rx.try_recv().expect("an action must be emitted") {
+            UiAction::Select { selection, model } => {
+                assert_eq!(model.as_deref(), Some("opus"), "the model leg is forwarded");
+                assert_eq!(
+                    selection.subagent_models.get("tester").map(String::as_str),
+                    Some("haiku"),
+                    "the override map is forwarded"
+                );
+            }
+            other => panic!("expected UiAction::Select, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -5,12 +5,13 @@
 //! with existing PeakBot types (TodoList, SessionStats, etc.).
 
 use crate::TodoStatus;
+use crate::config::resolve::{ProfileInfo, Selection};
 use crate::image_cache::ImageRef;
-use crate::pipeline::PipelineInfo;
 use crate::tools::todo::TodoItem as CoreTodoItem;
 use crate::tools::view_image;
 use crate::ui::ui_trait::TodoItemAction;
 use chrono::{DateTime, Local};
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::fmt;
@@ -19,7 +20,17 @@ use std::fmt;
 ///
 /// This is the single source of truth for all UI-renderable state.
 /// The StateManager keeps this in sync with the core PeakBot state.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+///
+/// `Serialize` is implemented by hand (not derived) so the wire shape can
+/// carry the DERIVED field `settings_available = !profile_pinned` (§8.7) —
+/// the pin hides the Settings tab, and it is computed at serialization,
+/// never stored (a stored copy would drift from the pin).
+///
+/// `Deserialize` stays derived: `OutboundMessage` (wire.rs) derives it so
+/// recorded frames can round-trip in tests. Every field must therefore be
+/// owned — which is why `ProfileInfo.origin` is a `String`, not
+/// `&'static str` (a borrow would pin the derive to `'de: 'static`).
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct AppState {
     /// Chat messages
     pub chat: ChatState,
@@ -139,37 +150,31 @@ pub struct AppState {
     #[serde(default)]
     pub bash_panel_visibility: BashPanelVisibility,
 
-    /// The pipelines (named teams) this install declares, in config order.
-    /// Projected once at session build from the boot-built `PipelineSet` —
-    /// the Agents panel renders the roster from this, and "no pipelines
-    /// configured" is `is_empty()`, never a separate flag.
+    /// The profiles this install declares, in catalog order (repo first) —
+    /// the §8.7 wire projection. Stamped at session build and after every
+    /// reload; the Agents panel renders the roster from this, and
+    /// `is_empty()` means "no profiles configured", never a separate flag.
     #[serde(default)]
-    pub pipelines: Vec<PipelineInfo>,
+    pub catalog: Vec<ProfileInfo>,
 
-    /// The pipeline this conversation is bound to, or `None` for single-agent
-    /// mode. Mirror of `Conversation.pipeline` (the persisted truth); mutable
-    /// only before the first turn. Everything downstream — delegate roster,
-    /// prompt recipe, orchestrator model, `/model` lock — derives from it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub selected_pipeline: Option<String>,
-
-    /// The config profile in effect for this conversation, or `None` for the
-    /// base config. Mirror of `Conversation.profile`; under a boot
-    /// `--profile` pin it is the pin.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_profile: Option<String>,
-
-    /// Profile names the client may pick (the Profile tab's picker),
-    /// sorted. Server-computed and stamped at session build and after every
-    /// profile apply/reload — `is_empty()` hides the profile tab, never a
-    /// separate flag. `#[serde(default)]` keeps pre-Layer-D snapshots
-    /// parsing cleanly.
+    /// The `(profile, agent)` this conversation is bound to — a projection
+    /// of the session's `Bound`, rewritten whenever it changes. Mutable
+    /// only before the first turn; under a boot `--profile` pin the profile
+    /// leg is frozen. Everything downstream derives from it.
     #[serde(default)]
-    pub profiles: Vec<String>,
+    pub selection: Selection,
+
+    /// `true` under a boot `--profile` pin — the profile is frozen for the
+    /// life of the session. The wire field `settings_available` is DERIVED
+    /// from this at serialization (`!profile_pinned`, see the `Serialize`
+    /// impl); it is never stored.
+    #[serde(default)]
+    pub profile_pinned: bool,
 
     /// The web tabs the client should render under this session's active
     /// profile — computed server-side (the client must not re-derive config
-    /// rules). Same stamping points as `profiles`.
+    /// rules), now from the bound profile's `tabs`. Same stamping points as
+    /// `catalog`.
     #[serde(default)]
     pub visible_tabs: Vec<String>,
 
@@ -200,6 +205,47 @@ impl AppState {
     /// Create a new empty AppState
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+impl Serialize for AppState {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Straight field projection plus the ONE derived wire field:
+        // `settings_available = !profile_pinned` (§8.7), computed here so a
+        // stored copy can never drift from the pin. `run_started_at` stays
+        // off the wire (`Instant` is not `Serialize`). Keep this list in
+        // sync with the struct above.
+        let mut ser = serializer.serialize_struct("AppState", 26)?;
+        ser.serialize_field("chat", &self.chat)?;
+        ser.serialize_field("todo", &self.todo)?;
+        ser.serialize_field("input", &self.input)?;
+        ser.serialize_field("stats", &self.stats)?;
+        ser.serialize_field("context", &self.context)?;
+        ser.serialize_field("conversation", &self.conversation)?;
+        ser.serialize_field("preferences", &self.preferences)?;
+        ser.serialize_field("is_running", &self.is_running)?;
+        ser.serialize_field("stop_pending", &self.stop_pending)?;
+        ser.serialize_field("is_loading", &self.is_loading)?;
+        ser.serialize_field("welcome", &self.welcome)?;
+        ser.serialize_field("is_final", &self.is_final)?;
+        ser.serialize_field("status_message", &self.status_message)?;
+        ser.serialize_field("exit_requested", &self.exit_requested)?;
+        ser.serialize_field("pending_input_count", &self.pending_input_count)?;
+        ser.serialize_field("bg", &self.bg)?;
+        ser.serialize_field("bash_panel", &self.bash_panel)?;
+        ser.serialize_field("bash_panel_visibility", &self.bash_panel_visibility)?;
+        ser.serialize_field("catalog", &self.catalog)?;
+        ser.serialize_field("selection", &self.selection)?;
+        ser.serialize_field("profile_pinned", &self.profile_pinned)?;
+        ser.serialize_field("settings_available", &!self.profile_pinned)?;
+        ser.serialize_field("visible_tabs", &self.visible_tabs)?;
+        ser.serialize_field("sub_agent", &self.sub_agent)?;
+        ser.serialize_field("supports_vision", &self.supports_vision)?;
+        ser.serialize_field("upload_limits", &self.upload_limits)?;
+        ser.end()
     }
 }
 
@@ -1003,7 +1049,7 @@ pub enum MessageSource {
     /// `get_agent_history` can filter it out of the orchestrator's wire
     /// context (see `is_orchestrator_lane`).
     SubAgent {
-        /// The pipeline role that produced this turn.
+        /// The subagent role that produced this turn.
         role: String,
     },
 }
@@ -1329,9 +1375,9 @@ pub struct LaneStat {
     pub output_tokens: u64,
     /// API calls made on this lane.
     pub api_calls: u64,
-    /// Model alias this lane runs on (orchestrator: the active alias; a role:
-    /// its member entry in the selected pipeline). Empty when unknown — old
-    /// wire snapshots and lanes with no configured role.
+    /// Model alias this lane runs on (main agent: the active alias; a role:
+    /// its entry under the selected agent's subagents). Empty when unknown —
+    /// old wire snapshots and lanes with no configured role.
     #[serde(default)]
     pub model: String,
     /// Accumulated cost (USD) on this lane.
@@ -1705,6 +1751,7 @@ pub struct WelcomeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::resolve::{AgentInfo, SubagentInfo};
 
     // ── Phase 1: sub-agent lane plumbing ────────────────────────────────
 
@@ -1794,33 +1841,31 @@ mod tests {
         let back: MessageSource = serde_json::from_str(&json).unwrap();
         assert_eq!(back, s);
     }
-    // ── Stage 1.2: AppState wire-shape back-compat ──────────────────────
+    // ── 0.24 cutover: AppState wire shape (catalog / selection / pin) ────
     //
-    // The plan removes `pipeline_available` and `subagents_enabled`
-    // from AppState and adds `pipelines: Vec<PipelineInfo>` and
-    // `selected_pipeline: Option<String>` (plan §3 "AppState — DELETED:
-    // pipeline_available, subagents_enabled (both derived)").
+    // The plan removes `pipeline_available`, `subagents_enabled`,
+    // `pipelines`, `selected_pipeline`, `active_profile` and `profiles`
+    // from AppState and adds `catalog: Vec<ProfileInfo>`,
+    // `selection: Selection`, `profile_pinned: bool` (§8.7). The wire
+    // serializer additionally emits the DERIVED `settings_available =
+    // !profile_pinned`.
     //
     // Two properties must hold:
     // 1. A snapshot emitted by the OLD code (fields present) still
-    //    parses on the new code. The fields must be `#[serde(default)]`
-    //    on the new code path, OR serde-tolerant in some other way.
+    //    parses on the new code (unknown fields are absorbed, the new
+    //    fields default).
     // 2. The new fields round-trip 1:1 through JSON.
 
-    /// A snapshot emitted by today's `AppState` (pre-Stage 1.2) carries
-    /// `pipeline_available: true` and `subagents_enabled: true`. When
-    /// the new code parses it, those fields must be silently absorbed
-    /// (the new code's `selected_pipeline` derives from the catalogue,
-    /// not from the deleted booleans). Without `#[serde(default)]` on
-    /// the new fields this test would fail with "missing field
-    /// selected_pipeline"; without absorb-tolerance for the old fields
-    /// it would fail with "unknown field pipeline_available".
+    /// A snapshot emitted by the pre-cutover code carries
+    /// `pipeline_available` / `subagents_enabled` / `pipelines` /
+    /// `selected_pipeline`. The new code must absorb the unknown fields
+    /// and default the new ones — a mid-rollout client/server pair must
+    /// not hard-fail.
     #[test]
-    fn old_app_state_snapshot_with_legacy_booleans_parses() {
-        // Hand-craft a JSON snapshot in the shape the pre-Stage 1.2
-        // code emits. Empty chat / stats / context / conversation —
-        // we only care about the field-level serde behaviour, not the
-        // content.
+    fn old_app_state_snapshot_with_legacy_fields_parses() {
+        // Hand-craft a JSON snapshot in the shape the pre-cutover code
+        // emits. Empty chat / stats / context / conversation — we only
+        // care about the field-level serde behaviour, not the content.
         let old_snapshot = r#"{
             "chat": {"messages": [], "auto_scroll": true, "scroll_offset": 0},
             "todo": {"items": [], "visible": false},
@@ -1839,60 +1884,119 @@ mod tests {
             "bash_panel": {"kind": "idle"},
             "bash_panel_visibility": "Auto",
             "pipeline_available": true,
-            "subagents_enabled": false
+            "subagents_enabled": false,
+            "selected_pipeline": "web-team"
         }"#;
 
         let parsed: AppState =
             serde_json::from_str(old_snapshot).expect("old snapshot must parse on new code");
-        // The legacy booleans were absorbed without error — the
-        // new code derives `selected_pipeline` from `pipelines` (the
-        // catalogue), not from those booleans. So:
-        assert_eq!(
-            parsed.selected_pipeline, None,
-            "old snapshot has no catalogue → selected_pipeline derives to None"
-        );
+        // The legacy fields were absorbed without error; the new fields
+        // default because the old snapshot has no catalogue/selection.
         assert!(
-            parsed.pipelines.is_empty(),
-            "old snapshot has no catalogue → pipelines is empty"
+            parsed.catalog.is_empty(),
+            "old snapshot has no catalogue → catalog is empty"
         );
+        assert_eq!(
+            parsed.selection,
+            Selection::default(),
+            "old snapshot has no selection → Selection defaults"
+        );
+        assert!(!parsed.profile_pinned, "old snapshot has no pin → unpinned");
     }
 
-    /// The new fields round-trip 1:1. `pipelines: Vec<PipelineInfo>`
-    /// uses `#[serde(default)]` for forward compat (a new code
-    /// snapshot read by an older client sees an empty vec). The
-    /// `selected_pipeline: Option<String>` uses
-    /// `skip_serializing_if = "Option::is_none"` so a snapshot with
-    /// no selection stays byte-identical to the pre-Stage-1.2 form
-    /// for that field.
+    /// T10: the wire snapshot carries the catalog (§8.7 projection), the
+    /// selection, the pin and the DERIVED `settings_available` — and the
+    /// old pipeline/profile fields are gone from the wire.
     #[test]
-    fn new_app_state_fields_round_trip() {
+    fn wire_appstate_catalog_snapshot() {
         let mut state = AppState::new();
-        // Stamp a non-empty selection + catalogue.
-        state.selected_pipeline = Some("web-team".into());
-        state.pipelines = vec![PipelineInfo {
-            name: "web-team".into(),
-            orchestrator_model: "sonnet".into(),
-            members: vec![("reviewer".to_string(), "flash".to_string())],
+        state.catalog = vec![ProfileInfo {
+            name: "dev".to_string(),
+            origin: "repo".to_string(),
+            overrides_global: true,
+            agents: vec![AgentInfo {
+                name: "team".to_string(),
+                model: "sonnet".to_string(),
+                subagents: vec![SubagentInfo {
+                    name: "researcher".to_string(),
+                    model: "qwen".to_string(),
+                    inherited: true,
+                }],
+            }],
         }];
+        state.selection = Selection {
+            profile: "dev".to_string(),
+            agent: "team".to_string(),
+            ..Default::default()
+        };
+        state.visible_tabs = vec!["session".to_string(), "agents".to_string()];
 
         let json = serde_json::to_string(&state).expect("serializes");
-        assert!(
-            json.contains("\"selected_pipeline\":\"web-team\""),
-            "selected_pipeline must serialize as a top-level field; got: {json}"
+        let v: serde_json::Value = serde_json::from_str(&json).expect("parses back");
+        // The catalog is the §8.7 wire projection, repo first.
+        assert_eq!(v["catalog"][0]["name"], "dev");
+        assert_eq!(v["catalog"][0]["origin"], "repo");
+        assert_eq!(v["catalog"][0]["overrides_global"], true);
+        assert_eq!(v["catalog"][0]["agents"][0]["name"], "team");
+        assert_eq!(v["catalog"][0]["agents"][0]["model"], "sonnet");
+        assert_eq!(
+            v["catalog"][0]["agents"][0]["subagents"][0]["name"],
+            "researcher"
         );
-        assert!(
-            json.contains("\"pipelines\""),
-            "pipelines must serialize as a top-level field; got: {json}"
+        assert_eq!(
+            v["catalog"][0]["agents"][0]["subagents"][0]["inherited"],
+            true
+        );
+        // The selection and the derived settings gate.
+        assert_eq!(
+            v["selection"],
+            serde_json::json!({ "profile": "dev", "agent": "team" }),
+            "the selection is on the wire"
+        );
+        assert_eq!(v["profile_pinned"], false);
+        assert_eq!(
+            v["settings_available"], true,
+            "unpinned ⇒ settings available (derived, not stored)"
+        );
+        assert_eq!(v["visible_tabs"], serde_json::json!(["session", "agents"]));
+        // The old pipeline/profile fields are gone from the wire.
+        for gone in [
+            "pipelines",
+            "selected_pipeline",
+            "active_profile",
+            "profiles",
+        ] {
+            assert!(
+                v.get(gone).is_none(),
+                "`{gone}` must be off the wire: {json}"
+            );
+        }
+
+        // The pin flips the derived field on the next serialization.
+        state.profile_pinned = true;
+        let json = serde_json::to_string(&state).expect("serializes");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("parses back");
+        assert_eq!(
+            v["settings_available"], false,
+            "pinned ⇒ settings hidden (derived at serialization)"
         );
 
+        // Round-trip: the new fields parse back 1:1.
         let parsed: AppState = serde_json::from_str(&json).expect("round-trips back");
-        assert_eq!(parsed.selected_pipeline, Some("web-team".into()));
-        assert_eq!(parsed.pipelines.len(), 1);
-        assert_eq!(parsed.pipelines[0].name, "web-team");
-        assert_eq!(parsed.pipelines[0].orchestrator_model, "sonnet");
+        assert_eq!(parsed.catalog.len(), 1);
+        assert_eq!(parsed.catalog[0].name, "dev");
         assert_eq!(
-            parsed.pipelines[0].members,
-            vec![("reviewer".to_string(), "flash".to_string())]
+            parsed.selection,
+            Selection {
+                profile: "dev".to_string(),
+                agent: "team".to_string(),
+                ..Default::default()
+            }
+        );
+        assert!(parsed.profile_pinned);
+        assert_eq!(
+            parsed.visible_tabs,
+            vec!["session".to_string(), "agents".to_string()]
         );
     }
 
@@ -2602,54 +2706,59 @@ mod tests {
         );
     }
 
-    // ── Layer D: `profiles` / `visible_tabs` fields on AppState (RED) ──────
+    // ── 0.24 cutover: `catalog` / `selection` / `visible_tabs` on AppState ─
     //
-    // D4: the outbound state snapshot must carry `profiles: Vec<String>`
-    // and `visible_tabs: Vec<String>` (`active_profile` already exists,
-    // pinned separately below) — snake_case, consistent with every other
-    // wire field (`selected_pipeline`, `active_profile`). Compile-RED
-    // until both fields exist on `AppState` (E0609 on `.profiles` /
-    // `.visible_tabs`, or "no field" on the struct literal below).
+    // The snapshot carries `catalog: Vec<ProfileInfo>`,
+    // `selection: Selection`, `profile_pinned: bool` and
+    // `visible_tabs: Vec<String>` — snake_case, consistent with every
+    // other wire field.
 
-    /// The new fields round-trip 1:1 and use the SAME snake_case naming
-    /// style the existing `selected_pipeline`/`active_profile` fields do
-    /// — no camelCase drift, no `#[serde(rename)]` needed anywhere else.
+    /// `visible_tabs` and `selection` round-trip 1:1 with the SAME
+    /// snake_case naming style every other wire field uses — no
+    /// camelCase drift, no `#[serde(rename)]` needed anywhere else.
     #[test]
     fn profile_view_fields_serialize_snake_case_and_round_trip() {
         let mut state = AppState::new();
-        state.profiles = vec!["admin".to_string(), "web".to_string()];
-        state.active_profile = Some("web".to_string());
+        state.selection = Selection {
+            profile: "web".to_string(),
+            agent: "main".to_string(),
+            ..Default::default()
+        };
         state.visible_tabs = vec!["session".to_string(), "bash".to_string()];
 
         let json = serde_json::to_string(&state).expect("serializes");
         assert!(
-            json.contains("\"profiles\":[\"admin\",\"web\"]"),
-            "profiles must serialize snake_case as a top-level array; got: {json}"
-        );
-        assert!(
-            json.contains("\"active_profile\":\"web\""),
-            "active_profile must serialize snake_case, matching the existing field; got: {json}"
+            json.contains("\"selection\":{\"profile\":\"web\",\"agent\":\"main\"}"),
+            "selection must serialize snake_case as a top-level object; got: {json}"
         );
         assert!(
             json.contains("\"visible_tabs\":[\"session\",\"bash\"]"),
             "visible_tabs must serialize snake_case as a top-level array; got: {json}"
         );
+        assert!(
+            json.contains("\"profile_pinned\":false"),
+            "profile_pinned must serialize snake_case as a top-level bool; got: {json}"
+        );
 
         let parsed: AppState = serde_json::from_str(&json).expect("round-trips back");
         assert_eq!(
-            parsed.profiles,
-            vec!["admin".to_string(), "web".to_string()]
+            parsed.selection,
+            Selection {
+                profile: "web".to_string(),
+                agent: "main".to_string(),
+                ..Default::default()
+            }
         );
-        assert_eq!(parsed.active_profile.as_deref(), Some("web"));
         assert_eq!(
             parsed.visible_tabs,
             vec!["session".to_string(), "bash".to_string()]
         );
     }
 
-    /// An old snapshot (pre-Layer-D) with no `profiles`/`visible_tabs`
-    /// keys must still parse — both fields need `#[serde(default)]` so a
-    /// mid-rollout client/server pair doesn't hard-fail on missing keys.
+    /// An old snapshot (pre-cutover) with no `catalog`/`selection`/
+    /// `profile_pinned`/`visible_tabs` keys must still parse — every new
+    /// field needs `#[serde(default)]` so a mid-rollout client/server pair
+    /// doesn't hard-fail on missing keys.
     #[test]
     fn old_snapshot_without_profile_view_fields_parses_with_empty_defaults() {
         let old_snapshot = r#"{
@@ -2673,8 +2782,57 @@ mod tests {
 
         let parsed: AppState =
             serde_json::from_str(old_snapshot).expect("old snapshot must parse on new code");
-        assert_eq!(parsed.profiles, Vec::<String>::new());
+        assert_eq!(parsed.catalog, Vec::<ProfileInfo>::new());
+        assert_eq!(parsed.selection, Selection::default());
+        assert!(!parsed.profile_pinned);
         assert_eq!(parsed.visible_tabs, Vec::<String>::new());
-        assert_eq!(parsed.active_profile, None);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RED test (selection-models plan §9.1, item 27): the state JSON's
+// `selection` carries `subagent_models` iff it is non-empty.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod subagent_models_wire_tests {
+    use super::AppState;
+    use crate::config::resolve::Selection;
+
+    #[test]
+    fn appstate_selection_serializes_subagent_models() {
+        let mut state = AppState::new();
+        state.selection = Selection {
+            profile: "dev".to_string(),
+            agent: "team".to_string(),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&state).expect("serializes");
+        assert!(
+            v["selection"].get("subagent_models").is_none(),
+            "an empty map is omitted from the wire; got: {}",
+            v["selection"]
+        );
+
+        state
+            .selection
+            .subagent_models
+            .insert("tester".to_string(), "opus".to_string());
+        let v = serde_json::to_value(&state).expect("serializes");
+        assert_eq!(
+            v["selection"]["subagent_models"],
+            serde_json::json!({ "tester": "opus" }),
+            "a non-empty map rides the state frame"
+        );
+
+        let parsed: AppState = serde_json::from_value(v).expect("round-trips");
+        assert_eq!(
+            parsed
+                .selection
+                .subagent_models
+                .get("tester")
+                .map(String::as_str),
+            Some("opus"),
+            "the map survives the AppState round trip"
+        );
     }
 }

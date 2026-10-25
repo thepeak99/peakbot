@@ -16,6 +16,22 @@ export function filterTabs<T extends { id: string }>(
   return tabs.filter((t) => allowed.has(t.id));
 }
 
+/** Gear (and Ctrl+,) gate (§9.12 + `settings_available`): the Settings entry
+ * points exist only when the server says Settings is available (false under a
+ * `--profile` pin) AND the bound profile's `visible_tabs` still lists
+ * `settings`. Both fields are absent on older servers / before the first
+ * state frame: absent `settings_available` = available; absent
+ * `visible_tabs` = no rule. Pure so it is unit-testable without the wire. */
+export function settingsGearEnabled(
+  settingsAvailable: boolean | undefined,
+  visibleTabs: string[] | undefined,
+): boolean {
+  return (
+    (settingsAvailable ?? true) &&
+    (visibleTabs === undefined || visibleTabs.includes("settings"))
+  );
+}
+
 /** Keep an open drawer pointed at a real tab after `visibleIds` changes.
  * Closed (`null`) stays closed. A still-visible active tab is untouched. A
  * hidden one falls back to the first visible tab, or `null` if none remain. */

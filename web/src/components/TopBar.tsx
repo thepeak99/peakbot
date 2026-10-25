@@ -4,10 +4,10 @@ import type {
   InboundMessage,
   ModelInfo,
 } from "../state";
-import type { SubAgentRun } from "../types";
-import { ModelSwitcher } from "./ModelSwitcher";
+import type { CatalogProfile, Selection, SubAgentRun } from "../types";
 import { CwdPicker } from "./CwdPicker";
 import { ConversationsPicker } from "./ConversationsPicker";
+import { SelectionChip } from "./SelectionChip";
 import { NotifyToggle } from "./NotifyToggle";
 import { FocusToggle } from "./FocusToggle";
 import { ThemeToggle } from "./ThemeToggle";
@@ -30,14 +30,18 @@ export function TopBar({
   conversations,
   conversationsError,
   send,
-  onSwitchModel,
   onLoadConversation,
   notifyEnabled,
   notifyPermission,
   onToggleNotify,
   focusMode,
   onToggleFocus,
-  lockedReason = null,
+  onOpenSettings,
+  catalog,
+  selection,
+  selectionLocked = false,
+  profilePinned = false,
+  onToast,
   stopPending = false,
 }: {
   isRunning: boolean;
@@ -55,14 +59,28 @@ export function TopBar({
   conversations: ConversationSummary[];
   conversationsError: string | null;
   send: (msg: InboundMessage) => void;
-  onSwitchModel: (alias: string) => void;
   onLoadConversation: (id: string) => void;
   notifyEnabled: boolean;
   notifyPermission: NotifyPermission;
   onToggleNotify: () => void;
   focusMode: boolean;
   onToggleFocus: () => void;
-  lockedReason?: string | null;
+  /** Opens the Settings view. The gear renders only when this is given —
+   * App passes it iff `settings_available` and the profile's `visible_tabs`
+   * include `settings`. */
+  onOpenSettings?: () => void;
+  // T32 chat chip (optional — absent ⇒ no chip, as on older servers): the
+  // profiles/agents catalog and this conversation's (profile, agent)
+  // selection. Both render null on their own when absent.
+  catalog?: CatalogProfile[];
+  selection?: Selection | null;
+  /** The conversation has a user/agent turn (`conversationHasTurns`) — the
+   * selection chip locks. Not `hasTranscript`: system notices don't lock. */
+  selectionLocked?: boolean;
+  /** `AppState.profile_pinned` — a --profile pin freezes the profile. */
+  profilePinned?: boolean;
+  /** Toast sink for `Next conversation: …`. */
+  onToast?(message: string): void;
   /** Two-stage stop: a graceful stop is pending. While set, the working…
    * chip shows the escalation sentence INSTEAD of the statusMessage. */
   stopPending?: boolean;
@@ -78,9 +96,20 @@ export function TopBar({
         <span className="font-semibold text-zinc-100">Shifu</span>
       </div>
 
-      {/* Sessions trio — conversations + model + cwd. On mobile they move
-          to the BottomBar to de-crowd the header, so hide them here below lg. */}
+      {/* Sessions trio — selection + conversations + cwd. The selection chip
+          owns profile, agent AND team-model setup (model/agents chips are
+          gone). On mobile they move to the BottomBar, so hide below lg. */}
       <div className="hidden items-center gap-3 lg:flex">
+        <SelectionChip
+          catalog={catalog ?? []}
+          selection={selection ?? null}
+          models={models}
+          activeAlias={activeAlias}
+          locked={selectionLocked}
+          pinned={profilePinned}
+          send={send}
+          onToast={onToast}
+        />
         <ConversationsPicker
           conversations={conversations}
           error={conversationsError}
@@ -89,15 +118,6 @@ export function TopBar({
           onLoad={onLoadConversation}
           onKill={(id) => send({ type: "kill_session", convo: id })}
         />
-
-       <ModelSwitcher
-          models={models}
-          activeAlias={activeAlias}
-          hasTranscript={hasTranscript}
-          onSwitch={onSwitchModel}
-          lockedReason={lockedReason}
-        />
- 
 
         {cwd && (
           <CwdPicker
@@ -163,6 +183,28 @@ export function TopBar({
           permission={notifyPermission}
           onToggle={onToggleNotify}
         />
+        {onOpenSettings && (
+          <button
+            type="button"
+            onClick={onOpenSettings}
+            title="Settings  Ctrl ,"
+            aria-label="Settings"
+            className="flex h-6 w-6 cursor-pointer items-center justify-center rounded text-zinc-500 transition-colors hover:text-zinc-300"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              className="h-4 w-4"
+            >
+              <circle cx="12" cy="12" r="3" />
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+            </svg>
+          </button>
+        )}
         <span
           className={`flex items-center gap-1.5 rounded px-1.5 py-0.5 ${
             connected ? "text-emerald-400" : "text-zinc-500"

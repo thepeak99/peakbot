@@ -214,7 +214,6 @@ mod tests {
         std::fs::write(session_dir.path().join("probe.unsupported"), "x").unwrap();
 
         let config = VectorDbConfig {
-            enabled: true,
             db_path: db_dir.path().join("v.db").display().to_string(),
             embeddings: EmbeddingsConfig {
                 base_url: "http://unused.invalid".into(),
@@ -223,7 +222,7 @@ mod tests {
                 dimensions: 3,
             },
         };
-        let store = VectorStore::open(&config).unwrap();
+        let store = VectorStore::open(&crate::vector::test_spec(&config)).unwrap();
         let tool = DocIndexTool::new(store).with_session_cwd(session_dir.path().to_path_buf());
 
         // Relative path — must resolve under session_dir and be found.
@@ -257,7 +256,6 @@ mod tests {
         let probe = session_dir.path().join("probe.unsupported");
         std::fs::write(&probe, "x").unwrap();
         let config = VectorDbConfig {
-            enabled: true,
             db_path: "./.peakbot/vectors.db".into(),
             embeddings: EmbeddingsConfig {
                 base_url: "http://unused.invalid".into(),
@@ -266,7 +264,7 @@ mod tests {
                 dimensions: 3,
             },
         };
-        let store = VectorStore::open(&config).unwrap();
+        let store = VectorStore::open(&crate::vector::test_spec(&config)).unwrap();
         let tool = DocIndexTool::new(store).with_session_cwd(session_dir.path().to_path_buf());
         let args: DocIndexArgs = serde_json::from_value(serde_json::json!({
             "path": "probe.unsupported"

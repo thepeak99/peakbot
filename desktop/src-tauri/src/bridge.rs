@@ -14,16 +14,24 @@ use peakbot_desktop_core::phase::{Dialog, Phase, StartStep, StatusView, TrayMode
 
 use crate::tray::{self, TrayItems};
 
-/// The embedded status page URL (DESIGN §4.8). Tauri serves embedded
+/// The embedded local page URL (DESIGN §4.8). Tauri serves embedded
 /// assets from `tauri://localhost` on Linux/macOS and
 /// `http://tauri.localhost` on Windows/Android.
-fn local_page_url() -> tauri::Url {
+pub(crate) fn local_page_url() -> tauri::Url {
     const URL: &str = if cfg!(any(target_os = "windows", target_os = "android")) {
         "http://tauri.localhost"
     } else {
         "tauri://localhost"
     };
     URL.parse().expect("static local page URL parses")
+}
+
+/// The embedded settings page URL (0.24, spec §9.10): the local page
+/// origin plus `settings.html` — the `main` window navigates there.
+pub(crate) fn settings_page_url() -> tauri::Url {
+    local_page_url()
+        .join("settings.html")
+        .expect("local page origin joins with settings.html")
 }
 
 /// Shared mutable state between the controller thread, the IPC commands
@@ -33,6 +41,10 @@ pub struct UiState {
     pub snapshot: Mutex<StatusView>,
     /// The allowed backend origin (`None` on the local status page).
     pub nav: Arc<RwLock<Option<String>>>,
+    /// The live backend URL the phase machine last navigated to
+    /// (`None` while not Ready) — where `← Back to PeakBot` returns
+    /// (0.24, spec §9.10).
+    pub backend_url: Mutex<Option<String>>,
     /// The last tray model the controller emitted.
     pub tray_model: Mutex<TrayModel>,
     /// Clones of the tray items that `TrayModel` updates (2.12's
@@ -46,6 +58,7 @@ impl UiState {
         Self {
             snapshot: Mutex::new(status_view(&starting)),
             nav: Arc::new(RwLock::new(None)),
+            backend_url: Mutex::new(None),
             tray_model: Mutex::new(peakbot_desktop_core::phase::tray_model(
                 &starting,
                 None,
@@ -126,12 +139,15 @@ impl TauriUi {
         match phase {
             Phase::Ready(mode) => {
                 *self.state.nav.write().expect("nav poisoned") = Some(mode.origin());
+                *self.state.backend_url.lock().expect("backend_url poisoned") =
+                    Some(mode.url().to_string());
                 if let Err(e) = win.navigate(mode.url()) {
                     log::warn!("navigate to backend failed: {e}");
                 }
             }
             Phase::Starting(_) | Phase::Failed(_) => {
                 *self.state.nav.write().expect("nav poisoned") = None;
+                *self.state.backend_url.lock().expect("backend_url poisoned") = None;
                 let on_local = win
                     .url()
                     .is_ok_and(|u| classify_navigation(&u, None) == NavDecision::Allow);

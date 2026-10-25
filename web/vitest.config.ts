@@ -16,7 +16,12 @@ import react from "@vitejs/plugin-react";
 export default defineConfig({
   plugins: [react()],
   test: {
-    environmentMatchGlobs: [["src/components/**", "jsdom"]],
+    environmentMatchGlobs: [
+      ["src/components/**", "jsdom"],
+      // Settings shell tests: the .tsx files need a DOM (the pure-logic
+      // .test.ts files in the same directory stay on `node`).
+      ["src/settings/**/*.test.tsx", "jsdom"],
+    ],
     setupFiles: ["./vitest.setup.ts"],
   },
 });

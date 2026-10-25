@@ -14,7 +14,8 @@ on launch, SIGINT→wait→SIGKILL on exit). Optionally the user ticks "Keep Pea
 background" and the app installs the bundled binary as the user's systemd/launchd service through
 peakbot's own `install` / `service …` verbs (**service mode**) and simply connects to
 `127.0.0.1:7823`. The web UI is never rebuilt, never bundled, never given IPC; the only local UI is
-a small local UI (the status page "starting… / error + Retry / Open logs", and the settings window, #377).
+a small local UI (the status page "starting… / error + Retry / Open logs", and the settings page in the
+main window, #377, in-window since 0.24).
 
 **The one key idea:** *the desktop app is a thin, stateless launcher — every decision is a pure
 function in a Tauri-free crate (`peakbot-desktop-core`), every fact comes from peakbot itself.*
@@ -38,14 +39,14 @@ desktop/
 ├── src-tauri/                     crate `peakbot-desktop` (bin) — thin glue
 │   ├── build.rs                   tauri_build with app-manifest (command ACL)
 │   ├── tauri.conf.json
-│   ├── capabilities/{status-page,settings-page}.json
+│   ├── capabilities/local-pages.json
 │   ├── icons/                     generated once by `tauri icon`, committed
 │   ├── binaries/.gitkeep          sidecar copied here at build time (gitignored)
 │   └── src/{main,window,tray,bridge,commands}.rs
 ├── ui/                            frontendDist — bundled local pages, no build step
 │   ├── index.html
 │   ├── status.js
-│   ├── settings.html              settings window (#377)
+│   ├── settings.html              settings page of the main window (#377; in-window since 0.24)
 │   └── settings.js
 ├── macos/
 │   ├── Info.plist.in              template (@VERSION@)
@@ -68,7 +69,7 @@ Dockerfile.desktop-macos
 | `core::sys` (`RealSys`) | The only place that spawns processes, opens sockets, sends signals, touches files | Injectable seam; tests use a `FakeSys` with a virtual clock. |
 | `src-tauri` glue | Window(s), navigation guard, tray, native dialogs, 4 IPC commands for the local pages, exit hook | Tauri-specific; deliberately logic-free. |
 | `core::settings` | The settings model (`Settings` sum type), boundary validation, `settings.json` parse/render/load, `settings_view` (#377) | Illegal combos (remote without HTTPS/token) are unrepresentable; validated once at the IPC edge. |
-| `ui/settings.*` settings window | Edits protocol/token/remote, toggles background; polled `settings_get`, `settings_set`/`act` | Opened from tray / macOS menu / Ctrl+Shift+S / status-page link; IPC-gated to the bundled origin only (#377). |
+| `ui/settings.*` settings page (main window) | Toggles background (`act`), `← Back to PeakBot` (`act` "back"); polled `settings_get` | Shown in the `main` window from tray / macOS menu / Ctrl+Shift+S / status-page link / the SPA's `Desktop app settings ↗` link (0.24, spec §9.10); IPC-gated to the bundled origin only. |
 | `ui/` status page | Shows `StatusView` (polled), buttons → `act` | The only thing shown when the backend isn't up. Plain HTML/JS, embedded via `frontendDist`. |
 | `macos/assemble-app.sh` | Builds the `.app` layout Tauri CLI can't build on Linux | Researcher: Tauri CLI cannot bundle `.app` on Linux. |
 | Dockerfiles + `build-desktop.sh` | Reproducible builds, same path locally (podman) and in CI (docker) | Follows the existing `Dockerfile.*` + `--output type=local` pattern. |
@@ -185,7 +186,7 @@ controller and never becomes a visible phase.
 
 ```rust
 #[derive(Serialize)] #[serde(rename_all = "snake_case")]
-pub enum UiAction { Retry, OpenLogs, ReinstallService, Quit, ToggleBackground }   // also Deserialize: the `act` command's input; status_view never emits ToggleBackground (settings window only, #377)
+pub enum UiAction { Retry, OpenLogs, ReinstallService, Quit, ToggleBackground, Back }   // also Deserialize: the `act` command's input; status_view never emits ToggleBackground (settings page only, #377) or Back (settings page's `← Back to PeakBot`, 0.24)
 
 #[derive(Serialize)]
 pub struct StatusView {
@@ -296,6 +297,8 @@ macOS `X.app/Contents/MacOS/peakbot`; dev `desktop/target/debug/peakbot` (tauri-
 10. (**I5**) Only the controller thread writes `settings.json` and `web-token`; writes are atomic (`write_private`).
 
 ### 3.9 Settings (`core::settings`) — amendment #377
+> **Superseded by §11 (0.24 config).** `settings.json`, `SaveRequest`, the web-token file and `Action::SaveSettings` are gone.
+
 ```rust
 pub const SETTINGS_VERSION: u32 = 1;
 
@@ -484,6 +487,8 @@ README's manual-removal section (§5.8), (c) by design the service runs from the
 vanished `/tmp/.mount_*` or `.app` path.
 
 ### 4.6 Shutdown and orphans
+> **0.24 (§11):** the reaper's identity check is the recorded sidecar path (pidfile `pid=…\nexe=…`), not `--bind`.
+
 
 `stop_session()` (used by Shutdown, Start-restart, Enable):
 `child.interrupt()` (SIGINT to the pid) → poll `try_wait` every `POLL_INTERVAL` up to `STOP_GRACE`
@@ -526,7 +531,8 @@ loop:
   anything else (`file:`, `data:`, `javascript:` …) → Block.
 - `on_new_window(url, _)` → same classifier, but Allow is treated as OpenExternal; always
   `NewWindowResponse::Deny` (no popups inside the app).
-- (amended #377) Reserved URL `peakbot-desktop:settings` → `NavDecision::OpenSettings` (wins over the allowed backend origin): the navigation/new-window is blocked and `window::request_settings` opens the single `settings` window (title `PeakBot Settings`, 520×600, min 420×480, `WebviewUrl::App("settings.html")`; a second trigger focuses it). Entry points: tray / macOS PeakBot submenu item `settings` (macOS accelerator `CmdOrCtrl+Shift+S`), the main window's init-script `keydown` (Ctrl/Cmd+Shift+S → `location.href = sentinel`, works on every origin incl. the remote UI, no IPC), and a status-page footer link. `request_settings` spawns on the async runtime — never build a window inside a nav/menu callback. The settings window's own nav guard allows the local origin only (I6).
+- (amended #377, in-window since 0.24) Reserved URL `peakbot-desktop:settings` → `NavDecision::OpenSettings` (wins over the allowed backend origin): the navigation/new-window is blocked and `window::request_settings_page` navigates the SAME `main` window to `WebviewUrl::App("settings.html")` (show + unminimize + focus) — there is no second settings window (spec §9.10). Entry points: tray / macOS PeakBot submenu item `settings` (macOS accelerator `CmdOrCtrl+Shift+S`), the main window's init-script `keydown` (Ctrl/Cmd+Shift+S → `location.href = sentinel`, works on every origin incl. the remote UI, no IPC), a status-page footer link, and the SPA's `Desktop app settings ↗` link. `request_settings_page` spawns on the async runtime — never navigate from inside a nav/menu callback. The page's `← Back to PeakBot` sends `act` "back": the `main` window navigates back to the live backend URL the phase machine last set (`UiState.backend_url`), or the status page while not Ready.
+- (0.24, spec §8.4) Reserved URL `peakbot-desktop:restart` → `NavDecision::Restart` (wins over the allowed backend origin): the navigation is blocked and the glue sends `Action::Restart` to the controller (session child relaunch / service reinstall — never the desktop app). Every other `peakbot-desktop:` URL stays `Block`.
 
 ### 4.9 Environment for every sidecar invocation
 `sanitize_env(parent)` (pure): if `APPDIR` is set, drop `APPDIR, APPIMAGE, ARGV0, OWD`; for
@@ -545,6 +551,8 @@ unset → set it to `1` (`unsafe { std::env::set_var }`, edition 2024). Decision
 `core::env::webkit_dmabuf_default(existing: Option<&OsStr>) -> Option<(&'static str, &'static str)>`.
 
 ### 4.11 Saving settings (`Action::SaveSettings`) — amendment #377
+> **Superseded by §11 (0.24 config).** `settings.json`, `SaveRequest`, the web-token file and `Action::SaveSettings` are gone.
+
 
 **`SaveSettings(new)`** (controller thread; ignored while `Starting`, like its siblings):
 ```
@@ -1519,3 +1527,44 @@ platform-parameterized function — `phase::Platform { Windows, Unix }` + `phase
 a `background_visible` flag derived from it; the glue (tray + settings view) hides the item/row when it is
 `false`. Unix behaviour is byte-identical (existing `t31`/`t74` tests pin it). Follow-up ticket: make it
 work (hidden window + `/Run`).
+
+## 11. AMENDMENT (0.24 config) — `general.web` is the desktop's web config (2026-10-24)
+
+Spec: `make-config-great-again.md` §8.4/§11.6. Supersedes §3.9, §4.11 and the token/port parts of §3.1,
+§3.6, §3.8 (I2/I4), §4.3, §4.6.
+
+- **Source of truth.** `<config_dir>/config.yaml` `general.web.{bind, tls, token}`, read leniently by
+  `web_target::read_web_target` (missing/legacy/unparsable ⇒ `127.0.0.1:7823`, http, no token). The desktop
+  owns no token file and no `settings.json`; it never generates, writes or removes a token.
+- **`Mode`** = `Session(WebTarget)` | `Service(WebTarget)`; URL host is `127.0.0.1` for loopback/unspecified
+  binds, else the bind IP; scheme `https` iff `tls`. Service mode ORs in the unit's `TLS: on` line (a unit
+  installed by hand with `--tls`), matching the server's `--tls || general.web.tls`.
+- **When read.** On every start/restart, and again once the backend answers (200 or 401): the child's first
+  boot may auto-migrate a legacy config and move the web-token into `general.web.token`. If the fresh read
+  differs, the controller probes once more with it and goes Ready on the fresh target (`await_backend`).
+- **Session launch.** argv `[]`; env = parent env minus `PEAKBOT_WEB_TOKEN`, plus `PEAKBOT_NO_OPEN=1`. No port
+  fallback: a busy bind ⇒ the child exits ⇒ `Failed(SessionExited)` with the log tail. `PortUnavailable`,
+  `Sys::free_port`, `Sys::random_token` and the 7824/`PORT_ATTEMPTS` constants are deleted.
+- **Pidfile** `pid=<u32>\nexe=<sidecar path>`; the reaper signals only if `cmdline_of(pid)` contains the
+  recorded path (works across AppImage remounts; never matches the service or a hand-started `peakbot`).
+- **Service install** is always bare `service install` (the unit reads `general.web` at start). Enable's
+  port-busy check uses `general.web.bind`, and is skipped while our own session holds that port.
+- **`Action::Restart`** (sentinel `peakbot-desktop:restart`, wired by the glue in T16): service installed ⇒
+  `reconfigure_service` (uninstall + bare install; binary not replaced — the reinstall is the restart);
+  otherwise ⇒ the full start path (stop child, re-read, relaunch). No dialog; the app never restarts.
+- **`SettingsView`** = `{cert_warning, background_visible, background, background_enabled, busy}` (the
+  spec's list plus `background_visible`, kept for the §10.5 Windows rule). `settings_set` is gone.
+- **T16 shell (wired).** ONE window: the settings window (`SETTINGS_LABEL`, `open_settings`) is
+  deleted; `OpenSettings` (tray `Settings…`, macOS menu, Ctrl+Shift+S init script, status-page
+  link, the SPA's `Desktop app settings ↗`) navigates `main` to the bundled `settings.html`
+  (`window::request_settings_page`, spawned on the async runtime). `peakbot-desktop:restart` →
+  `NavDecision::Restart` → `Action::Restart` (both nav callbacks); every other `peakbot-desktop:`
+  URL stays `Block`. One capability `local-pages.json` for window `main` (`allow-status`,
+  `allow-act`, `allow-settings-get`; no `remote` block) replaces `status-page.json` +
+  `settings-page.json`; the command ACL drops `settings_set` (build.rs). `settings.html`/`.js`
+  carry only the background row + `← Back to PeakBot` (`act` "back" → `UiState.backend_url`,
+  or the status page while not Ready) + a note that web settings live in
+  PeakBot → Settings → General.
+- Tests: `restart_session_rereads_bind`, `restart_service_reinstalls`, `ready_reread_picks_migrated_token`,
+  `no_settings_json_or_web_token_io`, `busy_bind_fails_with_log_tail_without_fallback`, `t55b_*`;
+  T16: `classify_restart`, `classify_settings`, `other_sentinel_blocked` (nav.rs).

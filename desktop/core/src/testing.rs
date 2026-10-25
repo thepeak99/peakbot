@@ -22,7 +22,6 @@ use url::Url;
 use crate::controller::Ui;
 use crate::phase::{Dialog, Phase, TrayModel};
 use crate::sys::{Child, Probe, RunOutput, Signal, SpawnSpec, Sys};
-use crate::token::Token;
 
 // ---------------------------------------------------------------------------
 // Effect log
@@ -63,8 +62,6 @@ pub enum Effect {
     Sleep {
         d: Duration,
     },
-    FreePort,
-    RandomToken,
     ChildInterrupt {
         pid: u32,
     },
@@ -92,18 +89,18 @@ pub(crate) struct FakeSysState {
     pub default_probe: Vec<Probe>,
     /// In-memory files.
     pub files: HashMap<PathBuf, String>,
+    /// Every path `read` was called on, in order (spec §11.6: no
+    /// settings.json / web-token reads).
+    pub reads: Vec<PathBuf>,
     /// Paths `write_private` was called on (the 0600 set).
     pub private_files: HashSet<PathBuf>,
     /// Paths where `write_private` fails (design #377 t83).
     pub fail_writes: HashSet<PathBuf>,
     pub port_free: HashMap<u16, bool>,
-    pub free_port_value: u16,
     pub cmdline: HashMap<u32, String>,
     /// Children `spawn` returns, in order (default: `never`).
     pub children: VecDeque<FakeChildSpec>,
     pub next_pid: u32,
-    pub token_counter: u64,
-    pub tokens: Vec<String>,
     pub spawned: Vec<SpawnSpec>,
     pub spawn_pids: Vec<u32>,
 }
@@ -121,7 +118,6 @@ impl FakeSys {
         Self {
             state: Arc::new(Mutex::new(FakeSysState {
                 now: None,
-                free_port_value: 7999,
                 next_pid: 1001,
                 ..Default::default()
             })),
@@ -164,10 +160,6 @@ impl FakeSys {
         self.state.lock().unwrap().port_free.insert(port, free);
     }
 
-    pub fn set_free_port(&self, port: u16) {
-        self.state.lock().unwrap().free_port_value = port;
-    }
-
     pub fn set_cmdline(&self, pid: u32, cmd: impl Into<String>) {
         self.state.lock().unwrap().cmdline.insert(pid, cmd.into());
     }
@@ -176,7 +168,7 @@ impl FakeSys {
         self.state.lock().unwrap().children.push_back(spec);
     }
 
-    /// Seed an in-memory file (web-token, config.yaml, pidfile, …).
+    /// Seed an in-memory file (config.yaml, pidfile, …).
     pub fn seed_file(&self, path: impl Into<PathBuf>, contents: impl Into<String>) {
         self.state
             .lock()
@@ -227,9 +219,9 @@ impl FakeSys {
         self.state.lock().unwrap().spawn_pids.clone()
     }
 
-    /// The raw token strings `random_token` produced, in order.
-    pub fn tokens_generated(&self) -> Vec<String> {
-        self.state.lock().unwrap().tokens.clone()
+    /// Every path `read` was called on, in order.
+    pub fn read_paths(&self) -> Vec<PathBuf> {
+        self.state.lock().unwrap().reads.clone()
     }
 
     /// Advance the virtual clock (what `sleep` does).
@@ -287,6 +279,11 @@ impl Sys for FakeSys {
             // RealSys truncates the session log at spawn.
             st.files.remove(&spec.log);
             let child_spec = st.children.pop_front().unwrap_or(FakeChildSpec::never());
+            // Models what the child does at boot before it answers (e.g.
+            // the 0.24 auto-migration rewriting config.yaml).
+            if let Some((path, contents)) = &child_spec.boot_write {
+                st.files.insert(path.clone(), contents.clone());
+            }
             let pid = st.next_pid;
             st.next_pid += 1;
             st.spawned.push(spec.clone());
@@ -331,11 +328,6 @@ impl Sys for FakeSys {
         probe
     }
 
-    fn free_port(&self) -> io::Result<u16> {
-        self.events.lock().unwrap().push(Effect::FreePort);
-        Ok(self.state.lock().unwrap().free_port_value)
-    }
-
     fn port_is_free(&self, port: u16) -> bool {
         self.state
             .lock()
@@ -346,20 +338,10 @@ impl Sys for FakeSys {
             .unwrap_or(true)
     }
 
-    fn random_token(&self) -> Token {
-        let n = {
-            let mut st = self.state.lock().unwrap();
-            st.token_counter += 1;
-            st.token_counter
-        };
-        self.events.lock().unwrap().push(Effect::RandomToken);
-        let raw = format!("{n:064x}");
-        self.state.lock().unwrap().tokens.push(raw.clone());
-        Token::parse(&raw).expect("a fake token must parse (no whitespace)")
-    }
-
     fn read(&self, path: &Path) -> io::Result<Option<String>> {
-        Ok(self.state.lock().unwrap().files.get(path).cloned())
+        let mut st = self.state.lock().unwrap();
+        st.reads.push(path.to_path_buf());
+        Ok(st.files.get(path).cloned())
     }
 
     fn write_private(&self, path: &Path, contents: &str) -> io::Result<()> {
@@ -460,6 +442,9 @@ pub struct FakeChildSpec {
     /// Written to the session log when the child exits (models the
     /// sidecar's stdout+stderr landing in the log).
     pub log_write: Option<String>,
+    /// Written (path, contents) at spawn, before the first probe —
+    /// models the child's boot-time auto-migration of config.yaml.
+    pub boot_write: Option<(PathBuf, String)>,
     pub pid: u32,
     /// Set by `FakeSys::spawn`; `None` for directly-constructed children.
     pub log_path: Option<PathBuf>,
@@ -471,6 +456,7 @@ impl Default for FakeChildSpec {
             mode: ChildMode::Never,
             exit: Some(0),
             log_write: None,
+            boot_write: None,
             pid: 0,
             log_path: None,
         }

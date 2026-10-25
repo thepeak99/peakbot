@@ -80,7 +80,6 @@ interface TopBarFixtureProps {
   dirListing: DirListing | null;
   conversations: ConversationSummary[];
   send: (msg: InboundMessage) => void;
-  onSwitchModel: (alias: string) => void;
   onLoadConversation: (id: string) => void;
   notifyEnabled: boolean;
   notifyPermission: NotifyPermission;
@@ -91,10 +90,8 @@ interface TopBarFixtureProps {
   // (D7), mirroring what App.tsx will pass once the hook exists.
   focusMode: boolean;
   onToggleFocus: () => void;
-  /** Two-stage stop: a graceful stop is pending. Not on TopBar's declared
-   *  props yet — the fixture carries it, like `focusMode` did. */
+  /** Two-stage stop: a graceful stop is pending. */
   stopPending?: boolean;
-  lockedReason?: string | null;
 }
 
 const baseProps: TopBarFixtureProps = {
@@ -110,7 +107,6 @@ const baseProps: TopBarFixtureProps = {
   statusMessage: null,
   subAgent: null,
   send: () => {},
-  onSwitchModel: () => {},
   onLoadConversation: () => {},
   notifyEnabled: false,
   onToggleNotify: () => {},

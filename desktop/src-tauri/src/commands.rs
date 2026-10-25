@@ -1,6 +1,6 @@
 //! The IPC commands for the bundled local pages (DESIGN §5.4, amendment
-//! #377): `status`/`act` for the status page, `settings_get`/`settings_set`
-//! for the settings window. The remote PeakBot web UI has no permissions
+//! #377): `status`/`act` for the status page, `settings_get` for the
+//! settings page (0.24: read-only — web settings live in config.yaml). The remote PeakBot web UI has no permissions
 //! at all (capability ACL).
 
 use std::sync::Arc;
@@ -12,8 +12,7 @@ use tauri_plugin_opener::OpenerExt;
 use peakbot_desktop_core::controller::Action;
 use peakbot_desktop_core::paths::DesktopPaths;
 use peakbot_desktop_core::phase::{StatusView, UiAction};
-use peakbot_desktop_core::settings::{self, SaveRequest, SettingsView, SettingsWire};
-use peakbot_desktop_core::token::Token;
+use peakbot_desktop_core::settings::{self, SettingsView};
 
 use crate::bridge::UiState;
 
@@ -27,9 +26,15 @@ pub fn status(state: State<'_, Arc<UiState>>) -> StatusView {
     state.snapshot.lock().expect("snapshot poisoned").clone()
 }
 
-/// A status-page button press (DESIGN §4.2/§5.4).
+/// A local-page button press (DESIGN §4.2/§5.4): status-page actions
+/// and the settings page's `← Back to PeakBot` (0.24, spec §9.10).
 #[tauri::command]
-pub fn act(action: UiAction, app: AppHandle, tx: State<'_, ActionTx>) -> Result<(), String> {
+pub fn act(
+    action: UiAction,
+    app: AppHandle,
+    tx: State<'_, ActionTx>,
+    ui: State<'_, Arc<UiState>>,
+) -> Result<(), String> {
     match action {
         UiAction::Retry => tx.0.send(Action::Start).map_err(|e| e.to_string()),
         UiAction::ReinstallService => {
@@ -48,50 +53,38 @@ pub fn act(action: UiAction, app: AppHandle, tx: State<'_, ActionTx>) -> Result<
             app.exit(0);
             Ok(())
         }
-        // The settings window's background row (design #377 §5.2); the
+        // The settings page's background row (design #377 §5.2); the
         // status page never emits it.
         UiAction::ToggleBackground => {
             tx.0.send(Action::ToggleBackground)
                 .map_err(|e| e.to_string())
         }
+        // The settings page's `← Back to PeakBot` (0.24, spec §9.10):
+        // the main window goes back to the live backend URL, or the
+        // status page if the backend is not Ready.
+        UiAction::Back => {
+            let backend = ui.backend_url.lock().expect("backend_url poisoned").clone();
+            let target = match backend {
+                Some(url) => url.parse::<tauri::Url>().map_err(|e| e.to_string())?,
+                None => crate::bridge::local_page_url(),
+            };
+            let Some(win) = app.get_webview_window(crate::window::MAIN_LABEL) else {
+                return Err("main window not found".into());
+            };
+            win.navigate(target).map_err(|e| e.to_string())
+        }
     }
 }
 
-/// The settings window's current view (design #377b §4.1): the saved
-/// `settings.json` (missing/corrupt ⇒ defaults, read-only here), the
-/// current web-token (dropped by the view when the token is off), and
-/// the live tray/status state. Only the controller writes the files.
+/// The settings page's current view: the live tray/status state only
+/// (0.24 config, spec §8.4 — no settings.json, no web-token).
 #[tauri::command]
-pub fn settings_get(
-    state: State<'_, Arc<UiState>>,
-    paths: State<'_, DesktopPaths>,
-) -> SettingsView {
-    let text = std::fs::read_to_string(paths.settings_file()).ok();
-    let settings = settings::load_settings(text.as_deref());
-    let token = std::fs::read_to_string(paths.web_token())
-        .ok()
-        .and_then(|t| Token::parse(&t));
+pub fn settings_get(state: State<'_, Arc<UiState>>) -> SettingsView {
     let tray = state
         .tray_model
         .lock()
         .expect("tray_model poisoned")
         .clone();
     let snapshot = state.snapshot.lock().expect("snapshot poisoned").clone();
-    settings::settings_view(settings, token, &tray, &snapshot, &paths.web_token())
-}
-
-/// Save the settings + the optional new token from the settings window
-/// (design #377b §4.3). `SaveRequest::parse` is THE boundary check: an
-/// illegal wire value or a bad token is rejected verbatim and nothing
-/// reaches the controller or the disk. An empty token keeps the
-/// current one (or generates one).
-#[tauri::command]
-pub fn settings_set(
-    settings: SettingsWire,
-    token: String,
-    tx: State<'_, ActionTx>,
-) -> Result<(), String> {
-    let req = SaveRequest::parse(settings, &token)?;
-    tx.0.send(Action::SaveSettings(req))
-        .map_err(|e| e.to_string())
+    settings::settings_view(&tray, &snapshot)
 }

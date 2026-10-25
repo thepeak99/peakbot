@@ -16,7 +16,6 @@ use url::Url;
 
 use crate::consts::{PROBE_TIMEOUT, RUN_TIMEOUT};
 use crate::env::sanitize_env;
-use crate::token::Token;
 
 /// THE only process constructor in this crate: every child goes through
 /// it, and on Windows it is created with the `CREATE_NO_WINDOW` flag, so
@@ -107,12 +106,8 @@ pub trait Sys: Send {
     fn spawn(&self, spec: SpawnSpec) -> io::Result<Box<dyn Child>>;
     /// GET, PROBE_TIMEOUT, no redirects followed.
     fn probe(&self, url: &Url) -> Probe;
-    /// Bind 127.0.0.1:0, read the port, drop.
-    fn free_port(&self) -> io::Result<u16>;
     /// Bind of 127.0.0.1:port succeeds.
     fn port_is_free(&self, port: u16) -> bool;
-    /// 32 random bytes, lowercase hex (64 chars).
-    fn random_token(&self) -> Token;
     /// `Ok(None)` if NotFound.
     fn read(&self, path: &Path) -> io::Result<Option<String>>;
     /// Byte-for-byte equality of two files. Lengths are compared first
@@ -275,20 +270,8 @@ impl Sys for RealSys {
         }
     }
 
-    fn free_port(&self) -> io::Result<u16> {
-        let listener = TcpListener::bind(("127.0.0.1", 0))?;
-        Ok(listener.local_addr()?.port())
-    }
-
     fn port_is_free(&self, port: u16) -> bool {
         TcpListener::bind(("127.0.0.1", port)).is_ok()
-    }
-
-    fn random_token(&self) -> Token {
-        let mut bytes = [0u8; 32];
-        getrandom::fill(&mut bytes).expect("getrandom: system RNG unavailable");
-        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        Token::parse(&hex).expect("lowercase hex always parses as a token")
     }
 
     fn read(&self, path: &Path) -> io::Result<Option<String>> {

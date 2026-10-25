@@ -23,6 +23,7 @@ pub mod settings;
 pub mod sys;
 pub mod token;
 pub mod version;
+pub mod web_target;
 
 #[cfg(test)]
 pub(crate) mod testing;

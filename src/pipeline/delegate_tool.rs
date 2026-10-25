@@ -12,71 +12,79 @@
 //! TEE'd to the shared transcript tagged `SubAgent { role }`, and filtered out
 //! of the orchestrator wire by `get_agent_history`).
 
-use crate::config::{BashConfig, SearXngConfig};
+use crate::config::ResolvedModel;
+use crate::config::resolve::{Bound, Subagent};
 use crate::hooks::events::SourcedEvent;
 use crate::pipeline::handoff;
-use crate::pipeline::registry::SubAgentRegistry;
 use crate::state::StateManager;
 use crate::tools::ShellKind;
+use crate::tools::env::ToolEnv;
 use crate::tools::todo::TodoList;
 use rig_core::completion::ToolDefinition;
 use rig_core::completion::message::Message;
 use rig_core::tool::Tool;
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::bg_processes::BgListEntry;
 
-/// Build context a sub-agent needs, captured where the orchestrator agent is
-/// constructed (inside `add_builtin_tools`). A per-delegation fresh agent
-/// genuinely needs the same build inputs the orchestrator had — searxng, the
-/// bash env, the session `StateManager` (session cwd + bg registry), the
-/// detected shell, the vector store, `max_turns` — plus the event sink to TEE
-/// its turns.
+/// What a delegation needs to build a fresh subagent: the session's `Bound`
+/// (its agent's `subagents` are the roster), the profile's `ToolEnv` (the
+/// same tools and MCP servers the main agent has), the session
+/// `StateManager` (session cwd + bg registry), the detected shell, the
+/// discovered skills, the event sink to TEE its turns, and the retry policy.
 #[derive(Clone)]
 pub struct SubAgentDeps {
-    pub registry: Arc<SubAgentRegistry>,
-    pub searxng: Option<SearXngConfig>,
-    pub bash_config: BashConfig,
-    pub tools_filter: crate::config::NameFilter,
+    /// The session's ONE `(profile, agent)`; `bound.agent().subagents` is
+    /// the roster the `delegate` tool offers.
+    pub bound: Bound,
+    /// The orchestrator's EFFECTIVE model (the session's active model, which
+    /// can differ from the agent's configured one after `/model` or a chip
+    /// pick). Inherited subagents ride it (I10).
+    pub orchestrator_model: ResolvedModel,
+    pub tool_env: Arc<ToolEnv>,
     pub state_manager: Arc<StateManager>,
     pub shell_kind: Option<ShellKind>,
-    pub vector_store: Option<crate::vector::VectorStore>,
-    pub max_turns: usize,
-    /// The discovered skills, used to build each role's per-role-filtered
-    /// skills section in the sub-agent preamble (derived at delegation time).
+    /// The discovered skills, used to build each subagent's filtered skills
+    /// section in its preamble (derived at delegation time).
     pub skills: crate::skills::SkillRegistry,
-    /// The orchestrator's event sink. Sub-agent events are pushed here tagged
-    /// `SubAgent { role }`. `None` under Ollama (hookless) — see `build_sub_agent`.
+    /// The main agent's event sink. Subagent events are pushed here tagged
+    /// `SubAgent { role }`. The provider build owns the channel, so it fills
+    /// this in (`with_event_sink`); `None` under Ollama (hookless).
     pub event_sink: Option<mpsc::UnboundedSender<SourcedEvent>>,
-    /// Retry policy for a delegation's wire calls — the orchestrator's own.
+    /// Retry policy for a delegation's wire calls — the main agent's own.
     pub retry: crate::config::RetryConfig,
-    /// Wall-clock budgets — the delegation's prompt loop reads `delegate_secs`
-    /// from here, so the operator's config drives it rather than a constant.
-    pub timeouts: crate::config::TimeoutsConfig,
-    /// The profile's `agents_md:` ceiling (config-level, defaults `true`):
-    /// ANDed with a role's own `agents_md` opt-in before building the
-    /// preamble, so `agents_md: false` strips even an opted-in role's
-    /// agents.md section.
-    pub agents_md_ceiling: bool,
-    /// The `fetch_url` tool config — the sub-agent's fetch_url is built from
-    /// the same `FetchUrlConfig` the orchestrator's was (one knob, both lanes).
-    pub fetch_url: crate::config::FetchUrlConfig,
 }
 
-/// The effective agents.md flag for a delegation: the role's own opt-in
-/// AND the profile's `agents_md:` ceiling — a profile with `agents_md:
-/// false` strips the section even from a role that opted in.
-fn agents_md_effective(role_agents_md: bool, profile_ceiling: bool) -> bool {
-    role_agents_md && profile_ceiling
+impl SubAgentDeps {
+    /// A copy wired to `sink` — the event channel the main agent's provider
+    /// build just created (the caller cannot know it in advance).
+    pub(crate) fn with_event_sink(
+        &self,
+        sink: Option<mpsc::UnboundedSender<SourcedEvent>>,
+    ) -> SubAgentDeps {
+        SubAgentDeps {
+            event_sink: sink,
+            ..self.clone()
+        }
+    }
+
+    fn subagents(&self) -> &[Subagent] {
+        &self.bound.agent().subagents
+    }
+
+    /// The model a delegation to `sub` runs on (I10): the bound's override,
+    /// else the inherited orchestrator model, else the configured one.
+    pub(crate) fn model_for<'a>(&'a self, sub: &'a Subagent) -> &'a ResolvedModel {
+        self.bound.subagent_model(sub, &self.orchestrator_model)
+    }
 }
 
 /// Build a sub-agent's preamble: `role_prompt` + the live env block + this
 /// role's filtered skills + the caller's background-process snapshot,
-/// optionally followed by the repo's `agents.md` (only when the role sets
-/// `agents_md: true`). Deliberately lean — no persona, core guidance, or
+/// optionally followed by the repo's `agents.md` (only when the subagent
+/// sets `agents_md: true`). Deliberately lean — no persona, core guidance, or
 /// memory. Sections are separated by blank lines; empty pieces (no skills
 /// shown, no bg processes, no agents.md) contribute nothing.
 // `pub` (not `pub(crate)`) only so the pre-0.24 behaviour-snapshot test
@@ -221,20 +229,6 @@ fn normalize_delegate_output(role: &str, raw: String) -> String {
     }
 }
 
-/// Merge a role's `env:` over a base bash env. Role keys win; base-only keys
-/// are kept. Returns a fresh `BashConfig` with the merged env — the base is
-/// not mutated (delegations must not leak env into the orchestrator's bash).
-fn merge_role_env(base: &BashConfig, role_env: Option<&HashMap<String, String>>) -> BashConfig {
-    let Some(role_env) = role_env else {
-        return base.clone();
-    };
-    let mut merged = base.env.clone().unwrap_or_default();
-    for (k, v) in role_env {
-        merged.insert(k.clone(), v.clone());
-    }
-    BashConfig { env: Some(merged) }
-}
-
 /// Tool for delegating a task to a sub-agent.
 #[derive(Clone)]
 pub struct DelegateTool {
@@ -246,14 +240,13 @@ impl DelegateTool {
         Self { deps }
     }
 
-    /// Sorted role names, for the tool description + error messages.
+    /// Sorted subagent names, for the tool description + error messages.
     fn available_roles(&self) -> Vec<String> {
         let mut roles: Vec<String> = self
             .deps
-            .registry
-            .list_agents()
-            .into_iter()
-            .map(|s| s.to_string())
+            .subagents()
+            .iter()
+            .map(|s| s.member.name.clone())
             .collect();
         roles.sort();
         roles
@@ -318,9 +311,10 @@ impl Tool for DelegateTool {
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let deps = &self.deps;
 
-        let role = deps
-            .registry
-            .role(&args.role)
+        let sub = deps
+            .subagents()
+            .iter()
+            .find(|s| s.member.name == args.role)
             .ok_or_else(|| DelegateError::UnknownRole {
                 role: args.role.clone(),
                 available: self.available_roles(),
@@ -332,7 +326,8 @@ impl Tool for DelegateTool {
 
         // Ollama is hookless by type — its sub-agent never reaches a
         // checkpoint, so it is not pausable (the UI hides the button).
-        let provider_config = &role.model.provider_config;
+        let model = deps.model_for(sub);
+        let provider_config = &model.provider_config;
         let pausable = !matches!(provider_config, crate::config::ProviderConfig::Ollama(_));
 
         // The guard owns the sub-agent slot for the whole call — success,
@@ -347,48 +342,31 @@ impl Tool for DelegateTool {
         // sub-agent what is already running and anchors the outbound delta.
         let bg_before = deps.state_manager.list_bg();
 
-        let bash_config = merge_role_env(&deps.bash_config, role.env.as_ref());
-
-        // Enrich the role prompt with a lean shared context: the live env
-        // block (cwd/time/shell) + this role's filtered skills + what is
-        // running in the shared bg registry, plus the repo's
-        // agents.md only when the role opts in (`agents_md: true`) AND the
-        // profile's `agents_md:` ceiling allows it. No persona, no core tool
-        // guidance, no memory — a sub-agent's `prompt` is its whole persona;
+        // Enrich the subagent's prompt with a lean shared context: the live
+        // env block (cwd/time/shell) + its filtered skills + what is running
+        // in the shared bg registry, plus the repo's agents.md only when the
+        // subagent opts in (`agents_md: true`). No persona, no core tool
+        // guidance, no memory — a subagent's `prompt` is its whole persona;
         // everything else it needs goes in the task. Derived here (not
         // cached) so cwd/time are always current.
         let preamble = build_sub_agent_preamble(
-            &role.prompt,
+            &sub.prompt,
             deps.shell_kind.as_ref(),
             &deps.state_manager.session_cwd(),
             &deps.skills,
-            &role.skills,
+            &sub.member.skills,
             &bg_before,
-            agents_md_effective(role.agents_md, deps.agents_md_ceiling),
+            sub.member.agents_md,
         );
 
-        // Size the gate against THIS role's model, not the orchestrator's:
-        // roles routinely run on smaller-context models.
-        let context_budget = deps
-            .state_manager
-            .compaction_threshold()
-            .map(|fraction| (fraction * role.model.context_size as f64) as usize);
-
         let (agent, hook) = crate::providers::build_sub_agent(
-            provider_config,
+            &deps.tool_env,
+            sub,
+            model,
             &preamble,
             deps.event_sink.clone(),
-            &args.role,
-            deps.searxng.as_ref(),
-            deps.max_turns,
-            &bash_config,
-            &deps.tools_filter,
             deps.state_manager.clone(),
             deps.shell_kind.as_ref(),
-            deps.vector_store.as_ref(),
-            context_budget,
-            &deps.timeouts,
-            &deps.fetch_url,
         )
         .map_err(|e| DelegateError::Build {
             role: args.role.clone(),
@@ -407,7 +385,7 @@ impl Tool for DelegateTool {
         // is still salvaged through the normal handoff path — the outer
         // `budget_for("delegate")` sits a salvage margin above this bound,
         // leaving room for that summarisation.
-        let budget = crate::tools::time_budget::delegate_loop_budget(&deps.timeouts);
+        let budget = crate::tools::time_budget::delegate_loop_budget(&deps.tool_env.timeouts);
         let bounded = crate::state::pause::pause_aware_timeout(&gate, budget, async {
             loop {
                 // The hook snapshots `history ++ [prompt]` right before every
@@ -486,7 +464,7 @@ impl Tool for DelegateTool {
                     ),
                     history: hook.history_snapshot(),
                 };
-                handoff::build(&args.role, h, &role.model.provider_config).await
+                handoff::build(&args.role, h, provider_config).await
             }
             Ok(Ok(text)) => normalize_delegate_output(&args.role, text),
             // A dead sub-agent still knows things. Every failure comes back as a
@@ -494,7 +472,7 @@ impl Tool for DelegateTool {
             // re-delegate instead of re-running the same wall.
             Ok(Err(e)) => {
                 let h = handoff::classify(e, hook.history_snapshot());
-                handoff::build(&args.role, h, &role.model.provider_config).await
+                handoff::build(&args.role, h, provider_config).await
             }
         };
 
@@ -572,139 +550,142 @@ mod tests {
     use crate::hooks::SessionHook;
     use crate::ui::app_state::MessageSource;
 
-    fn bash_with(env: &[(&str, &str)]) -> BashConfig {
-        BashConfig {
-            env: if env.is_empty() {
-                None
-            } else {
-                Some(
-                    env.iter()
-                        .map(|(k, v)| (k.to_string(), v.to_string()))
-                        .collect(),
-                )
-            },
+    /// `SubAgentDeps` for a single-profile config whose one agent runs on
+    /// `provider`'s single model (alias `sonnet`) with `subagents` — each
+    /// `(name, prompt)` on the same model. No search, vector store, or MCP
+    /// servers; built directly (not via `Config::parse`) so a test can use
+    /// a provider `parse` would reject (e.g. no API key).
+    fn deps_with_subagents(
+        sm: Arc<StateManager>,
+        provider: crate::config::ProviderEntry,
+        subagents: &[(&str, &str)],
+        retry: crate::config::RetryConfig,
+        shell_kind: Option<ShellKind>,
+    ) -> SubAgentDeps {
+        use crate::config::resolve::{
+            Bound, Head, Member, Origin, ResolvedAgent, ResolvedProfile, Subagent,
+        };
+        use crate::config::{ModelRegistry, NameFilter};
+
+        let registry = ModelRegistry::build(&[provider]).expect("test model registry builds");
+        let model = registry
+            .resolve("sonnet")
+            .cloned()
+            .expect("the test provider declares the `sonnet` model");
+        let member = |name: &str| Member {
+            name: name.to_string(),
+            model: model.clone(),
+            skills: NameFilter::default(),
+            agents_md: false,
+            env: Default::default(),
+        };
+        let profile = ResolvedProfile {
+            name: "dev".to_string(),
+            origin: Origin::Global,
+            tools: NameFilter::default(),
+            mcps: NameFilter::default(),
+            fetch_url: crate::config::FetchUrlConfig::default(),
+            env: Default::default(),
+            memory: crate::config::MemoryConfig::default(),
+            vector: None,
+            tabs: Vec::new(),
+            agents: vec![ResolvedAgent {
+                main: member("main"),
+                prompt: None,
+                head: Head::BuiltIn,
+                subagents: subagents
+                    .iter()
+                    .map(|(name, prompt)| Subagent {
+                        member: member(name),
+                        prompt: prompt.to_string(),
+                    })
+                    .collect(),
+            }],
+        };
+        let tool_env = ToolEnv {
+            tools: NameFilter::default(),
+            fetch_url: crate::config::FetchUrlConfig::default(),
+            search: None,
+            vector: None,
+            mcp: crate::tools::env::McpSource::for_test(&[], NameFilter::default()),
+            base_env: Default::default(),
+            timeouts: crate::config::TimeoutsConfig::default(),
+            max_turns: 0,
+        };
+        SubAgentDeps {
+            bound: Bound::new(Arc::new(profile), 0),
+            orchestrator_model: model.clone(),
+            tool_env: Arc::new(tool_env),
+            state_manager: sm,
+            shell_kind,
+            skills: crate::skills::SkillRegistry::default(),
+            event_sink: None,
+            retry,
         }
     }
 
-    /// Build a minimal `DelegateTool` for unit tests that need its schema
-    /// (`definition()`) but do not actually run a delegation. An empty
-    /// `SubAgentRegistry` is fine because `definition()` only reads role
-    /// names — never `call()`s them — and `Self::available_roles()` returns
-    /// an empty vec when no roles are configured. The wiring is the same
-    /// shape `providers::add_builtin_tools` builds in production, but every
-    /// optional / empty slot is stubbed out.
-    async fn minimal_delegate_tool() -> DelegateTool {
-        use crate::config::{
-            ModelEntry, ModelRegistry, PipelineConfig, ProviderEntry, ProviderType,
-        };
-
-        let provider = ProviderEntry {
+    fn openai_provider(base_url: Option<String>) -> crate::config::ProviderEntry {
+        crate::config::ProviderEntry {
             name: "openai".into(),
-            kind: ProviderType::OpenAI,
+            kind: crate::config::ProviderType::OpenAI,
             api_key: Some("sk-test".into()),
-            base_url: None,
+            base_url,
             preserve_reasoning: None,
             display_reasoning: None,
-            models: vec![ModelEntry {
-                name: "gpt-4o".into(),
-                alias: Some("gpt4".into()),
-                max_tokens: None,
-                temperature: None,
-                extra_params: None,
-                prompt_caching: None,
-                vision: None,
-                context_size: None,
-                preserve_reasoning: true,
-                display_reasoning: false,
-            }],
-        };
-        let model_registry =
-            ModelRegistry::build(&[provider], Some("gpt4")).expect("test model registry builds");
-        let pipeline_config = PipelineConfig {
-            enabled: false,
-            orchestrator_prompt: None,
-            // Stage 1.1: `agents` is a `Members` newtype (duplicate-key
-            // detection on parse). `HashMap::new()` is the empty default.
-            agents: crate::config::Members(std::collections::HashMap::new()),
-        };
-        let registry = SubAgentRegistry::new(&pipeline_config, &model_registry, &[])
-            .expect("empty role registry builds");
+            models: vec![test_model_entry()],
+        }
+    }
 
-        let deps = SubAgentDeps {
-            registry: Arc::new(registry),
-            searxng: None,
-            bash_config: BashConfig::default(),
-            tools_filter: crate::config::NameFilter::default(),
-            state_manager: StateManager::new_arc(),
-            shell_kind: None,
-            vector_store: None,
-            max_turns: 0,
-            skills: crate::skills::SkillRegistry::default(),
-            event_sink: None,
-            retry: crate::config::RetryConfig::default(),
-            timeouts: crate::config::TimeoutsConfig::default(),
-            agents_md_ceiling: true,
-            fetch_url: crate::config::FetchUrlConfig::default(),
-        };
+    fn test_model_entry() -> crate::config::ModelEntry {
+        crate::config::ModelEntry {
+            name: "anthropic/claude-3.7-sonnet".into(),
+            alias: Some("sonnet".into()),
+            max_tokens: None,
+            temperature: None,
+            extra_params: None,
+            prompt_caching: None,
+            vision: None,
+            context_size: None,
+            preserve_reasoning: true,
+            display_reasoning: false,
+        }
+    }
+
+    /// A `DelegateTool` for unit tests that need its schema (`definition()`)
+    /// but do not run a delegation: an agent with no subagents.
+    async fn minimal_delegate_tool() -> DelegateTool {
+        let deps = deps_with_subagents(
+            StateManager::new_arc(),
+            openai_provider(None),
+            &[],
+            crate::config::RetryConfig::default(),
+            None,
+        );
         DelegateTool::new(Arc::new(deps))
     }
 
-    /// RED: written against the locked spec — `SubAgentDeps.fetch_url` does
-    /// not exist yet. The sub-agent's fetch_url tool must be built from the
-    /// same `FetchUrlConfig` the orchestrator received (create_provider
-    /// threads `&config.fetch_url` into both), so the deps struct carries it.
-    #[test]
-    fn sub_agent_deps_carry_the_fetch_url_config() {
-        use crate::config::{
-            ModelEntry, ModelRegistry, PipelineConfig, ProviderEntry, ProviderType,
-        };
-
-        let provider = ProviderEntry {
-            name: "openai".into(),
-            kind: ProviderType::OpenAI,
-            api_key: Some("sk-test".into()),
-            base_url: None,
-            preserve_reasoning: None,
-            display_reasoning: None,
-            models: vec![ModelEntry {
-                name: "gpt-4o".into(),
-                alias: Some("gpt4".into()),
-                max_tokens: None,
-                temperature: None,
-                extra_params: None,
-                prompt_caching: None,
-                vision: None,
-                context_size: None,
-                preserve_reasoning: true,
-                display_reasoning: false,
-            }],
-        };
-        let model_registry =
-            ModelRegistry::build(&[provider], Some("gpt4")).expect("test model registry builds");
-        let pipeline_config = PipelineConfig::default();
-        let registry = SubAgentRegistry::new(&pipeline_config, &model_registry, &[])
-            .expect("empty role registry builds");
-
-        let deps = SubAgentDeps {
-            registry: Arc::new(registry),
-            searxng: None,
-            bash_config: BashConfig::default(),
-            tools_filter: crate::config::NameFilter::default(),
-            state_manager: StateManager::new_arc(),
-            shell_kind: None,
-            vector_store: None,
-            max_turns: 0,
-            skills: crate::skills::SkillRegistry::default(),
-            event_sink: None,
-            retry: crate::config::RetryConfig::default(),
-            timeouts: crate::config::TimeoutsConfig::default(),
-            agents_md_ceiling: true,
-            fetch_url: crate::config::FetchUrlConfig { allow_post: true },
-        };
+    /// The roster is the bound agent's `subagents` (sorted), and it is what
+    /// the tool description offers.
+    #[tokio::test]
+    async fn delegate_roles_come_from_the_bound_agents_subagents() {
+        let deps = deps_with_subagents(
+            StateManager::new_arc(),
+            openai_provider(None),
+            &[("writer", "Write."), ("researcher", "Research.")],
+            crate::config::RetryConfig::default(),
+            None,
+        );
+        let tool = DelegateTool::new(Arc::new(deps));
         assert_eq!(
-            deps.fetch_url,
-            crate::config::FetchUrlConfig { allow_post: true },
-            "the orchestrator's fetch_url config must reach the sub-agent deps"
+            tool.available_roles(),
+            vec!["researcher".to_string(), "writer".to_string()]
+        );
+        let def = <DelegateTool as Tool>::definition(&tool, String::new()).await;
+        assert!(
+            def.description
+                .contains("Available roles: researcher, writer"),
+            "the description lists the subagents: {}",
+            def.description
         );
     }
 
@@ -859,30 +840,6 @@ mod tests {
         );
     }
 
-    /// A role's `env:` overrides base keys and unions in role-only keys; base
-    /// keys the role doesn't touch survive.
-    #[test]
-    fn merge_role_env_overrides_and_unions() {
-        let base = bash_with(&[("SHARED", "base"), ("BASE_ONLY", "keep")]);
-        let role = HashMap::from([
-            ("SHARED".to_string(), "role".to_string()),
-            ("ROLE_ONLY".to_string(), "added".to_string()),
-        ]);
-        let merged = merge_role_env(&base, Some(&role)).env.expect("some env");
-        assert_eq!(merged.get("SHARED").map(String::as_str), Some("role"));
-        assert_eq!(merged.get("BASE_ONLY").map(String::as_str), Some("keep"));
-        assert_eq!(merged.get("ROLE_ONLY").map(String::as_str), Some("added"));
-    }
-
-    /// No role env → the base bash config is returned unchanged.
-    #[test]
-    fn merge_role_env_none_keeps_base() {
-        let base = bash_with(&[("BASE_ONLY", "keep")]);
-        let merged = merge_role_env(&base, None).env.expect("some env");
-        assert_eq!(merged.get("BASE_ONLY").map(String::as_str), Some("keep"));
-        assert_eq!(merged.len(), 1);
-    }
-
     /// The events-only sub-agent hook stamps `SubAgent { role }` on its lane —
     /// so its turns TEE to the transcript tagged with the role and its cost
     /// rolls up. (Asserts the flavor `build_sub_agent` gives the hook.)
@@ -921,63 +878,21 @@ mod tests {
         retry: crate::config::RetryConfig,
         shell_kind: Option<ShellKind>,
     ) -> DelegateTool {
-        use crate::config::{
-            AgentDefinition, ModelEntry, ModelRegistry, PipelineConfig, ProviderType,
-        };
+        use crate::config::ProviderType;
 
-        let provider = match provider.kind {
+        let mut provider = match provider.kind {
             // Both test providers declare the same single model.
             ProviderType::OpenRouter | ProviderType::OpenAI => provider,
             other => panic!("test provider must be openrouter or openai, got {other:?}"),
         };
-        let mut provider = provider;
-        provider.models = vec![ModelEntry {
-            name: "anthropic/claude-3.7-sonnet".into(),
-            alias: Some("sonnet".into()),
-            max_tokens: None,
-            temperature: None,
-            extra_params: None,
-            prompt_caching: None,
-            vision: None,
-            context_size: None,
-            preserve_reasoning: true,
-            display_reasoning: false,
-        }];
-        let model_registry =
-            ModelRegistry::build(&[provider], Some("sonnet")).expect("test model registry builds");
-        let pipeline_config = PipelineConfig {
-            enabled: true,
-            orchestrator_prompt: None,
-            agents: crate::config::Members(std::collections::HashMap::from([(
-                "researcher".to_string(),
-                AgentDefinition {
-                    model: Some("sonnet".into()),
-                    prompt: "research".into(),
-                    env: None,
-                    skills: crate::config::NameFilter::default(),
-                    agents_md: false,
-                },
-            )])),
-        };
-        let registry = SubAgentRegistry::new(&pipeline_config, &model_registry, &[])
-            .expect("role registry builds");
-
-        let deps = SubAgentDeps {
-            registry: Arc::new(registry),
-            searxng: None,
-            bash_config: BashConfig::default(),
-            tools_filter: crate::config::NameFilter::default(),
-            state_manager: sm,
-            shell_kind,
-            vector_store: None,
-            max_turns: 0,
-            skills: crate::skills::SkillRegistry::default(),
-            event_sink: None,
+        provider.models = vec![test_model_entry()];
+        let deps = deps_with_subagents(
+            sm,
+            provider,
+            &[("researcher", "research")],
             retry,
-            timeouts: crate::config::TimeoutsConfig::default(),
-            agents_md_ceiling: true,
-            fetch_url: crate::config::FetchUrlConfig::default(),
-        };
+            shell_kind,
+        );
         DelegateTool::new(Arc::new(deps))
     }
 
@@ -1246,6 +1161,354 @@ mod tests {
         (buf.len() >= total).then_some(total)
     }
 
+    // ── per-member model routing (selection-models plan §9.1, items 40–42) ──
+
+    /// `SubAgentDeps` over the plan's shared fixture: `dev › team` with the
+    /// inherited `reviewer`, explicit `tester` (haiku) and explicit-equal
+    /// `twin` (sonnet). `overrides` go through the validating constructor.
+    fn team_deps(orchestrator: &str, overrides: &[(&str, &str)]) -> SubAgentDeps {
+        use crate::config::resolve::{Config, ParseCtx, Source};
+
+        const YAML: &str = r#"
+providers:
+  - name: anthropic
+    type: anthropic
+    api_key: sk-ant-test
+    models:
+      - { name: claude-opus-5,   alias: opus,   context_size: 200000 }
+      - { name: claude-sonnet-5, alias: sonnet, context_size: 200000 }
+      - { name: claude-haiku-5,  alias: haiku,  context_size: 200000 }
+general: { context: { enabled: false } }
+profiles:
+  dev:
+    agents:
+      team:
+        model: sonnet
+        subagents:
+          reviewer: { prompt: "Review." }
+          tester:   { prompt: "Test.",  model: haiku }
+          twin:     { prompt: "Twin.",  model: sonnet }
+      solo: { model: opus }
+"#;
+        let cfg = Config::parse(
+            Source {
+                path: std::path::Path::new("/global/config.yaml"),
+                text: YAML,
+            },
+            None,
+            &ParseCtx { known_skills: &[] },
+        )
+        .expect("the shared team-models fixture parses");
+
+        let mut bound = cfg.catalog.resolve("dev", "team").expect("dev/team");
+        if !overrides.is_empty() {
+            let wanted: std::collections::BTreeMap<String, String> = overrides
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let (applied, rejected) = bound.with_subagent_models(&cfg.registry, &wanted);
+            assert!(
+                rejected.is_empty(),
+                "fixture overrides are valid: {rejected:?}"
+            );
+            bound = applied;
+        }
+        let profile = Arc::clone(&bound.profile);
+        SubAgentDeps {
+            bound,
+            orchestrator_model: cfg
+                .registry
+                .resolve(orchestrator)
+                .cloned()
+                .expect("the orchestrator alias is in the fixture registry"),
+            tool_env: Arc::new(ToolEnv::for_profile(&cfg, &profile, &Arc::new(Vec::new()))),
+            state_manager: StateManager::new_arc(),
+            shell_kind: None,
+            skills: crate::skills::SkillRegistry::default(),
+            event_sink: None,
+            retry: crate::config::RetryConfig::default(),
+        }
+    }
+
+    fn alias_for(deps: &SubAgentDeps, role: &str) -> String {
+        let sub = deps
+            .bound
+            .agent()
+            .subagents
+            .iter()
+            .find(|s| s.member.name == role)
+            .expect("the fixture subagent");
+        deps.model_for(sub).alias.clone()
+    }
+
+    /// §9.1/40: the ONE precedence rule — override > inherited (rides the
+    /// orchestrator's EFFECTIVE model) > configured.
+    #[test]
+    fn model_for_applies_precedence() {
+        // Orchestrator on opus, no overrides.
+        let deps = team_deps("opus", &[]);
+        assert_eq!(
+            alias_for(&deps, "reviewer"),
+            "opus",
+            "inherited follows the orchestrator"
+        );
+        assert_eq!(
+            alias_for(&deps, "twin"),
+            "opus",
+            "explicit-equal counts as inherited (Z4)"
+        );
+        assert_eq!(
+            alias_for(&deps, "tester"),
+            "haiku",
+            "explicit stays configured"
+        );
+
+        let deps = team_deps("opus", &[("tester", "sonnet"), ("reviewer", "haiku")]);
+        assert_eq!(
+            alias_for(&deps, "tester"),
+            "sonnet",
+            "override beats configured"
+        );
+        assert_eq!(
+            alias_for(&deps, "reviewer"),
+            "haiku",
+            "override beats inherited"
+        );
+        assert_eq!(
+            alias_for(&deps, "twin"),
+            "opus",
+            "no override: still inherited"
+        );
+
+        // Orchestrator on its configured model: inherited = sonnet.
+        let deps = team_deps("sonnet", &[]);
+        assert_eq!(alias_for(&deps, "reviewer"), "sonnet");
+        assert_eq!(alias_for(&deps, "tester"), "haiku");
+
+        // The plan's literal wording: {tester: opus} + orchestrator opus.
+        let deps = team_deps("opus", &[("tester", "opus")]);
+        assert_eq!(alias_for(&deps, "reviewer"), "opus");
+        assert_eq!(alias_for(&deps, "tester"), "opus");
+        assert_eq!(alias_for(&deps, "twin"), "opus");
+    }
+
+    /// A one-shot OpenAI-compatible responder that CAPTURES the request body
+    /// (so a test can read which wire model the sub-agent actually called).
+    async fn capturing_responder() -> (
+        u16,
+        tokio::task::JoinHandle<()>,
+        Arc<std::sync::Mutex<String>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener binds");
+        let port = listener
+            .local_addr()
+            .expect("listener has an address")
+            .port();
+        let captured = Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = Arc::clone(&captured);
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut stream, _) = listener.accept().await.expect("client connects");
+            let mut buf: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while request_complete(&buf).is_none() && buf.len() < 1_048_576 {
+                match stream.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(_) => break,
+                }
+            }
+            if let Some(total) = request_complete(&buf) {
+                let header_end = buf
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map(|i| i + 4)
+                    .unwrap_or(0);
+                *sink.lock().unwrap() =
+                    String::from_utf8_lossy(&buf[header_end..total]).into_owned();
+            }
+            let body = serde_json::json!({
+                "id": "resp_123",
+                "object": "response",
+                "created_at": 0,
+                "status": "completed",
+                "model": "anthropic/claude-3.7-sonnet",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_123",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "annotations": [], "text": "done"}]
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.ok();
+        });
+        (port, server, captured)
+    }
+
+    /// Deps whose provider declares TWO models on the loopback endpoint:
+    /// sonnet (`anthropic/claude-3.7-sonnet`) and opus (`anthropic/claude-opus-5`).
+    /// The main agent and `researcher` are both configured on sonnet (so the
+    /// role is *inherited*); `orchestrator` and `overrides` vary per test.
+    fn routing_deps(
+        port: u16,
+        sm: Arc<StateManager>,
+        orchestrator: &str,
+        overrides: &[(&str, &str)],
+    ) -> SubAgentDeps {
+        use crate::config::resolve::{
+            Bound, Head, Member, Origin, ResolvedAgent, ResolvedProfile, Subagent,
+        };
+        use crate::config::{ModelRegistry, NameFilter};
+
+        let entry = |name: &str, alias: &str| crate::config::ModelEntry {
+            name: name.into(),
+            alias: Some(alias.into()),
+            max_tokens: None,
+            temperature: None,
+            extra_params: None,
+            prompt_caching: None,
+            vision: None,
+            context_size: None,
+            preserve_reasoning: true,
+            display_reasoning: false,
+        };
+        let provider = crate::config::ProviderEntry {
+            name: "openai".into(),
+            kind: crate::config::ProviderType::OpenAI,
+            api_key: Some("sk-test".into()),
+            base_url: Some(format!("http://127.0.0.1:{port}/v1")),
+            preserve_reasoning: None,
+            display_reasoning: None,
+            models: vec![
+                entry("anthropic/claude-3.7-sonnet", "sonnet"),
+                entry("anthropic/claude-opus-5", "opus"),
+            ],
+        };
+        let registry = ModelRegistry::build(&[provider]).expect("two-model registry builds");
+        let sonnet = registry.resolve("sonnet").cloned().expect("sonnet");
+        let member = |name: &str| Member {
+            name: name.to_string(),
+            model: sonnet.clone(),
+            skills: NameFilter::default(),
+            agents_md: false,
+            env: Default::default(),
+        };
+        let profile = ResolvedProfile {
+            name: "dev".to_string(),
+            origin: Origin::Global,
+            tools: NameFilter::default(),
+            mcps: NameFilter::default(),
+            fetch_url: crate::config::FetchUrlConfig::default(),
+            env: Default::default(),
+            memory: crate::config::MemoryConfig::default(),
+            vector: None,
+            tabs: Vec::new(),
+            agents: vec![ResolvedAgent {
+                main: member("main"),
+                prompt: None,
+                head: Head::BuiltIn,
+                subagents: vec![Subagent {
+                    member: member("researcher"),
+                    prompt: "research".to_string(),
+                }],
+            }],
+        };
+        let mut bound = Bound::new(Arc::new(profile), 0);
+        if !overrides.is_empty() {
+            let wanted: std::collections::BTreeMap<String, String> = overrides
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let (applied, rejected) = bound.with_subagent_models(&registry, &wanted);
+            assert!(
+                rejected.is_empty(),
+                "fixture overrides are valid: {rejected:?}"
+            );
+            bound = applied;
+        }
+        let tool_env = ToolEnv {
+            tools: NameFilter::default(),
+            fetch_url: crate::config::FetchUrlConfig::default(),
+            search: None,
+            vector: None,
+            mcp: crate::tools::env::McpSource::for_test(&[], NameFilter::default()),
+            base_env: Default::default(),
+            timeouts: crate::config::TimeoutsConfig::default(),
+            max_turns: 0,
+        };
+        SubAgentDeps {
+            bound,
+            orchestrator_model: registry
+                .resolve(orchestrator)
+                .cloned()
+                .expect("the orchestrator alias is in the registry"),
+            tool_env: Arc::new(tool_env),
+            state_manager: sm,
+            shell_kind: None,
+            skills: crate::skills::SkillRegistry::default(),
+            event_sink: None,
+            retry: crate::config::RetryConfig::default(),
+        }
+    }
+
+    /// Run one `researcher` delegation against the capturing responder and
+    /// return the wire `model` it sent.
+    async fn delegated_wire_model(orchestrator: &str, overrides: &[(&str, &str)]) -> String {
+        let (port, server, captured) = capturing_responder().await;
+        let sm = StateManager::new_arc();
+        sm.add_todo("parent task".to_string());
+        let deps = routing_deps(port, sm, orchestrator, overrides);
+        let tool = DelegateTool::new(Arc::new(deps));
+        let out = tool
+            .call(DelegateArgs {
+                role: "researcher".into(),
+                task: "do it".into(),
+                parent_task_id: 1,
+            })
+            .await
+            .expect("a completed delegation returns its result");
+        assert!(out.contains("done"), "the delegation completed; got: {out}");
+        server.abort();
+        let body = captured.lock().unwrap().clone();
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("the captured request body is JSON ({e}): {body:?}"));
+        json["model"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the request carries a model: {body}"))
+            .to_string()
+    }
+
+    /// §9.1/41: the role is configured on sonnet but the bound overrides it to
+    /// opus — the request that hits the wire names opus's model.
+    #[tokio::test]
+    async fn delegate_runs_subagent_on_its_override_model() {
+        let model = delegated_wire_model("sonnet", &[("researcher", "opus")]).await;
+        assert_eq!(
+            model, "anthropic/claude-opus-5",
+            "the override model must reach the wire, not the configured sonnet"
+        );
+    }
+
+    /// §9.1/42: an inherited role follows the orchestrator's EFFECTIVE model —
+    /// orchestrator on opus ⇒ the sub-agent calls opus.
+    #[tokio::test]
+    async fn delegate_inherited_subagent_follows_orchestrator_model() {
+        let model = delegated_wire_model("opus", &[]).await;
+        assert_eq!(
+            model, "anthropic/claude-opus-5",
+            "an inherited sub-agent rides the orchestrator's current model"
+        );
+    }
+
     /// A sub-agent that returns empty or whitespace-only text must never reach
     /// the orchestrator as an empty `ToolResult` (#222 — empty tool-result
     /// content crashes provider adapters). The normalizer replaces it with a
@@ -1302,40 +1565,6 @@ mod tests {
             !opted_out.contains("SENTINEL-SUBAGENT-CONTEXT"),
             "default (agents_md: false) must keep the preamble lean"
         );
-    }
-
-    // =========================================================================
-    // CONTRACT B — the profile's `agents_md:` gate is a CEILING over the
-    // role's opt-in (RED).
-    //
-    // Sub-agent roles keep their own per-role `agents_md` opt-in (pinned
-    // above), but a profile with `agents_md: false` must strip it: a role
-    // with `agents_md: true` still gets none. The locked seam is the pure
-    // combine the delegation call site applies before calling
-    // `build_sub_agent_preamble` (whose last parameter stays the FINAL
-    // bool, so the pins above keep their shape):
-    //
-    //     fn agents_md_effective(role_agents_md: bool, profile_ceiling: bool) -> bool
-    //
-    // Compile-RED until the helper lands.
-    // =========================================================================
-
-    /// The ceiling rule: effective = role opt-in AND profile gate.
-    /// (RED — the helper does not exist yet.)
-    #[test]
-    fn agents_md_ceiling_is_role_opt_in_and_profile_gate() {
-        for (role, ceiling, expected) in [
-            (true, true, true),   // opted in, profile silent ⇒ injected
-            (true, false, false), // the ceiling: opted-in role still gets none
-            (false, true, false), // opt-out stays opt-out
-            (false, false, false),
-        ] {
-            assert_eq!(
-                agents_md_effective(role, ceiling),
-                expected,
-                "role agents_md={role} under profile ceiling={ceiling} must be {expected}"
-            );
-        }
     }
 
     /// A running bg process is surfaced to the sub-agent, positioned after the

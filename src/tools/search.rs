@@ -1,4 +1,4 @@
-use crate::SearXngConfig;
+use crate::config::SearchConfig;
 use crate::utils::strings::truncate_to_char_boundary;
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
@@ -10,7 +10,7 @@ const MAX_RESULTS_LIMIT: u32 = 20;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SearchError {
-    #[error("SearXNG is not configured. Set SEARXNG_BASE_URL in config.")]
+    #[error("SearXNG is not configured. Add a `general.search:` block to config.yaml.")]
     NotConfigured,
 
     #[error("SearXNG is disabled in configuration.")]
@@ -132,7 +132,7 @@ pub struct SearchTool {
 }
 
 impl SearchTool {
-    pub fn new(config: &SearXngConfig) -> Self {
+    pub fn new(config: &SearchConfig) -> Self {
         Self {
             base_url: config.base_url.clone(),
             timeout_seconds: config.timeout_seconds,

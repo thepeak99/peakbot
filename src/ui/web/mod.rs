@@ -84,8 +84,9 @@ use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
 
 mod images;
-mod registry;
-pub mod setup;
+pub mod registry;
+pub mod settings;
+pub mod system;
 pub mod tls;
 pub mod uploads;
 
@@ -145,7 +146,10 @@ struct Assets;
 /// snapshot. `deps` lives inside the registry.
 #[derive(Clone)]
 struct WsState {
-    registry: SessionRegistry,
+    /// `None` in needs_setup mode (spec §6.9): the `/ws` route is the 503
+    /// setup guard, so `handle_socket` (and with it the registry) is only
+    /// reachable when this is `Some`.
+    registry: Option<SessionRegistry>,
     models: Arc<Vec<ModelInfo>>,
     active_alias: Arc<str>,
     /// Idle-session TTL for the reaper (from `config.web`).
@@ -160,6 +164,12 @@ struct WsState {
 /// `token` is set, every route is gated by [`require_token`].
 pub struct WebUi {
     addr: SocketAddr,
+    /// The session deps — `None` ⇔ needs_setup mode (spec §6.9): the
+    /// server boots without a `Config` (missing global file, or a failed
+    /// global auto-migration in a windowed web session) and serves the SPA,
+    /// settings and system routes only. Fixed at boot; never filled in
+    /// later (no late deps build).
+    deps: Option<Arc<SessionDeps>>,
     ws_state: WsState,
     /// Shared secret guarding every route. `None` = open (loopback default).
     token: Option<Arc<str>>,
@@ -170,30 +180,46 @@ pub struct WebUi {
     extra_sans: Vec<String>,
     /// How often the reaper scans for expired sessions.
     reaper_tick: Duration,
-    /// Redirect only the root document to the setup wizard on first run.
-    needs_setup: bool,
+    /// Boot-time facts for the settings surface (spec §6.9/§8.2).
+    settings: settings::SettingsBoot,
 }
 
 impl WebUi {
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // boot constructor: each arg is a distinct boot fact
     pub fn new(
         addr: SocketAddr,
-        deps: Arc<SessionDeps>,
+        deps: Option<Arc<SessionDeps>>,
         models: Vec<ModelInfo>,
         active_alias: String,
         token: Option<String>,
         tls: bool,
         extra_sans: Vec<String>,
-        needs_setup: bool,
+        settings: settings::SettingsBoot,
     ) -> Self {
-        let web = deps.config.web.clone();
+        // needs_setup mode has no config: the `general.web` reaper/TTL
+        // fields fall back to their defaults (the reaper never runs then —
+        // there are no sessions to reap).
+        let web = deps
+            .as_ref()
+            .map(|d| d.config.general.web.clone())
+            .unwrap_or_default();
         // `SessionRegistry::new` consumes `deps`, so clone the store out
         // first (it is `Clone`-cheap: a PathBuf + a Copy config).
-        let uploads = deps.uploads.clone();
+        let uploads = match deps.as_ref() {
+            Some(d) => d.uploads.clone(),
+            None => crate::attachments::UploadStore::new(
+                crate::attachments::UploadStore::default_root(),
+                crate::config::UploadsConfig::default(),
+            ),
+        };
+        // `SessionRegistry::new` takes an `Arc<SessionDeps>`, so build the
+        // registry from a clone before `deps` moves into the struct.
+        let registry = deps.as_ref().map(|d| SessionRegistry::new(d.clone()));
         Self {
             addr,
+            deps,
             ws_state: WsState {
-                registry: SessionRegistry::new(deps),
+                registry,
                 models: Arc::new(models),
                 active_alias: active_alias.into(),
                 session_ttl: Duration::from_secs(web.session_ttl_secs),
@@ -203,7 +229,7 @@ impl WebUi {
             tls,
             extra_sans,
             reaper_tick: Duration::from_secs(web.reaper_tick_secs),
-            needs_setup,
+            settings,
         }
     }
 
@@ -243,7 +269,6 @@ impl Ui for WebUi {
 
     async fn run(&mut self) -> Result<()> {
         let mut app: Router = Router::new()
-            .route("/ws", get(ws_handler))
             .route("/commands", get(commands_handler))
             // Registered before `.fallback` (the SPA catch-all) and before
             // the token layer below, so it is routed AND token-gated — the
@@ -252,29 +277,51 @@ impl Ui for WebUi {
             .with_state(self.ws_state.clone())
             .fallback(static_handler);
 
-        if self.needs_setup {
-            app = app.route("/", get(setup_redirect));
-        }
+        // `/ws`: the real WebSocket upgrade — or, in needs_setup mode
+        // (deps None, spec §6.9), the 503 setup guard in its place. The SPA
+        // reads `GET /api/settings` first and never opens the socket then.
+        app = app.merge(match &self.deps {
+            Some(_) => Router::new()
+                .route("/ws", get(ws_handler))
+                .with_state(self.ws_state.clone()),
+            None => Router::new().route("/ws", get(ws_setup_guard)),
+        });
 
-        // Mount the setup wizard (plan §A-Q2, §B, §D S3). The router is
-        // merged BEFORE the token layer so every `/api/setup/*` route is
-        // gated by the same `require_token` as `/ws` and `/commands`.
-        // Constructed here (rather than in `WebUi::new`) so we read the
-        // config path fresh; the resolution is `dirs` + `ProjectDirs`
-        // and runs once at boot.
-        let config_path = crate::config::get_config_file_path()
-            .unwrap_or_else(|| std::path::PathBuf::from("config.yaml"));
-        let setup_state = setup::SetupState {
-            config_path,
-            facts_base: setup::FactsBase::current(),
-            needs_setup: self.needs_setup,
-            // Track I: the seams now point at the real install / service
-            // dispatchers. Tests still inject their own fakes via
-            // `SetupState`; production never sees `default_for_tests()`.
-            install: setup::InstallFn(setup::install_op_adapter),
-            service: setup::ServiceFn(setup::service_op_adapter),
+        // Mount the system routes (spec §8.2): the setup wizard's
+        // install/service surface, moved verbatim to `/api/system/*`. The
+        // router is merged BEFORE the token layer so every `/api/system/*`
+        // route is gated by the same `require_token` as `/ws` and
+        // `/commands`. The seams point at the real install / service
+        // dispatchers; tests inject their own fakes via `SystemState`,
+        // production never sees `default_for_tests()`.
+        let system_state = system::SystemState {
+            install: system::InstallFn(system::install_op_adapter),
+            service: system::ServiceFn(system::service_op_adapter),
         };
-        app = app.merge(setup::router(setup_state));
+        app = app.merge(system::router(system_state));
+
+        // The old `/api/setup*` surface is gone: tombstone 404s where the
+        // SPA fallback would otherwise serve index.html.
+        app = app.merge(system::setup_removed());
+
+        // The settings surface (spec §8.2): merged BEFORE the token layer
+        // like the system routes, so every `/api/settings` / `/api/config*`
+        // route is gated by the same `require_token`. The router carries its
+        // own `/api/*` catch-all, so unknown /api routes answer 404 JSON and
+        // never reach the SPA fallback (T14 follow-up).
+        let settings_state = settings::SettingsState {
+            deps: self.deps.clone(),
+            registry: self.ws_state.registry.clone(),
+            config_dir: self.settings.config_dir.clone(),
+            boot_cwd: self.settings.boot_cwd.clone(),
+            migrate_error: self.settings.migrate_error.clone(),
+            boot_web: settings::BootWeb {
+                bind: self.addr,
+                token_source: self.settings.token_source,
+                tls: self.tls,
+            },
+        };
+        app = app.merge(settings::router(settings_state));
 
         // Upload routes (file-uploads design §5.2). Merged BEFORE the
         // token layer, so both `/api/uploads` routes are gated by the same
@@ -297,17 +344,19 @@ impl Ui for WebUi {
 
         // Reaper: periodically expire sessions idle (no sockets) past the TTL.
         // A detached task tied to the process lifetime — the registry it holds
-        // is the same one every connection shares.
-        let reaper_registry = self.ws_state.registry.clone();
-        let ttl = self.ws_state.session_ttl;
-        let tick = self.reaper_tick;
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tick);
-            loop {
-                interval.tick().await;
-                reaper_registry.reap(ttl);
-            }
-        });
+        // is the same one every connection shares. needs_setup mode has no
+        // registry (no sessions), so no reaper.
+        if let Some(registry) = self.ws_state.registry.clone() {
+            let ttl = self.ws_state.session_ttl;
+            let tick = self.reaper_tick;
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(tick);
+                loop {
+                    interval.tick().await;
+                    registry.reap(ttl);
+                }
+            });
+        }
 
         if self.tls {
             self.serve_tls(app).await
@@ -481,6 +530,19 @@ fn ct_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
+/// The `/ws` route while `WebUi.deps` is None (spec §6.9, T19): the
+/// needs_setup server has no sessions to attach to, so the upgrade is
+/// refused with 503 and the exact JSON body `{"error":"setup required"}`.
+/// The SPA reads `GET /api/settings` first and never opens the socket.
+pub async fn ws_setup_guard() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({ "error": "setup required" }).to_string(),
+    )
+        .into_response()
+}
+
 /// `GET /ws` — upgrade to a WebSocket, then run one independent session
 /// for the connection's lifetime.
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<WsState>) -> Response {
@@ -638,7 +700,13 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
     };
 
     // Bind to a session. On failure, send one error frame and drop the socket.
-    let registered = match state.registry.attach(want) {
+    // The `/ws` upgrade is only mounted when deps exist (needs_setup mode
+    // replaces it with the 503 guard), so the registry is always present here.
+    let registry = state
+        .registry
+        .clone()
+        .expect("ws_handler is mounted only with deps; the needs_setup guard replaces it");
+    let registered = match registry.attach(want) {
         Ok(r) => r,
         Err(e) => {
             let _ = out_tx.send(OutboundMessage::Error {
@@ -673,7 +741,7 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
 
     let action_sender = registered.session.action_sender.clone();
     let sm_for_reader = registered.session.state_manager.clone();
-    let registry_for_reader = state.registry.clone();
+    let registry_for_reader = registry.clone();
     let reader_tx = out_tx.clone();
 
     // Process a non-attach handshake frame before the reader loop starts.
@@ -738,7 +806,7 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
     if !matches!(_exit, ForwardExit::WriterGone) {
         let _ = writer_task.await;
     }
-    state.registry.detach(session_key);
+    registry.detach(session_key);
 }
 
 /// Await the first text frame of a connection, skipping non-text control
@@ -781,12 +849,21 @@ fn dispatch_inbound(
         Ok(InboundMessage::SwitchCwd { path }) => {
             action_sender.send(UiAction::ChangeCwd(path)).is_ok()
         }
-        Ok(InboundMessage::SelectPipeline { name }) => {
-            action_sender.send(UiAction::SelectPipeline(name)).is_ok()
-        }
-        Ok(InboundMessage::SelectProfile { name }) => {
-            action_sender.send(UiAction::SelectProfile(name)).is_ok()
-        }
+        Ok(InboundMessage::Select {
+            profile,
+            agent,
+            model,
+            subagent_models,
+        }) => action_sender
+            .send(UiAction::Select {
+                selection: crate::config::resolve::Selection {
+                    profile,
+                    agent,
+                    subagent_models,
+                },
+                model,
+            })
+            .is_ok(),
         Ok(InboundMessage::ListDir { path }) => out_tx.send(build_dir_listing(&path)).is_ok(),
         Ok(InboundMessage::RequestConversations) => {
             let items = build_conversations_snapshot(
@@ -835,17 +912,6 @@ fn dispatch_inbound(
     }
 }
 
-/// Redirect only the first document request to the setup SPA route. This sits
-/// inside the existing token layer, so a token-bearing entry request receives
-/// its auth cookie on this 303 before the browser follows `/setup`.
-async fn setup_redirect() -> Response {
-    (
-        StatusCode::SEE_OTHER,
-        [(header::LOCATION, "/setup")],
-        Body::empty(),
-    )
-        .into_response()
-}
 /// Serve a single file from the embedded bundle. Unknown routes fall back
 /// to `index.html` (SPA client-side routing → 200, not 404), except paths
 /// containing `..` which are refused. When the bundle has no `index.html`
@@ -928,31 +994,7 @@ mod tests {
         let (action_tx, action_rx) = tokio::sync::mpsc::unbounded_channel();
         let (out_tx, _out_rx) = outbound_channel();
         let sm = StateManager::new_arc();
-        let config = crate::config::Config::default();
-        let model_registry = Arc::new(
-            config
-                .build_model_registry()
-                .expect("legacy registry builds"),
-        );
-        let deps = SessionDeps {
-            config,
-            model_registry,
-            skills: crate::skills::SkillRegistry::new(),
-            skill_warnings: Vec::new(),
-            mcp_handles: Arc::new(Vec::new()),
-            searxng_config: None,
-            pipelines: Arc::new(crate::pipeline::PipelineSet::default()),
-            vector_store: None,
-            shell_kind: None,
-            storage: None,
-            mcp_tools_count: 0,
-            skills_count: 0,
-            profile_pin: None,
-            uploads: crate::attachments::UploadStore::new(
-                crate::attachments::UploadStore::default_root(),
-                crate::config::UploadsConfig::default(),
-            ),
-        };
+        let deps = crate::session::test_support::test_deps(None);
         let registry = SessionRegistry::new(Arc::new(deps));
         (action_tx, action_rx, out_tx, sm, registry)
     }
@@ -1019,49 +1061,62 @@ mod tests {
         assert!(matches!(rx.try_recv().unwrap(), UiAction::RequestStop));
     }
 
-    // ── select_profile inbound → UiAction (Layer D, RED) ────────────────────
+    // ── select inbound → UiAction (0.24 cutover) ──────────────────────────
     //
-    // D4: `{"type":"select_profile","name":...}` must surface as
-    // `UiAction::SelectProfile(name)` on the controller's action channel —
-    // the same dispatch shape `SelectPipeline` already has. Compile-RED
-    // until `InboundMessage::SelectProfile` and `UiAction::SelectProfile`
-    // both exist.
+    // `{"type":"select","profile":…,"agent":…}` must surface as
+    // `UiAction::Select(Selection)` on the controller's action channel —
+    // the single frame that replaces `select_pipeline` / `select_profile`.
 
     #[test]
-    fn inbound_select_profile_with_name_maps_to_select_profile_action() {
+    fn inbound_select_maps_to_select_action() {
         let (tx, mut rx, out_tx, sm, registry) = dispatch_fixture();
         let kept = dispatch_inbound(
-            r#"{"type":"select_profile","name":"research"}"#,
+            r#"{"type":"select","profile":"dev","agent":"team"}"#,
             &tx,
             &out_tx,
             &sm,
             &registry,
         );
-        assert!(kept, "select_profile frame must keep the socket loop alive");
-        assert!(
-            matches!(
-                rx.try_recv().unwrap(),
-                UiAction::SelectProfile(Some(n)) if n == "research"
-            ),
-            "a named select_profile frame must surface as UiAction::SelectProfile(Some(name))"
+        assert!(kept, "select frame must keep the socket loop alive");
+        let action = rx.try_recv().expect("an action must be emitted");
+        assert_eq!(
+            action,
+            UiAction::Select {
+                selection: crate::config::resolve::Selection {
+                    profile: "dev".to_string(),
+                    agent: "team".to_string(),
+                    ..Default::default()
+                },
+                model: None,
+            },
+            "a select frame must surface as UiAction::Select with both legs"
         );
     }
 
+    /// Selection-models plan §9.1/26: the extended select frame must surface
+    /// with BOTH new legs on `UiAction::Select`.
     #[test]
-    fn inbound_select_profile_with_null_maps_to_clear_action() {
+    fn dispatch_select_frame_carries_models() {
         let (tx, mut rx, out_tx, sm, registry) = dispatch_fixture();
         let kept = dispatch_inbound(
-            r#"{"type":"select_profile","name":null}"#,
+            r#"{"type":"select","profile":"dev","agent":"team","model":"opus","subagent_models":{"tester":"haiku"}}"#,
             &tx,
             &out_tx,
             &sm,
             &registry,
         );
-        assert!(kept);
-        assert!(
-            matches!(rx.try_recv().unwrap(), UiAction::SelectProfile(None)),
-            "a null-name select_profile frame must clear the binding"
-        );
+        assert!(kept, "select frame must keep the socket loop alive");
+        match rx.try_recv().expect("an action must be emitted") {
+            UiAction::Select { selection, model } => {
+                assert_eq!(model.as_deref(), Some("opus"), "the model leg is forwarded");
+                assert_eq!(
+                    selection.subagent_models.get("tester").map(String::as_str),
+                    Some("haiku"),
+                    "the override map is forwarded"
+                );
+            }
+            other => panic!("expected UiAction::Select, got {other:?}"),
+        }
     }
 
     // ── kill_session inbound (RED until the refusal lands) ─────────────────
@@ -1085,10 +1140,9 @@ mod tests {
     ) {
         let (action_tx, _action_rx) = tokio::sync::mpsc::unbounded_channel();
         let (out_tx, out_rx) = outbound_channel();
-        let deps = crate::session::test_support::test_deps(
-            crate::session::test_support::ollama_registry(),
-            Arc::new(crate::storage::InMemoryStorage::default()),
-        );
+        let deps = crate::session::test_support::test_deps(Some(Arc::new(
+            crate::storage::InMemoryStorage::default(),
+        )));
         (
             action_tx,
             out_tx,
@@ -1247,26 +1301,6 @@ mod tests {
         assert_eq!(status, 200, "body: {body}");
         let ct_index = body.find("Shifu").unwrap_or(usize::MAX);
         assert!(ct_index < 1024, "root body did not contain Shifu: {body}");
-    }
-
-    #[tokio::test]
-    async fn first_run_root_redirects_to_setup() {
-        let app: Router = Router::new()
-            .route("/", get(setup_redirect))
-            .fallback(static_handler);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.ok();
-        });
-
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap();
-        let resp = client.get(format!("http://{addr}/")).send().await.unwrap();
-        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-        assert_eq!(resp.headers()[header::LOCATION], "/setup");
     }
 
     #[tokio::test]

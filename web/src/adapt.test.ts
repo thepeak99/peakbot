@@ -1,9 +1,12 @@
 import { describe, it, expect } from "vitest";
 import {
+  adaptCatalog,
   adaptMessage,
+  adaptSelection,
   adaptStats,
   adaptSubAgent,
   assignDelegationCalls,
+  conversationHasTurns,
   deriveSubAgentRoster,
   filterMessagesByView,
   flatTree,
@@ -726,6 +729,147 @@ describe("adaptSubAgent", () => {
   });
 });
 
+// adaptCatalog / adaptSelection: the 0.24 cutover replaced `pipelines` /
+// `selected_pipeline` / `profiles` / `active_profile` on the wire with
+// `catalog: ProfileInfo[]` and `selection: {profile, agent}` (both
+// `#[serde(default)]`, so old snapshots omit them). The adapter maps the
+// snake_case wire fields to the view's camelCase and normalises absent to
+// `[]` / `null` so callers get one shape.
+describe("adapt_catalog_selection", () => {
+  const WIRE_CATALOG = [
+    {
+      name: "dev",
+      origin: "repo",
+      overrides_global: true,
+      agents: [
+        {
+          name: "team",
+          model: "sonnet",
+          subagents: [
+            { name: "junior", model: "haiku", inherited: false },
+            { name: "senior", model: "sonnet", inherited: true },
+          ],
+        },
+        { name: "solo", model: "opus", subagents: [] },
+      ],
+    },
+    {
+      name: "dev",
+      origin: "global",
+      overrides_global: false,
+      agents: [{ name: "team", model: "sonnet", subagents: [] }],
+    },
+  ];
+
+  function stateWithCatalog(
+    catalog: unknown,
+    selection: unknown,
+  ): AppState {
+    return {
+      chat: { messages: [] },
+      todo: { visible: false, items: [] },
+      stats: {
+        total_input_tokens: 0,
+        total_output_tokens: 0,
+        total_api_calls: 0,
+        total_cost: 0,
+        model: "m",
+        provider_name: "p",
+        model_alias: "a",
+      },
+      context: {
+        current_usage: 0,
+        window_size: 1000,
+        compaction_enabled: true,
+        compaction_threshold: 0.8,
+      },
+      conversation: null,
+      is_running: false,
+      is_loading: false,
+      welcome: null,
+      exit_requested: false,
+      bg: { recent_summaries: [] },
+      bash_panel: { kind: "idle" },
+      ...(catalog === undefined ? {} : { catalog }),
+      ...(selection === undefined ? {} : { selection }),
+    } as unknown as AppState;
+  }
+
+  it("maps a full catalog from wire snake_case to view camelCase", () => {
+    const adapted = adaptCatalog(stateWithCatalog(WIRE_CATALOG, undefined));
+    expect(adapted).toEqual([
+      {
+        name: "dev",
+        origin: "repo",
+        overridesGlobal: true,
+        agents: [
+          {
+            name: "team",
+            model: "sonnet",
+            subagents: [
+              { name: "junior", model: "haiku", inherited: false },
+              { name: "senior", model: "sonnet", inherited: true },
+            ],
+          },
+          { name: "solo", model: "opus", subagents: [] },
+        ],
+      },
+      {
+        name: "dev",
+        origin: "global",
+        overridesGlobal: false,
+        agents: [{ name: "team", model: "sonnet", subagents: [] }],
+      },
+    ]);
+  });
+
+  it("normalises an absent catalog (old snapshot) to []", () => {
+    expect(adaptCatalog(stateWithCatalog(undefined, undefined))).toEqual([]);
+  });
+
+  it("maps selection {profile, agent} through verbatim", () => {
+    const state = stateWithCatalog(
+      undefined,
+      { profile: "dev", agent: "team" },
+    );
+    expect(adaptSelection(state)).toEqual({
+      profile: "dev",
+      agent: "team",
+      subagentModels: {},
+    });
+  });
+
+  it("adaptSelection_normalizes_subagent_models", () => {
+    // Absent on the wire → `{}` (never undefined).
+    expect(
+      adaptSelection(stateWithCatalog(undefined, { profile: "dev", agent: "team" })),
+    ).toEqual({ profile: "dev", agent: "team", subagentModels: {} });
+
+    // Present → copied under its camelCase view name.
+    const wire = { tester: "opus", reviewer: "haiku" };
+    const adapted = adaptSelection(
+      stateWithCatalog(undefined, {
+        profile: "dev",
+        agent: "team",
+        subagent_models: wire,
+      }),
+    );
+    expect(adapted).toEqual({
+      profile: "dev",
+      agent: "team",
+      subagentModels: { tester: "opus", reviewer: "haiku" },
+    });
+    expect(adapted?.subagentModels, "a copy, not the wire object").not.toBe(wire);
+
+    // No selection at all → null.
+    expect(adaptSelection(stateWithCatalog(undefined, undefined))).toBeNull();
+  });
+
+  it("normalises an absent selection (old snapshot) to null", () => {
+    expect(adaptSelection(stateWithCatalog(undefined, undefined))).toBeNull();
+  });
+});
+
 // ─── T9: attachments ──────────────────────────────────────────────────────
 // RED: §5.7 — WireChatMessage carries `attachments?: WireAttachment[]` and
 // adaptMessage maps each one to an AttachmentView with
@@ -800,5 +944,26 @@ describe("adaptMessage — attachments (T9)", () => {
       attachments: [],
     });
     expect(adapted.attachments ?? []).toEqual([]);
+  });
+});
+
+// T34 regression: the selection chip locked as soon as a system notice (e.g.
+// the `Profile: …` confirmation of a pick) landed. Mirrors the server's
+// StateManager::conversation_has_turns.
+describe("conversationHasTurns", () => {
+  const m = (role: WireChatMessage["role"]): WireChatMessage => ({
+    role,
+    content: "x",
+    timestamp: "2026-01-01T00:00:00Z",
+  });
+
+  it("is false for an empty or system-only transcript", () => {
+    expect(conversationHasTurns([])).toBe(false);
+    expect(conversationHasTurns([m("system"), m("system")])).toBe(false);
+  });
+
+  it("is true once a user or agent message exists", () => {
+    expect(conversationHasTurns([m("system"), m("user")])).toBe(true);
+    expect(conversationHasTurns([m("agent")])).toBe(true);
   });
 });

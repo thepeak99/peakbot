@@ -1,92 +1,76 @@
 //! Session sidecar helpers (DESIGN §5.2).
 
-use crate::settings::{Protocol, Settings};
-use crate::token::Token;
+use std::path::PathBuf;
 
-/// `["--bind", "{bind_host}:{port}"]` + `["--tls"]` when https. The
-/// bind host comes from the settings (remote ⇒ 0.0.0.0).
-pub fn session_args(port: u16, s: Settings) -> Vec<String> {
-    let mut args = vec!["--bind".to_string(), format!("{}:{}", s.bind_host(), port)];
-    if s.protocol() == Protocol::Https {
-        args.push("--tls".to_string());
-    }
-    args
+/// The session child's argv (spec §8.4): empty — no `--bind`, no
+/// `--tls`, no `--token`. The child reads `general.web` from
+/// config.yaml itself (single source of truth).
+pub fn session_args() -> Vec<String> {
+    Vec::new()
 }
 
-/// `[("PEAKBOT_WEB_TOKEN", tok)]?` + `("PEAKBOT_NO_OPEN", "1")` — exactly
-/// these (on top of the sanitized base env). No token ⇒ no
-/// `PEAKBOT_WEB_TOKEN` at all.
-pub fn session_env(token: Option<&Token>) -> Vec<(String, String)> {
-    let mut env = Vec::new();
-    if let Some(t) = token {
-        env.push(("PEAKBOT_WEB_TOKEN".to_string(), t.as_str().to_string()));
-    }
+/// The session child's env: the parent env with any inherited
+/// `PEAKBOT_WEB_TOKEN` REMOVED and `PEAKBOT_NO_OPEN=1` (spec §8.4) —
+/// so the server and the desktop read the same token from config.yaml.
+/// A pre-existing `PEAKBOT_NO_OPEN` is normalized to exactly `1`, once.
+pub fn session_env(parent_env: &[(String, String)]) -> Vec<(String, String)> {
+    let mut env = parent_env
+        .iter()
+        .filter(|(k, _)| k != "PEAKBOT_WEB_TOKEN")
+        .cloned()
+        .collect::<Vec<_>>();
+    env.retain(|(k, _)| k != "PEAKBOT_NO_OPEN");
     env.push(("PEAKBOT_NO_OPEN".to_string(), "1".to_string()));
     env
 }
 
-/// `pidfile` content: `pid=<u32>\nport=<u16>\n`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `pidfile` content: `pid=<u32>\nexe=<sidecar path>\n`. The exe is
+/// recorded at spawn, so the reaper can identify the child even when the
+/// app now runs from a different path (a new AppImage mount).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PidRecord {
     pub pid: u32,
-    pub port: u16,
+    pub exe: PathBuf,
 }
 
 impl PidRecord {
     pub fn render(&self) -> String {
-        format!("pid={}\nport={}\n", self.pid, self.port)
+        format!("pid={}\nexe={}\n", self.pid, self.exe.display())
     }
 
+    /// Both keys required; an unknown line (e.g. a pre-0.24 `port=`)
+    /// rejects the record.
     pub fn parse(s: &str) -> Option<PidRecord> {
         let mut pid: Option<u32> = None;
-        let mut port: Option<u16> = None;
+        let mut exe: Option<PathBuf> = None;
         for line in s.lines() {
-            let line = line.trim();
-            if line.is_empty() {
+            if line.trim().is_empty() {
                 continue;
             }
             if let Some(v) = line.strip_prefix("pid=") {
-                let p: u32 = v.parse().ok()?;
-                pid = Some(p);
+                pid = Some(v.trim().parse().ok()?);
             } else {
-                let v = line.strip_prefix("port=")?;
-                let p: u16 = v.parse().ok()?;
-                port = Some(p);
+                let v = line.strip_prefix("exe=")?;
+                if v.is_empty() {
+                    return None;
+                }
+                exe = Some(PathBuf::from(v));
             }
         }
         Some(PidRecord {
             pid: pid?,
-            port: port?,
+            exe: exe?,
         })
     }
 }
 
-/// Identity check for the stale-pidfile reaper (DESIGN §4.6): cmdline
-/// contains `peakbot` AND `--bind <host>:<rec.port>` where host is
-/// 127.0.0.1 (loopback) or 0.0.0.0 (remote sessions).
+/// Identity check for the stale-pidfile reaper (DESIGN §4.6, spec
+/// §8.4): the process's cmdline contains the recorded sidecar path. The
+/// session child has no args to match on, and the path is what tells it
+/// apart from a hand-started `peakbot` or the service binary.
 pub fn is_our_sidecar(cmdline: &str, rec: &PidRecord) -> bool {
-    if !cmdline.contains("peakbot") {
-        return false;
-    }
-    let port = format!(":{}", rec.port);
-    cmdline.contains(&format!("--bind 127.0.0.1{port}"))
-        || cmdline.contains(&format!("--bind 0.0.0.0{port}"))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EarlyExit {
-    PortTaken,
-    Crashed,
-}
-
-/// Log tail contains `already in use` → PortTaken, else Crashed.
-/// (`code` is kept for the locked signature; the tail is the signal.)
-pub fn classify_early_exit(_code: Option<i32>, log_tail: &str) -> EarlyExit {
-    if log_tail.contains("already in use") {
-        EarlyExit::PortTaken
-    } else {
-        EarlyExit::Crashed
-    }
+    let exe = rec.exe.to_string_lossy();
+    !exe.is_empty() && cmdline.contains(exe.as_ref())
 }
 
 /// Last `n` lines; fewer lines → all; empty → empty.
@@ -102,46 +86,53 @@ pub fn tail_lines(text: &str, n: usize) -> String {
 mod tests {
     use super::*;
 
-    // §9.1 case 17 (updated for #377: args take `Settings` — bind host
-    // and `--tls` derive from it; env takes an optional token).
+    // T15a (0.24 config, spec §8.4): the session child is launched with
+    // NO web flags — no `--bind`, no `--tls`, no `--token`. The child
+    // reads `general.web` from config.yaml itself (single source of
+    // truth). ASSUMED new signature: `pub fn session_args() -> Vec<String>`
+    // (the old `(port, Settings)` form is deleted by T15b).
     #[test]
-    fn t17_session_args_and_env() {
-        use crate::settings::{Protocol, Settings};
+    fn session_argv_has_no_web_flags() {
         assert_eq!(
-            session_args(7824, Settings::default()),
-            vec!["--bind".to_string(), "127.0.0.1:7824".to_string()]
+            session_args(),
+            Vec::<String>::new(),
+            "no --bind/--tls/--token in argv; general.web is the source"
         );
-        assert_eq!(
-            session_args(
-                7824,
-                Settings::Loopback {
-                    protocol: Protocol::Https,
-                    token: true
-                }
+    }
+
+    // T15a (spec §8.4): the child env is the parent env with an inherited
+    // `PEAKBOT_WEB_TOKEN` REMOVED and `PEAKBOT_NO_OPEN=1` — so the server
+    // and the desktop read the same token from config.yaml. ASSUMED new
+    // signature: `pub fn session_env(parent_env: &[(String, String)])
+    // -> Vec<(String, String)>` (the old `Option<&Token>` form is deleted
+    // by T15b).
+    #[test]
+    fn env_strips_inherited_token() {
+        let parent = vec![
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            (
+                "PEAKBOT_WEB_TOKEN".to_string(),
+                "inherited-secret".to_string(),
             ),
-            vec![
-                "--bind".to_string(),
-                "127.0.0.1:7824".to_string(),
-                "--tls".to_string()
-            ],
-            "https ⇒ --tls after the bind"
+        ];
+        let env = session_env(&parent);
+        assert!(
+            !env.iter().any(|(k, _)| k == "PEAKBOT_WEB_TOKEN"),
+            "inherited PEAKBOT_WEB_TOKEN must be removed; got {env:?}"
         );
-        assert_eq!(
-            session_args(7824, Settings::Remote),
-            vec![
-                "--bind".to_string(),
-                "0.0.0.0:7824".to_string(),
-                "--tls".to_string()
-            ],
-            "remote ⇒ 0.0.0.0 bind + --tls"
+        assert!(
+            env.iter().any(|(k, v)| k == "PEAKBOT_NO_OPEN" && v == "1"),
+            "PEAKBOT_NO_OPEN=1 must be present; got {env:?}"
+        );
+        assert!(
+            env.iter().any(|(k, v)| k == "PATH" && v == "/usr/bin"),
+            "unrelated parent vars are kept; got {env:?}"
         );
 
-        let tok = Token::parse("s3cret").expect("parses");
-        let env = session_env(Some(&tok));
-        assert_eq!(env.len(), 2, "exactly the two vars; got {env:?}");
+        // No inherited token: PEAKBOT_NO_OPEN=1 on top of the parent.
+        let env = session_env(&[("PATH".to_string(), "/usr/bin".to_string())]);
         assert!(
-            env.iter()
-                .any(|(k, v)| k == "PEAKBOT_WEB_TOKEN" && v == "s3cret"),
+            !env.iter().any(|(k, _)| k == "PEAKBOT_WEB_TOKEN"),
             "got {env:?}"
         );
         assert!(
@@ -149,73 +140,70 @@ mod tests {
             "got {env:?}"
         );
 
-        // Token off: only PEAKBOT_NO_OPEN — no PEAKBOT_WEB_TOKEN at all.
+        // A pre-existing PEAKBOT_NO_OPEN is normalized to exactly "1"
+        // (once, no duplicates).
+        let env = session_env(&[("PEAKBOT_NO_OPEN".to_string(), "0".to_string())]);
         assert_eq!(
-            session_env(None),
-            vec![("PEAKBOT_NO_OPEN".to_string(), "1".to_string())]
+            env,
+            vec![("PEAKBOT_NO_OPEN".to_string(), "1".to_string())],
+            "PEAKBOT_NO_OPEN must be exactly 1, once; got {env:?}"
+        );
+
+        // Empty parent env.
+        assert_eq!(
+            session_env(&[]),
+            vec![("PEAKBOT_NO_OPEN".to_string(), "1".to_string())],
+            "empty parent ⇒ just PEAKBOT_NO_OPEN=1"
         );
     }
 
-    // §9.1 case 18.
+    // §9.1 case 18 (0.24: the record carries the exe path, not a port).
     #[test]
     fn t18_pid_record_roundtrip_and_rejects() {
         let rec = PidRecord {
             pid: 4242,
-            port: 7824,
+            exe: PathBuf::from("/Applications/PeakBot Desktop.app/Contents/MacOS/peakbot"),
         };
         let rt = PidRecord::parse(&rec.render()).expect("render→parse roundtrip");
-        assert_eq!(rt, rec);
-        assert_eq!(PidRecord::parse("pid=4242\n"), None, "missing port");
+        assert_eq!(rt, rec, "paths with spaces survive");
+        assert_eq!(PidRecord::parse("pid=4242\n"), None, "missing exe");
         assert_eq!(
-            PidRecord::parse("pid=x\nport=7824\n"),
+            PidRecord::parse("pid=x\nexe=/app/peakbot\n"),
             None,
             "non-numeric pid"
+        );
+        assert_eq!(
+            PidRecord::parse("pid=4242\nport=7824\n"),
+            None,
+            "a pre-0.24 port record is rejected"
         );
         assert_eq!(PidRecord::parse(""), None, "empty");
     }
 
-    // §9.1 case 19 (updated for #377: the reaper also accepts the
-    // remote 0.0.0.0 bind).
+    // §9.1 case 19 (0.24, spec §8.4: identity by executable path — the
+    // session child is launched with no `--bind`).
     #[test]
     fn t19_is_our_sidecar() {
-        let rec = PidRecord { pid: 1, port: 7824 };
+        let rec = PidRecord {
+            pid: 1,
+            exe: PathBuf::from("/tmp/.mount_x/usr/bin/peakbot"),
+        };
         assert!(
-            is_our_sidecar("/tmp/.mount_x/usr/bin/peakbot --bind 127.0.0.1:7824", &rec),
-            "matching peakbot + port ⇒ ours"
-        );
-        assert!(
-            is_our_sidecar(
-                "/tmp/.mount_x/usr/bin/peakbot --bind 0.0.0.0:7824 --tls",
-                &rec
-            ),
-            "remote sessions bind 0.0.0.0 (with --tls after the bind) ⇒ ours"
+            is_our_sidecar("/tmp/.mount_x/usr/bin/peakbot", &rec),
+            "the recorded exe, no args ⇒ ours"
         );
         assert!(
-            !is_our_sidecar("/tmp/.mount_x/usr/bin/peakbot --bind 127.0.0.1:7825", &rec),
-            "port mismatch ⇒ not ours"
+            is_our_sidecar("\"/tmp/.mount_x/usr/bin/peakbot\" ", &rec),
+            "a quoted cmdline (wmic) ⇒ ours"
         );
         assert!(
-            !is_our_sidecar("/usr/bin/vim --bind 127.0.0.1:7824", &rec),
-            "not peakbot ⇒ not ours"
+            !is_our_sidecar("/home/u/.local/bin/peakbot", &rec),
+            "another peakbot binary (the service, a hand-started one) ⇒ not ours"
         );
         assert!(
-            !is_our_sidecar("peakbot service status", &rec),
-            "peakbot without `--bind <host>:<port>` ⇒ not ours"
+            !is_our_sidecar("/usr/bin/vim", &rec),
+            "PID reuse by another program ⇒ not ours"
         );
-    }
-
-    // §9.1 case 20.
-    #[test]
-    fn t20_classify_early_exit() {
-        assert_eq!(
-            classify_early_exit(Some(1), "127.0.0.1:7824 is already in use — try again"),
-            EarlyExit::PortTaken
-        );
-        assert_eq!(
-            classify_early_exit(Some(1), "panic: something else"),
-            EarlyExit::Crashed
-        );
-        assert_eq!(classify_early_exit(None, ""), EarlyExit::Crashed);
     }
 
     // §9.1 case 21.

@@ -150,3 +150,38 @@ export interface Welcome {
    * hasn't populated it yet (pre-v0.14 wire snapshot). */
   peakbotVersion: string;
 }
+
+// Catalog view (0.24 cutover): the profiles/agents/sub-agents this install
+// declares, mapped from the wire `WireProfileInfo` (state.ts). The Agents
+// panel renders the bound agent's roster from this.
+export type CatalogOrigin = "repo" | "global";
+
+export interface CatalogSubagent {
+  name: string;
+  model: string;
+  /** Derived: the sub-agent's model alias equals the agent's. */
+  inherited: boolean;
+}
+
+export interface CatalogAgent {
+  name: string;
+  model: string;
+  subagents: CatalogSubagent[];
+}
+
+export interface CatalogProfile {
+  name: string;
+  origin: CatalogOrigin;
+  /** A repo profile shadowing a same-named global one. */
+  overridesGlobal: boolean;
+  agents: CatalogAgent[];
+}
+
+/** The (profile, agent) this conversation is bound to, normalised by the
+ * adapter: `null` when the wire field is absent (old snapshot). */
+export interface Selection {
+  profile: string;
+  agent: string;
+  /** Subagent → alias, overridden only; `{}` when none (adapter-normalized). */
+  subagentModels: Record<string, string>;
+}

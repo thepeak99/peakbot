@@ -1,8 +1,10 @@
 //! The one error shape of the 0.24 config boundary (spec §4.1), shared by the
 //! CLI, reload and the Settings HTTP API.
 
-/// Which file an error points into.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which file an error points into. Serialises lowercase (`"global"` |
+/// `"repo"`) — the Settings API `errors[].file` wire value (spec §8.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ConfigFileKind {
     Global,
     Repo,
@@ -10,15 +12,18 @@ pub enum ConfigFileKind {
 
 /// One segment of a YAML key path. A segment array, not a dotted string,
 /// because profile/agent names may themselves contain `.` and spaces.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Serialises untagged: keys as JSON strings, indices as JSON numbers.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(untagged)]
 pub enum PathSeg {
     Key(String),
     Index(usize),
 }
 
 /// A single config error: the file, the YAML path (`[]` = document root) and
-/// a human sentence without a path prefix.
-#[derive(Debug, Clone)]
+/// a human sentence without a path prefix. Serialises as the Settings API
+/// `{file, path, message}` entry.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ConfigError {
     pub file: ConfigFileKind,
     pub path: Vec<PathSeg>,

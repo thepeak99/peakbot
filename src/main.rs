@@ -2,14 +2,17 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use peakbot::config::resolve::{LoadError, ParseCtx, Source};
+use peakbot::config::{ConfigErrors, ConfigFileKind, auto_migrate, resolve_token};
 use peakbot::{
-    Config, FileStorage, ShellKind, Ui, get_config_file_path,
+    Config, FileStorage, RepoMode, ShellKind, Ui,
     install::{
         InstallAction, InstallOutcome, PathState, ServiceOp, ServicePlan, install_binary,
-        install_target, path_state, resolve_token, service_op, web_token_path, write_web_token,
+        install_target, path_state, service_op,
     },
     load_default_skills, load_mcp_servers, print_no_shell_warning,
 };
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -56,7 +59,7 @@ enum ServiceAction {
         #[arg(long = "tls-name", value_name = "NAME", requires = "tls")]
         tls_name: Vec<String>,
     },
-    /// Remove the service. Leaves the binary and the token file alone.
+    /// Remove the service. Leaves the binary and config.yaml alone.
     Uninstall,
     /// Print what is registered, where it points, and whether it is running.
     Status,
@@ -84,27 +87,27 @@ struct Cli {
     #[arg(long, hide = true, conflicts_with = "tui")]
     web: bool,
 
-    /// Address the web server listens on (`host:port`). Defaults to loopback
-    /// (`127.0.0.1:7823`). Binding beyond loopback requires
-    /// `--token`/`PEAKBOT_WEB_TOKEN` — an unauthenticated agent must never
-    /// be exposed to the network.
+    /// Address the web server listens on (`host:port`). Overrides
+    /// `general.web.bind`; defaults to loopback (`127.0.0.1:7823`). Binding
+    /// beyond loopback requires a token (`--token`, `PEAKBOT_WEB_TOKEN` or
+    /// `general.web.token`) — an unauthenticated agent must never be exposed
+    /// to the network.
     #[arg(long, value_name = "ADDR", conflicts_with_all = ["tui", "stdio"])]
     bind: Option<std::net::SocketAddr>,
 
     /// Shared secret guarding the web server. When set, every request
     /// (assets, `/commands`, `/ws`) must present it via `?token=…` (first
     /// load, which then sets a cookie) or the `peakbot_token` cookie.
-    /// Falls back to the `PEAKBOT_WEB_TOKEN` env var (preferred — keeps the
-    /// secret out of shell history and `ps`) and to `<config_dir>/web-token`
-    /// (track I, plan §E.5) so `peakbot service install --token …` is enough
-    /// to start a token-guarded server without ever exporting the secret.
+    /// Falls back to the `PEAKBOT_WEB_TOKEN` env var (keeps the secret out of
+    /// shell history and `ps`), then to `general.web.token` in config.yaml
+    /// (which `peakbot service install --token …` writes).
     #[arg(long, value_name = "SECRET", conflicts_with_all = ["tui", "stdio"])]
     token: Option<String>,
 
     /// Serve the web UI over HTTPS using PeakBot's built-in CA. On first use
     /// PeakBot self-signs a CA (in the OS cache dir) and prints the URL to
     /// install it on your phone; every boot mints a fresh leaf whose SANs follow
-    /// this machine's addresses. Overrides `web.tls` in config.
+    /// this machine's addresses. On when this flag or `general.web.tls` is set.
     #[arg(long, conflicts_with_all = ["tui", "stdio"])]
     tls: bool,
 
@@ -116,11 +119,9 @@ struct Cli {
     #[arg(long = "tls-name", value_name = "NAME", requires = "tls")]
     tls_name: Vec<String>,
 
-    /// Pin a named overlay from the master config's `profiles:` block,
-    /// applied as the final step of config resolution (after per-repo, after
-    /// master) — see `docs/profiles-and-web-mode.md` §1. Pinned means every
-    /// conversation runs under it and `/profile <name>` is refused. Applies
-    /// to `--tui`, `--stdio`, and the web UI alike.
+    /// Pin a global profile; repo profiles are ignored. Every conversation
+    /// runs under it and `/profile <name>` is refused. Applies to `--tui`,
+    /// `--stdio`, and the web UI alike.
     #[arg(long, value_name = "NAME")]
     profile: Option<String>,
 
@@ -144,37 +145,8 @@ impl Cli {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FirstRun {
-    Proceed,
-    SetupWizard,
-    Refuse,
-}
-
-fn first_run_action(config_found: bool, has_key: bool, mode: Mode, windowed: bool) -> FirstRun {
-    if config_found || has_key {
-        FirstRun::Proceed
-    } else if mode == Mode::Web && windowed {
-        FirstRun::SetupWizard
-    } else {
-        FirstRun::Refuse
-    }
-}
-
-/// Check if the provider has an API key configured.
-/// Returns true if any API key is set (OpenRouter, OpenAI, or LlamaCpp).
-fn has_api_key(config: &Config) -> bool {
-    match &config.provider {
-        peakbot::ProviderConfig::OpenRouter(c) => c.api_key.is_some(),
-        peakbot::ProviderConfig::OpenAI(c) => c.api_key.is_some(),
-        peakbot::ProviderConfig::Anthropic(_) => true, // Anthropic key optional (local servers)
-        peakbot::ProviderConfig::LlamaCpp(c) => c.api_key.is_some(),
-        peakbot::ProviderConfig::Ollama(_) => true, // Ollama uses no API key
-    }
-}
-
 /// Print a friendly "config not found" error with instructions.
-fn print_config_not_found_message(config_path: &std::path::Path) {
+fn print_config_not_found_message(config_path: &Path) {
     eprintln!();
     eprintln!("╔══════════════════════════════════════════════════════════════╗");
     eprintln!("║                    ⚠️  Config not found!                        ║");
@@ -194,49 +166,52 @@ fn print_config_not_found_message(config_path: &std::path::Path) {
     eprintln!("        - name: anthropic/claude-3.7-sonnet");
     eprintln!("          alias: sonnet");
     eprintln!();
-    eprintln!("  default_model: sonnet");
+    eprintln!("  profiles:");
+    eprintln!("    default:");
+    eprintln!("      agents:");
+    eprintln!("        main:");
+    eprintln!("          model: sonnet");
     eprintln!();
     eprintln!("Find models at: https://openrouter.ai/models");
+    eprintln!("For local models, use an `ollama` provider (base_url: http://localhost:11434).");
     eprintln!();
-    eprintln!("For local models, use Ollama:");
-    eprintln!();
-    eprintln!("  providers:");
-    eprintln!("    - name: ollama");
-    eprintln!("      type: ollama");
-    eprintln!("      base_url: http://localhost:11434");
-    eprintln!("      models:");
-    eprintln!("        - name: llama3");
-    eprintln!("          alias: local");
-    eprintln!();
-    eprintln!("  default_model: local");
-    eprintln!();
-    eprintln!("No graphical session detected (no DISPLAY/WAYLAND_DISPLAY, or you are over SSH),");
-    eprintln!("so the setup wizard cannot open a browser here.");
     eprintln!("Write the file above by hand, then run `peakbot` again.");
-    eprintln!(
-        "On a desktop, bare `peakbot` opens the setup wizard; a TUI configurator is future work."
-    );
     eprintln!();
 }
 
-/// Read the web-token file for the boot token chain. **Best-effort** —
-/// missing file, whitespace-only content, or unreadable-permissions all
-/// collapse to `None` so the chain still works on a fresh box. We never
-/// want a token-file glitch to block a default (tokenless) loopback boot.
-fn read_web_token_for_chain(path: &std::path::Path) -> Option<String> {
-    match peakbot::install::read_web_token(path) {
-        Ok(t) => t,
-        Err(e) => {
-            // Permission denied on the token file is a *configuration*
-            // mistake, not a reason to fail boot. Log via tracing and
-            // move on — the user will see the 401 and fix the perms.
-            eprintln!(
-                "warning: could not read web-token file ({}): {e}",
-                path.display()
-            );
-            None
-        }
+/// The text boot prints, after the migration error itself, when step 0
+/// fails (spec §6.9).
+const CANNOT_START_WITH_FILE: &str = "PeakBot cannot start with this file. Fix it and restart PeakBot, \
+     or keep using PeakBot 0.23 with it.";
+
+/// Print `lines` on stderr and exit 1 — boot's hard-error path (spec §6.9).
+/// Exits directly so no extra `Error: …` line follows the exact copy.
+fn exit_with(lines: &[String]) -> ! {
+    for line in lines {
+        eprintln!("{line}");
     }
+    std::process::exit(1);
+}
+
+/// Spec §4.1 CLI rendering: `"{file}: {path}: {message}"`, one per error,
+/// `{file}` the absolute path of the file the error is in.
+fn render_config_errors(errors: &ConfigErrors, global: &Path, repo: &Path) -> Vec<String> {
+    errors
+        .0
+        .iter()
+        .map(|e| {
+            let file = match e.file {
+                ConfigFileKind::Global => global,
+                ConfigFileKind::Repo => repo,
+            };
+            let path = e.dotted_path();
+            if path.is_empty() {
+                format!("{}: {}", file.display(), e.message)
+            } else {
+                format!("{}: {path}: {}", file.display(), e.message)
+            }
+        })
+        .collect()
 }
 
 /// Resolve the install target for the CLI. Mirrors
@@ -317,36 +292,103 @@ fn resolve_service_exe() -> (std::path::PathBuf, Option<String>) {
     )
 }
 
-/// Build a `ServicePlan` from CLI `service install` arguments. The bind
-/// default is `127.0.0.1:7823` (the same as the web UI). Returns
-/// `PlanError` (the loopback/token invariant) wrapped as `anyhow::Error`
-/// so the caller can `?` through a single error type. Clap can't enforce
-/// the invariant because it doesn't know about the bind/token relationship.
+/// Build a `ServicePlan` from CLI `service install` arguments.
+///
+/// The loopback/token invariant is checked against what the service will
+/// actually run with: the explicit `--bind`, else `general.web.bind`, else
+/// `127.0.0.1:7823`; the explicit `--token`, else `general.web.token`. The
+/// config is read only when it parses (a missing or broken file just means
+/// the defaults). Only explicit flags go on the argv (§8.4); the artifact
+/// never embeds the secret.
 fn build_plan_for_install(
     bind: Option<std::net::SocketAddr>,
     token: Option<&str>,
     tls: bool,
     tls_names: Vec<String>,
 ) -> Result<(ServicePlan, Option<String>), anyhow::Error> {
-    let bind = bind.unwrap_or_else(|| {
-        peakbot::ui::DEFAULT_WEB_ADDR
-            .parse()
-            .expect("DEFAULT_WEB_ADDR is a valid SocketAddr literal")
-    });
-    // If the user didn't pass --token, fall back to the web-token file —
-    // the same chain main uses for a live bind. The artifact never
-    // embeds the secret; the binary reads it back at launch.
-    let owned_token: Option<String> = match token.map(str::trim).filter(|t| !t.is_empty()) {
-        Some(t) => Some(t.to_string()),
-        None => web_token_path()
-            .as_deref()
-            .and_then(|p| peakbot::install::read_web_token(p).ok().flatten()),
-    };
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let web = Config::load(&cwd, RepoMode::Ignore, &ParseCtx { known_skills: &[] })
+        .ok()
+        .map(|config| config.general.web);
+    let effective_bind = bind
+        .or_else(|| web.as_ref().map(|w| w.bind))
+        .unwrap_or_else(|| {
+            peakbot::ui::DEFAULT_WEB_ADDR
+                .parse()
+                .expect("DEFAULT_WEB_ADDR is a valid SocketAddr literal")
+        });
+    let effective_token = resolve_token(token, None, web.as_ref().and_then(|w| w.token.as_deref()));
     let (exe, fallback_note) = resolve_service_exe();
-    let plan = ServicePlan::new(exe, bind, owned_token)?
+    let plan = ServicePlan::new(exe, effective_bind, effective_token)?
+        .with_bind_in_argv(bind.is_some())
         .with_tls(tls)
         .with_tls_names(tls_names);
     Ok((plan, fallback_note))
+}
+
+/// `service install --token T` (spec §8.4): migrate a legacy config.yaml
+/// first (exactly like boot), then set `general.web.token: T`, validate
+/// through `Config::parse` and save. Returns the lines to print.
+fn write_token_to_config(config_dir: &Path, token: &str) -> anyhow::Result<Vec<String>> {
+    let mut lines = auto_migrate(config_dir, None)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .notices();
+
+    let path = config_dir.join("config.yaml");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => anyhow::bail!(
+            "config.yaml not found at {} — start PeakBot once to set it up, then rerun \
+             'peakbot service install --token …'.",
+            path.display()
+        ),
+        Err(e) => anyhow::bail!("cannot read {}: {e}", path.display()),
+    };
+    let mut doc: serde_yaml::Value =
+        serde_yaml::from_str(&text).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    set_web_token(&mut doc, token)
+        .ok_or_else(|| anyhow::anyhow!("{}: not a YAML mapping", path.display()))?;
+    let new_text = serde_yaml::to_string(&doc)?;
+    if let Err(errors) = Config::parse(
+        Source {
+            path: &path,
+            text: &new_text,
+        },
+        None,
+        &ParseCtx { known_skills: &[] },
+    ) {
+        let repo = PathBuf::new();
+        anyhow::bail!(
+            "config.yaml would not be valid with the token set:\n{}",
+            render_config_errors(&errors, &path, &repo).join("\n")
+        );
+    }
+    peakbot::config::save_config_at(config_dir, &new_text)?;
+    lines.push(format!(
+        "Wrote general.web.token to {} (comments in config.yaml are not preserved; \
+         previous file: config.yaml.bak).",
+        path.display()
+    ));
+    Ok(lines)
+}
+
+/// Set `general.web.token`, creating the `general` / `web` mappings as
+/// needed. `None` when the document (or one of those keys) is not a mapping.
+fn set_web_token(doc: &mut serde_yaml::Value, token: &str) -> Option<()> {
+    use serde_yaml::{Mapping, Value};
+    let mut node = doc;
+    for key in ["general", "web"] {
+        let map = node.as_mapping_mut()?;
+        node = map
+            .entry(Value::from(key))
+            .or_insert_with(|| Value::Mapping(Mapping::new()));
+        if node.is_null() {
+            *node = Value::Mapping(Mapping::new());
+        }
+    }
+    node.as_mapping_mut()?
+        .insert(Value::from("token"), Value::from(token));
+    Some(())
 }
 
 /// Dispatch a subcommand. Returns `Ok(())` after printing the result;
@@ -364,20 +406,19 @@ fn run_subcommand(cmd: Command, cli: &Cli) -> Result<()> {
                 tls,
                 tls_name,
             } => {
+                // An explicit --token goes into config.yaml first, so the
+                // plan below validates against the config the service will
+                // read. A migration or write failure stops the install.
+                if let Some(t) = token.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+                    let config_dir = peakbot::config::get_config_dir()
+                        .ok_or_else(|| anyhow::anyhow!("cannot determine the config directory"))?;
+                    for line in write_token_to_config(&config_dir, t)? {
+                        println!("{line}");
+                    }
+                }
                 let (plan, fallback_note) =
                     build_plan_for_install(bind, token.as_deref(), tls, tls_name)
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
-                // If the caller passed --token explicitly, write the
-                // web-token file as a side-effect so a later
-                // `peakbot` (web) boot finds it via the chain. The
-                // service artifact itself never embeds the secret.
-                if let Some(t) = token.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
-                    let path = web_token_path()
-                        .ok_or_else(|| anyhow::anyhow!("no config dir for web-token file"))?;
-                    write_web_token(&path, t)
-                        .map_err(|e| anyhow::anyhow!("failed to write web-token: {e}"))?;
-                    println!("Wrote web-token to: {}", path.display());
-                }
                 let mut report = service_op(ServiceOp::Install { plan })
                     .map_err(|e| anyhow::anyhow!("service install failed: {e}"))?;
                 // Surface the §E.5 fallback note when the service is
@@ -392,18 +433,8 @@ fn run_subcommand(cmd: Command, cli: &Cli) -> Result<()> {
                 print_service_report(&report);
             }
             ServiceAction::Uninstall => {
-                let mut report = service_op(ServiceOp::Uninstall)
+                let report = service_op(ServiceOp::Uninstall)
                     .map_err(|e| anyhow::anyhow!("service uninstall failed: {e}"))?;
-                // §E.5: uninstall does NOT delete the token file. Carry
-                // the same note the wizard does so the CLI and the
-                // wizard say exactly the same words (§E.12).
-                if let Some(path) = web_token_path() {
-                    report.notes.push(format!(
-                        "the web-token file at {} was NOT deleted; \
-                         remove it by hand if you want to drop the secret.",
-                        path.display()
-                    ));
-                }
                 println!("Service uninstalled.");
                 print_service_report(&report);
             }
@@ -457,81 +488,111 @@ async fn main() -> Result<()> {
 
     // ── Shared setup ──────────────────────────────────────────────
 
-    // Load configuration with metadata about what was found
-    let loaded = Config::load(cli.profile.as_deref())?;
-    let config_found = loaded.config_file_found;
-    let mut needs_setup = false;
+    let boot_cwd = std::env::current_dir().unwrap_or_default();
+    let config_dir = peakbot::config::get_config_dir()
+        .ok_or_else(|| anyhow::anyhow!("cannot determine the config directory"))?;
+    let global_path = config_dir.join("config.yaml");
+    let repo_path = boot_cwd.join(".peakbot").join("config.yaml");
 
-    match first_run_action(
-        config_found,
-        has_api_key(&loaded.config),
-        mode,
-        peakbot::ui::web::windowed_session(),
+    // Step 0 (spec §6.9), every mode, before anything reads the config:
+    // migrate a pre-0.24 global (and, unpinned, the boot cwd's repo file).
+    // Only a windowed web session may boot into needs_setup on a failed
+    // GLOBAL migration (spec §6.9); every other mode exits.
+    let windowed_web = mode == Mode::Web && peakbot::ui::web::windowed_session();
+    let (boot_notices, migrate_error) = match auto_migrate(
+        &config_dir,
+        cli.profile.is_none().then_some(boot_cwd.as_path()),
     ) {
-        FirstRun::Proceed => {}
-        FirstRun::SetupWizard => {
-            needs_setup = true;
-            eprintln!("No config found — opening the setup wizard…");
+        Ok(outcome) => (outcome.notices(), None),
+        Err(e) if windowed_web && e.file == ConfigFileKind::Global => {
+            eprintln!("{e}");
+            (Vec::new(), Some(e.to_string()))
         }
-        FirstRun::Refuse => {
-            if let Some(config_path) = loaded.config_file_path.as_deref() {
-                print_config_not_found_message(config_path);
-            } else if let Some(config_path) = get_config_file_path() {
-                print_config_not_found_message(&config_path);
-            }
-            anyhow::bail!("No config file found. See instructions above.");
-        }
+        Err(e) => exit_with(&[e.to_string(), CANNOT_START_WITH_FILE.to_string()]),
+    };
+    for notice in &boot_notices {
+        eprintln!("{notice}");
     }
 
-    let mut config = loaded.config;
-    // Boot-only: every HTTP client built from here on inherits these.
-    peakbot::http::init_timeouts(config.http.clone());
+    // A failed global migration in a windowed web session: there is no
+    // Config to load — boot the needs_setup server (spec §6.9) and let the
+    // SPA show the reason (there is no migrate endpoint).
+    if let Some(migrate_error) = migrate_error {
+        return run_needs_setup_web(&cli, &config_dir, &boot_cwd, Some(migrate_error)).await;
+    }
+
     // Load skills relative to the boot cwd (an allowed mint-site read of the
-    // process cwd). Warnings are surfaced later as system messages by the
-    // session factory; per-session verbs re-scan against the session cwd.
-    let boot_cwd = std::env::current_dir().unwrap_or_default();
+    // process cwd): `Config::parse` checks skill names against them. Each
+    // session rescans for its own cwd and surfaces the warnings itself.
     let (skills, skill_warnings) = load_default_skills(&boot_cwd);
     for w in &skill_warnings {
         tracing::warn!("{w}");
     }
-    let skills_count = skills.len(); // Keep count before moving skills
+
+    // A pin names a global profile, so repo files are ignored under it.
+    let repo_mode = if cli.profile.is_some() {
+        RepoMode::Ignore
+    } else {
+        RepoMode::Include
+    };
+    let known_skills = skills.names();
+    let parse_ctx = ParseCtx {
+        known_skills: &known_skills,
+    };
+    let config = match Config::load(&boot_cwd, repo_mode, &parse_ctx) {
+        Ok(config) => config,
+        Err(LoadError::Missing(path)) => {
+            // §6.9: a windowed web session with no global file boots the
+            // settings server (needs_setup) — there is no Config yet.
+            if windowed_web {
+                return run_needs_setup_web(&cli, &config_dir, &boot_cwd, None).await;
+            }
+            print_config_not_found_message(&path);
+            anyhow::bail!("No config file found. See instructions above.");
+        }
+        // Only reachable if the file changed after step 0.
+        Err(LoadError::Legacy(path)) => exit_with(&[format!(
+            "{}: {}",
+            path.display(),
+            peakbot::config::resolve::L1_MESSAGE
+        )]),
+        Err(LoadError::Invalid(errors)) => {
+            exit_with(&render_config_errors(&errors, &global_path, &repo_path))
+        }
+        Err(LoadError::Io(path, e)) => exit_with(&[format!("cannot read {}: {e}", path.display())]),
+    };
+    for warning in &config.warnings {
+        eprintln!("warning: {warning}");
+    }
+    let start = match config.catalog.start_bound(cli.profile.as_deref()) {
+        Ok(bound) => bound,
+        Err(message) => exit_with(&[message]),
+    };
+
+    // Boot-only: every HTTP client built from here on inherits these.
+    peakbot::http::init_timeouts(config.general.http.clone());
 
     // Detect the shell first — the system prompt needs it so the model is
     // told which syntax + shell tool to use (#82). On Windows with no shell
     // found, warn and continue; other tools still work.
     let shell_kind = ShellKind::detect();
+    if let Some(ref sk) = shell_kind {
+        tracing::info!("Detected shell: {} ({})", sk.name(), sk.executable());
+    } else {
+        print_no_shell_warning();
+    }
 
-    // Build the model registry. Two paths:
-    // - `providers:` list declared → multi-model, `/model` enabled.
-    // - Legacy `provider:` block → synthesised one-entry registry
-    //   with alias `default`. `/model default` is a no-op; the user
-    //   gets a "no other models declared" message if they try to
-    //   switch. See `multi-model.md`.
-    let model_registry = match config.build_model_registry() {
-        Ok(reg) => Arc::new(reg),
-        Err(e) => {
-            anyhow::bail!("Invalid model configuration: {e}");
-        }
-    };
-
-    // Load MCP servers
-    let mcp_handles = load_mcp_servers(&config).await?;
-    let mcp_tools_count = mcp_handles.len(); // Keep count before moving handles
-    // Wrap the handles in an Arc so each session can re-derive its tools
-    // list without restarting the underlying subprocesses. McpTool: Clone
-    // (rig 0.33) makes the per-session tool list cheap. See session.rs.
-    let mcp_handles_arc = Arc::new(mcp_handles);
-
-    let searxng_config = config
-        .searxng_enabled()
-        .then_some(config.searxng.clone())
-        .flatten();
+    // One set of MCP subprocesses for the process. Each session re-derives
+    // its tools list from the shared handles (McpTool: Clone), filtered by
+    // its profile — see `ToolEnv`.
+    let mcp_handles = Arc::new(load_mcp_servers(&config).await?);
 
     // Create shared conversation storage if enabled. One storage instance
     // is shared by every session — it writes distinct files per
     // conversation id (see session::SessionDeps).
-    let storage: Option<Arc<dyn peakbot::ConversationStorage>> = if config.conversation_enabled() {
-        let storage_dir = config.conversation_storage_dir();
+    let conversation = &config.general.conversation;
+    let storage: Option<Arc<dyn peakbot::ConversationStorage>> = if conversation.auto_save {
+        let storage_dir = conversation.storage_dir_or_default();
         match FileStorage::new(storage_dir.clone()) {
             Ok(storage) => {
                 tracing::info!("Conversation storage enabled at: {:?}", storage_dir);
@@ -551,82 +612,27 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Pipelines. One resolved set for the whole process, shared across sessions
-    // via Arc. Every team's orchestrator + roles resolve their model alias here
-    // (unknown alias → clear boot error), and a legacy `pipeline:` block is a
-    // hard error with a migration recipe.
-    let pipelines = Arc::new(peakbot::PipelineSet::build(
-        &config,
-        &model_registry,
-        Some(&skills.names()),
-    )?);
+    let registry = config.registry.clone();
+    let active_alias = start.agent().main.model.alias.clone();
+    let web = config.general.web.clone();
+    let uploads = peakbot::attachments::UploadStore::new(
+        peakbot::attachments::UploadStore::default_root(),
+        config.general.uploads,
+    );
 
-    // Mirror the registry's boot provider into `config.provider` so
-    // `AgentRunner::new`'s compaction-model construction reads the active
-    // provider, not the stale `OpenRouterConfig::default()` (api_key=None)
-    // that would fail with a misleading "OpenRouter API key not configured".
-    // Matches the `/model` switch path at `lib.rs:1082`. The return value is
-    // unused — each session derives its own provider from the resolved boot
-    // model; only the `config.provider` side-effect matters here.
-    config.resolve_and_mirror_boot_provider(&model_registry);
-
-    // Log the detected shell here; each session applies it to its own
-    // StateManager via the factory. On Windows with no shell, warn once.
-    if let Some(ref sk) = shell_kind {
-        tracing::info!("Detected shell: {} ({})", sk.name(), sk.executable());
-    } else {
-        print_no_shell_warning();
-    }
-
-    // Build the shared vector store (doc_index / doc_search) when configured
-    // and enabled. Opened once here and injected into both tools via the
-    // provider builder; reused across `/model` switches via RebuildContext.
-    // A failure to open is non-fatal — we warn and continue without the tools,
-    // matching how a missing shell degrades gracefully.
-    let vector_store = match config.vector_db.as_ref() {
-        Some(vc) if vc.enabled => match peakbot::vector::VectorStore::open(vc) {
-            Ok(store) => {
-                tracing::info!(
-                    "Vector store enabled; DB resolved per session cwd from: {}",
-                    vc.db_path
-                );
-
-                Some(store)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to open vector store at {}: {e}. \
-                     Continuing without doc_index/doc_search.",
-                    vc.db_path
-                );
-                None
-            }
-        },
-        _ => None,
-    };
-
-    // Build the shared, immutable session deps once. Each session (the
-    // single TUI/stdio session, or one per web-socket connection) is built
-    // from these via `create_session`. `Arc` so the web UI can hand a clone
-    // to every connection handler. See `src/session.rs`.
+    // Build the shared session deps once. Each session (the single
+    // TUI/stdio session, or one per web-socket connection) is built from
+    // these via `create_session`. `Arc` so the web UI can hand a clone to
+    // every connection handler. See `src/session.rs`.
     let session_deps = Arc::new(peakbot::SessionDeps {
-        config: config.clone(),
-        model_registry: model_registry.clone(),
+        config: Arc::new(config),
         skills,
-        skill_warnings,
-        mcp_handles: mcp_handles_arc.clone(),
-        searxng_config,
-        pipelines,
-        vector_store,
+        mcp_handles,
+        boot_notices: std::sync::Mutex::new(boot_notices),
         shell_kind,
         storage,
-        mcp_tools_count,
-        skills_count,
         profile_pin: cli.profile.clone(),
-        uploads: peakbot::attachments::UploadStore::new(
-            peakbot::attachments::UploadStore::default_root(),
-            config.uploads,
-        ),
+        uploads,
     });
 
     use peakbot::ui::{ReplUi, StdioUi, WebUi, build_models_snapshot};
@@ -635,26 +641,15 @@ async fn main() -> Result<()> {
     // the deps and never boots a single shared session. The TUI and stdio
     // views are single-session: build one, drive it, drop it (teardown).
     if mode == Mode::Web {
-        // Resolve the bind address (default loopback) and the shared secret
-        // (flag > env > web-token file). Parse-at-the-boundary: validate
-        // here, then trust the Option<token> inside WebUi.
-        let addr: std::net::SocketAddr = cli.bind.unwrap_or_else(|| {
-            peakbot::ui::DEFAULT_WEB_ADDR
-                .parse()
-                .expect("DEFAULT_WEB_ADDR is a valid SocketAddr literal")
-        });
-        // §E.5 chain: --token > $PEAKBOT_WEB_TOKEN > <config_dir>/web-token.
-        // The file is written by `peakbot service install --token …` and is
-        // the only artifact that *can* carry the secret; the unit/plist/task
-        // never do. `resolve_token` collapses empty/whitespace to "absent".
+        // Bind, token and TLS (spec §8.4): CLI first, then `general.web`.
+        // Parse-at-the-boundary: validate here, then trust the
+        // Option<token> inside WebUi.
+        let addr = cli.bind.unwrap_or(web.bind);
         let env_token = std::env::var("PEAKBOT_WEB_TOKEN").ok();
-        let file_token = web_token_path()
-            .as_deref()
-            .and_then(read_web_token_for_chain);
         let token = resolve_token(
             cli.token.as_deref(),
             env_token.as_deref(),
-            file_token.as_deref(),
+            web.token.as_deref(),
         );
 
         // An agent that can run shell commands must never be reachable on a
@@ -662,22 +657,34 @@ async fn main() -> Result<()> {
         if !addr.ip().is_loopback() && token.is_none() {
             anyhow::bail!(
                 "refusing to bind the web UI to non-loopback {addr} without a token — \
-                 set --token, PEAKBOT_WEB_TOKEN, or write <config_dir>/web-token"
+                 set --token, PEAKBOT_WEB_TOKEN, or general.web.token"
             );
         }
 
-        let active_alias = model_registry.default_alias().to_string();
-        // Flag overrides config, same precedent as the token resolution above.
-        let tls = cli.tls || session_deps.config.web.tls;
+        let tls = cli.tls || web.tls;
+        // The settings surface's boot facts (spec §8.2 `boot` block): the
+        // token source mirrors `resolve_token`'s chain. A failed global
+        // migration already returned the needs_setup server above, so
+        // `migrate_error` is None here.
+        let settings = peakbot::ui::web::settings::SettingsBoot {
+            config_dir: config_dir.clone(),
+            boot_cwd: boot_cwd.clone(),
+            migrate_error: None,
+            token_source: peakbot::ui::web::settings::TokenSource::resolve(
+                cli.token.as_deref(),
+                env_token.as_deref(),
+                web.token.as_deref(),
+            ),
+        };
         let mut ui = WebUi::new(
             addr,
-            session_deps.clone(),
-            build_models_snapshot(&model_registry),
+            Some(session_deps.clone()),
+            build_models_snapshot(&registry),
             active_alias,
             token,
             tls,
             cli.tls_name.clone(),
-            needs_setup,
+            settings,
         );
         ui.init().await?;
         ui.run().await?;
@@ -697,7 +704,7 @@ async fn main() -> Result<()> {
         let mut ui = StdioUi::new(
             state_manager.clone(),
             action_sender,
-            build_models_snapshot(&model_registry),
+            build_models_snapshot(&registry),
             boot_alias.clone(),
         );
         ui.init().await?;
@@ -707,7 +714,7 @@ async fn main() -> Result<()> {
         // The registry lets the View intercept/validate `/model <alias>`
         // before any UiAction is dispatched.
         let mut ui =
-            ReplUi::new_with_registry(state_manager.clone(), action_sender, model_registry.clone());
+            ReplUi::new_with_registry(state_manager.clone(), action_sender, registry.clone());
         ui.init().await?;
         ui.run().await?;
         ui.shutdown().await?;
@@ -718,6 +725,58 @@ async fn main() -> Result<()> {
     // PTY children — the clean teardown path (see session::Session).
     drop(session);
 
+    Ok(())
+}
+
+/// §6.9 needs_setup server: the web UI without session deps — the SPA,
+/// `/api/settings`, `/api/config*` and `/api/system/*`, with `/ws` the 503
+/// setup guard. Reached from a windowed web session whose global file is
+/// missing, or whose boot auto-migration failed (`migrate_error` carries
+/// the reason verbatim). Bind/token/TLS resolve without a config: CLI
+/// flags and env only, the same non-loopback refusal as normal boot.
+async fn run_needs_setup_web(
+    cli: &Cli,
+    config_dir: &Path,
+    boot_cwd: &Path,
+    migrate_error: Option<String>,
+) -> Result<()> {
+    let addr = cli.bind.unwrap_or_else(|| {
+        peakbot::ui::DEFAULT_WEB_ADDR
+            .parse()
+            .expect("DEFAULT_WEB_ADDR is a valid SocketAddr literal")
+    });
+    let env_token = std::env::var("PEAKBOT_WEB_TOKEN").ok();
+    let token = resolve_token(cli.token.as_deref(), env_token.as_deref(), None);
+    if !addr.ip().is_loopback() && token.is_none() {
+        anyhow::bail!(
+            "refusing to bind the web UI to non-loopback {addr} without a token — \
+             set --token, PEAKBOT_WEB_TOKEN, or general.web.token"
+        );
+    }
+    let tls = cli.tls;
+    let settings = peakbot::ui::web::settings::SettingsBoot {
+        config_dir: config_dir.to_path_buf(),
+        boot_cwd: boot_cwd.to_path_buf(),
+        migrate_error,
+        token_source: peakbot::ui::web::settings::TokenSource::resolve(
+            cli.token.as_deref(),
+            env_token.as_deref(),
+            None,
+        ),
+    };
+    let mut ui = peakbot::ui::WebUi::new(
+        addr,
+        None,
+        Vec::new(),
+        String::new(),
+        token,
+        tls,
+        cli.tls_name.clone(),
+        settings,
+    );
+    ui.init().await?;
+    ui.run().await?;
+    ui.shutdown().await?;
     Ok(())
 }
 
@@ -974,39 +1033,25 @@ mod tests {
     }
 
     #[test]
-    fn first_run_proceeds_with_config_or_key() {
-        for mode in [Mode::Web, Mode::Tui, Mode::Stdio] {
-            for windowed in [false, true] {
-                assert_eq!(
-                    first_run_action(true, false, mode, windowed),
-                    FirstRun::Proceed
-                );
-                assert_eq!(
-                    first_run_action(false, true, mode, windowed),
-                    FirstRun::Proceed
-                );
-            }
-        }
+    fn set_web_token_creates_missing_general_and_web_maps() {
+        let mut doc: serde_yaml::Value = serde_yaml::from_str("providers: []\n").unwrap();
+        set_web_token(&mut doc, "t0k").unwrap();
+        assert_eq!(doc["general"]["web"]["token"].as_str(), Some("t0k"));
     }
 
     #[test]
-    fn first_run_opens_wizard_only_for_windowed_web() {
-        assert_eq!(
-            first_run_action(false, false, Mode::Web, true),
-            FirstRun::SetupWizard
-        );
-        assert_eq!(
-            first_run_action(false, false, Mode::Web, false),
-            FirstRun::Refuse
-        );
-        assert_eq!(
-            first_run_action(false, false, Mode::Tui, true),
-            FirstRun::Refuse
-        );
-        assert_eq!(
-            first_run_action(false, false, Mode::Stdio, true),
-            FirstRun::Refuse
-        );
+    fn set_web_token_keeps_sibling_keys_and_replaces_the_old_token() {
+        let mut doc: serde_yaml::Value =
+            serde_yaml::from_str("general:\n  web:\n    tls: true\n    token: old\n").unwrap();
+        set_web_token(&mut doc, "new").unwrap();
+        assert_eq!(doc["general"]["web"]["token"].as_str(), Some("new"));
+        assert_eq!(doc["general"]["web"]["tls"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn set_web_token_refuses_a_non_mapping_document() {
+        let mut doc = serde_yaml::Value::String("nope".into());
+        assert!(set_web_token(&mut doc, "t").is_none());
     }
 
     // ── §E.5 — `resolve_service_exe` picks installed target when present,

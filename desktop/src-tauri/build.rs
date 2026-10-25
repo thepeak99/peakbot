@@ -40,16 +40,12 @@ fn main() {
         println!("cargo:rustc-env=PEAKBOT_SIDECAR_ID={id}");
     }
 
-    // Command ACL: `status`, `act`, `settings_get` and `settings_set` get
-    // generated `allow-`/`deny-` permissions; the capabilities grant each
-    // local window exactly its own set.
+    // Command ACL: `status`, `act` and `settings_get` get generated
+    // `allow-`/`deny-` permissions; the local-pages capability grants
+    // the main window exactly that set (0.24: `settings_set` is gone —
+    // web settings live in config.yaml `general.web`, spec §8.4).
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
-        tauri_build::AppManifest::new().commands(&[
-            "status",
-            "act",
-            "settings_get",
-            "settings_set",
-        ]),
+        tauri_build::AppManifest::new().commands(&["status", "act", "settings_get"]),
     ))
     .expect("tauri-build failed");
 }

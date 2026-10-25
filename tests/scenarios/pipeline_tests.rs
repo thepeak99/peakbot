@@ -1,18 +1,33 @@
-//! Pipeline (orchestrator + sub-agent) integration tests.
+//! Agent + sub-agent delegation integration tests (0.24 port of the old
+//! pipeline tests).
 //!
-//! Consumer-level guard that the lane seams *compose*: a delegation TEEs the
+//! Consumer-level guards that the lane seams *compose*: a delegation TEEs the
 //! sub-agent's internal turns into the shared transcript tagged
 //! `SubAgent { role }`, rolls its cost into the parent stats, and yet the
-//! orchestrator's wire history (`get_agent_history`) sees only its own delegate
-//! `ToolCall`/`ToolResult`. Each of these is unit-tested in isolation elsewhere;
-//! this test locks that they hold *together* through the real public seams
-//! (`StateManager::add_tool_call`/`add_tool_result`/`add_request`/
-//! `get_agent_history`/`get_stats`) — a refactor could keep every unit test
-//! green while breaking the interaction.
+//! main agent's wire history (`get_agent_history`) sees only its own
+//! `delegate` `ToolCall`/`ToolResult`. Each of these is unit-tested in
+//! isolation elsewhere; these tests lock that they hold *together* through
+//! the real public seams (`StateManager::add_tool_call`/`add_tool_result`/
+//! `add_request`/`get_agent_history`/`get_stats` and the `DelegateTool`
+//! surface the LLM reads).
+//!
+//! The 0.23 "two pipelines sharing a role name" scenario is gone with the
+//! pipelines: a session runs exactly ONE resolved `(profile, agent)` — the
+//! `Bound` — and the `delegate` tool's roster is `bound.agent().subagents`.
+//! The cross-team isolation contract survives as: the schema names ONLY the
+//! bound agent's subagents, never the siblings' (a different agent in the
+//! same profile is as foreign as a different pipeline used to be).
 
 use peakbot::StateManager;
+use peakbot::config::resolve::{Config, ParseCtx, Source};
+use peakbot::pipeline::{DelegateTool, SubAgentDeps};
+use peakbot::skills::SkillRegistry;
+use peakbot::tools::env::ToolEnv;
 use peakbot::ui::app_state::{MessageRole, MessageSource};
 use rig_core::completion::message::{Message as RigMessage, UserContent};
+use rig_core::tool::Tool;
+use std::path::Path;
+use std::sync::Arc;
 
 fn sub_agent(role: &str) -> MessageSource {
     MessageSource::SubAgent {
@@ -22,18 +37,18 @@ fn sub_agent(role: &str) -> MessageSource {
 
 /// Simulate one full delegation and assert all four load-bearing properties
 /// together: (a) sub-agent turns are in the transcript tagged `SubAgent`,
-/// (b) the orchestrator wire history excludes them but keeps the delegate
+/// (b) the main agent's wire history excludes them but keeps the delegate
 /// round-trip, (c) the returned string is exactly the delegate `ToolResult`
-/// the orchestrator sees, (d) the sub-agent's cost rolled into `/stats`.
+/// the main agent sees, (d) the sub-agent's cost rolled into `/stats`.
 #[test]
-fn delegation_tees_sub_agent_turns_but_isolates_orchestrator_wire() {
+fn delegation_tees_sub_agent_turns_but_isolates_main_agent_wire() {
     let sm = StateManager::new();
 
-    // The user talks to the orchestrator, which decides to delegate.
+    // The user talks to the main agent, which decides to delegate.
     sm.add_user_message("build the thing".to_string());
 
-    // Orchestrator's own delegate call — stays on the Human (orchestrator) lane.
-    // This IS the input the orchestrator should see.
+    // The main agent's own delegate call — stays on the Human (main agent)
+    // lane. This IS the input the main agent should see.
     sm.add_tool_call(
         MessageSource::Human,
         None,
@@ -44,7 +59,7 @@ fn delegation_tees_sub_agent_turns_but_isolates_orchestrator_wire() {
 
     // The sub-agent runs its own tool loop. Its internal turns are TEE'd into
     // the transcript tagged SubAgent — visible to the user, hidden from the
-    // orchestrator wire.
+    // main agent's wire.
     sm.add_tool_call(
         sub_agent("researcher"),
         None,
@@ -63,9 +78,9 @@ fn delegation_tees_sub_agent_turns_but_isolates_orchestrator_wire() {
     // The sub-agent's cost rolls into the parent stats (lane-agnostic).
     sm.add_request(&MessageSource::Human, 100, 50, 0.02);
 
-    // The delegation returns one string — recorded as the orchestrator's
+    // The delegation returns one string — recorded as the main agent's
     // delegate ToolResult (Human lane). This is the ONLY thing about the
-    // sub-agent the orchestrator sees.
+    // sub-agent the main agent sees.
     let returned = "Brief: 3 TODOs, all in src/legacy.rs. Recommend triage.";
     sm.add_tool_result(
         MessageSource::Human,
@@ -89,7 +104,7 @@ fn delegation_tees_sub_agent_turns_but_isolates_orchestrator_wire() {
         "the sub-agent's ToolCall + ToolResult must be in the transcript, tagged SubAgent"
     );
 
-    // ── (b) orchestrator wire history excludes the sub-agent's turns ──────
+    // ── (b) main agent wire history excludes the sub-agent's turns ────────
     let wire = sm.get_agent_history();
 
     let sub_agent_bash_leaked = wire.iter().any(|m| match m {
@@ -102,10 +117,10 @@ fn delegation_tees_sub_agent_turns_but_isolates_orchestrator_wire() {
     });
     assert!(
         !sub_agent_bash_leaked,
-        "the sub-agent's internal bash turn leaked into the orchestrator wire history"
+        "the sub-agent's internal bash turn leaked into the main agent's wire history"
     );
 
-    // ...but the orchestrator's OWN delegate result IS in the wire (input+output).
+    // ...but the main agent's OWN delegate result IS in the wire (input+output).
     let delegate_result_in_wire = wire.iter().any(|m| match m {
         RigMessage::User { content } => content.iter().any(|c| {
             matches!(c, UserContent::ToolResult(tr)
@@ -115,17 +130,17 @@ fn delegation_tees_sub_agent_turns_but_isolates_orchestrator_wire() {
     });
     assert!(
         delegate_result_in_wire,
-        "the orchestrator's own delegate ToolResult must remain in its wire history"
+        "the main agent's own delegate ToolResult must remain in its wire history"
     );
 
     // ── (c) the returned string is exactly the delegate ToolResult ────────
-    let orchestrator_delegate_result = transcript
+    let main_delegate_result = transcript
         .iter()
         .find(|m| m.role == MessageRole::ToolResult && m.source == MessageSource::Human)
-        .expect("orchestrator delegate ToolResult must exist");
+        .expect("main agent delegate ToolResult must exist");
     assert!(
-        orchestrator_delegate_result.content.contains(returned),
-        "the orchestrator sees exactly the string the delegation returned"
+        main_delegate_result.content.contains(returned),
+        "the main agent sees exactly the string the delegation returned"
     );
 
     // ── (d) the sub-agent's cost rolled into /stats ───────────────────────
@@ -138,236 +153,86 @@ fn delegation_tees_sub_agent_turns_but_isolates_orchestrator_wire() {
         stats.total_cost
     );
 }
-// ── Stage 1.2: multi-pipeline cross-team isolation ──────────────────────
+
+// ── Delegate scoping: the schema names ONLY the bound agent's subagents ────
 //
-// These tests pin the §4 RUNTIME / AGENT DESIGN contract: with two
-// configured pipelines BOTH defining role `reviewer` (each on a
-// different model), the `delegate` tool's schema description lists
-// ONLY the selected pipeline's roles — cross-pipe roles don't exist
-// in the schema (plan §4 "Delegate scoping"). The `DelegateTool` is
-// built around an `Arc<SubAgentRegistry>`; the rebuild seam hands it
-// the SELECTED pipeline's registry (not the global one), and the
-// description is a direct projection of that registry's roles.
-//
-// We exercise the contract at the `DelegateTool::definition()` seam
-// — the cheapest end-to-end pin available without standing up a full
-// agent loop. A full harness-based scenario (with `MockCompletionModel`
-// and recorded requests) requires Stage 1.2 to first teach the
-// harness how to stamp `selected_pipeline`; that's the next test
-// added here.
-//
-// NOTE on visibility: the integration test crate can ONLY reach types
-// re-exported at the crate root (`peakbot::DelegateTool`,
-// `peakbot::SubAgentRegistry`, …). `peakbot::pipeline::PipelineSet`,
-// `peakbot::pipeline::SubAgentDeps`, etc. live behind a private module
-// and aren't `pub use`'d yet. The Stage 1.2 implementer MUST add the
-// re-exports at `src/lib.rs` (alongside the existing
-// `pub use pipeline::{DelegateTool, SubAgentRegistry}`). Until then,
-// the test below uses the directly-accessible `SubAgentRegistry` +
-// `DelegateTool` pair to pin the contract from the bottom up — the
-// `PipelineSet` plumbing at the seam layer is separately pinned by
-// the in-module test in `src/pipeline/set.rs::tests::happy_path_*`.
-//
-// ── Lane-isolation pin — UNTOUCHED ─────────────────────────────────────
-// The existing `delegation_tees_sub_agent_turns_but_isolates_orchestrator_wire`
-// test above pins the orthogonal lane-isolation contract. Stage 1.2
-// does not change it; the rebuild seam hands a different registry to
-// the `DelegateTool`, but the lane identity (`MessageSource::SubAgent`)
-// and wire-history filtering are unchanged. The companion pin in
-// `state_manager::tests::get_agent_history_excludes_sub_agent_lane_keeps_background`
-// stays green through this refactor by construction.
+// The 0.23 "two pipelines sharing role `reviewer`" scenario: a session runs
+// ONE `(profile, agent)`, so the isolation axis is now the AGENT. Two agents
+// in the same profile both define `reviewer` (on different models); the
+// `delegate` tool built for agent A must name ONLY A's subagents — a
+// sibling agent's roster is as invisible as a foreign pipeline used to be.
 
-use peakbot::config::ModelRegistry;
-use peakbot::{DelegateTool, SubAgentRegistry};
-use rig_core::tool::Tool;
-// `StateManager` is already imported above (used by the lane-isolation
-// test).
+const DELEGATE_GLOBAL: &str = "providers:\n  - name: openrouter\n    type: openrouter\n    api_key: sk-test\n    models:\n      - { name: google/gemini-2.0-flash-001, alias: flash }\n      - { name: anthropic/claude-3.7-sonnet, alias: sonnet }\nprofiles:\n  dev:\n    agents:\n      team:\n        model: flash\n        subagents:\n          reviewer:\n            model: flash\n            prompt: web reviewer\n          tester:\n            prompt: web tester\n      ops:\n        model: sonnet\n        subagents:\n          reviewer:\n            model: sonnet\n            prompt: research reviewer\n          writer:\n            prompt: research writer\n";
 
-/// Build a registry that mirrors the per-pipeline role list we want
-/// to test cross-pipeline isolation against. Two registries, each with
-/// a `reviewer` role on a different model, plus one exclusive role
-/// each. This is the "two pipelines sharing role `reviewer` on
-/// different models" shape the Stage 1.2 spec calls out.
-fn two_registries_with_shared_reviewer() -> (SubAgentRegistry, SubAgentRegistry) {
-    use peakbot::config::{ModelEntry, ProviderEntry, ProviderType};
-
-    let prov = ProviderEntry {
-        name: "openrouter".into(),
-        kind: ProviderType::OpenRouter,
-        api_key: Some("sk-test".into()),
-        base_url: None,
-        preserve_reasoning: None,
-        display_reasoning: None,
-        models: vec![
-            ModelEntry {
-                name: "google/gemini-2.0-flash-001".into(),
-                alias: Some("flash".into()),
-                max_tokens: None,
-                temperature: None,
-                extra_params: None,
-                prompt_caching: None,
-                vision: None,
-                context_size: None,
-                preserve_reasoning: true,
-                display_reasoning: false,
-            },
-            ModelEntry {
-                name: "anthropic/claude-3.7-sonnet".into(),
-                alias: Some("sonnet".into()),
-                max_tokens: None,
-                temperature: None,
-                extra_params: None,
-                prompt_caching: None,
-                vision: None,
-                context_size: None,
-                preserve_reasoning: true,
-                display_reasoning: false,
-            },
-        ],
-    };
-    let registry: ModelRegistry =
-        ModelRegistry::build(std::slice::from_ref(&prov), Some("flash")).expect("registry");
-
-    let yaml_a = "\
-pipeline:
-  enabled: true
-  agents:
-    reviewer:
-      model: flash
-      prompt: web reviewer
-    tester:
-      prompt: web tester
-";
-    let yaml_b = "\
-pipeline:
-  enabled: true
-  agents:
-    reviewer:
-      model: sonnet
-      prompt: research reviewer
-    writer:
-      prompt: research writer
-";
-    let cfg_a: peakbot::config::Config = serde_yaml::from_str(yaml_a).expect("config a parses");
-    let cfg_b: peakbot::config::Config = serde_yaml::from_str(yaml_b).expect("config b parses");
-
-    // NOTE: `SubAgentRegistry::new` takes a legacy `PipelineConfig`.
-    // This is intentional — we want to exercise the existing registry
-    // API (the seam Stage 1.2's rebuild hands the delegate tool).
-    // Once Stage 1.2 lands, the same registries can be built via
-    // `PipelineSet::get(name).registry.clone()`.
-    //
-    // Suppress the boot-error: amendment 5 makes a legacy `pipeline:`
-    // block a HARD boot error, but we bypass that by calling
-    // `SubAgentRegistry::new` directly (not `PipelineSet::build`).
-    // The error path doesn't apply to direct registry construction.
-    let members_a = cfg_a.pipeline.as_ref().unwrap().agents.clone();
-    let members_b = cfg_b.pipeline.as_ref().unwrap().agents.clone();
-    // `SubAgentRegistry::from_members` is the Stage 1.1 narrower
-    // constructor — but it's `pub(crate)`. Fall back to `new` which
-    // is `pub` and takes a `&PipelineConfig`.
-    let reg_a = SubAgentRegistry::new(
-        &peakbot::config::PipelineConfig {
-            enabled: true,
-            orchestrator_prompt: None,
-            agents: members_a,
+fn parse_delegate_global() -> Config {
+    Config::parse(
+        Source {
+            path: Path::new("/global/config.yaml"),
+            text: DELEGATE_GLOBAL,
         },
-        &registry,
-        &[],
+        None,
+        &ParseCtx { known_skills: &[] },
     )
-    .expect("registry a builds");
-    let reg_b = SubAgentRegistry::new(
-        &peakbot::config::PipelineConfig {
-            enabled: true,
-            orchestrator_prompt: None,
-            agents: members_b,
-        },
-        &registry,
-        &[],
-    )
-    .expect("registry b builds");
-    (reg_a, reg_b)
+    .expect("delegate fixture must parse")
 }
 
-/// Build a `DelegateTool` over the given registry, with the minimal
-/// scaffolding needed for `definition()` to work. Mirrors the helper
-/// in `src/pipeline/delegate_tool.rs::tests::minimal_delegate_tool`.
-fn delegate_tool_for_registry(registry: std::sync::Arc<SubAgentRegistry>) -> DelegateTool {
-    // SubAgentDeps is re-exported as `peakbot::pipeline::SubAgentDeps`
-    // but the module is private. Until Stage 1.2 re-exports it (or
-    // makes the module pub), we have to construct via the private
-    // path. The minimal test helper in `delegate_tool.rs::tests`
-    // demonstrates the right shape.
-    //
-    // To stay in the integration crate without reaching into private
-    // modules, we construct via the `DelegateTool::new(Arc<SubAgentDeps>)`
-    // path. SubAgentDeps IS re-exported from `crate::pipeline` (see
-    // `src/pipeline/mod.rs:15`), but only via `peakbot::pipeline` —
-    // which is itself a private module from the integration crate's
-    // perspective. Stage 1.2 must `pub use` it.
-    //
-    // For now this test is RED with the right reason: SubAgentDeps
-    // (and PipelineSet, etc.) need re-exporting at the crate root.
-    // Once that's done, the body below compiles and the assertions
-    // pin the contract.
-    let deps = peakbot::pipeline::SubAgentDeps {
-        registry,
-        searxng: None,
-        bash_config: peakbot::config::BashConfig::default(),
-        tools_filter: peakbot::config::NameFilter::default(),
+/// A `DelegateTool` over the bound `(dev, <agent>)` — the same wiring the
+/// provider build uses (`build_bound_agent`).
+fn delegate_tool_for_agent(cfg: &Config, agent_name: &str) -> DelegateTool {
+    let profile = cfg.catalog.profile("dev").expect("the dev profile");
+    let agent_index = profile
+        .agents
+        .iter()
+        .position(|a| a.main.name == agent_name)
+        .unwrap_or_else(|| panic!("agent '{agent_name}' in the fixture"));
+    let bound = peakbot::config::resolve::Bound::new(Arc::clone(profile), agent_index);
+    let deps = SubAgentDeps {
+        bound,
+        orchestrator_model: cfg
+            .registry
+            .resolve(&profile.agents[agent_index].main.model.alias)
+            .cloned()
+            .expect("the agent's model is in the registry"),
+        tool_env: Arc::new(ToolEnv::for_profile(cfg, profile, &Arc::new(Vec::new()))),
         state_manager: StateManager::new_arc(),
         shell_kind: None,
-        vector_store: None,
-        max_turns: 0,
-        skills: peakbot::SkillRegistry::default(),
+        skills: SkillRegistry::default(),
         event_sink: None,
-        retry: peakbot::config::RetryConfig::default(),
-        timeouts: peakbot::config::TimeoutsConfig::default(),
-        agents_md_ceiling: true,
-        fetch_url: peakbot::config::FetchUrlConfig::default(),
+        retry: cfg.general.retry.clone(),
     };
-    DelegateTool::new(std::sync::Arc::new(deps))
+    DelegateTool::new(Arc::new(deps))
 }
 
-/// The headline Stage 1.2 cross-pipeline isolation contract: when two
-/// pipelines both define role `reviewer` (on different models) and
-/// pipeline A is the selected team, the `delegate` tool's description
-/// — the prompt-side surface the LLM actually reads — names ONLY A's
-/// roles. Pipeline B's role names must NOT appear, or the orchestrator
-/// could hallucinate a delegation into the wrong team and `DelegateTool::call`
-/// would route through the wrong registry (an unknown-role error if
-/// the same role name happens to collide, or worse, a silent wrong-team
-/// dispatch if the names diverge).
+/// The headline scoping contract: with two agents both defining role
+/// `reviewer` (on different models), the `delegate` tool's description and
+/// role schema — the prompt-side surface the LLM actually reads — name ONLY
+/// the bound agent's subagents. A sibling's role names must NOT appear, or
+/// the main agent could hallucinate a delegation into a sub-agent that does
+/// not exist in its bound.
 #[tokio::test]
-async fn delegate_tool_description_lists_only_selected_pipeline_roles() {
-    let (reg_a, reg_b) = two_registries_with_shared_reviewer();
+async fn delegate_tool_description_lists_only_the_bound_agents_subagents() {
+    let cfg = parse_delegate_global();
 
-    // Build a DelegateTool with registry A (the "selected" team).
-    let tool_a = delegate_tool_for_registry(std::sync::Arc::new(reg_a));
-    let def_a = Tool::definition(&tool_a, String::new()).await;
-
-    // The description must name registry A's roles (reviewer, tester)…
+    // The tool built for `team`…
+    let def_a = Tool::definition(&delegate_tool_for_agent(&cfg, "team"), String::new()).await;
     assert!(
         def_a.description.contains("reviewer"),
-        "team-A description must include `reviewer`; got: {desc}",
-        desc = def_a.description
+        "team description must include `reviewer`; got: {}",
+        def_a.description
     );
     assert!(
         def_a.description.contains("tester"),
-        "team-A description must include `tester`; got: {desc}",
-        desc = def_a.description
+        "team description must include `tester`; got: {}",
+        def_a.description
     );
-
-    // …and must NOT name registry B's exclusive role (`writer`).
     assert!(
         !def_a.description.contains("writer"),
-        "team-A description must NOT mention team-B's `writer` role; got: {desc}",
-        desc = def_a.description
+        "team description must NOT mention the sibling agent's `writer`; got: {}",
+        def_a.description
     );
 
-    // The roles enum in the JSON schema parameter is the LLM-visible
-    // role vocabulary. It must list exactly registry A's roles and not
-    // registry B's exclusive `writer`. Parse the schema to assert.
+    // The roles text in the JSON schema parameter is the LLM-visible role
+    // vocabulary. It must list exactly the bound agent's subagents.
     let role_schema_desc = def_a
         .parameters
         .get("properties")
@@ -377,161 +242,118 @@ async fn delegate_tool_description_lists_only_selected_pipeline_roles() {
         .expect("delegate schema must have a `role.description`");
     assert!(
         role_schema_desc.contains("reviewer") && role_schema_desc.contains("tester"),
-        "role enum must list team-A's roles; got: {role_schema_desc}"
+        "role text must list team's subagents; got: {role_schema_desc}"
     );
     assert!(
         !role_schema_desc.contains("writer"),
-        "role enum must NOT list team-B's exclusive role; got: {role_schema_desc}"
+        "role text must NOT list the sibling agent's `writer`; got: {role_schema_desc}"
     );
 
-    // Symmetry: building the tool with registry B flips the visibility
-    // — `writer` appears, `tester` does not.
-    let tool_b = delegate_tool_for_registry(std::sync::Arc::new(reg_b));
-    let def_b = Tool::definition(&tool_b, String::new()).await;
+    // Symmetry: the tool built for `ops` flips the visibility — `writer`
+    // appears, `tester` does not.
+    let def_b = Tool::definition(&delegate_tool_for_agent(&cfg, "ops"), String::new()).await;
     assert!(
         def_b.description.contains("reviewer") && def_b.description.contains("writer"),
-        "team-B description must include its own roles; got: {desc}",
-        desc = def_b.description
+        "ops description must include its own subagents; got: {}",
+        def_b.description
     );
     assert!(
         !def_b.description.contains("tester"),
-        "team-B description must NOT mention team-A's `tester` role; got: {desc}",
-        desc = def_b.description
+        "ops description must NOT mention team's `tester`; got: {}",
+        def_b.description
     );
 }
 
-/// The two registries also pin the fact that the SAME role name
-/// (`reviewer`) is mapped to different models per pipeline. The
-/// selected pipeline's `SubAgentRegistry` carries the per-role model
-/// binding — when the delegate tool dispatches a `reviewer` call, it
-/// dispatches to the SELECTED team's model. This is asserted by
-/// inspecting each registry's `role_model_aliases()` directly: a
-/// caller that runs `delegate("reviewer", …)` under team A must end
-/// up routing to A's reviewer model.
+/// The same subagent name (`reviewer`) maps to different models per agent.
+/// The bound carries the per-subagent model binding — a `reviewer` call
+/// under `team` routes to team's model, under `ops` to ops'.
 #[test]
-fn same_role_name_routes_to_selected_teams_model() {
-    let (reg_a, reg_b) = two_registries_with_shared_reviewer();
-
-    // Registry A's reviewer is on `flash`; registry B's reviewer is on `sonnet`.
-    let a_reviewers: Vec<(String, String)> = reg_a.role_model_aliases();
-    let b_reviewers: Vec<(String, String)> = reg_b.role_model_aliases();
-
-    let a_reviewer_model = a_reviewers
+fn same_subagent_name_routes_to_the_bound_agents_model() {
+    let cfg = parse_delegate_global();
+    let profile = cfg.catalog.profile("dev").expect("the dev profile");
+    let team = profile
+        .agents
         .iter()
-        .find(|(r, _)| r == "reviewer")
-        .map(|(_, m)| m.as_str())
-        .expect("registry A must have a reviewer role");
-    let b_reviewer_model = b_reviewers
+        .find(|a| a.main.name == "team")
+        .expect("team agent");
+    let ops = profile
+        .agents
         .iter()
-        .find(|(r, _)| r == "reviewer")
-        .map(|(_, m)| m.as_str())
-        .expect("registry B must have a reviewer role");
+        .find(|a| a.main.name == "ops")
+        .expect("ops agent");
+
+    let team_reviewer = team
+        .subagents
+        .iter()
+        .find(|s| s.member.name == "reviewer")
+        .expect("team has a reviewer subagent");
+    let ops_reviewer = ops
+        .subagents
+        .iter()
+        .find(|s| s.member.name == "reviewer")
+        .expect("ops has a reviewer subagent");
 
     assert_eq!(
-        a_reviewer_model, "flash",
-        "registry A's reviewer must be on `flash` (per the YAML fixture)"
+        team_reviewer.member.model.alias, "flash",
+        "team's reviewer must be on `flash` (per the fixture)"
     );
     assert_eq!(
-        b_reviewer_model, "sonnet",
-        "registry B's reviewer must be on `sonnet` (per the YAML fixture)"
+        ops_reviewer.member.model.alias, "sonnet",
+        "ops' reviewer must be on `sonnet` (per the fixture)"
     );
     assert_ne!(
-        a_reviewer_model, b_reviewer_model,
-        "the SAME role name MUST map to different models per pipeline — \
-         that's the cross-pipeline conflict Stage 1.2 has to scope correctly"
+        team_reviewer.member.model.alias, ops_reviewer.member.model.alias,
+        "the SAME subagent name MUST map to different models per agent — \
+         that's the cross-agent conflict the bound has to scope correctly"
     );
 }
 
-// ── Ticket pipelines-reload.md §8 test 15: dangling-selection ⇒ no delegate ─
+// ── A bound without subagents ⇒ an empty role enum ─────────────────────────
 //
-// Invariant I-2 from the ticket: "an unresolvable selection is inert, not
-// broken. ... A dangling name yields no orchestrator override and no
-// `delegate` tool (`src/providers/mod.rs:606-624`) — the exact same agent
-// as `None`."
-//
-// We can't drive `rebuild_agent_for_resolved` end-to-end from the
-// integration crate (it needs a live mock provider + session hook), but
-// we CAN pin the seam where the decision is taken: `boot_registry` is
-// `None` whenever the rebuild seam's `active = sm.selected_pipeline()
-// .and_then(|name| ctx.pipelines.get(&name))` lookup returns `None`
-// (a dangling name). `DelegateTool` built over an empty
-// `SubAgentRegistry` is what `boot_registry = None` looks like to the
-// delegate code path; its `definition()` must therefore expose an empty
-// role enum — no role can be delegated to. The companion unit test
-// `src/lib.rs::tests::dangling_selection_resolves_to_none_at_the_rebuild_seam`
-// pins the lookup itself; this one pins the downstream effect on the
-// tool the LLM can actually call.
+// The 0.23 "dangling selection ⇒ no delegate" invariant in its 0.24 form:
+// the `delegate` tool exists iff the bound agent has subagents
+// (`delegate_enabled`), and a bound whose agent has none exposes an empty
+// role enum — no sub-agent is invokable.
 
-use peakbot::config::PipelineConfig;
-use peakbot::pipeline::PipelineSet;
+/// A global with one subagent-FREE agent.
+const NO_SUBAGENTS_GLOBAL: &str = "providers:\n  - name: openrouter\n    type: openrouter\n    api_key: sk-test\n    models:\n      - { name: google/gemini-2.0-flash-001, alias: flash }\nprofiles:\n  dev:\n    agents:\n      solo:\n        model: flash\n";
 
-/// A minimal `ModelRegistry` — only its existence is needed; the empty
-/// `Members` argument means `SubAgentRegistry::new` never consults the
-/// model registry, so any well-formed one suffices. Reuses the
-/// `flash`/`sonnet` fixture the rest of the file already builds via
-/// `two_registries_with_shared_reviewer` — extracting it once here so
-/// the assertion below stays focused on the dangling-selection contract.
-fn minimal_model_registry() -> peakbot::config::ModelRegistry {
-    use peakbot::config::{ModelEntry, ProviderEntry, ProviderType};
-    let prov = ProviderEntry {
-        name: "openrouter".into(),
-        kind: ProviderType::OpenRouter,
-        api_key: Some("sk-test".into()),
-        base_url: None,
-        preserve_reasoning: None,
-        display_reasoning: None,
-        models: vec![ModelEntry {
-            name: "google/gemini-2.0-flash-001".into(),
-            alias: Some("flash".into()),
-            max_tokens: None,
-            temperature: None,
-            extra_params: None,
-            prompt_caching: None,
-            vision: None,
-            context_size: None,
-            preserve_reasoning: true,
-            display_reasoning: false,
-        }],
-    };
-    peakbot::config::ModelRegistry::build(std::slice::from_ref(&prov), Some("flash"))
-        .expect("minimal registry builds")
-}
-
-/// Build a `DelegateTool` whose `SubAgentDeps.registry` is the empty
-/// `SubAgentRegistry` — the shape the rebuild seam produces when
-/// `boot_registry = None` (no selected pipeline / dangling selection).
-/// Reuses the `delegate_tool_for_registry` harness from above.
-fn delegate_tool_with_empty_registry() -> DelegateTool {
-    let empty_registry = peakbot::pipeline::SubAgentRegistry::new(
-        &PipelineConfig {
-            enabled: true,
-            orchestrator_prompt: None,
-            agents: peakbot::config::Members::default(),
-        },
-        &minimal_model_registry(),
-        &[],
-    )
-    .expect(
-        "empty Members produces an empty SubAgentRegistry without consulting the model registry",
-    );
-    delegate_tool_for_registry(std::sync::Arc::new(empty_registry))
-}
-
-/// The dangling-selection contract: a `DelegateTool` built on top of an
-/// empty `SubAgentRegistry` (what `boot_registry = None` produces) MUST
-/// expose an empty role enum — no role is invokable. A non-empty role
-/// enum here would mean a dangling selection still hands the orchestrator
-/// a `delegate` tool that names a role whose team doesn't exist.
 #[tokio::test]
-async fn selected_pipeline_that_vanishes_yields_no_delegate_tool() {
-    let tool = delegate_tool_with_empty_registry();
-    let def = Tool::definition(&tool, String::new()).await;
+async fn bound_without_subagents_yields_an_empty_delegate_role_enum() {
+    let cfg = Config::parse(
+        Source {
+            path: Path::new("/global/config.yaml"),
+            text: NO_SUBAGENTS_GLOBAL,
+        },
+        None,
+        &ParseCtx { known_skills: &[] },
+    )
+    .expect("no-subagents fixture must parse");
 
-    // The schema's `role.description` lists every invokable role. With
-    // an empty registry this MUST NOT contain any role name from the
-    // fixtures used elsewhere in this file (so a future regression
-    // that hard-codes roles in the schema — e.g. "Available roles:
-    // reviewer, tester, writer" — would fail this pin).
+    // The tool is not registered at all for such a bound (the F3 seam)…
+    assert!(
+        !peakbot::tools::env::delegate_enabled(&cfg.catalog.profile("dev").unwrap().agents[0]),
+        "no subagents ⇒ no delegate tool"
+    );
+
+    // …and even built directly, it exposes an empty role enum.
+    let profile = cfg.catalog.profile("dev").unwrap();
+    let bound = peakbot::config::resolve::Bound::new(Arc::clone(profile), 0);
+    let deps = SubAgentDeps {
+        bound,
+        orchestrator_model: cfg
+            .registry
+            .resolve(&profile.agents[0].main.model.alias)
+            .cloned()
+            .expect("the agent's model is in the registry"),
+        tool_env: Arc::new(ToolEnv::for_profile(&cfg, profile, &Arc::new(Vec::new()))),
+        state_manager: StateManager::new_arc(),
+        shell_kind: None,
+        skills: SkillRegistry::default(),
+        event_sink: None,
+        retry: cfg.general.retry.clone(),
+    };
+    let def = Tool::definition(&DelegateTool::new(Arc::new(deps)), String::new()).await;
     let role_desc = def
         .parameters
         .get("properties")
@@ -539,35 +361,13 @@ async fn selected_pipeline_that_vanishes_yields_no_delegate_tool() {
         .and_then(|r| r.get("description"))
         .and_then(|d| d.as_str())
         .unwrap_or("");
-
     assert!(
-        !role_desc.contains("reviewer"),
-        "the empty-registry delegate tool must NOT name any role (e.g. \
-         'reviewer'); a dangling selection that still exposes a \
-         delegate tool with roles is I-2 (src/providers/mod.rs:606-624) \
-         violation. Got: {role_desc}"
+        role_desc.trim_end().ends_with("One of:"),
+        "the role list after 'One of:' must be empty; got: {role_desc}"
     );
     assert!(
-        !role_desc.contains("tester"),
-        "empty-registry delegate must NOT name `tester` either; got: {role_desc}"
-    );
-    assert!(
-        !role_desc.contains("writer"),
-        "empty-registry delegate must NOT name `writer` either; got: {role_desc}"
-    );
-
-    // Cross-check: `PipelineSet::default()` is empty, so any selection
-    // lookup against it (the rebuild seam's `ctx.pipelines.get(&name)`)
-    // yields None — exactly the dangling case. The unit test
-    // `src/lib.rs::tests::dangling_selection_resolves_to_none_at_the_rebuild_seam`
-    // exercises that lookup directly with a real selection.
-    assert!(
-        PipelineSet::default().is_empty(),
-        "PipelineSet::default() must be empty (sanity)"
-    );
-    assert!(
-        PipelineSet::default().get("ghost").is_none(),
-        "PipelineSet::default().get(\"ghost\") must be None — this is the \
-         lookup shape the rebuild seam's dangling case relies on"
+        def.description.contains("Available roles: \n"),
+        "no role names may follow 'Available roles:'; got: {}",
+        def.description
     );
 }

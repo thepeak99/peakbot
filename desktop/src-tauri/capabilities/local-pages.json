@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "local-pages",
+  "description": "Bundled local pages of the main window only (status page + settings page). No remote origins, ever.",
+  "windows": ["main"],
+  "permissions": ["allow-status", "allow-act", "allow-settings-get"]
+}

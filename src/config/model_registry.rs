@@ -1,17 +1,21 @@
 //! Multi-model registry — providers list, models with aliases, and a
 //! resolver that maps a user-typed alias to a fully-formed
 //! [`ProviderConfig`] the existing `create_provider` already understands.
-//!
-//! See `multi-model.md` for the locked design. Highlights:
+//! Highlights:
 //! - `providers:` is a YAML *list*, each entry owns its `models:` list.
 //! - Provider `name` is informational only (no cross-references).
 //! - Model `alias` is optional; falls back to `name`.
 //! - Aliases are globally unique and must match `^[A-Za-z0-9_./:-]+$`.
-//! - `default_model` is required iff any models are declared.
+//! - There is no registry default: the model a session runs on comes from
+//!   its bound agent (see [`ModelRegistry::resolve_boot`]).
 //!
-//! Conversations persist `(provider_name, model_name)` — never the alias.
-//! Aliases are UI sugar; the wire identity is the re-activation key. See
-//! [`ModelRegistry::find_by_wire_id`].
+//! The conversation's (orchestrator) model is persisted as
+//! `(provider_name, model_name)` — never the alias. That model owns a
+//! transcript replayed against its exact wire (reasoning signatures), so the
+//! wire identity is the re-activation key. See
+//! [`ModelRegistry::find_by_wire_id`]. Subagent overrides are selection
+//! preferences (subagents never replay a transcript) and persist by alias —
+//! see `Conversation::subagent_models`.
 //!
 //! The registry's only job is *alias → existing-shape*. Everything
 //! downstream (`create_provider`, `ProviderInfo`, the agent itself)
@@ -147,13 +151,12 @@ pub struct ResolvedModel {
 /// saved model was unavailable. Returned by [`ModelRegistry::resolve_boot`].
 #[derive(Debug)]
 pub struct BootSelection<'a> {
-    /// The chosen model — always present. `resolve_boot` requires a
-    /// registry with a default (every config-built registry has one), so
-    /// there is always a model to boot on.
+    /// The chosen model — always present: the saved model when it still
+    /// exists, else the caller's fallback.
     pub model: &'a ResolvedModel,
     /// `Some((provider, model))` iff a complete saved wire id was requested
     /// on resume but no longer exists in the registry, so `model` fell back
-    /// to the default. Drives a user-facing "not available" note.
+    /// to the fallback. Drives a user-facing "not available" note.
     pub unavailable: Option<(String, String)>,
 }
 
@@ -193,43 +196,35 @@ pub enum RegistryError {
         model: String,
     },
 
-    #[error("default_model `{alias}` does not match any declared alias. Available: {available}")]
-    UnknownDefault { alias: String, available: String },
-
-    #[error("default_model is required when at least one model is declared")]
-    MissingDefault,
-
     #[error("no models declared — a registry must contain at least one model")]
     EmptyRegistry,
 }
 
-/// Resolved alias → model lookup, plus the boot default.
+/// Resolved alias → model lookup.
 ///
 /// Built once at config load via [`ModelRegistry::build`]; thereafter
 /// looked up by alias on `/model` and `/load`.
 #[derive(Debug, Clone)]
 pub struct ModelRegistry {
     by_alias: HashMap<String, ResolvedModel>,
-    default_alias: String,
+    /// Aliases in declaration order (providers, then models) — the order
+    /// `build` walked them, so `aliases_in_order` is not a sort.
+    order: Vec<String>,
 }
 
 impl ModelRegistry {
-    /// Build and validate a registry from the providers list and
-    /// optional default alias.
+    /// Build and validate a registry from the providers list.
     ///
     /// # Errors
     /// - duplicate aliases across the whole tree,
     /// - any alias matching the reserved literal `unknown`,
     /// - any alias not matching `^[A-Za-z0-9_./:-]+$`,
-    /// - `default_model` referencing a non-existent alias,
-    /// - `default_model` missing when models are declared.
-    pub fn build(
-        providers: &[ProviderEntry],
-        default_model: Option<&str>,
-    ) -> Result<Self, RegistryError> {
+    /// - no models declared at all.
+    pub fn build(providers: &[ProviderEntry]) -> Result<Self, RegistryError> {
         let mut by_alias: HashMap<String, ResolvedModel> = HashMap::new();
         // Track first-seen origin for nicer duplicate error messages.
         let mut origins: HashMap<String, (String, String)> = HashMap::new();
+        let mut order: Vec<String> = Vec::new();
 
         for prov in providers {
             for model in &prov.models {
@@ -265,6 +260,7 @@ impl ModelRegistry {
                     });
                 }
                 origins.insert(alias.clone(), (prov.name.clone(), model.name.clone()));
+                order.push(alias.clone());
 
                 let provider_config = build_provider_config(prov, model);
                 let context_size = model.context_size.unwrap_or_else(|| {
@@ -284,30 +280,11 @@ impl ModelRegistry {
             }
         }
 
-        let default_alias = match default_model {
-            Some(d) if !d.is_empty() => {
-                if !by_alias.contains_key(d) {
-                    let mut available: Vec<&str> = by_alias.keys().map(|s| s.as_str()).collect();
-                    available.sort_unstable();
-                    return Err(RegistryError::UnknownDefault {
-                        alias: d.to_string(),
-                        available: if available.is_empty() {
-                            "(none)".to_string()
-                        } else {
-                            available.join(", ")
-                        },
-                    });
-                }
-                d.to_string()
-            }
-            _ if by_alias.is_empty() => return Err(RegistryError::EmptyRegistry),
-            _ => return Err(RegistryError::MissingDefault),
-        };
+        if by_alias.is_empty() {
+            return Err(RegistryError::EmptyRegistry);
+        }
 
-        Ok(Self {
-            by_alias,
-            default_alias,
-        })
+        Ok(Self { by_alias, order })
     }
 
     /// Whether any models were declared.
@@ -318,12 +295,6 @@ impl ModelRegistry {
     /// Number of declared models.
     pub fn len(&self) -> usize {
         self.by_alias.len()
-    }
-
-    /// The boot alias (`default_model:`). Always present — a registry
-    /// cannot be built without at least one model and a resolved default.
-    pub fn default_alias(&self) -> &str {
-        &self.default_alias
     }
 
     /// Look up a model by alias.
@@ -357,23 +328,17 @@ impl ModelRegistry {
     /// `saved_wire_id` is the `(provider_name, model)` of a conversation
     /// being resumed (`None` for a fresh session). A resumed conversation
     /// boots on the model it was saved with — the same re-activation the
-    /// REPL `/load` performs — falling back to the default when that model
-    /// is no longer in the registry (renamed/removed in config).
-    /// [`BootSelection::unavailable`] reports that fallback so the caller
-    /// can tell the user instead of downgrading silently. Pre-v5 files
+    /// REPL `/load` performs — falling back to `fallback` (the bound agent's
+    /// model) when that model is no longer in the registry (renamed/removed
+    /// in config). [`BootSelection::unavailable`] reports that fallback so the
+    /// caller can tell the user instead of downgrading silently. Pre-v5 files
     /// (empty `provider_name`) can't be re-activated and fall through to
-    /// the default without a note.
-    ///
-    /// # Panics
-    /// Requires a registry with a default model — every config-built
-    /// registry has one (multi-model requires `default_model`; the legacy
-    /// single-provider path synthesises a `default` alias). A session
-    /// cannot boot with zero models, so this is a genuine precondition of
-    /// the boot decision, not a general registry operation.
-    pub fn resolve_boot(&self, saved_wire_id: Option<(&str, &str)>) -> BootSelection<'_> {
-        let default = self
-            .resolve(self.default_alias())
-            .expect("resolve_boot requires a registry with a default model");
+    /// `fallback` without a note.
+    pub fn resolve_boot<'a>(
+        &'a self,
+        saved_wire_id: Option<(&str, &str)>,
+        fallback: &'a ResolvedModel,
+    ) -> BootSelection<'a> {
         match saved_wire_id {
             Some((provider, model)) if !provider.is_empty() && !model.is_empty() => {
                 match self.find_by_wire_id(provider, model) {
@@ -382,13 +347,13 @@ impl ModelRegistry {
                         unavailable: None,
                     },
                     None => BootSelection {
-                        model: default,
+                        model: fallback,
                         unavailable: Some((provider.to_string(), model.to_string())),
                     },
                 }
             }
             _ => BootSelection {
-                model: default,
+                model: fallback,
                 unavailable: None,
             },
         }
@@ -400,6 +365,13 @@ impl ModelRegistry {
         let mut v: Vec<String> = self.by_alias.keys().cloned().collect();
         v.sort_unstable();
         v
+    }
+
+    /// All declared aliases in declaration order (providers, then models)
+    /// — for the M2 messages and the UI, where config order is the
+    /// user's order.
+    pub fn aliases_in_order(&self) -> Vec<&str> {
+        self.order.iter().map(String::as_str).collect()
     }
 
     /// Iterate all (alias, ResolvedModel) pairs in alphabetical alias
@@ -593,12 +565,11 @@ mod tests {
     }
 
     #[test]
-    fn build_resolves_aliases_and_default() {
+    fn build_resolves_aliases() {
         let providers = vec![or_provider(), oai_provider()];
-        let reg = ModelRegistry::build(&providers, Some("sonnet")).expect("should build");
+        let reg = ModelRegistry::build(&providers).expect("should build");
 
         assert_eq!(reg.len(), 4);
-        assert_eq!(reg.default_alias(), "sonnet");
         assert!(reg.contains("sonnet"));
         assert!(reg.contains("opus"));
         assert!(reg.contains("oai-gpt4"));
@@ -611,7 +582,7 @@ mod tests {
     #[test]
     fn unaliased_model_uses_provider_qualified_handle() {
         let providers = vec![oai_provider()];
-        let reg = ModelRegistry::build(&providers, Some("openai/o3")).expect("should build");
+        let reg = ModelRegistry::build(&providers).expect("should build");
         let resolved = reg.resolve("openai/o3").unwrap();
         assert_eq!(resolved.alias, "openai/o3");
         assert_eq!(
@@ -651,8 +622,7 @@ mod tests {
                 display_reasoning: false,
             }],
         };
-        let reg = ModelRegistry::build(&[prov], Some("patchnotes/minimax/MiniMax-M2.7"))
-            .expect("should build");
+        let reg = ModelRegistry::build(&[prov]).expect("should build");
         assert!(reg.contains("patchnotes/minimax/MiniMax-M2.7"));
         // Without the provider prefix the model is invisible.
         assert!(!reg.contains("minimax/MiniMax-M2.7"));
@@ -667,7 +637,7 @@ mod tests {
         let mut b = oai_provider();
         b.models[0].alias = Some("dup".into());
 
-        let err = ModelRegistry::build(&[a, b], Some("dup")).unwrap_err();
+        let err = ModelRegistry::build(&[a, b]).unwrap_err();
         match err {
             RegistryError::DuplicateAlias { alias, .. } => assert_eq!(alias, "dup"),
             other => panic!("expected DuplicateAlias, got {other:?}"),
@@ -678,41 +648,20 @@ mod tests {
     fn invalid_alias_is_rejected() {
         let mut p = or_provider();
         p.models[0].alias = Some("Bad Alias!".into());
-        let err = ModelRegistry::build(&[p], Some("opus")).unwrap_err();
+        let err = ModelRegistry::build(&[p]).unwrap_err();
         assert!(matches!(err, RegistryError::InvalidAlias { .. }));
     }
 
     #[test]
-    fn unknown_default_model_fails_to_load() {
-        let providers = vec![or_provider()];
-        let err = ModelRegistry::build(&providers, Some("ghost")).unwrap_err();
-        match err {
-            RegistryError::UnknownDefault { alias, available } => {
-                assert_eq!(alias, "ghost");
-                assert!(available.contains("sonnet"));
-                assert!(available.contains("opus"));
-            }
-            other => panic!("expected UnknownDefault, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn missing_default_with_models_is_rejected() {
-        let providers = vec![or_provider()];
-        let err = ModelRegistry::build(&providers, None).unwrap_err();
-        assert_eq!(err, RegistryError::MissingDefault);
-    }
-
-    #[test]
     fn empty_registry_is_rejected() {
-        let err = ModelRegistry::build(&[], None).unwrap_err();
+        let err = ModelRegistry::build(&[]).unwrap_err();
         assert_eq!(err, RegistryError::EmptyRegistry);
     }
 
     #[test]
     fn resolved_model_carries_provider_config_with_overrides() {
         let providers = vec![or_provider()];
-        let reg = ModelRegistry::build(&providers, Some("sonnet")).unwrap();
+        let reg = ModelRegistry::build(&providers).unwrap();
 
         let resolved = reg.resolve("sonnet").unwrap();
         assert_eq!(resolved.provider_kind, ProviderType::OpenRouter);
@@ -737,7 +686,7 @@ mod tests {
     #[test]
     fn aliases_sorted_is_alphabetical() {
         let providers = vec![or_provider(), oai_provider()];
-        let reg = ModelRegistry::build(&providers, Some("sonnet")).unwrap();
+        let reg = ModelRegistry::build(&providers).unwrap();
         let aliases = reg.aliases_sorted();
         assert_eq!(aliases, vec!["oai-gpt4", "openai/o3", "opus", "sonnet"]);
     }
@@ -772,7 +721,7 @@ mod tests {
                 display_reasoning: false,
             }],
         };
-        let reg = ModelRegistry::build(&[prov], Some("patchnotes/minimax/MiniMax-M2.7"))
+        let reg = ModelRegistry::build(&[prov])
             .expect("qualified handle <prov>/<full wire id> should be valid");
         let resolved = reg.resolve("patchnotes/minimax/MiniMax-M2.7").unwrap();
         assert_eq!(resolved.alias, "patchnotes/minimax/MiniMax-M2.7");
@@ -805,7 +754,7 @@ mod tests {
                 display_reasoning: false,
             }],
         };
-        let reg = ModelRegistry::build(&[prov], Some("ollama/qwen2.5-coder:14b"))
+        let reg = ModelRegistry::build(&[prov])
             .expect("colon-bearing Ollama tag with no `/` keeps full id as leaf");
         assert!(reg.contains("ollama/qwen2.5-coder:14b"));
     }
@@ -850,7 +799,7 @@ mod tests {
                 },
             ],
         };
-        let reg = ModelRegistry::build(&[prov], Some("sonnet")).unwrap();
+        let reg = ModelRegistry::build(&[prov]).unwrap();
         assert_eq!(reg.resolve("sonnet").unwrap().context_size, 200_000);
         assert_eq!(reg.resolve("custom").unwrap().context_size, 42);
     }
@@ -893,7 +842,7 @@ mod tests {
                 display_reasoning: false,
             }],
         };
-        let reg = ModelRegistry::build(&[prov], Some("patchnotes/minimax/MiniMax-M2.7"))
+        let reg = ModelRegistry::build(&[prov])
             .expect("default referencing <provider>/<full wire id> must resolve");
         assert!(
             reg.contains("patchnotes/minimax/MiniMax-M2.7"),
@@ -956,8 +905,7 @@ models:
         let prov: ProviderEntry = serde_yaml::from_str(yaml).expect("vision flag parses");
         assert_eq!(prov.models[0].vision, Some(true));
 
-        let reg = ModelRegistry::build(std::slice::from_ref(&prov), Some("local"))
-            .expect("registry builds");
+        let reg = ModelRegistry::build(std::slice::from_ref(&prov)).expect("registry builds");
         match &reg.resolve("local").unwrap().provider_config {
             ProviderConfig::Anthropic(c) => assert_eq!(c.vision, Some(true)),
             other => panic!("expected Anthropic config, got {other:?}"),
@@ -992,11 +940,10 @@ models:
 ";
         let prov: ProviderEntry =
             serde_yaml::from_str(yaml).expect("preserve_reasoning field parses");
-        assert_eq!(prov.models[0].preserve_reasoning, false);
-        assert_eq!(prov.models[1].preserve_reasoning, true); // default
+        assert!(!prov.models[0].preserve_reasoning);
+        assert!(prov.models[1].preserve_reasoning); // default
 
-        let reg = ModelRegistry::build(std::slice::from_ref(&prov), Some("qwen"))
-            .expect("registry builds");
+        let reg = ModelRegistry::build(std::slice::from_ref(&prov)).expect("registry builds");
         match &reg.resolve("qwen").unwrap().provider_config {
             ProviderConfig::Anthropic(c) => assert_eq!(c.preserve_reasoning, Some(false)),
             other => panic!("expected Anthropic config, got {other:?}"),
@@ -1021,11 +968,10 @@ models:
 ";
         let prov: ProviderEntry =
             serde_yaml::from_str(yaml).expect("display_reasoning field parses");
-        assert_eq!(prov.models[0].display_reasoning, true);
-        assert_eq!(prov.models[1].display_reasoning, false);
+        assert!(prov.models[0].display_reasoning);
+        assert!(!prov.models[1].display_reasoning);
 
-        let reg = ModelRegistry::build(std::slice::from_ref(&prov), Some("show"))
-            .expect("registry builds");
+        let reg = ModelRegistry::build(std::slice::from_ref(&prov)).expect("registry builds");
         match &reg.resolve("show").unwrap().provider_config {
             ProviderConfig::Anthropic(c) => assert_eq!(c.display_reasoning, Some(true)),
             other => panic!("expected Anthropic config, got {other:?}"),
@@ -1049,8 +995,8 @@ models:
         let prov: ProviderEntry =
             serde_yaml::from_str(yaml).expect("legacy config without new fields still parses");
         // Defaults: preserve=true, display=false.
-        assert_eq!(prov.models[0].preserve_reasoning, true);
-        assert_eq!(prov.models[0].display_reasoning, false);
+        assert!(prov.models[0].preserve_reasoning);
+        assert!(!prov.models[0].display_reasoning);
     }
 
     /// Provider-level `preserve_reasoning: false` outranks a per-model
@@ -1075,8 +1021,7 @@ models:
         assert_eq!(prov.preserve_reasoning, Some(false));
         assert_eq!(prov.display_reasoning, Some(true));
 
-        let reg = ModelRegistry::build(std::slice::from_ref(&prov), Some("think"))
-            .expect("registry builds");
+        let reg = ModelRegistry::build(std::slice::from_ref(&prov)).expect("registry builds");
         match &reg.resolve("think").unwrap().provider_config {
             ProviderConfig::Anthropic(c) => {
                 assert_eq!(
@@ -1103,7 +1048,7 @@ models:
     #[test]
     fn find_by_wire_id_returns_resolved_match() {
         let prov = or_provider();
-        let reg = ModelRegistry::build(&[prov], Some("opus")).expect("build");
+        let reg = ModelRegistry::build(&[prov]).expect("build");
 
         let resolved = reg
             .find_by_wire_id("openrouter", "anthropic/claude-opus-4")
@@ -1119,10 +1064,10 @@ models:
     fn find_by_wire_id_is_stable_across_alias_rename() {
         let mut prov = or_provider();
         prov.models[0].alias = Some("the-old-name".into());
-        let reg_before = ModelRegistry::build(&[prov.clone()], Some("the-old-name")).unwrap();
+        let reg_before = ModelRegistry::build(&[prov.clone()]).unwrap();
 
         prov.models[0].alias = Some("the-new-name".into());
-        let reg_after = ModelRegistry::build(&[prov], Some("the-new-name")).unwrap();
+        let reg_after = ModelRegistry::build(&[prov]).unwrap();
 
         let before = reg_before
             .find_by_wire_id("openrouter", "anthropic/claude-3.7-sonnet")
@@ -1141,7 +1086,7 @@ models:
     #[test]
     fn find_by_wire_id_misses_cleanly_on_unknown_tuple() {
         let prov = or_provider();
-        let reg = ModelRegistry::build(&[prov], Some("opus")).expect("build");
+        let reg = ModelRegistry::build(&[prov]).expect("build");
 
         assert!(reg.find_by_wire_id("openrouter", "no-such-model").is_none());
         assert!(
@@ -1152,37 +1097,41 @@ models:
 
     // ── resolve_boot ─────────────────────────────────────────────────────
 
-    /// A fresh session (`None`) boots the registry default, no warning.
+    /// A fresh session (`None`) boots the fallback (the bound agent's
+    /// model), no warning.
     #[test]
-    fn resolve_boot_fresh_session_uses_default() {
-        let reg = ModelRegistry::build(&[or_provider()], Some("sonnet")).expect("build");
+    fn resolve_boot_fresh_session_uses_fallback() {
+        let reg = ModelRegistry::build(&[or_provider()]).expect("build");
+        let fallback = reg.resolve("sonnet").unwrap();
 
-        let boot = reg.resolve_boot(None);
+        let boot = reg.resolve_boot(None, fallback);
         assert_eq!(boot.model.alias, "sonnet");
         assert!(boot.unavailable.is_none());
     }
 
-    /// Resuming a conversation saved on a non-default model boots on THAT
-    /// model (the bug fix), not the default. No warning.
+    /// Resuming a conversation saved on another model boots on THAT model
+    /// (the bug fix), not the fallback. No warning.
     #[test]
-    fn resolve_boot_resumes_saved_non_default_model() {
-        let reg = ModelRegistry::build(&[or_provider()], Some("sonnet")).expect("build");
+    fn resolve_boot_resumes_saved_non_fallback_model() {
+        let reg = ModelRegistry::build(&[or_provider()]).expect("build");
+        let fallback = reg.resolve("sonnet").unwrap();
 
-        let boot = reg.resolve_boot(Some(("openrouter", "anthropic/claude-opus-4")));
+        let boot = reg.resolve_boot(Some(("openrouter", "anthropic/claude-opus-4")), fallback);
         assert_eq!(
             boot.model.alias, "opus",
-            "resumed conversation must boot on its saved model, not the default"
+            "resumed conversation must boot on its saved model, not the fallback"
         );
         assert!(boot.unavailable.is_none());
     }
 
     /// Resuming a conversation whose saved model is gone from the registry
-    /// falls back to the default AND reports the unavailable wire id.
+    /// falls back to the fallback AND reports the unavailable wire id.
     #[test]
     fn resolve_boot_unavailable_saved_model_falls_back_with_note() {
-        let reg = ModelRegistry::build(&[or_provider()], Some("sonnet")).expect("build");
+        let reg = ModelRegistry::build(&[or_provider()]).expect("build");
+        let fallback = reg.resolve("sonnet").unwrap();
 
-        let boot = reg.resolve_boot(Some(("patchnotes", "ghost/model-9")));
+        let boot = reg.resolve_boot(Some(("patchnotes", "ghost/model-9")), fallback);
         assert_eq!(boot.model.alias, "sonnet");
         assert_eq!(
             boot.unavailable,
@@ -1191,17 +1140,86 @@ models:
     }
 
     /// Pre-v5 files carry an empty `provider_name` — they can't be
-    /// re-activated by wire id, so they fall through to the default
+    /// re-activated by wire id, so they fall through to the fallback
     /// SILENTLY (no note for ancient data).
     #[test]
-    fn resolve_boot_pre_v5_empty_provider_is_silent_default() {
-        let reg = ModelRegistry::build(&[or_provider()], Some("sonnet")).expect("build");
+    fn resolve_boot_pre_v5_empty_provider_is_silent_fallback() {
+        let reg = ModelRegistry::build(&[or_provider()]).expect("build");
+        let fallback = reg.resolve("sonnet").unwrap();
 
-        let boot = reg.resolve_boot(Some(("", "anthropic/claude-opus-4")));
+        let boot = reg.resolve_boot(Some(("", "anthropic/claude-opus-4")), fallback);
         assert_eq!(boot.model.alias, "sonnet");
         assert!(
             boot.unavailable.is_none(),
             "pre-v5 files must not raise an availability warning"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// T1 RED tests (plan "T1 core API finish"): `aliases_in_order`. Written
+// BEFORE the method exists, against spec §10 (model_registry row): declaration
+// order (providers, then models), not sorted.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod t1_tests {
+    use super::*;
+
+    fn provider(name: &str, kind: ProviderType, models: Vec<ModelEntry>) -> ProviderEntry {
+        ProviderEntry {
+            name: name.into(),
+            kind,
+            api_key: Some("sk-test".into()),
+            base_url: None,
+            preserve_reasoning: None,
+            display_reasoning: None,
+            models,
+        }
+    }
+
+    fn model(name: &str, alias: Option<&str>) -> ModelEntry {
+        ModelEntry {
+            name: name.into(),
+            alias: alias.map(str::to_string),
+            max_tokens: None,
+            temperature: None,
+            extra_params: None,
+            prompt_caching: None,
+            vision: None,
+            context_size: None,
+            preserve_reasoning: true,
+            display_reasoning: false,
+        }
+    }
+
+    /// Declaration order (providers, then models), with unaliased models under
+    /// their qualified `<provider>/<name>` handle — deliberately unsorted so a
+    /// `sort()` implementation cannot pass.
+    #[test]
+    fn aliases_in_order_is_declaration_order() {
+        let providers = vec![
+            provider(
+                "patchnotes",
+                ProviderType::OpenAI,
+                vec![
+                    model("anthropic/claude-sonnet-4.5", Some("sonnet")),
+                    model("anthropic/claude-opus-4.1", Some("opus")),
+                ],
+            ),
+            provider(
+                "local",
+                ProviderType::Ollama,
+                vec![
+                    model("llama3.1:8b", Some("llama")),
+                    model("qwen2.5-coder", None),
+                ],
+            ),
+        ];
+        let registry = ModelRegistry::build(&providers).expect("registry builds");
+        assert_eq!(
+            registry.aliases_in_order(),
+            vec!["sonnet", "opus", "llama", "local/qwen2.5-coder"],
+            "providers in order, then models in order (not sorted)"
         );
     }
 }

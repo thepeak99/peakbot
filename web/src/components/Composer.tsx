@@ -76,6 +76,7 @@ export function Composer({
   pendingInput,
   attachments = NO_ATTACHMENTS,
   supportsVision = true,
+  settingsEnabled = true,
   stopPending = false,
 }: {
   isRunning: boolean;
@@ -104,6 +105,10 @@ export function Composer({
   attachments?: Attachments;
   /** `AppState.supports_vision` — drives the ⚠ on image chips. */
   supportsVision?: boolean;
+  /** Gear-gate result (settingsGearEnabled). The `Ctrl+, settings` hint only
+   * makes sense when the Settings entry points exist; default true so a
+   * standalone Composer (no wire fields yet) keeps showing it. */
+  settingsEnabled?: boolean;
   /** `AppState.stop_pending` — a graceful stop is already armed (first
    * press). The Stop control takes the escalation label and a subtle
    * pulse; a second press aborts immediately (the backend decides). */
@@ -423,6 +428,11 @@ export function Composer({
           <span>
             <kbd className="rounded bg-zinc-800 px-1 text-zinc-400">/</kbd> for commands
           </span>
+          {settingsEnabled && (
+            <span data-testid="composer-settings-hint">
+              <kbd className="rounded bg-zinc-800 px-1 text-zinc-400">Ctrl+,</kbd> settings
+            </span>
+          )}
           <span>
             <kbd className="rounded bg-zinc-800 px-1 text-zinc-400">Shift+Enter</kbd> newline
           </span>

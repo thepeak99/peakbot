@@ -2,10 +2,16 @@
 
 use url::Url;
 
-/// Reserved URL the settings window is opened from (design #377 §4.1):
-/// any origin navigating to it gets the settings window, and the
-/// navigation itself is blocked.
+/// Reserved URL the bundled settings page is navigated to (0.24, spec
+/// §9.10): any origin navigating to it gets the settings page in the
+/// SAME main window, and the navigation itself is blocked.
 pub const SETTINGS_URL: &str = "peakbot-desktop:settings";
+
+/// Reserved URL that restarts only the PeakBot server (0.24, spec
+/// §8.4): the navigation is blocked and the desktop sends
+/// `Action::Restart` (session child relaunch / service reinstall —
+/// never the desktop app itself).
+pub const RESTART_URL: &str = "peakbot-desktop:restart";
 
 /// What to do about a webview navigation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,17 +20,23 @@ pub enum NavDecision {
     Allow,
     /// Open in the external browser and block in-app (other http(s)/mailto).
     OpenExternal,
-    /// The reserved settings sentinel: open the settings window, block
-    /// the navigation.
+    /// The reserved settings sentinel: show the bundled settings page in
+    /// the main window, block the navigation (0.24, spec §9.10).
     OpenSettings,
+    /// The reserved restart sentinel: restart only the PeakBot server
+    /// (`Action::Restart`), block the navigation (0.24, spec §8.4).
+    Restart,
     /// `file:`, `data:`, `javascript:` …
     Block,
 }
 
 pub fn classify_navigation(url: &Url, backend_origin: Option<&str>) -> NavDecision {
-    // The sentinel wins over everything, incl. the allowed backend origin.
+    // The sentinels win over everything, incl. the allowed backend origin.
     if url.as_str() == SETTINGS_URL {
         return NavDecision::OpenSettings;
+    }
+    if url.as_str() == RESTART_URL {
+        return NavDecision::Restart;
     }
     // Local app origins (the bundled status page) are always in-app.
     let scheme = url.scheme();
@@ -121,12 +133,13 @@ mod tests {
             "backend URL with no allowed origin opens externally"
         );
 
-        // The reserved settings sentinel (design #377 §4.1).
+        // The reserved settings sentinel (design #377 §4.1; 0.24 §9.10:
+        // in-window page, not a second window).
         assert_eq!(SETTINGS_URL, "peakbot-desktop:settings");
         assert_eq!(
             classify_navigation(&u(SETTINGS_URL), None),
             NavDecision::OpenSettings,
-            "the sentinel opens the settings window"
+            "the sentinel shows the settings page in the main window"
         );
         assert_eq!(
             classify_navigation(&u("peakbot-desktop:other"), None),
@@ -138,6 +151,57 @@ mod tests {
             NavDecision::OpenSettings,
             "the sentinel wins over the allowed backend origin"
         );
+    }
+
+    // 0.24 (spec §8.4, T16): the reserved restart sentinel — restarts
+    // only the PeakBot server (child or service), never the desktop app.
+    #[test]
+    fn classify_restart() {
+        assert_eq!(RESTART_URL, "peakbot-desktop:restart");
+        assert_eq!(
+            classify_navigation(&u(RESTART_URL), None),
+            NavDecision::Restart,
+            "the restart sentinel ⇒ Restart"
+        );
+        assert_eq!(
+            classify_navigation(&u(RESTART_URL), Some("http://127.0.0.1:7824")),
+            NavDecision::Restart,
+            "the sentinel wins over the allowed backend origin"
+        );
+    }
+
+    // 0.24 (spec §9.10, T16): the settings sentinel now means "show the
+    // bundled settings page in the same main window" — no second window.
+    #[test]
+    fn classify_settings() {
+        assert_eq!(SETTINGS_URL, "peakbot-desktop:settings");
+        assert_eq!(
+            classify_navigation(&u(SETTINGS_URL), None),
+            NavDecision::OpenSettings,
+            "the sentinel ⇒ OpenSettings (in-window settings page)"
+        );
+        assert_eq!(
+            classify_navigation(&u(SETTINGS_URL), Some("http://127.0.0.1:7824")),
+            NavDecision::OpenSettings,
+            "the sentinel wins over the allowed backend origin"
+        );
+    }
+
+    // 0.24 (spec §8.4/§9.10, T16): every other `peakbot-desktop:` URL is
+    // an unknown sentinel and stays blocked.
+    #[test]
+    fn other_sentinel_blocked() {
+        for other in [
+            "peakbot-desktop:other",
+            "peakbot-desktop:settings2",
+            "peakbot-desktop:restart/extra",
+        ] {
+            assert_eq!(
+                classify_navigation(&u(other), None),
+                NavDecision::Block,
+                "{other} must be blocked"
+            );
+        }
     }
 
     // Design #377b t101: the pure "is this failing URL our live
