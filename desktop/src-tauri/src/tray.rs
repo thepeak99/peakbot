@@ -171,7 +171,7 @@ pub fn build_app_submenu(app: &AppHandle) -> tauri::Result<tauri::menu::Submenu<
         &open,
         &settings,
         &PredefinedMenuItem::separator(app)?,
-        &items
+        items
             .background
             .as_ref()
             .expect("background is offered on macOS (Unix)"),
