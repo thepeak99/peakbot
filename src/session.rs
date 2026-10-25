@@ -152,10 +152,15 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     let nonempty = |s: &str| (!s.is_empty()).then(|| s.to_string());
     let saved_profile = saved.as_ref().and_then(|s| nonempty(&s.profile));
     let saved_agent = saved.as_ref().and_then(|s| nonempty(&s.agent));
+    let empty_overrides = std::collections::BTreeMap::new();
     let (bound, warnings) = crate::selection::resolve_saved_selection(
         &ctx.config.catalog,
+        &ctx.config.registry,
         saved_profile.as_deref(),
         saved_agent.as_deref(),
+        saved
+            .as_ref()
+            .map_or(&empty_overrides, |s| &s.subagent_models),
         deps.profile_pin.as_deref(),
     );
     ctx.bound = bound;

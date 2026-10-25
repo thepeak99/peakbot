@@ -16,6 +16,60 @@
 import { describe, it, expect } from "vitest";
 import { select, type AppState, type InboundMessage } from "./state";
 
+describe("select — models legs (selection-models plan §9.2/9)", () => {
+  it("select_builder_omits_absent_fields", () => {
+    // Exactly the 3-key frame: no `model: undefined`, no `subagent_models`.
+    expect(select("dev", "team")).toStrictEqual({
+      type: "select",
+      profile: "dev",
+      agent: "team",
+    });
+    // An EMPTY override map is "none" — still the 3-key frame.
+    expect(select("dev", "team", { subagentModels: {} })).toStrictEqual({
+      type: "select",
+      profile: "dev",
+      agent: "team",
+    });
+    expect(select("dev", "team", {})).toStrictEqual({
+      type: "select",
+      profile: "dev",
+      agent: "team",
+    });
+    // Model + map → 5 keys, the map under its wire name.
+    expect(
+      select("dev", "team", { model: "opus", subagentModels: { tester: "haiku" } }),
+    ).toStrictEqual({
+      type: "select",
+      profile: "dev",
+      agent: "team",
+      model: "opus",
+      subagent_models: { tester: "haiku" },
+    });
+  });
+
+  it("select_builder_emits_each_leg_independently", () => {
+    expect(select("dev", "team", { model: "opus" })).toStrictEqual({
+      type: "select",
+      profile: "dev",
+      agent: "team",
+      model: "opus",
+    });
+    expect(select("dev", "team", { subagentModels: { a: "b" } })).toStrictEqual({
+      type: "select",
+      profile: "dev",
+      agent: "team",
+      subagent_models: { a: "b" },
+    });
+  });
+
+  it("select_builder_does_not_alias_the_callers_map", () => {
+    const models = { tester: "haiku" };
+    const frame = select("dev", "team", { subagentModels: models });
+    models.tester = "mutated";
+    expect(JSON.parse(JSON.stringify(frame)).subagent_models).toEqual({ tester: "haiku" });
+  });
+});
+
 describe("select — inbound frame builder (replaces select_profile/select_pipeline)", () => {
   it("builds exactly {type:'select', profile, agent} for a real pair", () => {
     expect(select("dev", "team")).toEqual({

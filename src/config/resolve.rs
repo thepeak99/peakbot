@@ -4,6 +4,7 @@
 //! [`Config::parse`], so their invariants hold by construction and nothing
 //! downstream re-checks them.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -93,10 +94,7 @@ pub struct Catalog {
 impl Catalog {
     /// The first agent of the first profile.
     pub fn default_bound(&self) -> Bound {
-        Bound {
-            profile: Arc::clone(&self.profiles[0]),
-            agent_index: 0,
-        }
+        Bound::new(Arc::clone(&self.profiles[0]), 0)
     }
 
     pub fn profile(&self, name: &str) -> Option<&Arc<ResolvedProfile>> {
@@ -107,18 +105,12 @@ impl Catalog {
         self.profiles.iter()
     }
 
-    /// The `(profile, agent)` both names must name — `None` otherwise,
-    /// never a silent default (§5.3).
-    pub fn resolve(&self, sel: &Selection) -> Option<Bound> {
-        let profile = self.profile(&sel.profile)?;
-        let agent_index = profile
-            .agents
-            .iter()
-            .position(|a| a.main.name == sel.agent)?;
-        Some(Bound {
-            profile: Arc::clone(profile),
-            agent_index,
-        })
+    /// `(profile, agent)` → a Bound with NO overrides; `None` if either name
+    /// is unknown — never a silent default (§5.3).
+    pub fn resolve(&self, profile: &str, agent: &str) -> Option<Bound> {
+        let profile = self.profile(profile)?;
+        let agent_index = profile.agents.iter().position(|a| a.main.name == agent)?;
+        Some(Bound::new(Arc::clone(profile), agent_index))
     }
 
     /// The session's starting `Bound`: the pinned profile's first agent
@@ -146,10 +138,7 @@ impl Catalog {
                 configured.join(", ")
             ));
         };
-        Ok(Bound {
-            profile,
-            agent_index: 0,
-        })
+        Ok(Bound::new(profile, 0))
     }
 
     /// The wire projection for Settings and AppState (§8.7), in catalog
@@ -284,13 +273,31 @@ impl DbPathSpec {
 pub struct Selection {
     pub profile: String,
     pub agent: String,
+    /// Subagent name → model alias, ONLY for overridden subagents (I9).
+    /// Omitted from JSON when empty; absent in JSON = empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub subagent_models: BTreeMap<String, String>,
 }
 
-/// A conversation's `(profile, agent)`. I2: a session holds exactly one.
+/// A conversation's `(profile, agent)` plus its subagent model overrides.
+/// I2: a session holds exactly one.
+/// I9: every key of `subagent_models` names a subagent of `agent()`; only
+/// `with_subagent_models` writes the map (the field is private, so no
+/// struct literal outside this module can break I9).
 #[derive(Debug, Clone)]
 pub struct Bound {
     pub profile: Arc<ResolvedProfile>,
     pub agent_index: usize,
+    subagent_models: BTreeMap<String, ResolvedModel>,
+}
+
+/// Why a subagent model override could not apply (plan §5.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverrideRejection {
+    /// The key names no subagent of the bound agent.
+    UnknownSubagent { subagent: String },
+    /// The alias is not in the registry.
+    UnknownAlias { subagent: String, alias: String },
 }
 
 impl Bound {
@@ -298,10 +305,86 @@ impl Bound {
         &self.profile.agents[self.agent_index]
     }
 
+    /// The wire projection, with the override map as aliases.
     pub fn selection(&self) -> Selection {
         Selection {
             profile: self.profile.name.clone(),
             agent: self.agent().main.name.clone(),
+            subagent_models: self
+                .subagent_models
+                .iter()
+                .map(|(subagent, model)| (subagent.clone(), model.alias.clone()))
+                .collect(),
+        }
+    }
+
+    /// A `Bound` with NO overrides: an agent pick is a fresh setup, so the
+    /// clearing is structural, not a rule (I12).
+    pub fn new(profile: Arc<ResolvedProfile>, agent_index: usize) -> Bound {
+        Bound {
+            profile,
+            agent_index,
+            subagent_models: BTreeMap::new(),
+        }
+    }
+
+    /// REPLACES (never merges) the override map. Valid entries apply even
+    /// when others are rejected; rejections come back in subagent-name
+    /// order (plan §5.1).
+    pub fn with_subagent_models(
+        self,
+        registry: &ModelRegistry,
+        wanted: &BTreeMap<String, String>,
+    ) -> (Bound, Vec<OverrideRejection>) {
+        let mut subagent_models = BTreeMap::new();
+        let mut rejected = Vec::new();
+        for (subagent, alias) in wanted {
+            match self
+                .agent()
+                .subagents
+                .iter()
+                .find(|s| &s.member.name == subagent)
+            {
+                None => rejected.push(OverrideRejection::UnknownSubagent {
+                    subagent: subagent.clone(),
+                }),
+                Some(_) => match registry.resolve(alias) {
+                    None => rejected.push(OverrideRejection::UnknownAlias {
+                        subagent: subagent.clone(),
+                        alias: alias.clone(),
+                    }),
+                    Some(model) => {
+                        subagent_models.insert(subagent.clone(), model.clone());
+                    }
+                },
+            }
+        }
+        (
+            Bound {
+                subagent_models,
+                ..self
+            },
+            rejected,
+        )
+    }
+
+    /// I10 — the effective subagent model, the ONE rule delegation uses:
+    /// override, else the orchestrator's effective model when the sub is
+    /// *inherited* (alias == the agent's, explicit-equal included, Z4),
+    /// else the sub's configured model. `sub` must be one of
+    /// `self.agent().subagents`.
+    pub fn subagent_model<'a>(
+        &'a self,
+        sub: &'a Subagent,
+        orchestrator: &'a ResolvedModel,
+    ) -> &'a ResolvedModel {
+        if let Some(model) = self.subagent_models.get(&sub.member.name) {
+            return model;
+        }
+        if sub.member.model.alias == self.agent().main.model.alias {
+            orchestrator
+        } else {
+            &sub.member.model
         }
     }
 }
@@ -1478,7 +1561,8 @@ default_model: patchnotes/anthropic/claude-sonnet-4.5
             bound.selection(),
             Selection {
                 profile: "dev".into(),
-                agent: "team".into()
+                agent: "team".into(),
+                ..Default::default()
             }
         );
         let bound = catalog
@@ -1488,7 +1572,8 @@ default_model: patchnotes/anthropic/claude-sonnet-4.5
             bound.selection(),
             Selection {
                 profile: "research".into(),
-                agent: "scholar".into()
+                agent: "scholar".into(),
+                ..Default::default()
             }
         );
     }
@@ -1498,35 +1583,21 @@ default_model: patchnotes/anthropic/claude-sonnet-4.5
     #[test]
     fn catalog_resolve_requires_both_names() {
         let catalog = catalog(None);
-        let ok = catalog
-            .resolve(&Selection {
-                profile: "dev".into(),
-                agent: "team".into(),
-            })
-            .expect("both names exist");
+        let ok = catalog.resolve("dev", "team").expect("both names exist");
         assert_eq!(
             ok.selection(),
             Selection {
                 profile: "dev".into(),
-                agent: "team".into()
+                agent: "team".into(),
+                ..Default::default()
             }
         );
-        let sel = |profile: &str, agent: &str| Selection {
-            profile: profile.into(),
-            agent: agent.into(),
-        };
+        assert!(catalog.resolve("dev", "ghost").is_none(), "unknown agent");
         assert!(
-            catalog.resolve(&sel("dev", "ghost")).is_none(),
-            "unknown agent"
-        );
-        assert!(
-            catalog.resolve(&sel("ghost", "team")).is_none(),
+            catalog.resolve("ghost", "team").is_none(),
             "unknown profile"
         );
-        assert!(
-            catalog.resolve(&sel("ghost", "ghost")).is_none(),
-            "both unknown"
-        );
+        assert!(catalog.resolve("ghost", "ghost").is_none(), "both unknown");
     }
 
     /// §8.7/I1/I7: `infos()` is the wire projection in catalog order — repo
@@ -1572,5 +1643,273 @@ default_model: patchnotes/anthropic/claude-sonnet-4.5
             [false, false, true, true],
             "absent model and explicit-equal model are both inherited"
         );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-member subagent model overrides live INSIDE `Bound` (I9, private map +
+// validating constructor) and the effective-model rule is the one place that
+// decides what a delegation runs on (I10).
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod subagent_model_tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    /// The plan's shared Rust fixture (§9).
+    const YAML: &str = r#"
+providers:
+  - name: anthropic
+    type: anthropic
+    api_key: sk-ant-test
+    models:
+      - { name: claude-opus-5,   alias: opus,   context_size: 200000 }
+      - { name: claude-sonnet-5, alias: sonnet, context_size: 200000 }
+      - { name: claude-haiku-5,  alias: haiku,  context_size: 200000 }
+general: { context: { enabled: false } }
+profiles:
+  dev:
+    agents:
+      team:
+        model: sonnet
+        subagents:
+          reviewer: { prompt: "Review." }
+          tester:   { prompt: "Test.",  model: haiku }
+          twin:     { prompt: "Twin.",  model: sonnet }
+      solo: { model: opus }
+  research:
+    agents:
+      main: { model: haiku }
+"#;
+
+    fn config() -> Config {
+        Config::parse(
+            Source {
+                path: Path::new("/global/config.yaml"),
+                text: YAML,
+            },
+            None,
+            &ParseCtx { known_skills: &[] },
+        )
+        .expect("the shared team-models fixture parses")
+    }
+
+    fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// `dev › team` built through the constructor the plan mandates.
+    fn team(cfg: &Config) -> Bound {
+        let profile = Arc::clone(cfg.catalog.profile("dev").expect("dev"));
+        let idx = profile
+            .agents
+            .iter()
+            .position(|a| a.main.name == "team")
+            .expect("team");
+        Bound::new(profile, idx)
+    }
+
+    fn model<'a>(cfg: &'a Config, alias: &str) -> &'a ResolvedModel {
+        cfg.registry.resolve(alias).expect("fixture alias")
+    }
+
+    /// The alias a delegation to `sub` would run on.
+    fn effective(bound: &Bound, sub: &str, orchestrator: &ResolvedModel) -> String {
+        let s = bound
+            .agent()
+            .subagents
+            .iter()
+            .find(|s| s.member.name == sub)
+            .expect("fixture subagent");
+        bound.subagent_model(s, orchestrator).alias.clone()
+    }
+
+    /// 1. A freshly built `Bound` has no overrides.
+    #[test]
+    fn bound_new_has_no_overrides() {
+        let cfg = config();
+        assert!(team(&cfg).selection().subagent_models.is_empty());
+    }
+
+    /// 2. Valid entries apply, with no rejections, and show in the projection.
+    #[test]
+    fn with_subagent_models_applies_valid_overrides() {
+        let cfg = config();
+        let (bound, rejected) =
+            team(&cfg).with_subagent_models(&cfg.registry, &map(&[("tester", "opus")]));
+        assert!(rejected.is_empty(), "got: {rejected:?}");
+        assert_eq!(
+            bound.selection().subagent_models,
+            map(&[("tester", "opus")])
+        );
+    }
+
+    /// 3. The map is REPLACED, never merged.
+    #[test]
+    fn with_subagent_models_replaces_not_merges() {
+        let cfg = config();
+        let (first, _) =
+            team(&cfg).with_subagent_models(&cfg.registry, &map(&[("tester", "opus")]));
+        let (second, rejected) =
+            first.with_subagent_models(&cfg.registry, &map(&[("reviewer", "haiku")]));
+        assert!(rejected.is_empty(), "got: {rejected:?}");
+        assert_eq!(
+            second.selection().subagent_models,
+            map(&[("reviewer", "haiku")]),
+            "the previous `tester` entry must be gone"
+        );
+    }
+
+    /// 4. A key naming no subagent of the agent is rejected and not stored.
+    #[test]
+    fn with_subagent_models_rejects_unknown_subagent() {
+        let cfg = config();
+        let (bound, rejected) =
+            team(&cfg).with_subagent_models(&cfg.registry, &map(&[("ghost", "opus")]));
+        assert_eq!(
+            rejected,
+            vec![OverrideRejection::UnknownSubagent {
+                subagent: "ghost".into()
+            }]
+        );
+        assert!(bound.selection().subagent_models.is_empty());
+    }
+
+    /// 5. An alias outside the registry is rejected and not stored.
+    #[test]
+    fn with_subagent_models_rejects_unknown_alias() {
+        let cfg = config();
+        let (bound, rejected) =
+            team(&cfg).with_subagent_models(&cfg.registry, &map(&[("tester", "nope")]));
+        assert_eq!(
+            rejected,
+            vec![OverrideRejection::UnknownAlias {
+                subagent: "tester".into(),
+                alias: "nope".into()
+            }]
+        );
+        assert!(bound.selection().subagent_models.is_empty());
+    }
+
+    /// 6. Valid entries still apply when others are rejected.
+    #[test]
+    fn with_subagent_models_keeps_valid_entries_alongside_rejections() {
+        let cfg = config();
+        let (bound, rejected) = team(&cfg).with_subagent_models(
+            &cfg.registry,
+            &map(&[("ghost", "opus"), ("tester", "opus")]),
+        );
+        assert_eq!(
+            rejected,
+            vec![OverrideRejection::UnknownSubagent {
+                subagent: "ghost".into()
+            }],
+            "exactly one rejection: the ghost"
+        );
+        assert_eq!(
+            bound.selection().subagent_models,
+            map(&[("tester", "opus")])
+        );
+    }
+
+    /// 7. I10: override > inherited (rides the orchestrator's EFFECTIVE model,
+    ///    explicit-equal included) > configured.
+    #[test]
+    fn subagent_model_precedence_override_inherited_configured() {
+        let cfg = config();
+        let opus = model(&cfg, "opus");
+        let sonnet = model(&cfg, "sonnet");
+
+        // Orchestrator on opus, no overrides.
+        let bound = team(&cfg);
+        assert_eq!(
+            effective(&bound, "reviewer", opus),
+            "opus",
+            "inherited follows"
+        );
+        assert_eq!(
+            effective(&bound, "twin", opus),
+            "opus",
+            "explicit-equal is inherited (Z4)"
+        );
+        assert_eq!(
+            effective(&bound, "tester", opus),
+            "haiku",
+            "explicit stays configured"
+        );
+
+        // With overrides on tester and reviewer.
+        let (bound, rejected) = team(&cfg).with_subagent_models(
+            &cfg.registry,
+            &map(&[("tester", "sonnet"), ("reviewer", "haiku")]),
+        );
+        assert!(rejected.is_empty(), "got: {rejected:?}");
+        assert_eq!(
+            effective(&bound, "tester", opus),
+            "sonnet",
+            "override beats configured"
+        );
+        assert_eq!(
+            effective(&bound, "reviewer", opus),
+            "haiku",
+            "override beats inherited"
+        );
+        assert_eq!(
+            effective(&bound, "twin", opus),
+            "opus",
+            "no override: still inherited"
+        );
+
+        // Orchestrator on its configured model.
+        let bound = team(&cfg);
+        assert_eq!(effective(&bound, "reviewer", sonnet), "sonnet");
+    }
+
+    /// 8. `Catalog::resolve` takes NAMES and returns a `Bound` with no overrides.
+    #[test]
+    fn catalog_resolve_takes_names_and_returns_no_overrides() {
+        let cfg = config();
+        let bound = cfg
+            .catalog
+            .resolve("dev", "team")
+            .expect("both names exist");
+        assert_eq!(bound.agent().main.name, "team");
+        assert!(bound.selection().subagent_models.is_empty());
+        assert!(
+            cfg.catalog.resolve("dev", "ghost").is_none(),
+            "unknown agent"
+        );
+    }
+
+    /// 9. `Selection` JSON: the map is omitted when empty and defaults to empty
+    ///    when absent.
+    #[test]
+    fn selection_json_omits_empty_subagent_models() {
+        let plain = Selection {
+            profile: "dev".into(),
+            agent: "team".into(),
+            subagent_models: BTreeMap::new(),
+        };
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"profile":"dev","agent":"team"}"#
+        );
+
+        let with = Selection {
+            subagent_models: map(&[("tester", "opus")]),
+            ..plain
+        };
+        assert_eq!(
+            serde_json::to_string(&with).unwrap(),
+            r#"{"profile":"dev","agent":"team","subagent_models":{"tester":"opus"}}"#
+        );
+
+        let back: Selection =
+            serde_json::from_str(r#"{"profile":"dev","agent":"team"}"#).expect("parses");
+        assert!(back.subagent_models.is_empty(), "absent key = empty map");
     }
 }

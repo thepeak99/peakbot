@@ -314,7 +314,6 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
         conversations={conversations}
         conversationsError={conversationsError}
         send={send}
-        onSwitchModel={(alias) => send({ type: "switch_model", alias })}
         onLoadConversation={loadConversation}
         notifyEnabled={notify.enabled}
         notifyPermission={notify.permission}
@@ -417,7 +416,6 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
         dirListing={dirListing}
         recentDirs={recentDirs}
         send={send}
-        onSwitchModel={(alias) => send({ type: "switch_model", alias })}
         onLoadConversation={loadConversation}
         catalog={catalog}
         selection={selection}

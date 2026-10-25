@@ -1921,6 +1921,7 @@ mod tests {
         state.selection = Selection {
             profile: "dev".to_string(),
             agent: "team".to_string(),
+            ..Default::default()
         };
         state.visible_tabs = vec!["session".to_string(), "agents".to_string()];
 
@@ -1982,7 +1983,8 @@ mod tests {
             parsed.selection,
             Selection {
                 profile: "dev".to_string(),
-                agent: "team".to_string()
+                agent: "team".to_string(),
+                ..Default::default()
             }
         );
         assert!(parsed.profile_pinned);
@@ -2714,6 +2716,7 @@ mod tests {
         state.selection = Selection {
             profile: "web".to_string(),
             agent: "main".to_string(),
+            ..Default::default()
         };
         state.visible_tabs = vec!["session".to_string(), "bash".to_string()];
 
@@ -2736,7 +2739,8 @@ mod tests {
             parsed.selection,
             Selection {
                 profile: "web".to_string(),
-                agent: "main".to_string()
+                agent: "main".to_string(),
+                ..Default::default()
             }
         );
         assert_eq!(
@@ -2776,5 +2780,53 @@ mod tests {
         assert_eq!(parsed.selection, Selection::default());
         assert!(!parsed.profile_pinned);
         assert_eq!(parsed.visible_tabs, Vec::<String>::new());
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RED test (selection-models plan §9.1, item 27): the state JSON's
+// `selection` carries `subagent_models` iff it is non-empty.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod subagent_models_wire_tests {
+    use super::AppState;
+    use crate::config::resolve::Selection;
+
+    #[test]
+    fn appstate_selection_serializes_subagent_models() {
+        let mut state = AppState::new();
+        state.selection = Selection {
+            profile: "dev".to_string(),
+            agent: "team".to_string(),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&state).expect("serializes");
+        assert!(
+            v["selection"].get("subagent_models").is_none(),
+            "an empty map is omitted from the wire; got: {}",
+            v["selection"]
+        );
+
+        state
+            .selection
+            .subagent_models
+            .insert("tester".to_string(), "opus".to_string());
+        let v = serde_json::to_value(&state).expect("serializes");
+        assert_eq!(
+            v["selection"]["subagent_models"],
+            serde_json::json!({ "tester": "opus" }),
+            "a non-empty map rides the state frame"
+        );
+
+        let parsed: AppState = serde_json::from_value(v).expect("round-trips");
+        assert_eq!(
+            parsed
+                .selection
+                .subagent_models
+                .get("tester")
+                .map(String::as_str),
+            Some("opus"),
+            "the map survives the AppState round trip"
+        );
     }
 }

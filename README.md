@@ -106,7 +106,9 @@ talk to — a starting `model:`, an optional `persona:`/`prompt:`, and optional
 `subagents:` (an agent without subagents is a plain single-agent setup).
 
 Selection is per conversation: `/profile <name>` and `/agent <name>` (web: the
-📁 chip in the composer). Both lock once the conversation has started; `/new`
+selection chip in the top bar (bottom bar on phones): Profile › Agent › Team ›
+Model drill-down; per-member model override before the first message). Both
+lock once the conversation has started; `/new`
 keeps the selection, and a fresh session starts at the first profile's first
 agent. Booting with `--profile <name>` **pins** a global profile — every
 conversation runs under it, `/profile` is refused, and repo files are ignored.

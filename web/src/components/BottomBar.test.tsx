@@ -1,8 +1,9 @@
 // T34b regression (QA fix 7): on mobile (≤800 px) the BottomBar's chip row
-// (selection · conversations · model · agents · cwd) must not overflow the
-// bar horizontally. jsdom cannot measure layout, so the regression is pinned
-// on the wrap rule: the bar is a `flex-wrap` row (chips flow to a second
-// line) and NOT a `flex-nowrap` one, with every chip still rendered.
+// (selection · conversations · cwd) must not overflow the bar horizontally.
+// jsdom cannot measure layout, so the regression is pinned on the wrap rule:
+// the bar is a `flex-wrap` row (chips flow to a second line) and NOT a
+// `flex-nowrap` one, with every chip still rendered. The separate model chip
+// and the "Agents · N" chip are gone — the selection chip owns both jobs.
 
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { act } from "react";
@@ -39,7 +40,7 @@ const CATALOG: CatalogProfile[] = [
     agents: [{ name: "main", model: "sonnet", subagents: [] }],
   },
 ];
-const SELECTION: Selection = { profile: "dev", agent: "main" };
+const SELECTION: Selection = { profile: "dev", agent: "main", subagentModels: {} };
 const MODELS: ModelInfo[] = [
   { alias: "sonnet", provider_name: "openrouter", model_name: "anthropic/claude-sonnet-4.5", context_size: 200000 },
 ];
@@ -59,7 +60,6 @@ function mountBar() {
       dirListing={null}
       recentDirs={[]}
       send={vi.fn((m: InboundMessage) => void m)}
-      onSwitchModel={vi.fn()}
       onLoadConversation={vi.fn()}
       catalog={CATALOG}
       selection={SELECTION}
@@ -85,16 +85,21 @@ describe("bottom bar mobile overflow (T34b)", () => {
     expect(cls).not.toMatch(/overflow-x-(auto|scroll)/);
   });
 
-  it("all_five_chips_still_render_in_the_writing_row", () => {
+  it("selection_conversations_and_cwd_chips_render", () => {
     mountBar();
     for (const sel of [
       '[data-testid="selection-chip"]',
       'button[title="Load a saved conversation"]',
-      'button[title="Switch model"]',
-      '[data-testid="agents-chip"]',
       'button[title="/work/repo"]',
     ]) {
       expect(host.querySelector(sel) !== null, `chip ${sel} rendered`).toBe(true);
+    }
+    // The model chip and the Agents chip are folded into the selection chip.
+    for (const sel of [
+      'button[title="Switch model"]',
+      '[data-testid="agents-chip"]',
+    ]) {
+      expect(host.querySelector(sel), `chip ${sel} must be gone`).toBeNull();
     }
   });
 });

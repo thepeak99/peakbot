@@ -1,5 +1,7 @@
 //! Conversation persistence - data structures for storing conversation history.
 
+use std::collections::BTreeMap;
+
 use crate::ui::app_state::MessageSource;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -329,6 +331,12 @@ pub struct Conversation {
     /// re-applied by `/load`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// Subagent model overrides of the bound agent, by ALIAS (subagent →
+    /// alias). Same lifecycle as `agent`/`profile`. Absent = none (pre-
+    /// feature files and conversations without overrides are byte-identical
+    /// to before).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub subagent_models: BTreeMap<String, String>,
 }
 
 impl Conversation {
@@ -362,6 +370,7 @@ impl Conversation {
             todos: crate::tools::todo::TodoList::new(),
             agent: None,
             profile: None,
+            subagent_models: BTreeMap::new(),
         }
     }
 
@@ -1450,5 +1459,60 @@ mod tests {
         );
         assert_eq!(parsed.name, "old");
         assert_eq!(parsed.model, "anthropic/claude-3.7-sonnet");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RED tests (selection-models plan §9.1, items 16–18): the `subagent_models`
+// persistence field — alias map, absent-when-empty.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod subagent_models_tests {
+    use std::collections::BTreeMap;
+
+    use super::Conversation;
+
+    fn conv() -> Conversation {
+        Conversation::new(
+            "c".into(),
+            "anthropic".into(),
+            "claude-sonnet-5".into(),
+            "/work".into(),
+        )
+    }
+
+    /// A fresh conversation serializes WITHOUT the `subagent_models` key —
+    /// pre-feature files and override-free conversations stay byte-identical.
+    #[test]
+    fn subagent_models_omitted_when_empty() {
+        let v = serde_json::to_value(conv()).expect("serializes");
+        assert!(
+            v.get("subagent_models").is_none(),
+            "empty map must be omitted from the JSON; got: {v}"
+        );
+    }
+
+    /// Set → serialize → deserialize: the alias map round-trips intact.
+    #[test]
+    fn subagent_models_round_trip() {
+        let mut c = conv();
+        let mut map = BTreeMap::new();
+        map.insert("tester".to_string(), "opus".to_string());
+        c.subagent_models = map.clone();
+
+        let json = serde_json::to_string(&c).expect("serializes");
+        let back: Conversation = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back.subagent_models, map, "the alias map round-trips");
+    }
+
+    /// A file written before the feature (no `subagent_models` key) loads
+    /// with an empty map.
+    #[test]
+    fn old_file_without_subagent_models_loads_empty() {
+        let c = conv();
+        let mut v = serde_json::to_value(&c).expect("serializes");
+        v.as_object_mut().expect("object").remove("subagent_models");
+        let back: Conversation = serde_json::from_value(v).expect("old file parses");
+        assert!(back.subagent_models.is_empty(), "absent key = no overrides");
     }
 }

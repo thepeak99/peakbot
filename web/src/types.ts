@@ -182,4 +182,6 @@ export interface CatalogProfile {
 export interface Selection {
   profile: string;
   agent: string;
+  /** Subagent → alias, overridden only; `{}` when none (adapter-normalized). */
+  subagentModels: Record<string, string>;
 }

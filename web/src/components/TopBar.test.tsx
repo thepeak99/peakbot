@@ -80,7 +80,6 @@ interface TopBarFixtureProps {
   dirListing: DirListing | null;
   conversations: ConversationSummary[];
   send: (msg: InboundMessage) => void;
-  onSwitchModel: (alias: string) => void;
   onLoadConversation: (id: string) => void;
   notifyEnabled: boolean;
   notifyPermission: NotifyPermission;
@@ -106,7 +105,6 @@ const baseProps: TopBarFixtureProps = {
   statusMessage: null,
   subAgent: null,
   send: () => {},
-  onSwitchModel: () => {},
   onLoadConversation: () => {},
   notifyEnabled: false,
   onToggleNotify: () => {},

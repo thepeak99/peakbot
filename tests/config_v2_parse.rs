@@ -165,7 +165,8 @@ fn minimal_valid_global_gives_one_profile_one_agent_and_default_selection() {
         sel,
         Selection {
             profile: "p".to_string(),
-            agent: "a".to_string()
+            agent: "a".to_string(),
+            ..Default::default()
         }
     );
 }
@@ -948,7 +949,8 @@ fn repo_profiles_listed_first_and_become_default() {
         sel,
         Selection {
             profile: "r1".to_string(),
-            agent: "x".to_string()
+            agent: "x".to_string(),
+            ..Default::default()
         },
         "the first repo profile is the default here"
     );
@@ -1103,7 +1105,8 @@ fn spec_global_and_repo_examples_parse_to_the_effective_catalog() {
         sel,
         Selection {
             profile: "peakbot-dev".to_string(),
-            agent: "team".to_string()
+            agent: "team".to_string(),
+            ..Default::default()
         }
     );
 

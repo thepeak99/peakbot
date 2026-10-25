@@ -9,9 +9,13 @@
 //! - There is no registry default: the model a session runs on comes from
 //!   its bound agent (see [`ModelRegistry::resolve_boot`]).
 //!
-//! Conversations persist `(provider_name, model_name)` — never the alias.
-//! Aliases are UI sugar; the wire identity is the re-activation key. See
-//! [`ModelRegistry::find_by_wire_id`].
+//! The conversation's (orchestrator) model is persisted as
+//! `(provider_name, model_name)` — never the alias. That model owns a
+//! transcript replayed against its exact wire (reasoning signatures), so the
+//! wire identity is the re-activation key. See
+//! [`ModelRegistry::find_by_wire_id`]. Subagent overrides are selection
+//! preferences (subagents never replay a transcript) and persist by alias —
+//! see `Conversation::subagent_models`.
 //!
 //! The registry's only job is *alias → existing-shape*. Everything
 //! downstream (`create_provider`, `ProviderInfo`, the agent itself)

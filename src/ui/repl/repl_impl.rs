@@ -4354,6 +4354,7 @@ mod model_popup_tests {
             selection: Selection {
                 profile: "peakbot-dev".into(),
                 agent: "team".into(),
+                ..Default::default()
             },
             ..Default::default()
         };
