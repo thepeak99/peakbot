@@ -582,6 +582,34 @@ else
     bad "T42 release-tag: happy path ($why)"
 fi
 
+# ── H: release.yml GITEA_TOKEN preflight (fail fast on empty secret) ───────
+
+# T43: an empty RELEASE_TOKEN secret must not burn 1-2 h of docker builds
+# before failing in release-publish. Statically against release.yml:
+#   1. a non-empty test on GITEA_TOKEN exists — `-n`/`-z` with the quoted
+#      variable, `$GITEA_TOKEN` or `${GITEA_TOKEN}` (the unquoted form is
+#      deliberately NOT accepted: `[ -n $VAR ]` with an empty VAR is the
+#      one-argument form and tests TRUE, so quotes are part of the contract);
+#   2. that test's line number is strictly BEFORE the `make release` line;
+#   3. the workflow never echoes/prints the token value.
+tok_re='-[nz][[:space:]]+"\$\{?GITEA_TOKEN\}?"'
+t43=1; why=""
+fail43() { t43=0; why="${why}${why:+; }$1"; }
+tok_line=$(grep -nE -- "$tok_re" "$RY" 2>/dev/null | head -n 1 | cut -d: -f1)
+mr_line=$(grep -nF -- 'make release' "$RY" 2>/dev/null | head -n 1 | cut -d: -f1)
+[ -n "$tok_line" ] || fail43 'no non-empty test on GITEA_TOKEN (want e.g. [ -n "$GITEA_TOKEN" ] || exit 1)'
+[ -n "$mr_line" ] || fail43 'no make-release step found in release.yml'
+if [ -n "$tok_line" ] && [ -n "$mr_line" ] && [ "$tok_line" -ge "$mr_line" ]; then
+    fail43 "token test (line $tok_line) is not before make release (line $mr_line)"
+fi
+grep -qE -- '(echo|printf)[[:space:]].*\$\{?GITEA_TOKEN\}?' "$RY" 2>/dev/null \
+    && fail43 'workflow echoes/prints the GITEA_TOKEN value'
+if [ "$t43" -eq 1 ]; then
+    ok "T43 release.yml: GITEA_TOKEN preflight (non-empty test before make release, value never printed)"
+else
+    bad "T43 release.yml: GITEA_TOKEN preflight ($why)"
+fi
+
 # ── Summary ────────────────────────────────────────────────────────────────
 
 echo ""
