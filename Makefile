@@ -1,7 +1,7 @@
 .PHONY: all build build-linux build-macos build-windows build-android clean test docker-build help \
         web dev \
         desktop-test desktop-test-windows desktop-fonttest desktop-dev desktop-linux desktop-macos desktop-windows desktop \
-        release release-bump release-tag \
+        release release-check release-bump release-tag \
         release-build-linux release-build-windows release-build-macos release-build-android release-publish
 
 # Config
@@ -10,8 +10,11 @@ DOCKERFILE_LINUX   := Dockerfile.linux
 DOCKERFILE_MACOS   := Dockerfile.macos
 DOCKERFILE_ANDROID := Dockerfile.android
 OUTPUT_DIR         := output
-# Default (unversioned) artifact names. Release builds bake the version into
-# the filename via --build-arg VERSION=$v from the .release-version stash.
+# RELEASE_VERSION — the version being released, straight from the root
+# Cargo.toml [package] section (single source of truth — no state file).
+RELEASE_VERSION := $(shell awk '/^\[package\]/{p=1} p && /^version[[:space:]]*=/{gsub(/[" ]/,"",$$3); print $$3; exit}' Cargo.toml)
+# Default (unversioned) artifact names. Release builds bake RELEASE_VERSION
+# into the filename via --build-arg VERSION.
 LINUX_BIN          := peakbot-linux-amd64
 WIN_BIN            := peakbot-windows-amd64.exe
 MACOS_BIN          := peakbot-macos-universal2
@@ -24,12 +27,8 @@ GITEA_URL  ?= $(shell echo $(ORIGIN_URL) | sed -E 's#(https?://[^/]+).*#\1#')
 OWNER      ?= $(shell echo $(ORIGIN_URL) | sed -E 's#https?://[^/]+/([^/]+)/.*#\1#')
 REPO       ?= $(shell basename -s .git $(ORIGIN_URL) 2>/dev/null)
 
-# VERSION may be passed on the CLI (make release VERSION=0.2.0) or prompted.
+# VERSION for release-bump: make release-bump VERSION=X.Y.Z (required, no prompt).
 VERSION ?=
-
-# NOTES may point to a markdown file used as the release body + tag message.
-# Default resolution (in release-tag and release-publish): release-notes/<v>.md.
-NOTES ?=
 
 # Default target
 all: build
@@ -122,7 +121,6 @@ clean:
 	rm -rf web/dist web/node_modules
 	rm -rf desktop/src-tauri/gen desktop/src-tauri/linux/fonts
 	rm -f  desktop/src-tauri/binaries/peakbot-*
-	rm -f  .release-version
 	@mkdir -p web/dist && touch web/dist/.gitkeep desktop/src-tauri/binaries/.gitkeep
 	@echo "🧹 Cleaned all build artifacts"
 
@@ -180,219 +178,237 @@ desktop:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Release pipeline
+#
+# Flow: make release-bump VERSION=X.Y.Z → open a PR → merge → make release-tag
+#       (the tag push triggers CI, which runs: make release TAG=X.Y.Z)
 # ─────────────────────────────────────────────────────────────────────────────
 
-## release: Full release flow — bump, tag, build, publish to Gitea
-release: release-bump release-tag release-build-linux release-build-windows release-build-macos release-build-android release-publish
-	@echo ""
-	@echo "🎉 Release $$(grep '^version' Cargo.toml | head -1 | cut -d'\"' -f2) complete!"
+# PRUNE=1 makes the release recipe prune the container builder between
+# platform builds. Read by the recipe shell (not make) so the guard text
+# survives `make -n` (see tests/release.sh T32).
+PRUNE ?=
+export PRUNE
+PRUNE_STEP = if [ "$${PRUNE}" = "1" ]; then $(CONTAINER_BUILDER) builder prune -af; fi
 
-## release-bump: Sync branch with origin (ff-only), update Cargo.toml + Cargo.lock + desktop workspace, commit
+## release-check: Verify TAG is set and equals the Cargo.toml version, desktop
+##                version is in sync, and release-notes/<TAG>.md exists
+release-check:
+	@set -eu; \
+	if [ -z "$(TAG)" ]; then \
+	  echo "❌ TAG is not set — pass TAG=<version> (expected: $(RELEASE_VERSION))"; exit 1; \
+	fi; \
+	if [ "$(TAG)" != "$(RELEASE_VERSION)" ]; then \
+	  echo "❌ TAG '$(TAG)' does not match the Cargo.toml version '$(RELEASE_VERSION)'"; exit 1; \
+	fi; \
+	sh desktop/scripts/check-version.sh; \
+	if [ ! -f "release-notes/$(TAG).md" ]; then \
+	  echo "❌ Release notes missing: release-notes/$(TAG).md"; exit 1; \
+	fi; \
+	echo "✅ release-check passed: TAG=$(TAG)"
+
+## release: Full release pipeline — check, build all 7 assets, publish to
+##          Gitea. CI runs this on tag push: make release TAG=<v>.
+##          Explicit sequential recipe of sub-make calls: the per-platform
+##          targets (release-build-*, desktop-*) are the single source of
+##          truth for the build commands — nothing is inlined here.
+##          Command-line vars (TAG, PRUNE, CONTAINER_BUILDER, GITEA_URL,
+##          OWNER, REPO, OUTPUT_DIR) propagate to the sub-makes via
+##          MAKEFLAGS; GITEA_TOKEN rides along in the environment.
+##          Order matters: never run with -j.
+release:
+	@echo "🚀 Release $(RELEASE_VERSION) — sequential by design, do not run with -j"
+	$(MAKE) release-check TAG=$(TAG)
+	$(MAKE) release-build-linux
+	$(MAKE) desktop-linux
+	$(PRUNE_STEP)
+	$(MAKE) release-build-macos
+	$(MAKE) desktop-macos
+	$(PRUNE_STEP)
+	$(MAKE) release-build-windows
+	$(MAKE) desktop-windows
+	$(PRUNE_STEP)
+	$(MAKE) release-build-android
+	$(MAKE) release-publish TAG=$(TAG)
+
+## release-bump: Bump to VERSION (X.Y.Z, required) on a fresh release/<v>
+##               branch cut from origin/master — bump both Cargo.tomls (+
+##               lock updates), promote release-notes/current.md to
+##               release-notes/<v>.md, commit, push. Open a PR; after the
+##               merge, run release-tag.
 release-bump:
 	@set -eu; \
 	if [ -z "$(VERSION)" ]; then \
-	  current=$$(awk '/^\[package\]/{p=1} p && /^version[[:space:]]*=/{gsub(/[" ]/,"",$$3); print $$3; exit}' Cargo.toml); \
-	  printf "Current version: %s\nNew version: " "$$current"; \
-	  read v; \
-	else \
-	  v="$(VERSION)"; \
+	  echo "❌ VERSION is required: make release-bump VERSION=X.Y.Z"; exit 1; \
 	fi; \
-	if ! echo "$$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$$'; then \
+	v="$(VERSION)"; \
+	if ! echo "$$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$$'; then \
 	  echo "❌ Invalid version: '$$v' (expected X.Y.Z)"; exit 1; \
 	fi; \
 	if git rev-parse "refs/tags/$$v" >/dev/null 2>&1; then \
 	  echo "❌ Tag '$$v' already exists"; exit 1; \
 	fi; \
-	if [ -z "$${ALLOW_DIRTY:-}" ] && [ -n "$$(git status --porcelain | grep -v '^?? ')" ]; then \
-	  echo "❌ Working tree has uncommitted changes (set ALLOW_DIRTY=1 to override):"; \
+	if [ -n "$$(git status --porcelain | grep -v '^?? ')" ]; then \
+	  echo "❌ Working tree has uncommitted changes (dirty tree) — commit or stash first:"; \
 	  git status --short; exit 1; \
 	fi; \
-	branch=$$(git rev-parse --abbrev-ref HEAD); \
-	echo "🔄 Syncing $$branch with origin (fast-forward only)..."; \
-	git fetch origin "$$branch"; \
-	if ! git merge --ff-only "origin/$$branch"; then \
-	  echo "❌ Local $$branch has diverged from origin/$$branch — a release branch cut here would not be a descendant of the base, and the merge would stick (see the 0.13.3 post-mortem). Reconcile ('git pull --rebase' or reset) and retry."; exit 1; \
-	fi; \
-	echo "📝 Bumping version to $$v..."; \
+	echo "🌿 Cutting release/$$v from origin/master..."; \
+	git fetch origin master; \
+	git switch -c "release/$$v" origin/master; \
+	echo "📝 Bumping Cargo.toml to $$v..."; \
 	awk -v v="$$v" '/^\[package\]/{p=1} p && /^version[[:space:]]*=/ && !done {sub(/"[^"]*"/, "\"" v "\""); done=1} {print}' Cargo.toml > Cargo.toml.tmp && mv Cargo.toml.tmp Cargo.toml; \
 	echo "🖥️  Bumping desktop/Cargo.toml to $$v..."; \
 	awk -v v="$$v" '/^\[workspace.package\]/{p=1} p && /^version[[:space:]]*=/ && !done {sub(/"[^"]*"/, "\"" v "\""); done=1} {print}' desktop/Cargo.toml > desktop/Cargo.toml.tmp && mv desktop/Cargo.toml.tmp desktop/Cargo.toml; \
 	echo "🔒 Updating Cargo.lock..."; \
 	cargo update -p peakbot --precise "$$v" >/dev/null 2>&1 || cargo update -p peakbot >/dev/null; \
 	cargo update --workspace --manifest-path desktop/Cargo.toml >/dev/null 2>&1; \
-	git add Cargo.toml Cargo.lock desktop/Cargo.toml desktop/Cargo.lock; \
+	echo "📄 Promoting release notes: release-notes/$$v.md ← release-notes/current.md"; \
+	if [ ! -f release-notes/current.md ]; then \
+	  echo "❌ release-notes/current.md not found"; exit 1; \
+	fi; \
+	awk '/^## /{f=1} f' release-notes/current.md > release-notes/$$v.md; \
+	awk '/^## /{exit} {print}' release-notes/current.md > release-notes/current.md.tmp; \
+	printf '## Changes\n' >> release-notes/current.md.tmp; \
+	mv release-notes/current.md.tmp release-notes/current.md; \
+	git add Cargo.toml Cargo.lock desktop/Cargo.toml desktop/Cargo.lock release-notes/$$v.md release-notes/current.md; \
 	git commit -m "chore: release $$v" -m "Co-authored by PeakBot!"; \
-	echo "✅ Committed version bump to $$v"; \
-	echo "$$v" > .release-version
+	echo "📤 Pushing release/$$v to origin..."; \
+	git push -u origin HEAD; \
+	echo "✅ Bumped to $$v on release/$$v — open a PR, merge it, then run make release-tag"
 
-## release-tag: Create annotated tag and push branch + tag.
-## If the branch is protected, automatically opens a PR, merges it (verifying
-## the merge via the PR's `merged` flag, not the merge response body), then
-## pushes the tag.
+## release-tag: Create the annotated tag for the Cargo.toml version (the
+##              release-notes file as tag message) and push it. Requires a
+##              clean tree on master in sync with origin, an existing
+##              release-notes/<v>.md, and a not-yet-existing tag.
 release-tag:
 	@set -eu; \
-	if [ ! -f .release-version ]; then \
-	  echo "❌ No .release-version file — run 'make release-bump' first"; exit 1; \
+	v="$(RELEASE_VERSION)"; \
+	if [ -n "$$(git status --porcelain | grep -v '^?? ')" ]; then \
+	  echo "❌ Working tree has uncommitted changes (dirty tree) — commit or stash first:"; \
+	  git status --short; exit 1; \
 	fi; \
-	v=$$(cat .release-version); \
-	branch=$$(git rev-parse --abbrev-ref HEAD); \
-	echo "🏷️  Tagging $$v on branch '$$branch'..."; \
-	notes="$${NOTES:-release-notes/$$v.md}"; \
-	if [ -f "$$notes" ]; then \
-	  echo "📝 Using release notes from $$notes"; \
-	  git tag -a "$$v" -F "$$notes"; \
-	else \
-	  echo "ℹ️  No release-notes file (looked for $$notes); using default tag message"; \
-	  git tag -a "$$v" -m "Release $$v"; \
+	git fetch origin --no-tags; \
+	if [ "$$(git rev-parse HEAD)" != "$$(git rev-parse origin/master)" ]; then \
+	  echo "❌ HEAD is not at origin/master — release-tag must run on master, in sync with origin"; exit 1; \
 	fi; \
-	echo "📤 Pushing branch and tag..."; \
-	if git push origin "$$branch" 2>/dev/null; then \
-	  echo "✅ Branch pushed"; \
-	else \
-	  echo "⚠️  Direct push to $$branch failed (protected branch?). Creating PR..."; \
-	  if [ -z "$${GITEA_TOKEN:-}" ]; then \
-	    echo "❌ GITEA_TOKEN is not set. Cannot create PR."; exit 1; \
-	  fi; \
-	  command -v jq >/dev/null   || { echo "❌ 'jq' is required";   exit 1; }; \
-	  command -v curl >/dev/null || { echo "❌ 'curl' is required"; exit 1; }; \
-	  release_branch="release/$$v"; \
-	  git checkout -b "$$release_branch"; \
-	  git push origin "$$release_branch"; \
-	  api="$(GITEA_URL)/api/v1/repos/$(OWNER)/$(REPO)"; \
-	  pr_body="## Release $$v\\n\\nThis PR contains the version bump for v$$v.\\n\\nCo-authored by PeakBot!"; \
-	  pr_resp=$$(curl -sS -X POST "$$api/pulls" \
-	    -H "Authorization: token $$GITEA_TOKEN" \
-	    -H "Content-Type: application/json" \
-	    -d "{\"title\":\"chore: release $$v\",\"body\":\"$$pr_body\",\"head\":\"$$release_branch\",\"base\":\"$$branch\"}"); \
-	  pr_num=$$(echo "$$pr_resp" | jq -r '.number // empty'); \
-	  if [ -z "$$pr_num" ]; then \
-	    echo "❌ Failed to create PR. Response:"; echo "$$pr_resp" | jq .; exit 1; \
-	  fi; \
-	  echo "✅ Created PR #$$pr_num"; \
-	  echo "🔀 Merging PR #$$pr_num..."; \
-	  merge_resp=$$(curl -sS -X POST "$$api/pulls/$$pr_num/merge" \
-	    -H "Authorization: token $$GITEA_TOKEN" \
-	    -H "Content-Type: application/json" \
-	    -d '{"Do":"merge","merge_message_field":"chore: release '$$v'","delete_branch_after_merge":true}'); \
-	  merged=$$(curl -sS -H "Authorization: token $$GITEA_TOKEN" "$$api/pulls/$$pr_num" | jq -r '.merged // false'); \
-	  if [ "$$merged" != "true" ]; then \
-	    echo "❌ Failed to merge PR. Merge response:"; echo "$$merge_resp" | jq . 2>/dev/null || echo "$$merge_resp"; exit 1; \
-	  fi; \
-	  echo "✅ PR merged"; \
-	  git checkout "$$branch"; \
-	  git pull origin "$$branch"; \
-	  git branch -D "$$release_branch" 2>/dev/null || true; \
+	notes="release-notes/$$v.md"; \
+	if [ ! -f "$$notes" ]; then \
+	  echo "❌ Release notes missing: $$notes"; exit 1; \
 	fi; \
+	if git rev-parse "refs/tags/$$v" >/dev/null 2>&1; then \
+	  echo "❌ Tag '$$v' already exists"; exit 1; \
+	fi; \
+	echo "🏷️  Tagging $$v (message from $$notes)..."; \
+	git tag -a "$$v" -F "$$notes" --cleanup=verbatim; \
 	git push origin "$$v"; \
-	echo "✅ Pushed tag $$v"
+	echo "✅ Tagged and pushed $$v"
 
 ## release-build-linux: Build linux/amd64 binary (via Dockerfile.linux) with the release version baked into the filename
 release-build-linux:
 	@set -eu; \
-	if [ ! -f .release-version ]; then echo "❌ run release-bump first"; exit 1; fi; \
-	v=$$(cat .release-version); \
 	mkdir -p $(OUTPUT_DIR); \
-	echo "🐧 Building peakbot $$v for Linux..."; \
+	echo "🐧 Building peakbot $(RELEASE_VERSION) for Linux..."; \
 	$(CONTAINER_BUILDER) build \
-		--build-arg VERSION=$$v \
+		--build-arg VERSION=$(RELEASE_VERSION) \
 		--output type=local,dest=$(OUTPUT_DIR) \
 		-f $(DOCKERFILE_LINUX) \
 		.; \
-	chmod +x $(OUTPUT_DIR)/peakbot-$$v-linux-amd64; \
-	echo "✅ $(OUTPUT_DIR)/peakbot-$$v-linux-amd64"; \
-	ls -lh $(OUTPUT_DIR)/peakbot-$$v-linux-amd64
+	chmod +x $(OUTPUT_DIR)/peakbot-$(RELEASE_VERSION)-linux-amd64; \
+	echo "✅ $(OUTPUT_DIR)/peakbot-$(RELEASE_VERSION)-linux-amd64"; \
+	ls -lh $(OUTPUT_DIR)/peakbot-$(RELEASE_VERSION)-linux-amd64
 
 ## release-build-windows: Build windows/amd64 binary (via Dockerfile.windows) with the release version baked into the filename
 release-build-windows:
 	@set -eu; \
-	if [ ! -f .release-version ]; then echo "❌ run release-bump first"; exit 1; fi; \
-	v=$$(cat .release-version); \
 	mkdir -p $(OUTPUT_DIR); \
-	echo "🔨 Cross-compiling peakbot $$v for Windows..."; \
+	echo "🔨 Cross-compiling peakbot $(RELEASE_VERSION) for Windows..."; \
 	$(CONTAINER_BUILDER) build \
-		--build-arg VERSION=$$v \
+		--build-arg VERSION=$(RELEASE_VERSION) \
 		--output type=local,dest=$(OUTPUT_DIR) \
 		-f $(DOCKERFILE) \
 		.; \
-	echo "✅ $(OUTPUT_DIR)/peakbot-$$v-windows-amd64.exe"; \
-	ls -lh $(OUTPUT_DIR)/peakbot-$$v-windows-amd64.exe
+	echo "✅ $(OUTPUT_DIR)/peakbot-$(RELEASE_VERSION)-windows-amd64.exe"; \
+	ls -lh $(OUTPUT_DIR)/peakbot-$(RELEASE_VERSION)-windows-amd64.exe
 
 ## release-build-macos: Build macOS universal2 binary (via Dockerfile.macos) with the release version baked into the filename
 release-build-macos:
 	@set -eu; \
-	if [ ! -f .release-version ]; then echo "❌ run release-bump first"; exit 1; fi; \
-	v=$$(cat .release-version); \
 	mkdir -p $(OUTPUT_DIR); \
-	echo "🍎 Cross-compiling peakbot $$v for macOS (universal2)..."; \
+	echo "🍎 Building peakbot $(RELEASE_VERSION) for macOS (universal2)..."; \
 	$(CONTAINER_BUILDER) build \
-		--build-arg VERSION=$$v \
+		--build-arg VERSION=$(RELEASE_VERSION) \
 		--output type=local,dest=$(OUTPUT_DIR) \
 		-f $(DOCKERFILE_MACOS) \
 		.; \
-	chmod +x $(OUTPUT_DIR)/peakbot-$$v-macos-universal2; \
-	echo "✅ $(OUTPUT_DIR)/peakbot-$$v-macos-universal2"; \
-	ls -lh $(OUTPUT_DIR)/peakbot-$$v-macos-universal2
+	chmod +x $(OUTPUT_DIR)/peakbot-$(RELEASE_VERSION)-macos-universal2; \
+	echo "✅ $(OUTPUT_DIR)/peakbot-$(RELEASE_VERSION)-macos-universal2"; \
+	ls -lh $(OUTPUT_DIR)/peakbot-$(RELEASE_VERSION)-macos-universal2
 
 ## release-build-android: Build Android arm64 binary (via Dockerfile.android) with the release version baked into the filename
 release-build-android:
 	@set -eu; \
-	if [ ! -f .release-version ]; then echo "❌ run release-bump first"; exit 1; fi; \
-	v=$$(cat .release-version); \
 	mkdir -p $(OUTPUT_DIR); \
-	echo "🤖 Cross-compiling peakbot $$v for Android (arm64)..."; \
+	echo "🤖 Building peakbot $(RELEASE_VERSION) for Android (arm64)..."; \
 	$(CONTAINER_BUILDER) build \
-		--build-arg VERSION=$$v \
+		--build-arg VERSION=$(RELEASE_VERSION) \
 		--output type=local,dest=$(OUTPUT_DIR) \
 		-f $(DOCKERFILE_ANDROID) \
 		.; \
-	chmod +x $(OUTPUT_DIR)/peakbot-$$v-android-arm64; \
-	echo "✅ $(OUTPUT_DIR)/peakbot-$$v-android-arm64"; \
-	ls -lh $(OUTPUT_DIR)/peakbot-$$v-android-arm64
+	chmod +x $(OUTPUT_DIR)/peakbot-$(RELEASE_VERSION)-android-arm64; \
+	echo "✅ $(OUTPUT_DIR)/peakbot-$(RELEASE_VERSION)-android-arm64"; \
+	ls -lh $(OUTPUT_DIR)/peakbot-$(RELEASE_VERSION)-android-arm64
 
-## release-publish: Create Gitea release and upload binaries
+## release-publish: Create a DRAFT Gitea release (name = body source = the
+##              version), upload all 7 assets, then finalize (draft:false).
+##              Any failure DELETEs the draft. Requires TAG, GITEA_TOKEN and
+##              release-notes/<TAG>.md; GITEA_URL/OWNER/REPO default to the
+##              origin remote, OUTPUT_DIR stays overridable.
 release-publish:
 	@set -eu; \
-	if [ -z "$${GITEA_TOKEN:-}" ]; then \
+	if [ -z "$(TAG)" ]; then \
+	  echo "❌ TAG is not set — pass TAG=<version> (expected: $(RELEASE_VERSION))"; exit 1; \
+	fi; \
+	v="$(TAG)"; \
+	if [ -z "$(GITEA_TOKEN)" ]; then \
 	  echo "❌ GITEA_TOKEN is not set. Generate one at $(GITEA_URL)/user/settings/applications"; exit 1; \
 	fi; \
 	command -v jq >/dev/null   || { echo "❌ 'jq' is required";   exit 1; }; \
 	command -v curl >/dev/null || { echo "❌ 'curl' is required"; exit 1; }; \
-	if [ ! -f .release-version ]; then echo "❌ run release-bump first"; exit 1; fi; \
-	v=$$(cat .release-version); \
-	linux_asset="$(OUTPUT_DIR)/peakbot-$$v-linux-amd64"; \
-	win_asset="$(OUTPUT_DIR)/peakbot-$$v-windows-amd64.exe"; \
-	macos_asset="$(OUTPUT_DIR)/peakbot-$$v-macos-universal2"; \
-	android_asset="$(OUTPUT_DIR)/peakbot-$$v-android-arm64"; \
-	[ -f "$$linux_asset" ] || { echo "❌ Missing $$linux_asset"; exit 1; }; \
-	[ -f "$$win_asset"   ] || { echo "❌ Missing $$win_asset";   exit 1; }; \
-	[ -f "$$macos_asset" ] || { echo "❌ Missing $$macos_asset"; exit 1; }; \
-	[ -f "$$android_asset" ] || { echo "❌ Missing $$android_asset"; exit 1; }; \
-	api="$(GITEA_URL)/api/v1/repos/$(OWNER)/$(REPO)"; \
-	echo "🚀 Creating Gitea release $$v at $$api/releases ..."; \
-	notes="$${NOTES:-release-notes/$$v.md}"; \
-	if [ -f "$$notes" ]; then \
-	  echo "📝 Using release notes from $$notes"; \
-	  body=$$(jq -nc --arg tag "$$v" --arg name "Release $$v" --rawfile bd "$$notes" \
-	    '{tag_name:$$tag, target_commitish:"", name:$$name, body:$$bd, draft:false, prerelease:false}'); \
-	else \
-	  echo "ℹ️  No release-notes file (looked for $$notes); using default body"; \
-	  body=$$(jq -nc --arg tag "$$v" --arg name "Release $$v" --arg bd "Release $$v" \
-	    '{tag_name:$$tag, target_commitish:"", name:$$name, body:$$bd, draft:false, prerelease:false}'); \
+	notes="release-notes/$$v.md"; \
+	if [ ! -f "$$notes" ]; then \
+	  echo "❌ Release notes missing: $$notes (no fallback)"; exit 1; \
 	fi; \
+	assets=" \
+	  $(OUTPUT_DIR)/peakbot-$$v-linux-amd64 \
+	  $(OUTPUT_DIR)/peakbot-$$v-windows-amd64.exe \
+	  $(OUTPUT_DIR)/peakbot-$$v-macos-universal2 \
+	  $(OUTPUT_DIR)/peakbot-$$v-android-arm64 \
+	  $(OUTPUT_DIR)/desktop/PeakBot-Desktop-$$v-linux-x86_64.AppImage \
+	  $(OUTPUT_DIR)/desktop/PeakBot-Desktop-$$v-macos-universal.zip \
+	  $(OUTPUT_DIR)/desktop/PeakBot-Desktop-$$v-windows-x86_64.exe "; \
+	for f in $$assets; do \
+	  if [ ! -f "$$f" ]; then \
+	    echo "❌ Missing release asset: $$f"; exit 1; \
+	  fi; \
+	done; \
+	api="$(GITEA_URL)/api/v1/repos/$(OWNER)/$(REPO)"; \
+	echo "🚀 Creating draft Gitea release $$v at $$api/releases ..."; \
+	body=$$(jq -nc --arg tag "$$v" --arg name "$$v" --rawfile bd "$$notes" \
+	  '{tag_name:$$tag, target_commitish:"", name:$$name, body:$$bd, draft:true}'); \
 	resp=$$(curl -sS -X POST "$$api/releases" \
-	  -H "Authorization: token $$GITEA_TOKEN" \
+	  -H "Authorization: token $(GITEA_TOKEN)" \
 	  -H "Content-Type: application/json" \
 	  -d "$$body"); \
 	rid=$$(echo "$$resp" | jq -r '.id // empty'); \
 	if [ -z "$$rid" ]; then \
-	  echo "❌ Failed to create release. Response:"; echo "$$resp" | jq .; exit 1; \
+	  echo "❌ Failed to create draft release. Response:"; echo "$$resp" | jq .; exit 1; \
 	fi; \
-	echo "✅ Release id=$$rid"; \
-	for f in "$$linux_asset" "$$win_asset" "$$macos_asset" "$$android_asset"; do \
+	echo "✅ Draft release id=$$rid"; \
+	trap 'curl -sS -X DELETE "$$api/releases/$$rid" -H "Authorization: token $(GITEA_TOKEN)" >/dev/null 2>&1 || true; echo "🗑️  Deleted draft release $$rid (publish failed)"' EXIT; \
+	for f in $$assets; do \
 	  name=$$(basename "$$f"); \
 	  echo "⬆️  Uploading $$name ..."; \
 	  up=$$(curl -sS -X POST "$$api/releases/$$rid/assets?name=$$name" \
-	    -H "Authorization: token $$GITEA_TOKEN" \
+	    -H "Authorization: token $(GITEA_TOKEN)" \
 	    -F "attachment=@$$f"); \
 	  url=$$(echo "$$up" | jq -r '.browser_download_url // empty'); \
 	  if [ -z "$$url" ]; then \
@@ -400,7 +416,15 @@ release-publish:
 	  fi; \
 	  echo "    → $$url"; \
 	done; \
-	rm -f .release-version; \
+	echo "📢 Finalizing release $$v (draft → published)..."; \
+	fresp=$$(curl -sS -X PATCH "$$api/releases/$$rid" \
+	  -H "Authorization: token $(GITEA_TOKEN)" \
+	  -H "Content-Type: application/json" \
+	  -d '{"draft":false}'); \
+	if ! echo "$$fresp" | jq -e '.draft == false' >/dev/null 2>&1; then \
+	  echo "❌ Failed to finalize release. Response:"; echo "$$fresp" | jq .; exit 1; \
+	fi; \
+	trap - EXIT; \
 	echo "✅ Published $$v to $(GITEA_URL)/$(OWNER)/$(REPO)/releases/tag/$$v"
 
 ## help: Show this help
@@ -413,20 +437,17 @@ help:
 	@echo "Targets:"
 	@awk 'BEGIN {FS = ":[[:space:]]*"} /^## / {sub(/^## /,""); printf "  %-22s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 	@echo ""
-	@echo "Release usage:"
-	@echo "  export GITEA_TOKEN=...                      # required"
-	@echo "  make release                                # prompts for version"
-	@echo "  make release VERSION=0.2.0                  # non-interactive"
-	@echo "  make release VERSION=0.2.0 ALLOW_DIRTY=1    # bypass clean tree check"
-	@echo "  make release VERSION=0.2.0 NOTES=path/to/notes.md  # custom notes file"
+	@echo "Release usage (bump → PR → merge → tag; CI runs 'make release TAG=<v>'):"
+	@echo "  make release-bump VERSION=0.2.0   # cut release/0.2.0 from origin/master, bump, promote notes, push — open a PR"
+	@echo "  make release-tag                  # after the PR merges: annotated tag from release-notes/<v>.md + push"
+	@echo "  make release TAG=0.2.0            # full pipeline: release-check, build all 7 assets, publish to Gitea"
+	@echo "  make release TAG=0.2.0 PRUNE=1    # as above, pruning the container builder between platforms"
+	@echo "  GITEA_TOKEN                       # required for release-publish (env var or make variable)"
 	@echo ""
-	@echo "Release notes:"
-	@echo "  Default: release-notes/<v>.md (if present) is used as the Gitea body + git tag message."
-	@echo "  Override: pass NOTES=<path> to use any markdown file."
-	@echo "  Missing:  pipeline still ships, body falls back to \"Release <v>\"."
+	@echo "Release notes: release-notes/<v>.md is required — Gitea release body + git tag message (no fallback)."
 	@echo ""
 	@echo "Environment:"
 	@echo "  CONTAINER_BUILDER  Container runtime (default: podman or docker)"
-	@echo "  GITEA_TOKEN        Gitea personal access token (required for release)"
+	@echo "  GITEA_TOKEN        Gitea personal access token (required for release-publish)"
 	@echo "  GITEA_URL/OWNER/REPO  Auto-derived from origin remote — override if needed"
-	@echo "  NOTES              Path to a markdown release-notes file (default: release-notes/<v>.md)"
+	@echo "  PRUNE              1 = prune the container builder between platform builds in the release recipe"

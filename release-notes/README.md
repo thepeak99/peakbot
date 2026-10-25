@@ -6,26 +6,31 @@ both the Gitea release page and the annotated git tag.
 ## Convention
 
 - One file per shipped version: `release-notes/<v>.md` (e.g. `0.3.0.md`).
-- File version `<v>` must match the `make release VERSION=<v>` value.
+- File version `<v>` must match the tag name: `make release-bump VERSION=<v>`
+  bumps the crates; `make release-tag` (or `make release TAG=<v>`) tags it.
 - Plain Markdown — Gitea renders it on the release page and `git show <v>`
   prints it from the tag object.
-- Commit the notes file *before* running `make release`, ideally in the
-  same PR / branch that contains the changes being shipped.
+- Notes content lives in `release-notes/current.md` until `make release-bump`
+  promotes it to `release-notes/<v>.md` on the `release/<v>` branch; commit
+  notes changes with that release branch (PR), before the merge.
 
-## Resolution order in `make release`
+## Release body
 
-1. `NOTES=<path>` on the make CLI overrides everything.
-2. Otherwise: `release-notes/<v>.md` if present.
-3. Otherwise: literal fallback `Release <v>` (pipeline never blocks).
+There is no resolution order: `release-notes/<v>.md` is **required**
+(`release-check` exits non-zero with the missing notes file named). The `NOTES=`
+override and the `Release <v>` fallback have been removed — without the notes
+file, no release can be tagged.
 
 ## Example
 
 ```bash
-$EDITOR release-notes/0.3.0.md
-git add release-notes/0.3.0.md
-git commit -m "docs: 0.3.0 release notes"
-make release VERSION=0.3.0
+$EDITOR release-notes/current.md      # entry for 0.3.0 under "## Changes"
+make release-bump VERSION=0.3.0       # branch + bump + promote + push
+# open a PR; wait for ci.yml green; merge
+make release-tag                      # tag 0.3.0, message = release-notes/0.3.0.md
+                                      # the push triggers release.yml, which builds
+                                      # and publishes all 7 assets
 ```
 
-See `agents.md` § *Release pipeline → Release notes* for the full
+See `agents.md` § *Release notes workflow* and *Release pipeline* for the full
 walkthrough.

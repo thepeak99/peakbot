@@ -392,16 +392,23 @@ Every new task gets its own git worktree — never implement a task directly in 
 
 ### Release notes workflow (mandatory)
 
-`current.md` is the working draft for the *next* release; the release pipeline reads `release-notes/<version>.md`, never `current.md`. Before `make release`:
+`current.md` is the working draft for the *next* release; the tag/release body comes from `release-notes/<version>.md`, never `current.md`. Promotion is not hand-rolled — `make release-bump` does it:
 
 ```bash
-git mv release-notes/current.md release-notes/0.3.0.md   # promote (strip the working-draft header)
-git commit -m "docs: 0.3.0 release notes"
-# recreate an empty current.md (header + "## Changes"), commit it
-make release VERSION=0.3.0                                # picks up release-notes/0.3.0.md
+# "do a release" (human or agent): branch + bump + notes promotion + push
+make release-bump VERSION=0.3.0
+#   cuts release/0.3.0 from origin/master; bumps Cargo.toml + Cargo.lock and
+#   desktop/Cargo.toml + desktop/Cargo.lock; promotes current.md ->
+#   release-notes/0.3.0.md (working-draft header stripped, content from the
+#   first `## ` heading); writes a fresh current.md; commits + pushes the branch
+# open a PR; wait for ci.yml green; merge
+# on up-to-date master (HEAD == origin/master, notes file committed):
+make release-tag
+#   annotated tag 0.3.0, message = release-notes/0.3.0.md, pushed — the tag
+#   push triggers .gitea/workflows/release.yml
 ```
 
-Skipping the promotion ships the release with a fallback body (`Release <version>`) and loses the changelog.
+The notes file is **required** — `release-check` fails the run when `release-notes/<v>.md` is missing. There is no `Release <v>` fallback.
 
 ### Pre-commit gate
 
@@ -432,7 +439,7 @@ PeakBot ships as a single static binary for **Linux x86_64**, **Windows x86_64**
 | File | Builder | Notes |
 |------|---------|-------|
 | `Dockerfile.linux` | `rust:1.88-bookworm` | native; dummy-main caching trick |
-| `Dockerfile.windows` | `rust:1.88-bookworm` + mingw | cross via gcc-mingw |
+| `Dockerfile.windows` | `rust:1.91-bookworm` + clang/lld/llvm + cargo-xwin (MSVC SDK, static CRT) | cross to `x86_64-pc-windows-msvc` — the ONE Windows build: server asset AND the desktop sidecar are the same build (cache hit in the release pipeline) |
 | `Dockerfile.macos` | `cargo-zigbuild` | zig + macOS SDK; universal2 fat binary |
 | `Dockerfile.android` | `rust:1.91-bookworm` + NDK r27c | `cargo-ndk`; API level via `CARGO_NDK_PLATFORM` (24), **not** `-p` (collides with cargo `--package`); works clean because PeakBot is pure rustls/ring |
 
@@ -440,18 +447,21 @@ All four end `FROM scratch` with `--output type=local,dest=./output`. **Gotcha:*
 
 ### Make targets
 
-`make help` for the full list. Highlights: `make` / `make build` (all four platforms), `make build-{linux,windows,macos,android}`, `make clean`, `make web` (SPA bundle for the default web mode), `make dev` (backend under cargo-watch `:8080` + Vite HMR `:5173`; requires cargo-watch + Node 22+). Non-release builds produce unversioned filenames; the release flow injects semver via `--build-arg VERSION`.
+`make help` for the full list. Highlights: `make` / `make build` (all four platforms), `make build-{linux,windows,macos,android}`, `make clean`, `make web` (SPA bundle for the default web mode), `make dev` (backend under cargo-watch `:8080` + Vite HMR `:5173`; requires cargo-watch + Node 22+). Release: `make release-bump VERSION=X.Y.Z` (cut branch, bump versions, promote notes, push), `make release-tag` (tag from up-to-date master, push → CI publishes), `make release TAG=X.Y.Z` (local re-run of the CI job). Non-release builds produce unversioned filenames; the release flow injects semver via `--build-arg VERSION`.
 
 ### Release pipeline
 
-`make release` runs: `release-bump` (validate semver, refuse dirty tree unless `ALLOW_DIRTY=1`, bump `Cargo.toml`+lock, commit) → `release-tag` (annotated bare-semver tag, push; handles protected master by cutting a `release/X.Y.Z` branch + PR automatically) → `release-build-{linux,windows,macos,android}` → `release-publish` (Gitea release via REST + asset upload). In-flight state in `.release-version` (gitignored); each phase re-runnable — if publish dies mid-upload, just `make release-publish`.
+Fully CI-driven: `release-bump` branch → PR green → merged → `make release-tag` on up-to-date master (HEAD == origin/master) pushes the annotated tag → the push triggers `.gitea/workflows/release.yml` (runner `dind`, Alpine host driving the host docker daemon — no job container, 180-min timeout, secret `RELEASE_TOKEN` → env `GITEA_TOKEN`) which runs:
 
 ```bash
-export GITEA_TOKEN=...                    # required
-make release VERSION=0.2.0                # GITEA_URL/OWNER/REPO derived from origin
+make release TAG=0.3.0 PRUNE=1 CONTAINER_BUILDER=docker GITEA_URL=… OWNER=ai-bots REPO=peakbot
 ```
 
-Release body + tag message come from `NOTES=<path>`, else `release-notes/<v>.md`, else the literal `Release <v>`. The notes file is read via `jq --rawfile` — any Markdown is safe. Host needs: git, cargo, podman/docker, curl, jq, awk. To fully restart a failed release: delete local+remote tag, reset the chore commit, `rm .release-version`.
+`make release` = `release-check` (TAG == Cargo version == desktop version, `release-notes/<TAG>.md` exists) → per platform: `release-build-<p>` → `desktop-<p>` → prune, for linux, macos, windows → `release-build-android` → `release-publish`. Sequential by design — never run with `-j`.
+
+`release-publish` asserts all 7 assets exist **before** any API call — server: `peakbot-<v>-{linux-amd64, windows-amd64.exe, macos-universal2, android-arm64}`; desktop: `PeakBot-Desktop-<v>-{linux-x86_64.AppImage, macos-universal.zip, windows-x86_64.exe}` — then creates a DRAFT release, uploads all 7, and publishes; any failure deletes the draft, so a release is complete or absent, never partial.
+
+Release body + tag message = `release-notes/<v>.md` (read via `jq --rawfile` — any Markdown is safe). No `NOTES=` override, no fallback. Local re-run of the CI job: `make release TAG=X.Y.Z GITEA_TOKEN=…` (if the tag already went out, delete it locally + from origin first). Host needs: git, cargo, podman/docker, curl, jq, awk.
 
 ## Vision (image input)
 
@@ -597,7 +607,12 @@ Where it lives: `src/pipeline/{delegate_tool,handoff}.rs`, `build_sub_agent` in 
 
 ## CI (Gitea Actions)
 
-Workflow: `.gitea/workflows/ci.yml` — two jobs on runner `shinpachi` (label `dind`), `rust:1.95` container. Job `ci` = Node 22 frontend gate (`web/`: `npm ci` + lint/typecheck/test/build) → `cargo fmt --all -- --check` → `cargo clippy --all-targets --locked -- -D warnings` → `cargo test --workspace --locked`. Job `desktop` = the full desktop workspace (`--manifest-path desktop/Cargo.toml --workspace`) with the same fmt/clippy/test trio — after apt-installing the Tauri webkit deps (same set as `Dockerfile.desktop-linux`) and `touch`ing a placeholder sidecar binary (tauri-build requires `bundle.externalBin` to exist). No node/web build there: `desktop/ui` is committed static files. (Reproduce locally with exactly those commands; autofix with `cargo fmt --all` + `cargo clippy --fix --allow-dirty [--tests]`.)
+Two workflows on runner `shinpachi` (label `dind`):
+
+- **`ci.yml`** — `rust:1.95` container. Job `ci` = release contract tests (`sh tests/release.sh`, hermetic — Makefile targets + `release.yml`) → Node 22 frontend gate (`web/`: `npm ci` + lint/typecheck/test/build) → `cargo fmt --all -- --check` → `cargo clippy --all-targets --locked -- -D warnings` → `cargo test --workspace --locked`. Job `desktop` = the full desktop workspace (`--manifest-path desktop/Cargo.toml --workspace`) with the same fmt/clippy/test trio — after apt-installing the Tauri webkit deps (same set as `Dockerfile.desktop-linux`) and `touch`ing a placeholder sidecar binary (tauri-build requires `bundle.externalBin` to exist) — plus the Windows portable-exe static tests (`desktop/scripts/test-build-desktop-windows.sh`). No node/web build there: `desktop/ui` is committed static files.
+- **`release.yml`** — on tag push (`push: tags: ['*']`), on the `dind` runner (Alpine host driving the host docker daemon, no job container, `timeout-minutes: 180`, secret `RELEASE_TOKEN` → env `GITEA_TOKEN`): pure-git checkout, tool check, then `make release TAG=$GITHUB_REF_NAME PRUNE=1 CONTAINER_BUILDER=docker GITEA_URL=… OWNER=… REPO=…`.
+
+(Reproduce `ci` locally with exactly those commands; autofix with `cargo fmt --all` + `cargo clippy --fix --allow-dirty [--tests]`.)
 
 ### Inspecting a failed run
 

@@ -28,6 +28,16 @@ jobs:
             "https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git" \
             "$GITHUB_SHA"
           git checkout --detach FETCH_HEAD
+      # Release-pipeline contract tests (Makefile targets + .gitea/workflows/
+      # release.yml): fast, no docker builds — run before the cargo gate.
+      # rust:1.95 lacks jq. The suite sets its own git identity in the
+      # throwaway clones.
+      - name: Release pipeline contract tests
+        run: |
+          set -eu
+          apt-get update
+          apt-get install -y --no-install-recommends jq
+          sh tests/release.sh
       - name: Install rustfmt + clippy
         run: rustup component add rustfmt clippy
       # Frontend gate first so `web/dist/` is populated before the Rust
