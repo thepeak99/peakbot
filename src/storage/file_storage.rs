@@ -19,11 +19,19 @@ use uuid::Uuid;
 /// skipped by `list`'s scan (it is not a `<uuid>.json`).
 const INDEX_FILE: &str = "index.json";
 
+/// Index schema version. Old indexes lack the field, so they fail to
+/// parse in `read_index` and fold into a rebuild — the one-time heal for
+/// indexes that were fingerprint-blessed while missing conversations.
+const INDEX_VERSION: u32 = 1;
+
 /// On-disk shape of `index.json`. Fingerprint and entries live in ONE
 /// document so a crash mid-write can never pair a fresh fingerprint with a
 /// stale entry map — a failed parse simply folds into a rebuild.
 #[derive(Debug, Serialize, Deserialize)]
 struct ConversationIndex {
+    /// Schema version; old indexes lack it, so they are rebuilt (see
+    /// `INDEX_VERSION`).
+    version: u32,
     /// sha256 hex of the sorted conversation-file names. Names only, never
     /// content or mtime: in-band updates arrive through
     /// `index_upsert`/`index_remove` under `index_lock`, and hashing content
@@ -116,26 +124,37 @@ impl FileStorage {
         !name.starts_with('.') && name.ends_with(".json") && name != INDEX_FILE
     }
 
-    /// sha256 hex of the sorted conversation-file names (cheap `readdir`, no
-    /// parsing). The index is trusted while this matches the fingerprint it
-    /// recorded; corrupt or duplicate-id files are part of the set, so the
-    /// signal converges where a file COUNT never could.
-    fn dir_fingerprint(&self) -> String {
-        let mut names: Vec<String> = match fs::read_dir(&self.storage_dir) {
-            Ok(entries) => entries
-                .flatten()
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| Self::is_conversation_file(n))
-                .collect(),
-            Err(_) => Vec::new(),
-        };
+    /// sha256 hex of the sorted conversation-file names (no parsing). The
+    /// index is trusted while this matches the fingerprint it recorded;
+    /// corrupt or duplicate-id files are part of the set, so the signal
+    /// converges where a file COUNT never could.
+    fn fingerprint_names(names: &mut [String]) -> String {
         names.sort();
         let mut h = sha2::Sha256::new();
-        for n in &names {
+        for n in names {
             h.update(n.as_bytes());
             h.update(b"\n");
         }
         format!("{:x}", h.finalize())
+    }
+
+    /// Names of the `<uuid>.json` files currently in the storage directory
+    /// (cheap `readdir`, no parsing).
+    fn conversation_file_names(&self) -> Vec<String> {
+        fs::read_dir(&self.storage_dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| Self::is_conversation_file(n))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Fingerprint of the directory's current conversation-file set.
+    fn dir_fingerprint(&self) -> String {
+        Self::fingerprint_names(&mut self.conversation_file_names())
     }
 
     /// Read the summary index from disk. Returns `None` if it is absent or
@@ -214,14 +233,9 @@ impl FileStorage {
         // The fingerprint describes the set as scanned, including the files
         // that failed to load — otherwise they would re-trigger a rebuild on
         // every single list().
-        names.sort();
-        let mut h = sha2::Sha256::new();
-        for n in &names {
-            h.update(n.as_bytes());
-            h.update(b"\n");
-        }
         let index = ConversationIndex {
-            fingerprint: format!("{:x}", h.finalize()),
+            version: INDEX_VERSION,
+            fingerprint: Self::fingerprint_names(&mut names),
             entries,
         };
 
@@ -252,6 +266,7 @@ impl FileStorage {
                 // directory hash, so list() detects the missing entries and
                 // rebuilds lazily.
                 let seeded = ConversationIndex {
+                    version: INDEX_VERSION,
                     fingerprint: String::new(),
                     entries: HashMap::from([(
                         conversation.id,
@@ -264,7 +279,16 @@ impl FileStorage {
         index
             .entries
             .insert(conversation.id, ConversationSummary::from(conversation));
-        index.fingerprint = self.dir_fingerprint();
+        // save() wrote the file before calling us, so the index is
+        // trustworthy only if its fingerprint describes the directory
+        // WITHOUT this file; otherwise leave it stale and let list()
+        // rebuild.
+        let mut names = self.conversation_file_names();
+        let file = format!("{}.json", conversation.id);
+        let mut before: Vec<String> = names.iter().filter(|n| **n != file).cloned().collect();
+        if Self::fingerprint_names(&mut before) == index.fingerprint {
+            index.fingerprint = Self::fingerprint_names(&mut names);
+        }
         self.write_index(&index)
     }
 
@@ -277,7 +301,16 @@ impl FileStorage {
             None => return self.rebuild_index().map(|_| ()),
         };
         index.entries.remove(&id);
-        index.fingerprint = self.dir_fingerprint();
+        // delete() removed the file before calling us, so the index is
+        // trustworthy only if its fingerprint describes the directory WITH
+        // this file; otherwise leave it stale and let list() rebuild.
+        let mut names = self.conversation_file_names();
+        let file = format!("{}.json", id);
+        let mut before = names.clone();
+        before.push(file);
+        if Self::fingerprint_names(&mut before) == index.fingerprint {
+            index.fingerprint = Self::fingerprint_names(&mut names);
+        }
         self.write_index(&index)
     }
 }
@@ -616,5 +649,195 @@ mod tests {
             ids.contains(&a.id) && ids.contains(&b.id),
             "a seeded index must heal on the next list, not look fresh"
         );
+    }
+
+    // ── stale-conversation-index regression (upgrade path) ─────────────────
+    //
+    // A pre-0.24 store has conversation files but NO index.json. The first
+    // save seeds a 1-entry index with an EMPTY fingerprint so the next
+    // list() rebuilds. But a SECOND index-changing operation (a second
+    // auto-save upsert, or a delete) reads that seed and REFRESHES the
+    // fingerprint to the live directory hash — producing a "trusted" index
+    // that is missing every pre-existing conversation. list() then serves
+    // only the indexed entries forever (real-world: 7 of 2779 visible).
+
+    /// Write a conversation file straight to the storage dir, simulating a
+    /// pre-0.24 store where files exist before any index.json was written.
+    fn write_preexisting_file(dir: &Path, conv: &Conversation) {
+        let json = serde_json::to_string_pretty(conv).unwrap();
+        fs::write(dir.join(format!("{}.json", conv.id)), json).unwrap();
+    }
+
+    /// 3 pre-existing conversation files, no index.json; then a NEW
+    /// conversation is saved twice (two upserts, as auto-save does). The
+    /// second upsert must not "bless" the seeded 1-entry index with a live
+    /// fingerprint, or the pre-existing conversations vanish from list().
+    #[test]
+    fn list_includes_preexisting_conversations_after_two_saves_without_index() {
+        let dir = TempDir::new().unwrap();
+        let store = FileStorage::new(dir.path().to_path_buf()).unwrap();
+
+        // Simulate upgrading a store from before the index existed: N
+        // conversation files on disk, no index.json.
+        let preexisting: Vec<Conversation> = (0..3).map(|i| conv(&format!("pre {i}"))).collect();
+        for c in &preexisting {
+            write_preexisting_file(dir.path(), c);
+        }
+        assert!(!store.index_path().exists());
+
+        // Auto-save persists the same in-memory conversation repeatedly.
+        let fresh = conv("fresh");
+        store.save(&fresh).unwrap();
+        store.save(&fresh).unwrap();
+
+        let ids: Vec<Uuid> = store.list().unwrap().iter().map(|s| s.id).collect();
+        assert_eq!(
+            ids.len(),
+            4,
+            "list must return the 3 pre-existing conversations plus the \
+             newly saved one; the seeded index must not be fingerprint-blessed \
+             by the second upsert — got {ids:?}"
+        );
+        for c in &preexisting {
+            assert!(
+                ids.contains(&c.id),
+                "pre-existing conversation {} must be visible",
+                c.id
+            );
+        }
+        assert!(
+            ids.contains(&fresh.id),
+            "newly saved conversation must be visible"
+        );
+
+        // Heal check: once the file set changes out-of-band, the index must
+        // rebuild and surface ALL conversations (the files are authoritative).
+        let extra = conv("extra");
+        write_preexisting_file(dir.path(), &extra);
+        let ids: Vec<Uuid> = store.list().unwrap().iter().map(|s| s.id).collect();
+        assert_eq!(
+            ids.len(),
+            5,
+            "after an out-of-band change a rebuild must restore every file"
+        );
+        assert!(ids.contains(&extra.id));
+    }
+
+    /// Same upgrade scenario, but the second index-changing operation is a
+    /// DELETE of a pre-existing conversation (the index_remove path shares
+    /// the fingerprint-refresh pattern). The removed one drops out, but the
+    /// rest of the store must stay visible.
+    #[test]
+    fn list_includes_preexisting_conversations_after_save_and_delete_without_index() {
+        let dir = TempDir::new().unwrap();
+        let store = FileStorage::new(dir.path().to_path_buf()).unwrap();
+
+        let preexisting: Vec<Conversation> = (0..3).map(|i| conv(&format!("pre {i}"))).collect();
+        for c in &preexisting {
+            write_preexisting_file(dir.path(), c);
+        }
+        assert!(!store.index_path().exists());
+
+        let fresh = conv("fresh");
+        store.save(&fresh).unwrap();
+
+        // Delete one of the pre-existing conversations (file exists, so
+        // delete succeeds and index_remove runs).
+        store.delete(preexisting[0].id).unwrap();
+
+        let ids: Vec<Uuid> = store.list().unwrap().iter().map(|s| s.id).collect();
+        assert_eq!(
+            ids.len(),
+            3,
+            "list must return the 2 surviving pre-existing conversations \
+             plus the newly saved one; index_remove must not fingerprint-bless \
+             the seeded index — got {ids:?}"
+        );
+        assert!(
+            !ids.contains(&preexisting[0].id),
+            "deleted conversation must be gone"
+        );
+        assert!(
+            ids.contains(&preexisting[1].id) && ids.contains(&preexisting[2].id),
+            "surviving pre-existing conversations must be visible"
+        );
+        assert!(
+            ids.contains(&fresh.id),
+            "newly saved conversation must be visible"
+        );
+    }
+
+    /// Guard for the normal (index fully built) path: a second upsert
+    /// refreshing the fingerprint of a COMPLETE index is correct behaviour
+    /// and must keep working — two saves, list returns everything.
+    #[test]
+    fn list_returns_everything_after_two_saves_with_complete_index() {
+        let dir = TempDir::new().unwrap();
+        let store = FileStorage::new(dir.path().to_path_buf()).unwrap();
+
+        let a = conv("a");
+        store.save(&a).unwrap();
+        assert_eq!(
+            store.list().unwrap().len(),
+            1,
+            "index must be built by the first list"
+        );
+
+        // A second upsert over the complete index (auto-save of `a` again,
+        // plus a brand-new conversation).
+        store.save(&a).unwrap();
+        let b = conv("b");
+        store.save(&b).unwrap();
+
+        let ids: Vec<Uuid> = store.list().unwrap().iter().map(|s| s.id).collect();
+        assert_eq!(
+            ids.len(),
+            2,
+            "with a complete index, repeated saves must not lose entries"
+        );
+        assert!(ids.contains(&a.id) && ids.contains(&b.id));
+    }
+
+    /// A pre-fix install may carry a "blessed" index: a fingerprint that
+    /// matches the live directory, yet entries missing most conversations.
+    /// The file set alone cannot detect that — so old-format indexes (no
+    /// `version` field) are discarded and rebuilt from the files.
+    #[test]
+    fn list_rebuilds_blessed_index_from_old_format() {
+        let dir = TempDir::new().unwrap();
+        let store = FileStorage::new(dir.path().to_path_buf()).unwrap();
+
+        let preexisting: Vec<Conversation> = (0..3).map(|i| conv(&format!("pre {i}"))).collect();
+        for c in &preexisting {
+            write_preexisting_file(dir.path(), c);
+        }
+
+        let fresh = conv("fresh");
+        store.save(&fresh).unwrap();
+
+        // Hand-write an old-format index (no `version` key) that is
+        // fingerprint-blessed but carries only the seeded entry — exactly
+        // what the pre-fix upgrade path produced on disk.
+        let poisoned = serde_json::json!({
+            "fingerprint": store.dir_fingerprint(),
+            "entries": {
+                fresh.id.to_string(): serde_json::to_value(ConversationSummary::from(&fresh)).unwrap(),
+            },
+        });
+        fs::write(store.index_path(), poisoned.to_string()).unwrap();
+
+        let ids: Vec<Uuid> = store.list().unwrap().iter().map(|s| s.id).collect();
+        assert_eq!(
+            ids.len(),
+            4,
+            "an old-format blessed index must be discarded and rebuilt — got {ids:?}"
+        );
+        for c in &preexisting {
+            assert!(
+                ids.contains(&c.id),
+                "pre-existing conversation {} must be visible",
+                c.id
+            );
+        }
     }
 }
