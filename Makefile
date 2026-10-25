@@ -12,7 +12,7 @@ DOCKERFILE_ANDROID := Dockerfile.android
 OUTPUT_DIR         := output
 # RELEASE_VERSION — the version being released, straight from the root
 # Cargo.toml [package] section (single source of truth — no state file).
-RELEASE_VERSION := $(shell awk '/^\[package\]/{p=1} p && /^version[[:space:]]*=/{gsub(/[" ]/,"","$$3"); print $$3; exit}' Cargo.toml)
+RELEASE_VERSION := $(shell awk '/^\[package\]/{p=1} p && /^version[[:space:]]*=/{gsub(/[" ]/,"",$$3); print $$3; exit}' Cargo.toml)
 # Default (unversioned) artifact names. Release builds bake RELEASE_VERSION
 # into the filename via --build-arg VERSION.
 LINUX_BIN          := peakbot-linux-amd64

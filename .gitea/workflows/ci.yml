@@ -30,15 +30,13 @@ jobs:
           git checkout --detach FETCH_HEAD
       # Release-pipeline contract tests (Makefile targets + .gitea/workflows/
       # release.yml): fast, no docker builds — run before the cargo gate.
-      # rust:1.95 lacks jq and ships mawk as awk; the Makefile's
-      # RELEASE_VERSION awk is gawk-flavoured, so install both (gawk retakes
-      # the awk alternative slot). The suite sets its own git identity in
-      # the throwaway clones.
+      # rust:1.95 lacks jq. The suite sets its own git identity in the
+      # throwaway clones.
       - name: Release pipeline contract tests
         run: |
           set -eu
           apt-get update
-          apt-get install -y --no-install-recommends jq gawk
+          apt-get install -y --no-install-recommends jq
           sh tests/release.sh
       - name: Install rustfmt + clippy
         run: rustup component add rustfmt clippy
