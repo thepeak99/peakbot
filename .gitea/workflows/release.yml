@@ -25,11 +25,12 @@ jobs:
             "https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git" \
             "$GITHUB_SHA"
           git checkout --detach FETCH_HEAD
-      - name: Tool check (no installs — add missing tools to the runner image)
+      - name: Check required tools and release token (no installs — add missing tools to the runner image)
         run: |
           for t in make curl jq docker git awk; do
             command -v "$t" >/dev/null || { echo "missing tool on runner: $t (add it to the runner image)"; exit 1; }
           done
+          [ -n "$GITEA_TOKEN" ] || { echo "RELEASE_TOKEN secret missing/empty" >&2; exit 1; }
       - name: Release (check, build 7 assets, publish)
         run: |
           # No `origin` remote after the pure-git checkout — the Makefile
