@@ -593,9 +593,13 @@ impl RebuildContext {
 
 /// How a reload re-binds the session's `Bound` (spec §6.7 step 6).
 enum Rebind<'a> {
-    /// A session verb (`/cd`, `/new`, `/model`): keep the bound while the
-    /// conversation has turns, re-resolve it while it has none.
+    /// `/new`, `/model`: keep the bound while the conversation has turns,
+    /// re-resolve it while it has none.
     Session,
+    /// `/cd`: rebind for the target tree, ignoring the turn count — `/cd`
+    /// always starts a fresh conversation, so the target repo's agent is
+    /// adopted (the locked rule lives in `selection::rebind_for_cd`).
+    ChangeCwd,
     /// `/load`: a new binding from the loaded conversation's saved names
     /// (§6.6 `resolve_saved_selection`), including its saved overrides.
     Saved {
@@ -607,8 +611,8 @@ enum Rebind<'a> {
 
 /// Re-read the config + skills for a live session (spec §6.7 steps 1–7) so
 /// edits take effect on a session verb without a restart. `target_cwd` is
-/// the directory the session WILL be in after the verb — `/cd` passes its
-/// target, the other verbs the current session cwd.
+/// the session's cwd — `/new` and `/model` don't move it; `/cd` has its
+/// own seam, [`reload_for_cd`].
 ///
 /// Mutates `ctx` (`skills`, `config`, `bound`) and `sm` (catalog, selection,
 /// visible tabs). It does NOT rebuild the agent — the caller does (step 8).
@@ -621,6 +625,49 @@ pub fn reload_session_config(
     target_cwd: &std::path::Path,
 ) -> Vec<String> {
     reload_config(ctx, sm, target_cwd, Rebind::Session)
+}
+
+/// Re-read the config + skills for a `/cd` to `target_cwd` and rebind with
+/// the `/cd` rule (cd-rebind): the target tree's repo profiles win, so the
+/// bound re-resolves in the target catalog even while the conversation has
+/// turns. Mirrors [`reload_session_config`] (same steps 1–7), rebind step
+/// 6 replaced by `selection::rebind_for_cd`.
+///
+/// When the pair changes, the messages include exactly
+/// `ℹ Switched to <p> › <a> for <target>.`; when the pair is unchanged, no
+/// such line.
+pub fn reload_for_cd(
+    ctx: &mut RebuildContext,
+    sm: &Arc<StateManager>,
+    target_cwd: &std::path::Path,
+) -> Vec<String> {
+    reload_config(ctx, sm, target_cwd, Rebind::ChangeCwd)
+}
+
+/// The model a `/cd` rebuilds on (cd-rebind): the SAME pair keeps the
+/// session's ACTIVE model (the active alias, else the wire id); a CHANGED
+/// pair starts on the new agent's configured model.
+fn model_after_cd(
+    previous: &Bound,
+    ctx: &RebuildContext,
+    sm: &StateManager,
+) -> Result<ResolvedModel, String> {
+    if !previous.same_pair(&ctx.bound) {
+        return Ok(ctx.bound.agent().main.model.clone());
+    }
+    // The active alias is the session's live choice (a `/model` switch
+    // included); the wire id is the fallback when the alias was removed
+    // from config.
+    ctx.config
+        .registry
+        .resolve(&sm.get_model_alias())
+        .or_else(|| {
+            ctx.config
+                .registry
+                .find_by_wire_id(&sm.get_provider_name(), &sm.get_model())
+        })
+        .cloned()
+        .ok_or_else(|| "current model not found in registry".to_string())
 }
 
 fn reload_config(
@@ -683,6 +730,21 @@ fn reload_config(
     let catalog = &ctx.config.catalog;
     let pin = ctx.profile_pin.as_deref();
     match rebind {
+        Rebind::ChangeCwd => {
+            let (bound, warnings) =
+                crate::selection::rebind_for_cd(catalog, &ctx.config.registry, &ctx.bound);
+            // The one user-visible line a /cd switch emits (byte-exact).
+            if !bound.same_pair(&ctx.bound) {
+                messages.push(format!(
+                    "ℹ Switched to {} › {} for {}.",
+                    bound.profile.name,
+                    bound.agent().main.name,
+                    target_cwd.display()
+                ));
+            }
+            messages.extend(warnings);
+            ctx.bound = bound;
+        }
         Rebind::Saved {
             profile,
             agent,
@@ -716,12 +778,9 @@ fn reload_config(
                     // The pair re-resolved: re-validate the overrides
                     // leniently — a vanished entry drops with its ⚠ and the
                     // sub keeps its default (plan §4.4).
-                    let wanted = ctx.bound.selection().subagent_models;
-                    let (bound, rejected) =
-                        bound.with_subagent_models(&ctx.config.registry, &wanted);
-                    for rej in rejected {
-                        messages.push(crate::selection::override_warning(&rej, bound.agent()));
-                    }
+                    let (bound, warnings) =
+                        crate::selection::carry_overrides(bound, &ctx.bound, &ctx.config.registry);
+                    messages.extend(warnings);
                     ctx.bound = bound;
                 }
                 None => {
@@ -2192,13 +2251,20 @@ impl AgentRunner {
     ///    path-aware tools' `session_cwd` flip here, **without** mutating
     ///    the process-global cwd. Two web sessions in different trees
     ///    stay correct because nothing they share is mutated.
-    /// 3. Reload the config for the target tree (spec §6.7). The rebuild
-    ///    derives the prompt from `sm.session_cwd()`, so a later `/model`
-    ///    switch keeps the new cwd (the two axes are independent — #124).
-    /// 4. Rebuild the agent on the *current* model, then reset the
-    ///    conversation like `/new`. Tools snapshot the new
+    /// 3. Reload the config for the target tree (spec §6.7) and rebind
+    ///    with the `/cd` rule: the target tree's repo profiles win
+    ///    (cd-rebind). The rebuild derives the prompt from
+    ///    `sm.session_cwd()`, so a later `/model` switch keeps the new cwd
+    ///    (the two axes are independent — #124).
+    /// 4. Rebuild the agent — on the *current* model when the rebind kept
+    ///    the pair, on the new agent's starting model when it switched —
+    ///    then reset the conversation like `/new`. Tools snapshot the new
     ///    `session_cwd` at agent-build time, so the rebuild order is
     ///    `set_session_cwd` first, rebuild second.
+    ///
+    /// A failed model lookup or rebuild rolls the rebind back (bound +
+    /// published selection): the fresh conversation never ran on the new
+    /// selection, and the old conversation may still hold turns.
     ///
     /// The View pre-validated `path`; we re-validate defensively (config
     /// or the filesystem may have changed under us).
@@ -2218,32 +2284,30 @@ impl AgentRunner {
         if !target.is_dir() {
             return Err(format!("not a directory: {path}"));
         }
-        // Resolve the *current* model — /cd keeps the model, only the cwd
-        // changes. Prefer the active alias; fall back to the wire id.
         let sm = state_manager
             .clone()
             .ok_or_else(|| "state manager required for /cd".to_string())?;
 
-        // Re-read config + skills before resolving so a config edit lands
-        // on this /cd. The prompt is rebuilt again below against the new
-        // cwd; this refreshes the registry + skills the resolve relies on.
-        // `session_cwd` is the **target** dir — we pass it explicitly
-        // because process cwd never moves (no `set_current_dir`), so the
-        // per-repo config and the skill re-scan must read the NEW tree.
-        // Warnings are surfaced after the conversation reset below.
-        let reload_warnings = reload_session_config(ctx, &sm, target);
+        // Re-read config + skills before rebinding so a config edit lands
+        // on this /cd. `session_cwd` is the **target** dir — we pass it
+        // explicitly because process cwd never moves (no `set_current_dir`),
+        // so the per-repo config and the skill re-scan must read the NEW
+        // tree. Warnings are surfaced after the conversation reset below.
+        let previous = ctx.bound.clone();
+        let reload_warnings = reload_for_cd(ctx, &sm, target);
 
-        let resolved = ctx
-            .config
-            .registry
-            .resolve(&sm.get_model_alias())
-            .or_else(|| {
-                ctx.config
-                    .registry
-                    .find_by_wire_id(&sm.get_provider_name(), &sm.get_model())
-            })
-            .ok_or_else(|| "current model not found in registry".to_string())?
-            .clone();
+        // The model the fresh conversation runs on: the session's active
+        // model when the rebind kept the pair, the new agent's starting
+        // model when it switched. A failure rolls the rebind back — the
+        // reload already published the new selection.
+        let resolved = match model_after_cd(&previous, ctx, &sm) {
+            Ok(model) => model,
+            Err(e) => {
+                ctx.bound = previous;
+                publish_bound(&sm, &ctx.bound);
+                return Err(e);
+            }
+        };
 
         // Kill bg processes BEFORE the session-cwd flip so no reader
         // thread straddles it — they were rooted in the old tree anyway
@@ -2261,7 +2325,7 @@ impl AgentRunner {
         // reflect the new directory (welcome was stamped once at boot).
         sm.update_welcome_cwd(target.to_path_buf());
 
-        Self::rebuild_agent(
+        if let Err(e) = Self::rebuild_agent(
             &resolved,
             agent_slot,
             &sm,
@@ -2270,7 +2334,14 @@ impl AgentRunner {
             state_manager,
             ctx,
         )
-        .await?;
+        .await
+        {
+            // The fresh conversation never ran on the new selection — roll
+            // bound + published selection back to the pre-/cd pair.
+            ctx.bound = previous;
+            publish_bound(&sm, &ctx.bound);
+            return Err(e);
+        }
 
         // Reset conversation-scoped state — same path as /new and /model.
         // bg was already killed above (before the chdir); the unified
@@ -8818,6 +8889,57 @@ profiles:
             matches!(classify_submission("/models"), SubmitKind::Command(_)),
             "a longer keyword is not /model"
         );
+    }
+
+    // ─── cd-rebind: the model a `/cd` rebuilds on ──────────────────────────
+    //
+    // `model_after_cd` (private, the `/cd` seam): the SAME pair keeps the
+    // session's ACTIVE model (the `handle_change_cwd` lookup: active alias,
+    // else wire id); a CHANGED pair starts on the new agent's configured
+    // model.
+
+    /// cd-rebind: the SAME pair after a reload keeps the session's ACTIVE
+    /// model — a `/model` switch (alias `opus`) survives the `/cd`.
+    #[test]
+    fn cd_model_same_pair_keeps_active_model() {
+        let h = Harness::new();
+        h.sm.set_model_alias("opus".to_string());
+        let previous = h.ctx.bound.clone();
+
+        let model = model_after_cd(&previous, &h.ctx, h.sm.as_ref())
+            .expect("the active alias resolves in the registry");
+
+        assert_eq!(
+            model.alias, "opus",
+            "the active alias wins for the same pair"
+        );
+        assert_eq!(model.model_name, "claude-opus-5");
+    }
+
+    /// cd-rebind: a CHANGED pair after a reload starts on the NEW agent's
+    /// configured model — the old active alias is discarded.
+    #[test]
+    fn cd_model_switched_pair_uses_new_agents_model() {
+        let mut h = Harness::new();
+        let previous = h.ctx.bound.clone(); // dev/team
+        h.ctx.bound = h
+            .ctx
+            .config
+            .catalog
+            .resolve("research", "main")
+            .expect("research/main");
+
+        let model = model_after_cd(&previous, &h.ctx, h.sm.as_ref())
+            .expect("the new agent's configured model");
+
+        // `ResolvedModel` is not `PartialEq`: compare its identity fields.
+        let want = &h.ctx.bound.agent().main.model;
+        assert_eq!(
+            (&model.alias, &model.provider_name, &model.model_name),
+            (&want.alias, &want.provider_name, &want.model_name),
+            "the new agent's configured model is the rebuild model"
+        );
+        assert_eq!(model.alias, "haiku");
     }
 
     // ─── Two-stage Stop (TDD: written before the implementation) ────────────
