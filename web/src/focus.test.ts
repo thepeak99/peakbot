@@ -21,8 +21,9 @@
 // non-sub-agent agent message ("the answer") + errors (system content
 // starting with ❌/⚠) + non-error system messages after the last work
 // message (slash output, stop marker). Everything else is hidden.
-// Background turns are hidden entirely (including the reply), except
-// errors and trailing system messages.
+// Background turns hide the opener, work rows, the sub-agent lane, and any
+// background-tagged reply — except errors, trailing system messages, and
+// the untagged orchestrator answer once the turn is finished.
 //
 // Environment: node (vitest.config.ts — only src/components/** is jsdom).
 // No DOM, no React: both targets are pure TS.
