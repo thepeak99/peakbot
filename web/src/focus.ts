@@ -43,10 +43,15 @@ export function focusView(
     }
     for (let i = 0; i < turn.length; i++) {
       const m = turn[i];
+      // Background turn: once finished, show trailing system rows plus the
+      // answer if untagged — the orchestrator's [bg output] reply has no
+      // source in production (a background-tagged reply stays hidden).
       const show = isError(m)
         ? true
         : isBackground
-          ? !running && m.role === "system" && i > lastWorkIdx
+          ? !running &&
+            ((m.role === "system" && i > lastWorkIdx) ||
+              (i === answerIdx && m.source?.kind !== "background"))
           : running
             ? i === 0
             : i === 0 || i === answerIdx || (m.role === "system" && i > lastWorkIdx);
