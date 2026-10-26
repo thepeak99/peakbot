@@ -584,6 +584,8 @@ The load-bearing guarantee: sub-agent turns are filtered out of the agent's wire
 
 Delegation tokens/cost roll into the parent `/stats` lane-agnostically (exception: Ollama sub-agents are hookless — untracked).
 
+Orchestrator reply: rig returns only the last response's text, so prose from responses that also carried tool calls is staged by the hook (`StateManager::stage_prose`) and committed with the final text as one row (`commit_reply`) at the end of the turn (also on Stop/Error). An empty final reply is re-requested once with a wire-only nudge, then a `⚠` system row is shown.
+
 ### Context meter
 
 The Session tab context meter is sourced from the **main agent's lane** only (sub-agent turns do not move it). This is the same signal the compaction gate reads. Labelled "Orchestrator context" with a tooltip explaining the distinction. With no subagents, behaviour is identical to a single agent.

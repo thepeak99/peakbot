@@ -1765,6 +1765,115 @@ mod tests {
         );
     }
 
+    // ── Orchestrator reply: staged prose (ticket #294) ────────────────────
+    //
+    // Written FIRST against the locked design. `AssistantParts` gains
+    // `has_tool_call` (set in the ToolCall match arm of
+    // `extract_content_from_response`), and `on_completion_response` stages
+    // `parts.text` on the wired StateManager for orchestrator-lane responses
+    // that carried a tool call. Sub-agent hooks never stage.
+    //
+    // RED state: `parts.has_tool_call` and `sm.commit_reply` do not exist
+    // yet — this test fails to COMPILE on exactly those names (the intended
+    // RED). Staging is observed through the public commit seam
+    // (`commit_reply("")` flushes whatever was staged).
+
+    /// H-1 — a response carrying [Text "A", ToolCall] sets `has_tool_call`
+    /// and stages "A" on the orchestrator's StateManager; a [Text "A"]-only
+    /// response sets it false and stages nothing.
+    #[tokio::test]
+    async fn orchestrator_hook_stages_prose_only_when_the_response_carried_a_tool_call() {
+        use crate::state::StateManager;
+        use crate::ui::app_state::MessageRole;
+
+        // (a) extract_content_from_response: the flag follows the ToolCall.
+        let choice_with_call = OneOrMany::many([
+            AssistantContent::text("A"),
+            AssistantContent::tool_call("1", "todo", serde_json::json!({})),
+        ])
+        .unwrap();
+        let parts = extract_content_from_response(&choice_with_call);
+        assert!(
+            parts.has_tool_call,
+            "a response with a tool call must set has_tool_call"
+        );
+        assert_eq!(parts.text, "A");
+
+        let choice_text_only = OneOrMany::one(AssistantContent::text("A"));
+        let parts = extract_content_from_response(&choice_text_only);
+        assert!(
+            !parts.has_tool_call,
+            "a text-only response must not set has_tool_call"
+        );
+
+        // (b) on_completion_response stages the prose for (a), observable
+        //     through the commit seam: flush → ONE agent row "A".
+        let sm = StateManager::new_arc();
+        let (hook, _rx) = SessionHook::with_channel();
+        let hook = hook.with_state_manager(&sm);
+        let response = CompletionResponse {
+            choice: choice_with_call,
+            usage: rig_core::completion::Usage::default(),
+            raw_response: crate::mock::completion_model::MockModelResponse {
+                content: "A".into(),
+                is_tool_call: true,
+            },
+            message_id: None,
+        };
+        let action =
+            rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_completion_response(
+                &hook,
+                &user_msg("next"),
+                &response,
+            )
+            .await;
+        assert_eq!(action, HookAction::Continue);
+        assert!(
+            sm.commit_reply(""),
+            "the staged prose must be in the staging buffer"
+        );
+        let state = sm.get_state();
+        let agent_rows: Vec<&crate::ui::app_state::ChatMessage> = state
+            .chat
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Agent)
+            .collect();
+        assert_eq!(agent_rows.len(), 1, "exactly one row from the flush");
+        assert_eq!(agent_rows[0].content, "A");
+
+        // (c) (b)-shape: the text-only response stages NOTHING — a flush
+        //     commits nothing and no row is pushed.
+        let sm = StateManager::new_arc();
+        let (hook, _rx) = SessionHook::with_channel();
+        let hook = hook.with_state_manager(&sm);
+        let response = CompletionResponse {
+            choice: choice_text_only,
+            usage: rig_core::completion::Usage::default(),
+            raw_response: crate::mock::completion_model::MockModelResponse {
+                content: "A".into(),
+                is_tool_call: false,
+            },
+            message_id: None,
+        };
+        let action =
+            rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_completion_response(
+                &hook,
+                &user_msg("next"),
+                &response,
+            )
+            .await;
+        assert_eq!(action, HookAction::Continue);
+        assert!(
+            !sm.commit_reply(""),
+            "a text-only response must stage nothing"
+        );
+        assert!(
+            sm.get_state().chat.messages.is_empty(),
+            "no row may be pushed"
+        );
+    }
+
     #[tokio::test]
     async fn subagent_hook_ignores_stop_pending() {
         // Sub-agent hooks are built without a StateManager: a pending
@@ -2081,6 +2190,8 @@ struct AssistantParts {
     /// off, when the provider is not Anthropic, or when the model did
     /// not think. Order is wire order.
     thinking: Vec<crate::reasoning::ThinkingBlock>,
+    /// Whether the response requested a tool call (so it is not rig's final one).
+    has_tool_call: bool,
 }
 
 /// Map one rig `ReasoningContent` to one or zero `ThinkingBlock`s.
@@ -2123,6 +2234,7 @@ fn extract_content_from_response(choice: &OneOrMany<AssistantContent>) -> Assist
     let mut text = String::new();
     let mut reasoning = None;
     let mut thinking: Vec<crate::reasoning::ThinkingBlock> = Vec::new();
+    let mut has_tool_call = false;
 
     for item in choice.iter() {
         match item {
@@ -2166,7 +2278,8 @@ fn extract_content_from_response(choice: &OneOrMany<AssistantContent>) -> Assist
             // Tool calls and images are not prose — they reach the UI as their
             // own ChatMessage (or not at all); synthesising a text placeholder
             // here leaks a literal into the transcript.
-            AssistantContent::ToolCall(_) | AssistantContent::Image(_) => {}
+            AssistantContent::ToolCall(_) => has_tool_call = true,
+            AssistantContent::Image(_) => {}
         }
     }
 
@@ -2174,6 +2287,7 @@ fn extract_content_from_response(choice: &OneOrMany<AssistantContent>) -> Assist
         text,
         reasoning,
         thinking,
+        has_tool_call,
     }
 }
 
@@ -2332,6 +2446,12 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
             && let Some(sm) = weak.upgrade()
         {
             sm.begin_response(thinking.clone());
+            // Staged inline (not via the event task) so it happens-before rig
+            // returns. A tool-call response is never rig's final one, so staged
+            // prose and the returned text never overlap.
+            if parts.has_tool_call {
+                sm.stage_prose(parts.text.clone());
+            }
         }
 
         if let Some(ref sender) = self.event_sender {

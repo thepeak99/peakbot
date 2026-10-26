@@ -1784,3 +1784,88 @@ fn resumption_after_compaction_splits_by_response() {
         ),
     }
 }
+
+/// S-1 — In-loop compaction must not lose prose that was staged BEFORE the
+/// compaction boundary (ticket #294): a response carrying a tool call AND
+/// prose stages the prose, and the turn's final row must include it, joined
+/// with the final answer.
+///
+/// Shape: the in-loop compaction scenario (test 1.3 family) — a 500-token
+/// window, 50% threshold. Five low-token turns build 10 live messages
+/// (under every threshold), then the target turn starts: its first response
+/// carries the staged prose plus a tool round-trip, pushing the live count
+/// to 12 > max(keep_recent×3, 10) = 10 — the message-count fallback fires
+/// the hook's in-loop gate at the next LLM boundary (the harness's hook
+/// stats are not shared with the StateManager mid-loop, so the token branch
+/// is not visible there — the count branch is the deterministic trigger).
+/// Compaction runs, the loop resumes, and the final answer comes from the
+/// last queued response.
+///
+/// RED state: with no staging seam, the final row is only
+/// "FINAL_ANSWER_XYZ" and the `STAGED_PROSE_XYZ` assertion fails.
+#[tokio::test]
+async fn compaction_keeps_prose_staged_before_it() {
+    let config = ContextConfig {
+        threshold: 0.5,
+        keep_recent: 3,
+        enabled: true,
+        compaction_model: None,
+    };
+
+    let mut harness =
+        TestHarness::with_system_prompt_and_context("You are a helpful assistant.", config, 500);
+
+    // Five low-token turns → 10 live messages: zero usage (the token branch
+    // stays invisible) and at (not over) the message-count fallback (10).
+    for i in 0..5 {
+        harness.add_response(MockResponse::text(format!("HISTORY_{i}")));
+    }
+    // Target turn, request 1: prose + tool call in ONE response — the prose
+    // is staged, the tool round-trip continues the loop and pushes the live
+    // count to 12.
+    harness.add_response(MockResponse::tool_call_with_follow_up(
+        "todo",
+        serde_json::json!({"action": "add", "tasks": ["STAGED_TASK"]}),
+        "STAGED_PROSE_XYZ",
+    ));
+    // The summarizer answer consumed by force_compact at the gate.
+    harness.add_compaction_response(summarization_response());
+    // Resumed loop, request 2: one more tool round-trip…
+    harness.add_response(MockResponse::tool_call(
+        "todo",
+        serde_json::json!({"action": "add", "tasks": ["GATE_TASK"]}),
+    ));
+    // …then the final answer.
+    harness.add_response(agent_response("FINAL_ANSWER_XYZ", 100));
+
+    for i in 0..5 {
+        harness.run_message(&format!("setup {i}")).await;
+    }
+    harness.run_message("Do the thing").await;
+
+    assert!(
+        harness.has_compaction_occurred(),
+        "the gate must fire in-loop (this is the compaction scenario shape)"
+    );
+
+    // The final row keeps the prose staged BEFORE compaction, joined with
+    // the final answer.
+    let state = harness.get_state();
+    let last_agent = state
+        .chat
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == peakbot::ui::app_state::MessageRole::Agent)
+        .expect("the turn ended with an agent row");
+    assert!(
+        last_agent.content.contains("STAGED_PROSE_XYZ"),
+        "prose staged before compaction must survive into the final row, got: {:?}",
+        last_agent.content
+    );
+    assert!(
+        last_agent.content.contains("FINAL_ANSWER_XYZ"),
+        "the final answer must be in the same row, got: {:?}",
+        last_agent.content
+    );
+}

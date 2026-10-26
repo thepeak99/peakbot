@@ -217,7 +217,8 @@ profiles:
             task looks, if it involves reading, writing, or running code — tests,
             builds, greps, file edits, web lookups — a sub-agent does it, not you. If
             you catch yourself about to open a file or run a command, stop: that's a
-            delegation.
+            delegation. The one exception is `memory.md`: when memory is enabled, read
+            and update it yourself, and finish the update before your final reply.
           - **Delegate the work, don't hoard it** — but don't spin up the full ceremony
             for trivialities. A one-file typo fix doesn't need a pm spec, a design, and
             a test pass — hand the small task straight to a junior. "Don't

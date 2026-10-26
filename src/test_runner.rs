@@ -235,7 +235,7 @@ impl TestRunner {
                 Ok(response) => {
                     // Append the assistant response. The user message was
                     // appended at the top of this fn — see invariant above.
-                    self.state_manager.add_assistant_message(response.clone());
+                    self.state_manager.commit_reply(&response);
                     self.state_manager.set_running(false);
                     return ProcessResult::Success(response);
                 }
@@ -285,7 +285,7 @@ impl TestRunner {
                         self.process_session_hook_events();
                         match result {
                             Ok(response) => {
-                                self.state_manager.add_assistant_message(response.clone());
+                                self.state_manager.commit_reply(&response);
                                 self.state_manager.set_running(false);
                                 return ProcessResult::Success(response);
                             }

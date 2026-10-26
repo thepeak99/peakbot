@@ -190,6 +190,11 @@ pub struct StateManager {
     /// The response currently being materialised into transcript rows.
     /// See [`ResponseSlot`].
     response: RwLock<ResponseSlot>,
+
+    /// Orchestrator prose from responses that also carried tool calls, staged
+    /// by the hook and merged into the turn's single reply row by
+    /// [`Self::commit_reply`]. Cleared at every user-turn boundary.
+    turn_prose: RwLock<Vec<String>>,
 }
 
 /// The response currently being materialised into transcript rows.
@@ -275,6 +280,7 @@ impl StateManager {
                 id: 0,
                 thinking: Vec::new(),
             }),
+            turn_prose: RwLock::new(Vec::new()),
         }
     }
 
@@ -2110,7 +2116,7 @@ impl StateManager {
     /// every wire request, including the first one of a new prompt, so this
     /// site doesn't need its own check. See `mid-compaction.md` § 3 Step 4.
     pub fn add_user_message(&self, content: String) {
-        self.clear_response_thinking();
+        self.begin_turn();
         // Derive the provisional title before `content` moves into the row.
         let provisional = provisional_title(&content);
         let msg = ChatMessage::user(content);
@@ -2123,7 +2129,7 @@ impl StateManager {
     /// renderer can style the row and the transcript records which
     /// background processes contributed.
     pub fn add_user_message_from_background(&self, content: String, proc_ids: Vec<u32>) {
-        self.clear_response_thinking();
+        self.begin_turn();
         let msg = ChatMessage::user_from_background(content, proc_ids);
         self.update_chat(msg);
         if let Err(e) = self.persist_current() {
@@ -2140,7 +2146,7 @@ impl StateManager {
         content: String,
         attachments: Vec<crate::attachments::Attachment>,
     ) {
-        self.clear_response_thinking();
+        self.begin_turn();
         // Image-only turns derive no title (blank text ⇒ None).
         let provisional = provisional_title(&content);
         let msg = ChatMessage::user_with_attachments(content, attachments);
@@ -2179,6 +2185,51 @@ impl StateManager {
         }
     }
 
+    /// Stage prose from an orchestrator response that also carried tool
+    /// calls; rig returns only the last response's text, so this is the only
+    /// path by which earlier prose reaches the transcript. Blank text is ignored.
+    pub fn stage_prose(&self, text: String) {
+        if !text.trim().is_empty() {
+            self.turn_prose.write().unwrap().push(text);
+        }
+    }
+
+    /// Commit the turn's reply as ONE row: staged prose followed by
+    /// `final_text`, blank and duplicate chunks (by trimmed text) dropped.
+    /// Returns false, pushing nothing, when no chunk survives.
+    ///
+    /// The row goes through [`Self::add_assistant_message`] so it carries the
+    /// open response's id and claims its thinking blocks; with no row to
+    /// carry them they are dropped so they cannot attach to a later row.
+    pub fn commit_reply(&self, final_text: &str) -> bool {
+        let staged = std::mem::take(&mut *self.turn_prose.write().unwrap());
+        let mut seen: Vec<String> = Vec::new();
+        let mut parts: Vec<String> = Vec::new();
+        for chunk in staged
+            .into_iter()
+            .chain(std::iter::once(final_text.to_string()))
+        {
+            let key = chunk.trim();
+            if key.is_empty() || seen.iter().any(|s| s == key) {
+                continue;
+            }
+            seen.push(key.to_string());
+            parts.push(chunk);
+        }
+        if parts.is_empty() {
+            self.clear_response_thinking();
+            return false;
+        }
+        self.add_assistant_message(parts.join("\n\n"));
+        true
+    }
+
+    /// Reset per-turn state at a user-turn boundary.
+    fn begin_turn(&self) {
+        self.clear_response_thinking();
+        self.turn_prose.write().unwrap().clear();
+    }
+
     /// Add an assistant message to chat and persist.
     ///
     /// Compaction is **NOT** triggered here — see [`add_user_message`].
@@ -2188,8 +2239,8 @@ impl StateManager {
 
     /// Add an assistant message tagged with the producing lane, and persist.
     ///
-    /// The orchestrator's own prose flows through [`Self::add_assistant_message`]
-    /// (the `prompt_with_history` return value). A **sub-agent**'s prose has no
+    /// The orchestrator's own prose is staged by the hook and committed once
+    /// per turn by [`Self::commit_reply`]. A **sub-agent**'s prose has no
     /// such return path — its final text becomes the `delegate` ToolResult, and
     /// its intermediate prose would otherwise vanish. So `process_event_for_ui`
     /// calls this with the `SubAgent { role }` lane for sub-agent
@@ -2241,7 +2292,8 @@ impl StateManager {
     /// Open a new model response and stage the thinking blocks it produced.
     ///
     /// Called synchronously from `SessionHook::on_completion_response` for
-    /// EVERY orchestrator response — thinking-bearing or not. That is the
+    /// EVERY orchestrator response — thinking-bearing or not (the hook also
+    /// stages that response's prose when it carries a tool call). That is the
     /// whole point: the returned id is the only record of where one
     /// response ends and the next begins, and a response that emitted no
     /// thinking still has to close the previous one's group. Rig awaits
@@ -10530,5 +10582,136 @@ mod two_stage_stop_tests {
         assert_eq!(sm.stop_turn_processes(), StopTally { shell: true });
         assert!(token.is_cancelled());
         assert_eq!(sm.stop_turn_processes(), StopTally::default(), "idempotent");
+    }
+}
+
+// =========================================================================
+// ─── orchestrator reply: staged prose + commit seam (ticket #294) ──────────
+//
+// Written FIRST against the locked design. `stage_prose` / `commit_reply` do
+// not exist yet, so this module fails to COMPILE on exactly those names —
+// the intended RED.
+//
+// Contract under test:
+//   * `stage_prose(text)` appends a chunk for the CURRENT turn; blank /
+//     whitespace-only chunks are ignored.
+//   * `commit_reply(final_text) -> bool` takes the staged chunks, chains
+//     `final_text`, drops blank and duplicate entries (by trimmed text,
+//     first occurrence wins), joins with "\n\n", and pushes ONE assistant
+//     row (carrying the open response's id + thinking blocks). Returns
+//     false — pushing NOTHING and clearing the open response's thinking —
+//     when nothing remains. A single chunk is byte-identical (no
+//     trim/rejoin of the content).
+//   * The user-turn boundary (`add_user_message*`) clears both the open
+//     response's thinking and the staged chunks (`begin_turn`).
+#[cfg(test)]
+mod orchestrator_reply_tests {
+    use super::*;
+    use crate::reasoning::ThinkingBlock;
+    use crate::ui::app_state::MessageRole;
+
+    /// SM-1 — blank staging is a no-op, and `commit_reply("")` with nothing
+    /// staged returns false and pushes no row.
+    #[test]
+    fn stage_prose_ignores_blank_and_empty_commit_pushes_nothing() {
+        let sm = StateManager::new();
+        sm.stage_prose("  ".to_string());
+        sm.stage_prose(String::new());
+
+        let before = sm.get_state().chat.messages.len();
+        assert!(!sm.commit_reply(""), "nothing staged + blank final → false");
+        assert_eq!(
+            sm.get_state().chat.messages.len(),
+            before,
+            "no row may be pushed"
+        );
+    }
+
+    /// SM-2 — the user-turn boundary clears the staging: prose staged for a
+    /// previous turn must not leak into the next turn's reply.
+    #[test]
+    fn user_turn_boundary_clears_staged_prose() {
+        let sm = StateManager::new();
+        sm.stage_prose("old".to_string());
+        sm.add_user_message("next turn".to_string());
+
+        assert!(sm.commit_reply("new"), "the final text commits");
+        let msgs = sm.get_state().chat.messages;
+        let last = msgs.last().expect("a row exists");
+        assert_eq!(last.role, MessageRole::Agent);
+        assert_eq!(
+            last.content, "new",
+            "only the final text — the stale stage must be gone"
+        );
+        assert!(
+            !msgs.iter().any(|m| m.content == "old"),
+            "the stale staged prose must not surface anywhere"
+        );
+    }
+
+    /// SM-3 — `commit_reply("")` with nothing to commit clears the open
+    /// response's thinking blocks; a non-empty commit pushes ONE row that
+    /// carries the blocks, and the wire rebuild replays [Reasoning, Text].
+    #[test]
+    fn empty_commit_clears_open_response_thinking_and_commit_carries_blocks() {
+        let blocks = vec![ThinkingBlock::Thinking {
+            text: "the model thought".to_string(),
+            signature: "sig-1".to_string(),
+        }];
+
+        // (a) begin_response + empty commit → false, thinking cleared: a row
+        //     appended afterwards must NOT inherit the blocks.
+        let sm = StateManager::new();
+        sm.begin_response(blocks.clone());
+        assert!(!sm.commit_reply(""), "nothing to commit → false");
+        sm.add_assistant_message("x".to_string());
+        let state = sm.get_state();
+        let last = state.chat.messages.last().expect("the row exists");
+        assert!(
+            last.thinking.is_empty(),
+            "the open response's thinking must be cleared by the empty commit"
+        );
+
+        // (b) begin_response + non-empty commit → ONE row carrying the blocks.
+        let sm = StateManager::new();
+        sm.set_wire_reasoning(true);
+        sm.add_user_message("q".to_string());
+        sm.begin_response(blocks.clone());
+        assert!(sm.commit_reply("x"), "a final text commits");
+        let msgs = sm.get_state().chat.messages;
+        let last = msgs.last().expect("the row exists");
+        assert_eq!(last.role, MessageRole::Agent);
+        assert_eq!(last.content, "x");
+        assert_eq!(
+            last.thinking, blocks,
+            "the row carries the open response's blocks"
+        );
+
+        // Wire shape: [Reasoning, Text].
+        use rig_core::completion::message::{AssistantContent, Message as RigMessage, Text};
+        let history = sm.get_agent_history();
+        let assistant = history
+            .iter()
+            .rev()
+            .find_map(|m| match m {
+                RigMessage::Assistant { content, .. } => Some(content),
+                _ => None,
+            })
+            .expect("an assistant message is on the wire");
+        let items: Vec<&AssistantContent> = assistant.iter().collect();
+        assert_eq!(
+            items.len(),
+            2,
+            "wire content is [Reasoning, Text], got {items:?}"
+        );
+        let first = items[0];
+        assert!(
+            matches!(first, AssistantContent::Reasoning(_)),
+            "first wire item is the reasoning, got {first:?}"
+        );
+        match items[1] {
+            AssistantContent::Text(t) => assert_eq!(t, &Text::new("x")),
+            other => panic!("second wire item must be the text, got {other:?}"),
+        }
     }
 }

@@ -73,6 +73,8 @@ Use think when:
 - You need to follow detailed guidelines or policies
 - Mistakes are costly and you want to verify your approach
 
+The think tool and your private reasoning are invisible to the user. Never put your answer only there: your final reply must state the complete answer as plain text.
+
 # Using the todo tool
 
 For multi-step tasks, use the todo tool to:
@@ -114,7 +116,7 @@ Organize the memory in 3 areas:
 
 Keep the memory.md document updated, re-read and update every few conversation cycles.
 
-VERY IMPORTANT: Always read memory.md before a task and always update it during and after tasks!!!
+IMPORTANT: Always read memory.md before a task and update it as you work. Do your final memory.md update before you write your final reply, never after it — your final message must contain the complete answer for the user.
 
 Best practices:
 - Add tasks at the start of complex operations
