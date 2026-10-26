@@ -331,6 +331,75 @@ describe("focusView", () => {
   });
 });
 
+// ─── regression: the orchestrator's reply to [bg output] is UNTAGGED ──────
+// Production shape: the [bg output] user message carries source
+// {kind:"background",proc_ids:[…]}, but the orchestrator's OWN reply to it
+// carries NO source (undefined = human/orchestrator lane) — exactly the shape
+// of a normal answer. Case 15 above pins the tagged-reply shape (stays
+// hidden); this block pins the untagged one: once the background turn is
+// finished, the orchestrator's answer must be visible like any other answer,
+// while the [bg output] opener, tool rows, and the sub-agent lane stay
+// hidden. RED until focus.ts's isBackground branch also shows the answer row
+// (for rows whose source?.kind !== "background").
+
+describe("focusView — background turn, untagged orchestrator reply (regression)", () => {
+  it("a finished background turn shows the orchestrator's untagged reply (real-world shape)", () => {
+    const bg2: WireMessageSource = { kind: "background", proc_ids: [2] };
+    // Prior normal turn: user → agent answer (must stay untouched).
+    const u1 = u("run the test suite in the background");
+    const a1 = a("started, will report when it's done");
+    // The background turn: [bg output] opener → bash_bg → delegate →
+    // sub-agent lane → delegate result → todo → final untagged answer.
+    const uBg = u("[bg output] ─── #2 `npm test` (12 new lines) ───", bg2);
+    const tBashBg = tc("bash_bg", "npm test", bg2);
+    const trBashBg = tr("bash_bg", bg2);
+    const tDel = tc("delegate");
+    const aSub = a("sub-agent findings", sub("junior"));
+    const tSub = tc("bash", "ls -la", sub("junior"));
+    const trSub = tr("bash", sub("junior"));
+    const trDel = tr("delegate");
+    const tTodo = tc("todo");
+    const trTodo = tr("todo");
+    const aFin = a("the suite passed — 42 tests, no failures");
+    const view = focusView(
+      [u1, a1, uBg, tBashBg, trBashBg, tDel, aSub, tSub, trSub, trDel, tTodo, trTodo, aFin],
+      false,
+    );
+    // The prior normal turn is intact, and the untagged final answer is
+    // visible as the SAME object reference (expectVisible checks identity).
+    expectVisible(view, u1, a1, aFin);
+    expect(view.visible).toContain(aFin);
+    // Sub-agent lane rows never leak into the visible list.
+    expect(view.visible.filter((m) => m.source?.kind === "sub_agent")).toHaveLength(0);
+    // The [bg output] opener and the tool rows stay hidden (the fix only
+    // adds the answer, not the machinery).
+    for (const m of [uBg, tBashBg, trBashBg, tDel, trDel, tTodo, trTodo]) {
+      expect(view.visible, "opener/tool row must stay hidden").not.toContain(m);
+    }
+    expect(view.activity).toBeNull();
+  });
+
+  it("a finished background turn with only an untagged reply shows that reply (minimal shape)", () => {
+    const uBg = u("[bg output] ─── #2 `npm test` (12 new lines) ───", bg());
+    const aReply = a("the suite passed");
+    const view = focusView([uBg, aReply], false);
+    expectVisible(view, aReply);
+    expect(view.activity).toBeNull();
+  });
+
+  it("a running background turn keeps the untagged reply hidden and feeds it to the activity row (current behaviour, locked)", () => {
+    // Locks the current focus.ts behaviour for RUNNING background turns:
+    // nothing in the turn is visible while it is in flight, and the newest
+    // hidden step (here the reply) becomes the activity row. A fix for the
+    // finished case must not change this.
+    const uBg = u("[bg output] ─── #2 `npm test` (12 new lines) ───", bg());
+    const aReply = a("the suite passed");
+    const view = focusView([uBg, aReply], true);
+    expect(view.visible).toEqual([]);
+    expect(view.activity).toBe(aReply);
+  });
+});
+
 // ─── readFocusPref — plan §5 case 26 ──────────────────────────────────────
 // Pure preference reader for localStorage key "peakbot-focus" (values
 // "on"/"off"): default ON, only the exact string "off" disables, anything
