@@ -10,7 +10,7 @@ Organize the memory in 3 areas:
 
 Keep the memory.md document updated, re-read and update every few conversation cycles.
 
-VERY IMPORTANT: Always read memory.md before a task and always update it during and after tasks!!!
+IMPORTANT: Always read memory.md before a task and update it as you work. Do your final memory.md update before you write your final reply, never after it — your final message must contain the complete answer for the user.
 
 Best practices:
 - Add tasks at the start of complex operations

@@ -148,6 +148,8 @@ impl CompletionModel for MockCompletionModel {
         &self,
         request: CompletionRequest,
     ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+        // One scheduler tick so the event pump flushes the previous iteration's tool rows before this request's history is built.
+        tokio::task::yield_now().await;
         // Record the request for test inspection
         self.recorded_requests
             .lock()

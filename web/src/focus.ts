@@ -39,7 +39,9 @@ export function focusView(
     for (let i = 1; i < turn.length; i++) {
       const m = turn[i];
       if (m.role !== "system") lastWorkIdx = i;
-      if (m.role === "agent" && m.source?.kind !== "sub_agent") answerIdx = i;
+      if (m.role === "agent" && m.source?.kind !== "sub_agent" && (m.content ?? "").trim() !== "") {
+        answerIdx = i;
+      }
     }
     for (let i = 0; i < turn.length; i++) {
       const m = turn[i];

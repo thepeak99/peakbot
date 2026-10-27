@@ -332,6 +332,46 @@ describe("focusView", () => {
   });
 });
 
+// ─── blank answer rows (ticket #294 — web focus lane) ─────────────────────
+// A finished turn's answer is the last non-sub-agent agent row whose
+// content is NOT blank (`content.trim() !== ""`). A blank final row (the
+// Anthropic empty end_turn persisted as "") must never shadow the real
+// answer — the current code's `answerIdx = i` for ANY agent row does.
+//
+// These are RED until `web/src/focus.ts` gains the blank guard: today the
+// last agent row wins even when its content trims to "".
+
+describe("focusView blank answer rows", () => {
+  it("V-1: a blank final agent row does not shadow the real answer", () => {
+    const m1 = u("q");
+    const a1 = a("ANSWER");
+    const t1 = tc("todo");
+    const r1 = tr("todo");
+    const blank = a("");
+    const view = focusView([m1, a1, t1, r1, blank], false);
+    expectVisible(view, m1, a1);
+    expect(view.activity).toBeNull();
+  });
+
+  it("V-2: a whitespace-only final agent row is ignored", () => {
+    const m1 = u("q");
+    const a1 = a("real answer");
+    const ws = a(" \n");
+    const view = focusView([m1, a1, ws], false);
+    expectVisible(view, m1, a1);
+    expect(view.activity).toBeNull();
+  });
+
+  it("V-3: a turn whose agent rows are all blank shows the user message only", () => {
+    const m1 = u("q");
+    const b1 = a("");
+    const b2 = a("   ");
+    const view = focusView([m1, b1, b2], false);
+    expectVisible(view, m1);
+    expect(view.activity).toBeNull();
+  });
+});
+
 // ─── regression: the orchestrator's reply to [bg output] is UNTAGGED ──────
 // Production shape: the [bg output] user message carries source
 // {kind:"background",proc_ids:[…]}, but the orchestrator's OWN reply to it

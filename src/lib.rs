@@ -249,6 +249,13 @@ fn stop_message(t: crate::state::StopTally) -> String {
 }
 
 /// System message for a graceful (first-press) Stop that was not escalated.
+/// Wire-only user message sent once when the final reply came back blank.
+/// Never persisted to the transcript.
+const EMPTY_REPLY_NUDGE: &str =
+    "Your last reply was empty. Reply to the user now with your complete answer as plain text.";
+/// System row shown when the model stays blank even after the nudge.
+const EMPTY_REPLY_WARNING: &str = "⚠ The model returned an empty reply, even after being asked again. Try rephrasing or asking again.";
+
 const GRACEFUL_STOP_MESSAGE: &str = "Agent stopped by user (after the current tool call)";
 
 /// The stop handshake between the two loops. `Some(msg)` = a stop is in
@@ -2675,9 +2682,9 @@ impl AgentRunner {
                 sm.add_request(&source, usage.input_tokens, usage.output_tokens, usage.cost);
 
                 // Surface a **sub-agent's** prose on its own lane. The
-                // orchestrator's prose already enters via `prompt_with_history`'s
-                // return value → `add_assistant_message`, so adding it here too
-                // would double it — hence the orchestrator-lane guard. A
+                // orchestrator's prose is staged by the hook and committed once
+                // per turn by `commit_reply`, so adding it here too would
+                // double it — hence the orchestrator-lane guard. A
                 // sub-agent's final answer legitimately appears twice in the
                 // transcript: once here on its `🧩 role` lane (it *said* it) and
                 // once as the orchestrator's `delegate` ToolResult (it *received*
@@ -2738,12 +2745,30 @@ impl AgentRunner {
     /// against infinite terminate-restart cycles is in
     /// `apply_compaction` — see that fn's doc and `SessionStats::clear_last_input_tokens`.
     async fn process_message_internal(
+        current_turn: rig_core::completion::message::Message,
+        state_manager: &Option<Arc<StateManager>>,
+        agent: &Arc<DynAgent>,
+        config: &Config,
+    ) -> CompletionResult {
+        let result = Self::run_turn(current_turn, state_manager, agent, config).await;
+        // Flushes prose staged this turn on exits that never reach a final
+        // reply (Stop, Error); a no-op after a successful commit.
+        if let Some(sm) = state_manager.as_ref() {
+            sm.commit_reply("");
+        }
+        result
+    }
+
+    /// The retry / compaction / empty-reply-nudge loop behind
+    /// [`Self::process_message_internal`].
+    async fn run_turn(
         mut current_turn: rig_core::completion::message::Message,
         state_manager: &Option<Arc<StateManager>>,
         agent: &Arc<DynAgent>,
         config: &Config,
     ) -> CompletionResult {
         let mut retry_count = 0;
+        let mut nudged = false;
         // One-shot override for the post-compaction iteration. The compact
         // arm fills this with the resumption-shape history returned by
         // `build_resumption_from_tail()`; the loop top consumes it
@@ -2797,16 +2822,36 @@ impl AgentRunner {
 
             match result {
                 Ok(response) => {
-                    // Add assistant response to chat AND persist (StateManager handles persistence)
-                    if let Some(sm) = state_manager.as_ref() {
-                        sm.add_assistant_message(response.clone());
+                    let Some(sm) = state_manager.as_ref() else {
+                        return CompletionResult::Success;
+                    };
+                    // One row per turn (staged prose + final text), persisted by
+                    // StateManager.
+                    if sm.commit_reply(&response) {
                         sm.set_final_broadcast(true);
                         // Fire-and-forget: upgrade the provisional title
                         // after the first reply
                         sm.maybe_generate_title();
+                        return CompletionResult::Success;
                     }
-
-                    return CompletionResult::Success;
+                    if nudged {
+                        sm.add_system_message(EMPTY_REPLY_WARNING.to_string());
+                        sm.set_final_broadcast(true);
+                        return CompletionResult::Success;
+                    }
+                    // Blank reply with nothing staged: ask once more. The nudge
+                    // rides the wire only, so the transcript never shows it.
+                    nudged = true;
+                    tracing::warn!(target: "peakbot", "empty final reply; nudging the model once");
+                    refresh_attempt_from_transcript(sm, &mut current_turn, &mut history_override);
+                    let mut history =
+                        derive_history_for_iteration(&mut history_override, state_manager);
+                    history.push(std::mem::replace(
+                        &mut current_turn,
+                        rig_core::completion::message::Message::from(EMPTY_REPLY_NUDGE),
+                    ));
+                    history_override = Some(history);
+                    continue;
                 }
 
                 Err(PromptError::PromptCancelled { reason, .. }) if reason == "compact" => {
@@ -7133,6 +7178,677 @@ headers:
 
         pump.abort();
     }
+
+    // =========================================================================
+    // ─── orchestrator reply: staged prose + empty-reply nudge (ticket #294) ───
+    //
+    // Written FIRST against the locked design (TDD — production code absent):
+    //   1. `AssistantParts` gains `has_tool_call`; the orchestrator hook
+    //      stages `parts.text` via `StateManager::stage_prose` for every
+    //      response that carried a tool call (sub-agent hooks never stage).
+    //   2. `StateManager::commit_reply(final_text) -> bool` merges the staged
+    //      chunks + the final text into ONE assistant row — blank-dropped,
+    //      deduped by trimmed text (first occurrence wins), joined with
+    //      `"\n\n"`; a single chunk stays byte-identical. False when nothing
+    //      remains (no row, open-response thinking cleared).
+    //   3. `process_message_internal` calls `commit_reply(&response)` in the
+    //      Ok arm; a false commit nudges ONCE with the NON-persisted
+    //      `crate::EMPTY_REPLY_NUDGE` user message, and a second false commit
+    //      warns with `crate::EMPTY_REPLY_WARNING`. The wrapper flushes staged
+    //      prose on every exit (`commit_reply("")`), so Stop/Error still keep
+    //      the prose.
+    //
+    // RED state: `stage_prose` / `commit_reply` / `EMPTY_REPLY_NUDGE` /
+    // `EMPTY_REPLY_WARNING` do not exist yet, so the suite fails to COMPILE on
+    // exactly those names — the intended RED. (T4 is a pure no-regression
+    // guard: once the suite compiles it is green on old AND new behaviour.)
+    //
+    // Pattern: `stop_mid_tool_persists_interrupted_result` — create_mock_agent,
+    // event pump, `process_message_internal`. `fu(x)` below is
+    // `MockResponse::tool_call_with_follow_up("todo", …, x)`: one response
+    // carrying a tool call AND the prose `x` (the dropped-prose shape of
+    // ticket #294).
+
+    /// One `todo` tool call plus the prose `follow_up` in the SAME response —
+    /// the exact wire shape that used to lose `follow_up` on the orchestrator
+    /// lane.
+    #[cfg(feature = "mock")]
+    fn fu(follow_up: &str) -> crate::mock::MockResponse {
+        crate::mock::MockResponse::tool_call_with_follow_up(
+            "todo",
+            serde_json::json!({"action": "add", "tasks": ["t"]}),
+            follow_up,
+        )
+    }
+
+    /// Boot conversation + one user turn + mock agent + event pump + the
+    /// turn task. `responses` are queued in order. The pump writes the
+    /// ToolCall/ToolResult rows (the assistant row itself is written
+    /// synchronously by the commit seam, so no assertion here races it).
+    #[cfg(feature = "mock")]
+    fn staged_reply_fixture(
+        responses: Vec<crate::mock::MockResponse>,
+    ) -> (
+        Arc<StateManager>,
+        crate::mock::MockCompletionModel,
+        tokio::task::JoinHandle<CompletionResult>,
+    ) {
+        use crate::storage::{ConversationStorage, InMemoryStorage};
+
+        let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::new());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+        sm.ensure_boot_conversation(std::path::Path::new("."), "mock-model");
+        sm.add_user_message("go".to_string());
+
+        let (agent, _info, mut events, _hook, model) =
+            crate::providers::create_mock_agent("test prompt", 4, sm.clone())
+                .expect("mock agent builds");
+        model.add_responses(responses);
+
+        let sm_opt_pump = Some(sm.clone());
+        tokio::spawn(async move {
+            while let Some(ev) = events.recv().await {
+                AgentRunner::process_event_for_ui(&sm_opt_pump, ev);
+            }
+        });
+
+        sm.set_running(true);
+        let current_turn = sm
+            .build_current_turn_message()
+            .expect("the user turn was dispatched");
+        let agent = Arc::new(agent);
+        let config = test_config();
+        let sm_opt = Some(sm.clone());
+        let turn = tokio::spawn(async move {
+            AgentRunner::process_message_internal(current_turn, &sm_opt, &agent, &config).await
+        });
+        (sm, model, turn)
+    }
+
+    /// Orchestrator Agent rows after the (only) user message.
+    #[cfg(feature = "mock")]
+    fn agent_rows_after_user(
+        msgs: &[crate::ui::app_state::ChatMessage],
+    ) -> Vec<&crate::ui::app_state::ChatMessage> {
+        use crate::ui::app_state::MessageRole;
+        let user_idx = msgs
+            .iter()
+            .position(|m| m.role == MessageRole::User)
+            .expect("the user message is in the transcript");
+        msgs[user_idx + 1..]
+            .iter()
+            .filter(|m| m.role == MessageRole::Agent && m.source.is_orchestrator_lane())
+            .collect()
+    }
+
+    /// T1 — prose in a tool-call response is NOT dropped: it is staged and
+    /// committed into the final reply, which lands as exactly ONE orchestrator
+    /// agent row, `"\n\n"`-joined with the closing text.
+    #[cfg(feature = "mock")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn t1_tool_call_prose_is_staged_into_the_final_reply() {
+        let (sm, model, turn) = staged_reply_fixture(vec![
+            fu("ANSWER"),
+            crate::mock::MockResponse::text("🙏 amen"),
+        ]);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), turn)
+            .await
+            .expect("the turn finishes")
+            .expect("no panic");
+        assert!(matches!(result, CompletionResult::Success));
+
+        let msgs = sm.get_state().chat.messages;
+        let rows = agent_rows_after_user(&msgs);
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly one orchestrator agent row after the user msg; transcript={msgs:?}"
+        );
+        assert_eq!(
+            rows[0].content, "ANSWER\n\n🙏 amen",
+            "staged tool-call prose + closing text, joined with a blank line"
+        );
+        // The wire context carries "ANSWER" exactly once (inside the merged row).
+        assert_eq!(
+            count_occurrences(&sm.get_agent_history(), "ANSWER"),
+            1,
+            "ANSWER must occur once in get_agent_history()"
+        );
+        assert_eq!(model.request_count(), 2, "no nudge on a non-empty final");
+    }
+
+    /// T2 — a final reply duplicating the staged prose collapses to ONE row.
+    /// Dedup is by trimmed text, first occurrence wins.
+    #[cfg(feature = "mock")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn t2_duplicate_final_reply_collapses_to_one_row() {
+        let (sm, _model, turn) =
+            staged_reply_fixture(vec![fu("X"), crate::mock::MockResponse::text("X")]);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), turn)
+            .await
+            .expect("the turn finishes")
+            .expect("no panic");
+        assert!(matches!(result, CompletionResult::Success));
+
+        let msgs = sm.get_state().chat.messages;
+        let rows = agent_rows_after_user(&msgs);
+        assert_eq!(rows.len(), 1, "one row; transcript={msgs:?}");
+        assert_eq!(rows[0].content, "X", "dedup keeps the first occurrence");
+    }
+
+    /// T3 — multiple staged chunks join in order with blank lines; a
+    /// duplicated chunk collapses to its first occurrence.
+    #[cfg(feature = "mock")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn t3_multiple_staged_chunks_join_with_blank_lines() {
+        let (sm, _model, turn) =
+            staged_reply_fixture(vec![fu("A"), fu("B"), crate::mock::MockResponse::text("C")]);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), turn)
+            .await
+            .expect("the turn finishes")
+            .expect("no panic");
+        assert!(matches!(result, CompletionResult::Success));
+
+        let msgs = sm.get_state().chat.messages;
+        let rows = agent_rows_after_user(&msgs);
+        assert_eq!(rows.len(), 1, "one row; transcript={msgs:?}");
+        assert_eq!(rows[0].content, "A\n\nB\n\nC");
+    }
+
+    #[cfg(feature = "mock")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn t3_duplicate_staged_chunk_collapses() {
+        let (sm, _model, turn) =
+            staged_reply_fixture(vec![fu("A"), fu("A"), crate::mock::MockResponse::text("C")]);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), turn)
+            .await
+            .expect("the turn finishes")
+            .expect("no panic");
+        assert!(matches!(result, CompletionResult::Success));
+
+        let msgs = sm.get_state().chat.messages;
+        let rows = agent_rows_after_user(&msgs);
+        assert_eq!(rows.len(), 1, "one row; transcript={msgs:?}");
+        assert_eq!(rows[0].content, "A\n\nC", "the duplicate chunk is dropped");
+    }
+
+    /// T4 — the common path must not move: a plain text reply is persisted
+    /// BYTE-IDENTICAL (no trim/rejoin) and makes exactly ONE request (no
+    /// nudge machinery on a non-empty reply).
+    #[cfg(feature = "mock")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn t4_plain_text_reply_is_byte_identical_and_makes_one_request() {
+        let (sm, model, turn) = staged_reply_fixture(vec![crate::mock::MockResponse::text("hi")]);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), turn)
+            .await
+            .expect("the turn finishes")
+            .expect("no panic");
+        assert!(matches!(result, CompletionResult::Success));
+
+        let msgs = sm.get_state().chat.messages;
+        let rows = agent_rows_after_user(&msgs);
+        assert_eq!(rows.len(), 1, "one row; transcript={msgs:?}");
+        assert_eq!(rows[0].content, "hi", "byte-identical — no trim/rejoin");
+        assert_eq!(
+            model.request_count(),
+            1,
+            "a non-empty final reply must not trigger a nudge"
+        );
+    }
+
+    /// T5 — an empty final reply after staged prose commits the staged prose
+    /// (the reply is NOT empty once staged), so NO nudge fires: exactly two
+    /// requests, one row with the staged text.
+    #[cfg(feature = "mock")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn t5_empty_final_after_staged_prose_commits_without_nudge() {
+        let (sm, model, turn) =
+            staged_reply_fixture(vec![fu("ANSWER"), crate::mock::MockResponse::text("")]);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), turn)
+            .await
+            .expect("the turn finishes")
+            .expect("no panic");
+        assert!(matches!(result, CompletionResult::Success));
+
+        let msgs = sm.get_state().chat.messages;
+        let rows = agent_rows_after_user(&msgs);
+        assert_eq!(rows.len(), 1, "one row; transcript={msgs:?}");
+        assert_eq!(rows[0].content, "ANSWER");
+        assert_eq!(
+            model.request_count(),
+            2,
+            "the staged prose made the reply non-empty — no nudge"
+        );
+    }
+
+    /// T6 — a truly empty final reply (Anthropic empty end_turn → "") gets ONE
+    /// nudge: the second request's payload ends with a User message carrying
+    /// `EMPTY_REPLY_NUDGE`, preceded by the original user message. The nudge
+    /// is NOT persisted (no user row for it), and no blank row is pushed.
+    #[cfg(feature = "mock")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn t6_empty_reply_nudges_with_nonpersisted_user_message() {
+        let (sm, model, turn) = staged_reply_fixture(vec![
+            crate::mock::MockResponse::text(""),
+            crate::mock::MockResponse::text("real"),
+        ]);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), turn)
+            .await
+            .expect("the turn finishes")
+            .expect("no panic");
+        assert!(matches!(result, CompletionResult::Success));
+
+        let msgs = sm.get_state().chat.messages;
+        let rows = agent_rows_after_user(&msgs);
+        assert_eq!(rows.len(), 1, "one row; transcript={msgs:?}");
+        assert_eq!(rows[0].content, "real");
+        assert!(
+            !msgs.iter().any(|m| m.content.trim().is_empty()
+                && m.role == crate::ui::app_state::MessageRole::Agent),
+            "no blank agent row may be persisted; transcript={msgs:?}"
+        );
+        assert_eq!(model.request_count(), 2, "exactly one nudge");
+
+        // The nudge is a wire-only user message: NOT in the transcript…
+        assert!(
+            !msgs.iter().any(|m| m.content == crate::EMPTY_REPLY_NUDGE),
+            "the nudge must not be persisted; transcript={msgs:?}"
+        );
+        // …but it IS the prompt of the second request, right after the
+        // original user message.
+        let requests = model.get_recorded_requests();
+        assert_eq!(requests.len(), 2);
+        let payload = &requests[1].chat_history;
+        let user_texts: Vec<String> = payload
+            .iter()
+            .filter_map(|m| match m {
+                rig_core::completion::message::Message::User { content } => {
+                    content.iter().find_map(|c| match c {
+                        rig_core::completion::message::UserContent::Text(t) => Some(t.to_string()),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            user_texts,
+            vec!["go".to_string(), crate::EMPTY_REPLY_NUDGE.to_string()],
+            "2nd request ends with the nudge User message preceded by the \
+             original user message; payload={payload:?}"
+        );
+    }
+
+    /// T7 — the nudge after a completed tool round-trip resumes from the
+    /// transcript tail: the THIRD request's history tail is the ToolResult,
+    /// the prompt is the nudge, and the tool call/result pair is intact.
+    #[cfg(feature = "mock")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn t7_nudge_after_tool_roundtrip_carries_intact_pairs() {
+        let (sm, model, turn) = staged_reply_fixture(vec![
+            crate::mock::MockResponse::tool_call(
+                "todo",
+                serde_json::json!({"action": "add", "tasks": ["t"]}),
+            ),
+            crate::mock::MockResponse::text(""),
+            crate::mock::MockResponse::text("ok"),
+        ]);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), turn)
+            .await
+            .expect("the turn finishes")
+            .expect("no panic");
+        assert!(matches!(result, CompletionResult::Success));
+
+        let msgs = sm.get_state().chat.messages;
+        let rows = agent_rows_after_user(&msgs);
+        assert_eq!(rows.len(), 1, "one row; transcript={msgs:?}");
+        assert_eq!(rows[0].content, "ok");
+
+        let requests = model.get_recorded_requests();
+        assert_eq!(requests.len(), 3, "tool call, empty reply, nudged reply");
+        use rig_core::completion::message::{AssistantContent, Message as RigMessage, UserContent};
+        let payload = &requests[2].chat_history;
+
+        // Prompt is the nudge; the message before it is the ToolResult.
+        let last = payload.last().expect("payload non-empty");
+        match last {
+            RigMessage::User { content } => {
+                let text = content.iter().find_map(|c| match c {
+                    UserContent::Text(t) => Some(t.to_string()),
+                    _ => None,
+                });
+                assert_eq!(
+                    text.as_deref(),
+                    Some(crate::EMPTY_REPLY_NUDGE),
+                    "the 3rd request's prompt must be the nudge"
+                );
+            }
+            other => panic!("expected a User prompt, got {other:?}"),
+        }
+        let tail_before_prompt = payload
+            .get(payload.len() - 2)
+            .expect("payload has a message before the prompt");
+        assert!(
+            matches!(
+                tail_before_prompt,
+                RigMessage::User { content }
+                    if content
+                        .iter()
+                        .any(|c| matches!(c, UserContent::ToolResult(_)))
+            ),
+            "the history tail must be the ToolResult; got {tail_before_prompt:?}"
+        );
+        // The tool pair is intact: a ToolCall whose id matches a ToolResult.
+        let call_ids: Vec<String> = payload
+            .iter()
+            .flat_map(|m| match m {
+                RigMessage::Assistant { content, .. } => content
+                    .iter()
+                    .filter_map(|c| match c {
+                        AssistantContent::ToolCall(tc) => Some(tc.id.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                _ => vec![],
+            })
+            .collect();
+        assert!(
+            !call_ids.is_empty(),
+            "the 3rd request must carry the tool call; payload={payload:?}"
+        );
+        assert!(
+            payload.iter().any(|m| matches!(
+                m,
+                RigMessage::User { content }
+                    if content.iter().any(|c| matches!(
+                        c,
+                        UserContent::ToolResult(tr) if call_ids.contains(&tr.id)
+                    ))
+            )),
+            "the tool result must pair with its call id; payload={payload:?}"
+        );
+    }
+
+    /// T8 — empty, then whitespace-only: no agent row at all, exactly two
+    /// requests (one nudge, then give up), and ONE system message starting
+    /// with the ⚠ warning.
+    #[cfg(feature = "mock")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn t8_double_empty_reply_yields_warning_not_blank_row() {
+        let (sm, model, turn) = staged_reply_fixture(vec![
+            crate::mock::MockResponse::text(""),
+            crate::mock::MockResponse::text("  "),
+        ]);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), turn)
+            .await
+            .expect("the turn finishes")
+            .expect("no panic");
+        assert!(matches!(result, CompletionResult::Success));
+
+        let msgs = sm.get_state().chat.messages;
+        let rows = agent_rows_after_user(&msgs);
+        assert!(
+            rows.is_empty(),
+            "no agent row may be persisted for an empty-then-blank turn; transcript={msgs:?}"
+        );
+        assert_eq!(
+            model.request_count(),
+            2,
+            "one nudge, then the warning — no third request"
+        );
+        let warnings: Vec<&crate::ui::app_state::ChatMessage> = msgs
+            .iter()
+            .filter(|m| {
+                m.role == crate::ui::app_state::MessageRole::System && m.content.starts_with('⚠')
+            })
+            .collect();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "exactly one ⚠ system message; transcript={msgs:?}"
+        );
+        assert_eq!(
+            warnings[0].content,
+            crate::EMPTY_REPLY_WARNING,
+            "the warning carries the exact locked wording"
+        );
+    }
+
+    /// T9 — Stop mid-tool: the staged prose of the interrupted response is
+    /// flushed by the wrapper's `commit_reply("")` on the Stopped exit — the
+    /// agent row "PARTIAL" lands after the INTERRUPTED tool result, and the
+    /// staging buffer is empty afterwards.
+    #[cfg(feature = "mock")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn t9_stop_mid_tool_flushes_staged_prose_as_final_row() {
+        use crate::ui::app_state::MessageRole;
+
+        let storage: Arc<dyn crate::storage::ConversationStorage> =
+            Arc::new(crate::storage::InMemoryStorage::new());
+        let sm = StateManager::new_arc_with_storage(storage);
+        sm.ensure_boot_conversation(std::path::Path::new("."), "mock-model");
+        sm.add_user_message("go".to_string());
+
+        let (agent, _info, mut events, _hook, model) =
+            crate::providers::create_mock_agent("test prompt", 4, sm.clone())
+                .expect("mock agent builds");
+        // A real in-flight tool (30s sleep) carrying the staged prose.
+        model.add_response(crate::mock::MockResponse::tool_call_with_follow_up(
+            "bash",
+            serde_json::json!({ "command": "sleep 30" }),
+            "PARTIAL",
+        ));
+
+        let sm_opt_pump = Some(sm.clone());
+        let pump = tokio::spawn(async move {
+            while let Some(ev) = events.recv().await {
+                AgentRunner::process_event_for_ui(&sm_opt_pump, ev);
+            }
+        });
+
+        sm.set_running(true);
+        let current_turn = sm
+            .build_current_turn_message()
+            .expect("the user turn was dispatched");
+        let agent = Arc::new(agent);
+        let config = test_config();
+        let sm_opt = Some(sm.clone());
+        let turn = tokio::spawn(async move {
+            AgentRunner::process_message_internal(current_turn, &sm_opt, &agent, &config).await
+        });
+
+        // Wait (≤5s) until the ToolCall row has landed and the tool is in flight.
+        let call_id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let msgs = sm.get_state().chat.messages;
+                if let Some(tail) = msgs.last()
+                    && tail.role == MessageRole::ToolCall
+                    && tail.tool_name.as_deref() == Some("bash")
+                {
+                    return tail.call_id.clone();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the bash ToolCall row must land within 5s");
+
+        // Stop: cancels the per-turn token; the turn's future is dropped.
+        sm.stop_turn_processes();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), turn)
+            .await
+            .expect("the cancelled turn must finish within 5s")
+            .expect("the turn task must not panic");
+        assert!(
+            matches!(result, CompletionResult::Stopped),
+            "a cancelled turn must report Stopped"
+        );
+
+        let msgs = sm.get_state().chat.messages;
+        // The INTERRUPTED result is answered for the in-flight call…
+        let interrupted_idx = msgs
+            .iter()
+            .rposition(|m| m.role == MessageRole::ToolResult && m.call_id == call_id)
+            .expect("the INTERRUPTED result row exists");
+        let interrupted = &msgs[interrupted_idx];
+        assert!(
+            interrupted
+                .tool_result
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("INTERRUPTED")
+        );
+        // …and the staged prose lands as the final agent row, after it.
+        let rows: Vec<&crate::ui::app_state::ChatMessage> = msgs
+            .iter()
+            .skip(interrupted_idx + 1)
+            .filter(|m| m.role == MessageRole::Agent && m.source.is_orchestrator_lane())
+            .collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly one agent row after the INTERRUPTED result; transcript={msgs:?}"
+        );
+        assert_eq!(
+            rows[0].content, "PARTIAL",
+            "the staged prose is the flushed final row"
+        );
+        // Staging is empty afterwards: another flush commits nothing.
+        let before = msgs.len();
+        assert!(
+            !sm.commit_reply(""),
+            "staging must be empty after the flush"
+        );
+        assert_eq!(
+            sm.get_state().chat.messages.len(),
+            before,
+            "no further row may appear"
+        );
+
+        pump.abort();
+    }
+
+    /// T10 — a non-transient LLM error after staged prose: the turn reports
+    /// Error with its ❌ system message, and the staged prose is still
+    /// persisted as the agent row (the wrapper's flush-on-exit).
+    #[cfg(feature = "mock")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn t10_hard_error_flushes_staged_prose_and_keeps_error_row() {
+        let (sm, _model, turn) = staged_reply_fixture(vec![
+            fu("A"),
+            crate::mock::MockResponse::error("authentication failed"),
+        ]);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), turn)
+            .await
+            .expect("the turn finishes")
+            .expect("no panic");
+        assert!(
+            matches!(result, CompletionResult::Error),
+            "a non-transient error must report Error"
+        );
+
+        let msgs = sm.get_state().chat.messages;
+        let rows = agent_rows_after_user(&msgs);
+        assert_eq!(rows.len(), 1, "one row; transcript={msgs:?}");
+        assert_eq!(
+            rows[0].content, "A",
+            "the staged prose survives the error exit"
+        );
+        assert!(
+            msgs.iter().any(|m| {
+                m.role == crate::ui::app_state::MessageRole::System && m.content.starts_with('❌')
+            }),
+            "the ❌ failure message must be present; transcript={msgs:?}"
+        );
+    }
+
+    /// T11 — persistence: after the T1 shape (staged prose + closing text),
+    /// reloading the conversation from storage yields "ANSWER" exactly ONCE in
+    /// the messages and exactly ONCE in the rebuilt wire history — the merged
+    /// row round-trips, and nothing duplicates.
+    #[cfg(feature = "mock")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn t11_merged_reply_survives_reload_without_duplicating() {
+        use crate::storage::{ConversationStorage, InMemoryStorage};
+
+        let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::new());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+        sm.ensure_boot_conversation(std::path::Path::new("."), "mock-model");
+        sm.add_user_message("go".to_string());
+
+        let (agent, _info, mut events, _hook, model) =
+            crate::providers::create_mock_agent("test prompt", 4, sm.clone())
+                .expect("mock agent builds");
+        model.add_responses(vec![
+            fu("ANSWER"),
+            crate::mock::MockResponse::text("🙏 amen"),
+        ]);
+        let sm_opt_pump = Some(sm.clone());
+        let pump = tokio::spawn(async move {
+            while let Some(ev) = events.recv().await {
+                AgentRunner::process_event_for_ui(&sm_opt_pump, ev);
+            }
+        });
+        sm.set_running(true);
+        let current_turn = sm
+            .build_current_turn_message()
+            .expect("the user turn was dispatched");
+        let agent = Arc::new(agent);
+        let config = test_config();
+        let sm_opt = Some(sm.clone());
+        let turn = tokio::spawn(async move {
+            AgentRunner::process_message_internal(current_turn, &sm_opt, &agent, &config).await
+        });
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), turn)
+            .await
+            .expect("the turn finishes")
+            .expect("no panic");
+        assert!(matches!(result, CompletionResult::Success));
+
+        // Reload from storage into the SAME StateManager.
+        let id = sm
+            .get_current_conversation_id()
+            .expect("boot conversation exists");
+        sm.load_conversation(id).expect("conversation reloads");
+
+        let msgs = sm.get_state().chat.messages;
+        let containing: Vec<&crate::ui::app_state::ChatMessage> = msgs
+            .iter()
+            .filter(|m| m.content.contains("ANSWER"))
+            .collect();
+        assert_eq!(
+            containing.len(),
+            1,
+            "ANSWER must live in exactly one reloaded message; messages={msgs:?}"
+        );
+        assert_eq!(
+            containing[0].content, "ANSWER\n\n🙏 amen",
+            "the merged row round-trips byte-identical"
+        );
+        assert_eq!(
+            count_occurrences(&sm.get_agent_history(), "ANSWER"),
+            1,
+            "ANSWER must occur once in the wire history after reload"
+        );
+
+        pump.abort();
+    }
+
+    // T12 — no-regression pin (pre-existing, must stay UNCHANGED):
+    // `orchestrator_completion_prose_is_not_double_added` (above) — an
+    // orchestrator `CompletionResponse` event adds NO transcript row; the
+    // commit path owns that row.
 
     /// c — teardown mid-tool: when the action channel closes with a turn in
     /// flight, `run_loop` must abort the agent task and answer the in-flight
