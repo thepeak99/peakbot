@@ -24,6 +24,9 @@ function tick() {
       // Q1: the row is absent on platforms that don't offer the
       // background service (Windows in v1).
       $("row-background").hidden = !view.background_visible;
+      // Un-hide the form: the HTML keeps it hidden so the defaults never
+      // flash before the first successful load.
+      $("page").hidden = false;
     })
     .catch((err) => console.error("settings poll failed", err));
 }

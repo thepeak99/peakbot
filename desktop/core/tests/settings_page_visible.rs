@@ -33,7 +33,10 @@ use std::path::Path;
 /// `core/` dir). Panics with a setup explanation if the file is missing —
 /// so a failure is never confused with the blank-page bug itself.
 fn read_ui(name: &str) -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("ui").join(name);
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("ui")
+        .join(name);
     std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!(
             "test setup: cannot read committed UI file {} ({e}): \

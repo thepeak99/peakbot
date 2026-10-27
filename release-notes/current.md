@@ -7,3 +7,4 @@ This file is the working draft for the next release. When a version is tagged, t
 ### Fixes
 
 - Web: focus mode no longer hides the orchestrator's reply to a `[bg output]` turn (e.g. the final summary after a background build finished).
+- Desktop: the app settings window opened blank under the heading when opened from the "Desktop app settings ↗" link; the form is now revealed once the first `settings_get` load succeeds.
