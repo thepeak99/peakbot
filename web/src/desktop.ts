@@ -18,7 +18,6 @@ export function isDesktop(): boolean {
 
 /** The desktop's `settings_get` view (desktop/core/src/settings.rs). */
 export interface DesktopView {
-  cert_warning: boolean;
   background_visible: boolean;
   background: boolean;
   background_enabled: boolean;

@@ -62,6 +62,9 @@ pub enum StartStep {
     CheckingService,
     StartingSession,
     WaitingForBackend,
+    /// The system prompt to trust PeakBot's CA (macOS keychain /
+    /// Windows certificate store) — the one start step with a `detail`.
+    TrustingCertificate,
     InstallingService,
     RemovingService,
     ConnectingService,
@@ -98,6 +101,11 @@ pub enum StartError {
     ServiceCommandFailed {
         command: String,
         output: String,
+    },
+    /// PeakBot's CA is not in the user's trusted certificates (macOS /
+    /// Windows). `detail` carries the failed `add` command + output.
+    CertificateNotTrusted {
+        detail: String,
     },
 }
 
@@ -142,6 +150,7 @@ fn step_text(step: StartStep) -> &'static str {
         StartStep::CheckingService => "Looking for a background service…",
         StartStep::StartingSession => "Starting PeakBot…",
         StartStep::WaitingForBackend => "Waiting for PeakBot to be ready…",
+        StartStep::TrustingCertificate => "Approve PeakBot's certificate in the system prompt…",
         StartStep::InstallingService => "Installing the background service…",
         StartStep::RemovingService => "Removing the background service…",
         StartStep::ConnectingService => "Connecting to the background service…",
@@ -151,12 +160,24 @@ fn step_text(step: StartStep) -> &'static str {
 
 pub fn status_view(phase: &Phase) -> StatusView {
     match phase {
-        Phase::Starting(step) => StatusView {
-            kind: "starting",
-            title: step_text(*step).to_string(),
-            detail: None,
-            actions: Vec::new(),
-        },
+        Phase::Starting(step) => {
+            let title = step_text(*step).to_string();
+            // The one start step with a detail: the CA-trust prompt
+            // explains WHY the window is paused (design #376b §3).
+            let detail = match step {
+                StartStep::TrustingCertificate => Some(
+                    "PeakBot serves HTTPS with its own certificate authority (\"PeakBot Local CA\"). Approving adds it to this user account's trusted certificates so this window can open PeakBot."
+                        .to_string(),
+                ),
+                _ => None,
+            };
+            StatusView {
+                kind: "starting",
+                title,
+                detail,
+                actions: Vec::new(),
+            }
+        }
         Phase::Ready(_) => StatusView {
             kind: "ready",
             title: "Opening PeakBot…".to_string(),
@@ -230,37 +251,51 @@ fn failed_view(err: &StartError) -> StatusView {
                 UiAction::Quit,
             ],
         },
+        StartError::CertificateNotTrusted { detail } => StatusView {
+            kind: "failed",
+            title: "PeakBot's HTTPS certificate isn't trusted".into(),
+            detail: Some(format!(
+                "This window opens PeakBot over HTTPS (general.web.tls: true) and needs PeakBot's certificate authority in your trusted certificates. Press Retry to be asked again, or set general.web.tls: false in config.yaml and press Retry.\n\n{detail}"
+            )),
+            actions: vec![UiAction::Retry, UiAction::Quit],
+        },
     }
 }
 
-/// The host platform the app runs on. The glue decides it ONCE from
-/// `cfg!(windows)` (in `host_platform`) and the pure core derives the
-/// visible features from it — so the decision is unit-testable on every
-/// host (`core/tests/background_platform.rs`).
+/// The host platform the app runs on. The glue decides it ONCE in
+/// `host_platform` (windows / macOS / everything else) and the pure
+/// core derives the visible features from it — so the decision is
+/// unit-testable on every host (`core/tests/background_platform.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
     /// Background service is non-functional in v1 (Q1) — not offered.
     Windows,
-    /// Linux/macOS — unchanged.
-    Unix,
+    /// Linux: the webview trusts the CA itself (design #377b) — no
+    /// system-trust step is ever run.
+    Linux,
+    /// macOS: the CA goes into the user's login keychain.
+    MacOs,
 }
 
 /// The single place the compile target becomes a `Platform`: the Tauri
 /// glue calls it once and passes the result into the pure core
 /// (`Controller::new`, `tray_model`, the tray) — never a bare `cfg!`
-/// inside core.
+/// inside core. CA-trust design §2: Windows ⇒ `Windows`, macOS ⇒
+/// `MacOs`, everything else ⇒ `Linux`.
 pub fn host_platform() -> Platform {
     if cfg!(windows) {
         Platform::Windows
+    } else if cfg!(target_os = "macos") {
+        Platform::MacOs
     } else {
-        Platform::Unix
+        Platform::Linux
     }
 }
 
 /// Q1: the background-service toggle is NOT offered on Windows in v1
 /// (it would advertise a feature that doesn't work: schtasks has no
-/// `/Run`, `run_state` is Unknown, a console window at logon); on Unix
-/// (Linux/macOS) it stays offered, unchanged.
+/// `/Run`, `run_state` is Unknown, a console window at logon); on
+/// Linux and macOS it stays offered, unchanged.
 pub fn background_offered(p: Platform) -> bool {
     p != Platform::Windows
 }
@@ -453,8 +488,27 @@ mod tests {
             assert_eq!(sv.kind, "starting");
             assert_eq!(sv.title, title, "start-step title");
             assert!(sv.actions.is_empty(), "no actions while starting");
-            assert_eq!(sv.detail, None);
+            assert_eq!(
+                sv.detail, None,
+                "every start step except TrustingCertificate keeps detail None"
+            );
         }
+
+        // CA-trust design §3: TrustingCertificate is the ONE start step
+        // with a detail — the exact locked strings.
+        let sv = status_view(&Phase::Starting(StartStep::TrustingCertificate));
+        assert_eq!(sv.kind, "starting");
+        assert_eq!(
+            sv.title, "Approve PeakBot's certificate in the system prompt…",
+            "the ellipsis is U+2026, matching the other step titles"
+        );
+        assert_eq!(
+            sv.detail.as_deref(),
+            Some(
+                "PeakBot serves HTTPS with its own certificate authority (\"PeakBot Local CA\"). Approving adds it to this user account's trusted certificates so this window can open PeakBot."
+            )
+        );
+        assert!(sv.actions.is_empty(), "no actions while starting");
 
         // Ready.
         let tok = Token::parse("t").expect("parses");
@@ -590,6 +644,53 @@ mod tests {
             "detail is `$ <command>` + output; {:?}",
             sv.detail
         );
+
+        // CA-trust design §3: the exact locked failed view.
+        let sv = failed(StartError::CertificateNotTrusted {
+            detail: "macOS refused the certificate".into(),
+        });
+        assert_eq!(sv.kind, "failed");
+        assert_eq!(
+            sv.title, "PeakBot's HTTPS certificate isn't trusted",
+            "the exact locked title"
+        );
+        assert_eq!(
+            sv.detail.as_deref(),
+            Some(
+                "This window opens PeakBot over HTTPS (general.web.tls: true) and needs PeakBot's certificate authority in your trusted certificates. Press Retry to be asked again, or set general.web.tls: false in config.yaml and press Retry.\n\nmacOS refused the certificate"
+            ),
+            "detail is the locked prefix + the raw failure detail"
+        );
+        assert_eq!(sv.actions, vec![UiAction::Retry, UiAction::Quit]);
+    }
+
+    // CA-trust design §2: the compile target decides the Platform once.
+    // On Linux CI this asserts `host_platform() == Platform::Linux`.
+    #[test]
+    fn host_platform_follows_the_build_target() {
+        let expected = if cfg!(windows) {
+            Platform::Windows
+        } else if cfg!(target_os = "macos") {
+            Platform::MacOs
+        } else {
+            Platform::Linux
+        };
+        assert_eq!(
+            host_platform(),
+            expected,
+            "host_platform must mirror the build target (Linux CI ⇒ Linux)"
+        );
+    }
+
+    // CA-trust design §2: the offer decision over the three-way platform.
+    #[test]
+    fn background_offered_per_platform() {
+        assert!(background_offered(Platform::Linux), "Linux: offered");
+        assert!(background_offered(Platform::MacOs), "macOS: offered");
+        assert!(
+            !background_offered(Platform::Windows),
+            "Windows: NOT offered in v1 (Q1)"
+        );
     }
 
     // §9.1 case 31.
@@ -610,7 +711,7 @@ mod tests {
             &Phase::Starting(StartStep::CheckingBundled),
             Some(&ServiceState::NotInstalled),
             Some(&v),
-            Platform::Unix,
+            Platform::Linux,
         );
         assert_eq!(t.status, "PeakBot 0.23.0 · starting…");
         assert!(!t.background_checked);
@@ -622,14 +723,14 @@ mod tests {
             &ready_session,
             Some(&ServiceState::NotInstalled),
             Some(&v),
-            Platform::Unix,
+            Platform::Linux,
         );
         assert_eq!(t.status, "PeakBot 0.23.0 · running (port 7824)");
         assert!(!t.background_checked);
         assert!(t.background_enabled);
 
         // Ready(Service) + Installed → checked, enabled.
-        let t = tray_model(&ready_service, Some(&installed), Some(&v), Platform::Unix);
+        let t = tray_model(&ready_service, Some(&installed), Some(&v), Platform::Linux);
         assert_eq!(t.status, "PeakBot 0.23.0 · running in background");
         assert!(t.background_checked);
         assert!(t.background_enabled);
@@ -641,7 +742,7 @@ mod tests {
             }),
             Some(&installed),
             Some(&v),
-            Platform::Unix,
+            Platform::Linux,
         );
         assert_eq!(t.status, "PeakBot 0.23.0 · error");
         assert!(t.background_checked);
@@ -651,7 +752,7 @@ mod tests {
         let unavail = ServiceState::Unavailable {
             reason: "no bus".into(),
         };
-        let t = tray_model(&ready_session, Some(&unavail), Some(&v), Platform::Unix);
+        let t = tray_model(&ready_session, Some(&unavail), Some(&v), Platform::Linux);
         assert_eq!(
             t.background_label,
             "Keep PeakBot running in background (unavailable)"
@@ -659,7 +760,7 @@ mod tests {
         assert!(!t.background_enabled);
 
         // service None → disabled.
-        let t = tray_model(&ready_service, None, Some(&v), Platform::Unix);
+        let t = tray_model(&ready_service, None, Some(&v), Platform::Linux);
         assert!(!t.background_enabled);
 
         // bundled None → `?`.
@@ -667,7 +768,7 @@ mod tests {
             &Phase::Starting(StartStep::CheckingBundled),
             None,
             None,
-            Platform::Unix,
+            Platform::Linux,
         );
         assert_eq!(t.status, "PeakBot ? · starting…");
     }

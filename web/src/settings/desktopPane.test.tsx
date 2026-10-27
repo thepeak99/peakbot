@@ -87,7 +87,6 @@ function meta(): SettingsMeta {
 
 function view(over: Partial<DesktopView> = {}): DesktopView {
   return {
-    cert_warning: false,
     background_visible: true,
     background: false,
     background_enabled: true,

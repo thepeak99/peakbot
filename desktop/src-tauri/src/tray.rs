@@ -151,7 +151,7 @@ pub fn handle_menu_event(app: &AppHandle, id: &str) {
 pub fn build_app_submenu(app: &AppHandle) -> tauri::Result<tauri::menu::Submenu<tauri::Wry>> {
     use tauri::menu::Submenu;
 
-    let items = build_dynamic_items(app, true)?; // macOS ⇒ Unix ⇒ always offered
+    let items = build_dynamic_items(app, true)?; // macOS ⇒ always offered
     let open = MenuItem::with_id(app, "open", "Open PeakBot", true, None::<&str>)?;
     // The macOS accelerator (design #377 §5.3); the same id flows through
     // `handle_menu_event` on both the tray and the app menu.
@@ -174,7 +174,7 @@ pub fn build_app_submenu(app: &AppHandle) -> tauri::Result<tauri::menu::Submenu<
         items
             .background
             .as_ref()
-            .expect("background is offered on macOS (Unix)"),
+            .expect("background is offered on macOS (MacOs)"),
         &logs,
         &PredefinedMenuItem::separator(app)?,
         &quit,

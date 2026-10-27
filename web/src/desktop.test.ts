@@ -71,7 +71,6 @@ type TauriGlobal = { __TAURI__?: { core?: { invoke?: unknown } } };
 const tg = globalThis as TauriGlobal;
 
 const VIEW: DesktopView = {
-  cert_warning: false,
   background_visible: true,
   background: false,
   background_enabled: true,

@@ -3,12 +3,14 @@
 
 use std::io;
 use std::ops::ControlFlow;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Receiver;
 
 use semver::Version;
 
+use crate::ca_trust::{PeakbotCa, TrustStore};
 use crate::consts::{LOG_TAIL_LINES, POLL_INTERVAL, READY_TIMEOUT, STOP_GRACE, TICK};
 use crate::paths::DesktopPaths;
 use crate::phase::{Dialog, Mode, Phase, Platform, StartError, StartStep, TrayModel, tray_model};
@@ -59,10 +61,10 @@ pub struct Controller<S: Sys, U: Ui> {
     /// (release ⇒ Auto, debug ⇒ Ask).
     policy: ReplacePolicy,
     /// The host platform (Q1): set in `new`, never changes. Chosen once
-    /// by the glue from `cfg!(windows)` via `phase::host_platform()` —
-    /// the pure core never reads `cfg!` itself. On `Platform::Windows`
-    /// the start path is session-only: the background service is
-    /// non-functional in v1 and is never detected.
+    /// by the glue via `phase::host_platform()` (windows / macOS /
+    /// everything else) — the pure core never reads `cfg!` itself. On
+    /// `Platform::Windows` the start path is session-only: the background
+    /// service is non-functional in v1 and is never detected.
     platform: Platform,
     phase: Phase,
     /// The bundled (this app's) PeakBot version — the sidecar's
@@ -165,6 +167,63 @@ impl<S: Sys, U: Ui> Controller<S, U> {
 
     fn is_starting(&self) -> bool {
         matches!(self.phase, Phase::Starting(_))
+    }
+
+    /// THE single exit into `Phase::Ready` (design #376b): an HTTPS
+    /// target needs PeakBot's CA trusted first. Everything that makes the
+    /// window open goes through here — never a bare `set_phase(Ready)`.
+    fn enter_ready(&mut self, mode: Mode) {
+        if mode.target().tls
+            && let Err(detail) = self.ensure_ca_trusted()
+        {
+            self.fail(StartError::CertificateNotTrusted { detail });
+            return;
+        }
+        self.set_phase(Phase::Ready(mode));
+    }
+
+    /// macOS/Windows: PeakBot's CA must be in the user's trusted
+    /// certificates, else the webview can't open the HTTPS URL. Check
+    /// first; only a FAILED check runs the add (the OS prompt). Linux
+    /// trusts the CA in the webview and touches nothing. All failures are
+    /// a `String` detail for `CertificateNotTrusted` — the session child
+    /// is left alive (the caller owns the child; `fail` never stops it).
+    fn ensure_ca_trusted(&mut self) -> Result<(), String> {
+        if self.platform == Platform::Linux {
+            return Ok(());
+        }
+        let home = directories_next::BaseDirs::new()
+            .ok_or("no home directory (directories crate unavailable)")?
+            .home_dir()
+            .to_path_buf();
+        let Some(store) = TrustStore::for_platform(self.platform, &home) else {
+            return Ok(());
+        };
+        let path = crate::paths::peakbot_ca_cert()
+            .ok_or("cannot resolve the PeakBot CA certificate path")?;
+        let pem = match self.sys.read(&path) {
+            Ok(Some(pem)) => pem,
+            Ok(None) => return Err(format!("{} not found", path.display())),
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
+        let ca = PeakbotCa::parse(&path, &pem)?;
+
+        let check = store.check_cmd(&ca);
+        let check_args: Vec<&str> = check.args.iter().map(String::as_str).collect();
+        if let Ok(out) = self.sys.run(Path::new(check.program), &check_args)
+            && store.is_trusted(&ca, &out)
+        {
+            return Ok(());
+        }
+
+        self.set_phase(Phase::Starting(StartStep::TrustingCertificate));
+        let add = store.add_cmd(&ca);
+        let add_args: Vec<&str> = add.args.iter().map(String::as_str).collect();
+        match self.sys.run(Path::new(add.program), &add_args) {
+            Ok(out) if out.ok() => Ok(()),
+            Ok(out) => Err(format!("$ {add}\n{}", out.combined().trim())),
+            Err(e) => Err(format!("$ {add}\n{e}")),
+        }
     }
 
     // -------------------------------------------------------------------
@@ -370,7 +429,7 @@ impl<S: Sys, U: Ui> Controller<S, U> {
         match outcome {
             ReadyOutcome::Ready => {
                 self.session = Some(Session { child });
-                self.set_phase(Phase::Ready(mode));
+                self.enter_ready(mode);
             }
             // A busy bind lands here too: the child exits and the log
             // tail says why (spec §8.4 — no port fallback).
@@ -415,7 +474,7 @@ impl<S: Sys, U: Ui> Controller<S, U> {
             }
         }
         match self.await_backend(mode, None) {
-            (ReadyOutcome::Ready, mode) => self.set_phase(Phase::Ready(mode)),
+            (ReadyOutcome::Ready, mode) => self.enter_ready(mode),
             (ReadyOutcome::TokenRejected, _) => {
                 self.fail(StartError::TokenRejected { service: true })
             }
@@ -849,22 +908,23 @@ mod tests {
         started_with(sys, ui, ReplacePolicy::Ask)
     }
 
-    /// `Controller::new(…, policy)` + `handle(Start)` on `Platform::Unix`
+    /// `Controller::new(…, policy)` + `handle(Start)` on `Platform::Linux`
     /// — the pre-Q1 behaviour every existing test pins.
     fn started_with(
         sys: FakeSys,
         ui: FakeUi,
         policy: ReplacePolicy,
     ) -> Controller<FakeSys, FakeUi> {
-        started_on(sys, ui, policy, Platform::Unix)
+        started_on(sys, ui, policy, Platform::Linux)
     }
 
     /// `Controller::new(…, policy, platform)` + `handle(Start)`.
     ///
     /// CONTRACT (Q1, RED until the developer lands it): the constructor
     /// takes the host platform as its LAST parameter — the glue decides
-    /// it once from `cfg!(windows)` via `phase::host_platform()` and
-    /// passes it into the pure core, exactly like `policy`.
+    /// it once via `phase::host_platform()` (windows / macOS /
+    /// everything else) and passes it into the pure core, exactly like
+    /// `policy`.
     /// `pub fn new(sys, ui, paths, quitting, policy, platform: Platform)`.
     fn started_on(
         sys: FakeSys,
@@ -920,7 +980,7 @@ mod tests {
             paths(),
             Arc::new(AtomicBool::new(false)),
             ReplacePolicy::Ask,
-            Platform::Unix,
+            Platform::Linux,
         );
         let _ = ctrl.handle(Action::Start);
         match ctrl.phase() {
@@ -951,7 +1011,7 @@ mod tests {
             paths(),
             Arc::new(AtomicBool::new(false)),
             ReplacePolicy::Ask,
-            Platform::Unix,
+            Platform::Linux,
         );
         let _ = ctrl.handle(Action::Start);
         match ctrl.phase() {
@@ -2011,7 +2071,7 @@ mod tests {
             paths(),
             Arc::new(AtomicBool::new(false)),
             ReplacePolicy::Ask,
-            Platform::Unix,
+            Platform::Linux,
         );
         let _ = ctrl.handle(Action::ToggleBackground);
         let _ = ctrl.handle(Action::ReinstallService);
@@ -3217,7 +3277,7 @@ mod tests {
     // the session path, spawning the session sidecar exactly as when no
     // service is installed. This holds even when the fake reports a
     // service as installed (identical binary, an older version, running
-    // or unknown state). `Platform::Unix` behaviour is unchanged and is
+    // or unknown state). `Platform::Linux` behaviour is unchanged and is
     // pinned by the existing tests (t46/t47: installed ⇒ ConnectService).
     // -------------------------------------------------------------------
 
@@ -3715,6 +3775,654 @@ mod tests {
                 "no token in any argv (I7); got {r:?}"
             );
         }
+    }
+
+    // -------------------------------------------------------------------
+    // CA-trust design §5 — the CA trust step right before Ready.
+    //
+    // Setup for every case: config `general.web.tls: true` (unless noted),
+    // the CA PEM seeded at `paths::peakbot_ca_cert()`, default probe
+    // ready. FakeSys keys `run` by program FILE NAME, so the trust-store
+    // commands are scripted as "security" / "certutil.exe".
+    // -------------------------------------------------------------------
+
+    const TLS_YAML: &str = "general:\n  web:\n    tls: true\n";
+    const HTTP_YAML: &str = "general:\n  web:\n    tls: false\n";
+
+    /// The same real openssl fixture CA as `tests/ca_trust.rs` (PEM only,
+    /// no key in the repo).
+    const CA_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+MIIDJTCCAg2gAwIBAgIUWQWuHFoWUzh61plJAyaRzNKgpbUwDQYJKoZIhvcNAQEL
+BQAwIjEgMB4GA1UEAwwXUGVha0JvdCBUZXN0IEZpeHR1cmUgQ0EwHhcNMjYxMDI3
+MTQwNzA4WhcNMzYxMDI0MTQwNzA4WjAiMSAwHgYDVQQDDBdQZWFrQm90IFRlc3Qg
+Rml4dHVyZSBDQTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAIXf4iIa
+Z9Z0QXgRZD9ccGVEilX09MUaJcKnNo9RR9h/5rgWEn0sPbVDz/0IySxICzjdL5ek
+F30Xu/E13nXCcL5yFxBTA9VmkW2ZLj5Bn/pNZGfWeQeqZ7oFdOR8Iw75XeAjowjI
+1g0ZB8iM1JyuuaGJjtHWlJ8vpOY0VZEB/jvlSkVZ4NqvjT6f3h7S6USUhaNW6EFI
+LBKycWUZ8mWoL9Ly5jB+C6kR5geGHl8lK/1Z7RyqyEh2J6sp1iUvtqEOZR6NFfCy
+5eBE+BdUgvO0Gz6vfC4tXvpxWYSc0/dtSkq1rsT3HBoXuIgEo7n/LZ6pQqqBip1b
+tBZbjSzAE8t0AwECAwEAAaNTMFEwHQYDVR0OBBYEFBay38etvAkZau3PFkDys+zy
+0y3pMB8GA1UdIwQYMBaAFBay38etvAkZau3PFkDys+zy0y3pMA8GA1UdEwEB/wQF
+MAMBAf8wDQYJKoZIhvcNAQELBQADggEBAAw/cvPHEKiatiif+8XMoTyvTAG0nvma
+hhpnmeaQz3It2hnnJrgiEVY4m16o4AMjU9CZmE/isCpJKMVbmK4aRW+G4FyaLtF/
+rjD4gl0IRzgmzEDOOLhqpH34nliJNANHTWJxSE3qXTiACxxEAkrnijaihCCU/2Ta
+M2J9RlmrmvFDXhAO4y6VGXRhAxPrBs5yEQ5kvlON17L61ChdmIuH9YdlopsQiJEX
+zUm22DjFCRmsEF7T2nVXKFKuWmRc2DcTfK+jfPmJL27yTPso1ICK30wPJpDsGCkI
+Mau1Qxq3S7SfaVNWM0OeBd9HV3682/Fu/7MHE+ATQV5Ved7dQCfVoVc=
+-----END CERTIFICATE-----
+"#;
+
+    /// SHA-1 of the fixture CA (the thumbprint the Windows store uses).
+    const CT_CA_SHA1: &str = "FC78374057D7B930128238B5AC29E5531816611E";
+
+    fn ca_cert_path() -> PathBuf {
+        crate::paths::peakbot_ca_cert().expect("the cache dir resolves")
+    }
+
+    /// The login keychain the controller is expected to use in tests.
+    fn login_keychain() -> String {
+        directories_next::BaseDirs::new()
+            .expect("base dirs resolve")
+            .home_dir()
+            .join("Library/Keychains/login.keychain-db")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn ca_path_str() -> String {
+        ca_cert_path().to_string_lossy().into_owned()
+    }
+
+    /// `spaced_lower("ABCDEF")` ⇒ `"ab cd ef"` (certutil's hash style).
+    fn spaced_lower(hash: &str) -> String {
+        hash.as_bytes()
+            .chunks(2)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    }
+
+    fn macos_verify_args() -> Vec<String> {
+        vec![
+            "verify-cert".to_string(),
+            "-c".to_string(),
+            ca_path_str(),
+            "-p".to_string(),
+            "ssl".to_string(),
+            "-l".to_string(),
+            "-L".to_string(),
+            "-R".to_string(),
+            "offline".to_string(),
+        ]
+    }
+
+    /// `&[&str]` view of a `Vec<String>` (the `set_run` shape).
+    fn refs(args: &[String]) -> Vec<&str> {
+        args.iter().map(String::as_str).collect()
+    }
+
+    /// How many recorded `run` calls had exactly these args.
+    fn count_runs(runs: &[Vec<String>], args: &[String]) -> usize {
+        runs.iter().filter(|r| r.as_slice() == args).count()
+    }
+
+    fn macos_add_args() -> Vec<String> {
+        vec![
+            "add-trusted-cert".to_string(),
+            "-r".to_string(),
+            "trustRoot".to_string(),
+            "-p".to_string(),
+            "ssl".to_string(),
+            "-k".to_string(),
+            login_keychain(),
+            ca_path_str(),
+        ]
+    }
+
+    fn windows_check_args() -> Vec<String> {
+        vec![
+            "-user".to_string(),
+            "-store".to_string(),
+            "Root".to_string(),
+            CT_CA_SHA1.to_string(),
+        ]
+    }
+
+    fn windows_add_args() -> Vec<String> {
+        vec![
+            "-user".to_string(),
+            "-addstore".to_string(),
+            "Root".to_string(),
+            ca_path_str(),
+        ]
+    }
+
+    /// Base start script: versioned sidecar, no service, tls/http
+    /// config, live session child, probe 200, CA seeded (unless
+    /// `seed_ca` is false).
+    fn ct_base(tls: bool, seed_ca: bool) -> (FakeSys, FakeUi) {
+        let sys = FakeSys::new();
+        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
+        sys.set_run(
+            "peakbot",
+            &["service", "status"],
+            run_out(Some(0), NOT_INSTALLED, ""),
+        );
+        sys.set_default_probe(vec![Probe::Status(200)]);
+        sys.queue_child(crate::testing::FakeChildSpec::alive());
+        sys.seed_file(CONFIG_YAML, if tls { TLS_YAML } else { HTTP_YAML });
+        if seed_ca {
+            sys.seed_file(ca_cert_path(), CA_PEM);
+        }
+        (sys, FakeUi::new())
+    }
+
+    /// No `security` / `certutil.exe` run at all (the trust step never
+    /// ran).
+    fn assert_no_trust_store_runs(sys: &FakeSys) {
+        assert!(
+            sys.events().iter().all(|e| {
+                !matches!(
+                    e,
+                    Effect::Run { program, .. }
+                        if program
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| n == "security" || n == "certutil.exe")
+                )
+            }),
+            "no security/certutil runs; events: {:?}",
+            sys.events()
+        );
+    }
+
+    // CT1: MacOs session, the CA is already trusted ⇒ Ready with no
+    // add-trusted-cert and no TrustingCertificate step.
+    #[test]
+    fn ct1_macos_already_trusted_ready_without_add() {
+        let (sys, ui) = ct_base(true, true);
+        sys.set_run(
+            "security",
+            &refs(&macos_verify_args()),
+            run_out(Some(0), "", ""),
+        );
+        let ctrl = started_on(sys.clone(), ui.clone(), ReplacePolicy::Ask, Platform::MacOs);
+
+        assert!(
+            matches!(
+                ctrl.phase(),
+                Phase::Ready(Mode::Session(t)) if t.tls
+            ),
+            "Ready(Session, tls); got {:?}",
+            ctrl.phase()
+        );
+        let runs = sys.run_args();
+        assert_eq!(
+            count_runs(&runs, &macos_verify_args()),
+            1,
+            "the trust check ran exactly once; runs: {runs:?}"
+        );
+        assert!(
+            !runs
+                .iter()
+                .any(|r| r.first().is_some_and(|a| a == "add-trusted-cert")),
+            "no add-trusted-cert run; runs: {runs:?}"
+        );
+        assert!(
+            !ui.steps()
+                .iter()
+                .any(|p| { matches!(p, Phase::Starting(StartStep::TrustingCertificate)) }),
+            "TrustingCertificate must never be emitted; steps: {:?}",
+            ui.steps()
+        );
+    }
+
+    // CT2: MacOs, not trusted ⇒ the add runs exactly once, the phase
+    // goes … WaitingForBackend → TrustingCertificate → Ready, and the
+    // verify run happens AFTER the successful probe.
+    #[test]
+    fn ct2_macos_not_trusted_adds_then_ready() {
+        let (sys, ui) = ct_base(true, true);
+        sys.set_run(
+            "security",
+            &refs(&macos_verify_args()),
+            run_out(Some(1), "", ""),
+        );
+        let add_args = macos_add_args();
+        sys.set_run("security", &refs(&add_args), run_out(Some(0), "ok\n", ""));
+        let ctrl = started_on(sys.clone(), ui.clone(), ReplacePolicy::Ask, Platform::MacOs);
+
+        assert!(
+            matches!(
+                ctrl.phase(),
+                Phase::Ready(Mode::Session(t)) if t.tls
+            ),
+            "Ready(Session, tls); got {:?}",
+            ctrl.phase()
+        );
+        let runs = sys.run_args();
+        assert_eq!(
+            count_runs(&runs, &add_args),
+            1,
+            "the add ran exactly once; runs: {runs:?}"
+        );
+
+        // Phases: … WaitingForBackend → TrustingCertificate → Ready.
+        let steps = ui.steps();
+        let i_wait = steps
+            .iter()
+            .position(|p| matches!(p, Phase::Starting(StartStep::WaitingForBackend)))
+            .expect("WaitingForBackend emitted");
+        let i_trust = steps
+            .iter()
+            .position(|p| matches!(p, Phase::Starting(StartStep::TrustingCertificate)))
+            .expect("TrustingCertificate emitted");
+        let i_ready = steps
+            .iter()
+            .position(|p| matches!(p, Phase::Ready(_)))
+            .expect("Ready emitted");
+        assert!(
+            i_wait < i_trust && i_trust + 1 == i_ready,
+            "WaitingForBackend → TrustingCertificate → Ready; steps: {steps:?}"
+        );
+
+        // The verify run happens after the successful probe.
+        let evts = sys.events();
+        let i_probe = evts
+            .iter()
+            .position(|e| matches!(e, Effect::Probe { .. }))
+            .expect("a probe ran");
+        let i_verify = evts
+            .iter()
+            .position(|e| {
+                matches!(e, Effect::Run { args, .. }
+                    if args.first().is_some_and(|a| a == "verify-cert"))
+            })
+            .expect("verify ran");
+        assert!(
+            i_probe < i_verify,
+            "the verify run happens after the successful probe; events: {evts:?}"
+        );
+    }
+
+    // CT3: MacOs, the add is refused ⇒ Failed(CertificateNotTrusted)
+    // with the failed command in the detail — the session child stays
+    // alive (no interrupt, pidfile present). Retry interrupts the old
+    // child before spawning and checks again.
+    #[test]
+    fn ct3_macos_add_failure_fails_and_retry_rechecks() {
+        let (sys, ui) = ct_base(true, true);
+        // verify: 1st call Some(1) (first start), 2nd Some(0) (retry —
+        // the cert is in by then).
+        sys.set_run_seq(
+            "security",
+            &refs(&macos_verify_args()),
+            vec![run_out(Some(1), "", ""), run_out(Some(0), "", "")],
+        );
+        sys.set_run(
+            "security",
+            &refs(&macos_add_args()),
+            run_out(Some(1), "", "User canceled\n"),
+        );
+        sys.queue_child(crate::testing::FakeChildSpec::alive()); // the retry's child
+        let mut ctrl = started_on(sys.clone(), ui.clone(), ReplacePolicy::Ask, Platform::MacOs);
+
+        match ctrl.phase() {
+            Phase::Failed(StartError::CertificateNotTrusted { detail }) => {
+                assert!(
+                    detail.starts_with("$ /usr/bin/security add-trusted-cert"),
+                    "detail names the failed add command; {detail:?}"
+                );
+                assert!(
+                    detail.contains("User canceled"),
+                    "detail carries the add output; {detail:?}"
+                );
+            }
+            other => panic!("expected CertificateNotTrusted, got {other:?}"),
+        }
+        assert!(
+            !sys.events()
+                .iter()
+                .any(|e| matches!(e, Effect::ChildInterrupt { .. })),
+            "no child interrupt on a trust failure; events: {:?}",
+            sys.events()
+        );
+        assert!(
+            sys.has_file(Path::new(PIDFILE)),
+            "the pidfile stays: the session child is alive"
+        );
+
+        // Retry: the old pid is interrupted before the new spawn, and
+        // the check runs again.
+        let _ = ctrl.handle(Action::Start);
+        assert!(
+            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
+            "the retry reaches Ready; got {:?}",
+            ctrl.phase()
+        );
+        let pids = sys.spawned_pids();
+        assert_eq!(pids.len(), 2, "one child per start");
+        let evts = sys.events();
+        let i_int = evts
+            .iter()
+            .position(|e| matches!(e, Effect::ChildInterrupt { pid } if *pid == pids[0]))
+            .expect("the old child was interrupted");
+        let i_spawn2 = evts
+            .iter()
+            .position(|e| matches!(e, Effect::Spawn { pid, .. } if *pid == pids[1]))
+            .expect("the new child was spawned");
+        assert!(
+            i_int < i_spawn2,
+            "the old pid is interrupted before the new spawn; events: {evts:?}"
+        );
+        let verifies = evts
+            .iter()
+            .filter(|e| {
+                matches!(e, Effect::Run { args, .. }
+                    if args.first().is_some_and(|a| a == "verify-cert"))
+            })
+            .count();
+        assert_eq!(
+            verifies, 2,
+            "the check runs again on the retry; events: {evts:?}"
+        );
+    }
+
+    // CT4: MacOs, the check command itself errors (unscripted ⇒
+    // FakeSys NotFound) ⇒ treated as NOT trusted, the add runs, Ready.
+    #[test]
+    fn ct4_macos_check_error_treated_as_not_trusted() {
+        let (sys, ui) = ct_base(true, true);
+        // `verify-cert` is deliberately NOT scripted: run → Err.
+        sys.set_run(
+            "security",
+            &refs(&macos_add_args()),
+            run_out(Some(0), "ok\n", ""),
+        );
+        let ctrl = started_on(sys.clone(), ui.clone(), ReplacePolicy::Ask, Platform::MacOs);
+
+        assert!(
+            matches!(
+                ctrl.phase(),
+                Phase::Ready(Mode::Session(t)) if t.tls
+            ),
+            "a check error is not a hard failure; got {:?}",
+            ctrl.phase()
+        );
+        let runs = sys.run_args();
+        assert_eq!(
+            count_runs(&runs, &macos_add_args()),
+            1,
+            "the add ran exactly once; runs: {runs:?}"
+        );
+    }
+
+    // CT5: Windows, the store check says trusted (exit 0 + thumbprint
+    // in stdout) ⇒ Ready, no -addstore.
+    #[test]
+    fn ct5_windows_already_trusted_ready_without_addstore() {
+        let (sys, ui) = ct_base(true, true);
+        let out = format!("Cert Hash(sha1): {}\n", spaced_lower(CT_CA_SHA1));
+        sys.set_run(
+            "certutil.exe",
+            &refs(&windows_check_args()),
+            run_out(Some(0), &out, ""),
+        );
+        let ctrl = started_on(
+            sys.clone(),
+            ui.clone(),
+            ReplacePolicy::Ask,
+            Platform::Windows,
+        );
+
+        assert!(
+            matches!(
+                ctrl.phase(),
+                Phase::Ready(Mode::Session(t)) if t.tls
+            ),
+            "Ready(Session, tls); got {:?}",
+            ctrl.phase()
+        );
+        let runs = sys.run_args();
+        assert_eq!(
+            count_runs(&runs, &windows_check_args()),
+            1,
+            "the store check ran exactly once; runs: {runs:?}"
+        );
+        assert!(
+            !runs
+                .iter()
+                .any(|r| r.get(1).is_some_and(|a| a == "-addstore")),
+            "no -addstore run; runs: {runs:?}"
+        );
+    }
+
+    // CT6: Windows, not trusted ⇒ addstore runs, Ready.
+    #[test]
+    fn ct6_windows_not_trusted_addstore_then_ready() {
+        let (sys, ui) = ct_base(true, true);
+        sys.set_run(
+            "certutil.exe",
+            &refs(&windows_check_args()),
+            run_out(Some(1), "", ""),
+        );
+        sys.set_run(
+            "certutil.exe",
+            &refs(&windows_add_args()),
+            run_out(Some(0), "Command completed successfully.\n", ""),
+        );
+        let ctrl = started_on(
+            sys.clone(),
+            ui.clone(),
+            ReplacePolicy::Ask,
+            Platform::Windows,
+        );
+
+        assert!(
+            matches!(
+                ctrl.phase(),
+                Phase::Ready(Mode::Session(t)) if t.tls
+            ),
+            "Ready(Session, tls); got {:?}",
+            ctrl.phase()
+        );
+        let runs = sys.run_args();
+        assert_eq!(
+            count_runs(&runs, &windows_add_args()),
+            1,
+            "the addstore ran exactly once; runs: {runs:?}"
+        );
+    }
+
+    // CT7: Windows, the addstore is refused ⇒ Failed(CertificateNotTrusted).
+    #[test]
+    fn ct7_windows_addstore_failure_fails_certificate_not_trusted() {
+        let (sys, ui) = ct_base(true, true);
+        sys.set_run(
+            "certutil.exe",
+            &refs(&windows_check_args()),
+            run_out(Some(1), "", ""),
+        );
+        sys.set_run(
+            "certutil.exe",
+            &refs(&windows_add_args()),
+            run_out(Some(1), "", "The system cannot find the file specified.\n"),
+        );
+        let ctrl = started_on(
+            sys.clone(),
+            ui.clone(),
+            ReplacePolicy::Ask,
+            Platform::Windows,
+        );
+
+        match ctrl.phase() {
+            Phase::Failed(StartError::CertificateNotTrusted { detail }) => {
+                assert!(
+                    detail.starts_with("$ certutil.exe -user -addstore"),
+                    "detail names the failed addstore command; {detail:?}"
+                );
+            }
+            other => panic!("expected CertificateNotTrusted, got {other:?}"),
+        }
+    }
+
+    // CT8: tls false ⇒ no trust step at all, on MacOs AND Windows.
+    #[test]
+    fn ct8_tls_false_no_trust_step_on_macos_or_windows() {
+        for platform in [Platform::MacOs, Platform::Windows] {
+            let (sys, ui) = ct_base(false, true);
+            let ctrl = started_on(sys.clone(), ui.clone(), ReplacePolicy::Ask, platform);
+            assert!(
+                matches!(
+                    ctrl.phase(),
+                    Phase::Ready(Mode::Session(t)) if !t.tls
+                ),
+                "Ready(Session, http) on {platform:?}; got {:?}",
+                ctrl.phase()
+            );
+            assert_no_trust_store_runs(&sys);
+        }
+    }
+
+    // CT9: Linux with tls ⇒ the webview trusts the CA itself; no
+    // security/certutil runs, Ready(https).
+    #[test]
+    fn ct9_linux_tls_true_no_trust_step() {
+        let (sys, ui) = ct_base(true, true);
+        let ctrl = started_on(sys.clone(), ui.clone(), ReplacePolicy::Ask, Platform::Linux);
+        assert!(
+            matches!(
+                ctrl.phase(),
+                Phase::Ready(Mode::Session(t)) if t.tls
+            ),
+            "Ready(Session, https); got {:?}",
+            ctrl.phase()
+        );
+        assert_no_trust_store_runs(&sys);
+    }
+
+    // CT10: MacOs, tls, the CA file is missing ⇒ Failed, the detail
+    // names the file and "not found"; zero trust-store runs.
+    #[test]
+    fn ct10_macos_ca_missing_fails_not_found() {
+        let (sys, ui) = ct_base(true, false); // CA NOT seeded
+        let ctrl = started_on(sys.clone(), ui.clone(), ReplacePolicy::Ask, Platform::MacOs);
+        match ctrl.phase() {
+            Phase::Failed(StartError::CertificateNotTrusted { detail }) => {
+                assert!(
+                    detail.contains("ca-cert.pem"),
+                    "detail names the CA file; {detail:?}"
+                );
+                assert!(
+                    detail.contains("not found"),
+                    "detail says the file is missing; {detail:?}"
+                );
+            }
+            other => panic!("expected CertificateNotTrusted, got {other:?}"),
+        }
+        assert_no_trust_store_runs(&sys);
+    }
+
+    // CT11: MacOs, the CA file is unparseable ⇒ Failed; zero
+    // trust-store runs.
+    #[test]
+    fn ct11_macos_ca_garbage_fails_without_trust_store_runs() {
+        let (sys, ui) = ct_base(true, false);
+        sys.seed_file(ca_cert_path(), "this is not a pem\n");
+        let ctrl = started_on(sys.clone(), ui.clone(), ReplacePolicy::Ask, Platform::MacOs);
+        match ctrl.phase() {
+            Phase::Failed(StartError::CertificateNotTrusted { detail }) => {
+                assert!(
+                    !detail.is_empty(),
+                    "detail describes the parse failure; {detail:?}"
+                );
+            }
+            other => panic!("expected CertificateNotTrusted, got {other:?}"),
+        }
+        assert_no_trust_store_runs(&sys);
+    }
+
+    // CT12: MacOs, an installed service with TLS on (t84-style) ⇒ the
+    // trust step runs before Ready(Service, tls).
+    #[test]
+    fn ct12_macos_tls_service_trust_step_before_ready() {
+        let sys = FakeSys::new();
+        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
+        sys.set_run(
+            "peakbot",
+            &["service", "status"],
+            installed_status_tls("running", "on"),
+        );
+        sys.set_default_probe(vec![Probe::Status(200)]);
+        sys.seed_file(CONFIG_YAML, TLS_YAML);
+        sys.seed_file(ca_cert_path(), CA_PEM);
+        sys.set_run(
+            "security",
+            &refs(&macos_verify_args()),
+            run_out(Some(1), "", ""),
+        );
+        sys.set_run(
+            "security",
+            &refs(&macos_add_args()),
+            run_out(Some(0), "ok\n", ""),
+        );
+        let ui = FakeUi::new();
+        let ctrl = started_on(sys.clone(), ui.clone(), ReplacePolicy::Ask, Platform::MacOs);
+
+        assert!(
+            matches!(
+                ctrl.phase(),
+                Phase::Ready(Mode::Service(t)) if t.tls
+            ),
+            "Ready(Service, tls); got {:?}",
+            ctrl.phase()
+        );
+        let runs = sys.run_args();
+        assert_eq!(
+            count_runs(&runs, &macos_add_args()),
+            1,
+            "the add ran exactly once; runs: {runs:?}"
+        );
+    }
+
+    // CT13: MacOs, http config but the installed unit has TLS on ⇒ the
+    // effective target is https, so the trust step runs.
+    #[test]
+    fn ct13_macos_http_config_tls_unit_still_runs_trust_step() {
+        let sys = FakeSys::new();
+        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
+        sys.set_run(
+            "peakbot",
+            &["service", "status"],
+            installed_status_tls("running", "on"),
+        );
+        sys.set_default_probe(vec![Probe::Status(200)]);
+        sys.seed_file(CONFIG_YAML, HTTP_YAML); // tls: false in config
+        sys.seed_file(ca_cert_path(), CA_PEM);
+        // Already trusted: the check just has to RUN.
+        sys.set_run(
+            "security",
+            &refs(&macos_verify_args()),
+            run_out(Some(0), "", ""),
+        );
+        let ui = FakeUi::new();
+        let ctrl = started_on(sys.clone(), ui.clone(), ReplacePolicy::Ask, Platform::MacOs);
+
+        assert!(
+            matches!(
+                ctrl.phase(),
+                Phase::Ready(Mode::Service(t)) if t.tls
+            ),
+            "the unit's TLS: line ⇒ Ready(Service, tls); got {:?}",
+            ctrl.phase()
+        );
+        let runs = sys.run_args();
+        assert!(
+            runs.iter()
+                .any(|r| r.first().is_some_and(|a| a == "verify-cert")),
+            "the trust step (verify) ran; runs: {runs:?}"
+        );
     }
 
     /// The URL the bridge would navigate to (`None` unless Ready).

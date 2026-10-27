@@ -20,18 +20,19 @@
 //! #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 //! pub enum Platform {
 //!     Windows, // background service is non-functional in v1 (Q1)
-//!     Unix,    // Linux/macOS — unchanged
+//!     Linux,   // the webview trusts the CA itself
+//!     MacOs,   // the CA goes into the login keychain
 //! }
 //!
 //! /// Q1: the background-service toggle is NOT offered on Windows in v1; on
-//! /// Unix (Linux/macOS) it stays offered, unchanged.
+//! /// Linux and macOS it stays offered, unchanged.
 //! pub fn background_offered(p: Platform) -> bool;
 //! ```
 //!
 //! Wiring the developer completes (covered by the manual W11 check, not here):
 //! the glue computes `Platform` from `cfg!(windows)` once; `TrayModel` carries
 //! a `background_visible: bool` derived from `background_offered`; the tray
-//! item and the settings row are hidden when it is false. `Platform::Unix`
+//! item and the settings row are hidden when it is false. `Platform::Linux`
 //! behaviour must be byte-for-byte today's (this file pins the offer decision;
 //! the existing `t31`/`t74` tests pin the rest).
 
@@ -46,9 +47,13 @@ fn q1_background_service_is_not_offered_on_windows() {
 }
 
 #[test]
-fn q1_background_service_is_still_offered_on_unix() {
+fn q1_background_service_is_still_offered_on_linux_and_macos() {
     assert!(
-        background_offered(Platform::Unix),
-        "Q1: the background-service toggle must stay offered on Linux/macOS (Unix)"
+        background_offered(Platform::Linux),
+        "Q1: the background-service toggle must stay offered on Linux"
+    );
+    assert!(
+        background_offered(Platform::MacOs),
+        "Q1: the background-service toggle must stay offered on macOS"
     );
 }
