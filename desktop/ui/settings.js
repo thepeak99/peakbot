@@ -5,8 +5,8 @@
 // "back"); web server settings live in PeakBot → Settings → General
 // (config.yaml `general.web`). Polls `settings_get` every 1000 ms. No
 // build step: talks to the window through `window.__TAURI__`
-// (withGlobalTauri). The remote PeakBot UI has no permissions at all
-// (capability ACL).
+// (withGlobalTauri). The remote PeakBot UI may invoke only settings_get,
+// toggle_background and theme_set (capabilities/desktop-pane.json).
 
 const $ = (id) => document.getElementById(id);
 
@@ -24,6 +24,9 @@ function tick() {
       // Q1: the row is absent on platforms that don't offer the
       // background service (Windows in v1).
       $("row-background").hidden = !view.background_visible;
+      // Un-hide the form: the HTML keeps it hidden so the defaults never
+      // flash before the first successful load.
+      $("page").hidden = false;
     })
     .catch((err) => console.error("settings poll failed", err));
 }
@@ -37,7 +40,7 @@ if (!tauri) {
   // reflects the result (the confirm dialogs run in the controller).
   $("background").addEventListener("change", () => {
     tauri.core
-      .invoke("act", { action: "toggle_background" })
+      .invoke("toggle_background")
       .catch((err) => console.error("toggle_background failed", err));
   });
 

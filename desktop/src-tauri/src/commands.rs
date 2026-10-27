@@ -1,7 +1,9 @@
-//! The IPC commands for the bundled local pages (DESIGN §5.4, amendment
-//! #377): `status`/`act` for the status page, `settings_get` for the
-//! settings page (0.24: read-only — web settings live in config.yaml). The remote PeakBot web UI has no permissions
-//! at all (capability ACL).
+//! The IPC commands (DESIGN §5.4, amendment #377, desktop-pane design):
+//! `status`/`act` for the status page; `settings_get`, `toggle_background`
+//! and `theme_get` for the bundled settings page. The remote PeakBot web
+//! UI (loopback :7823 only, `capabilities/desktop-pane.json`) may invoke
+//! exactly `settings_get`, `toggle_background` and `theme_set` — never
+//! `status`, `act` (it carries `quit`) or `theme_get`.
 
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -12,7 +14,7 @@ use tauri_plugin_opener::OpenerExt;
 use peakbot_desktop_core::controller::Action;
 use peakbot_desktop_core::paths::DesktopPaths;
 use peakbot_desktop_core::phase::{StatusView, UiAction};
-use peakbot_desktop_core::settings::{self, SettingsView};
+use peakbot_desktop_core::settings::{self, SettingsView, Theme};
 
 use crate::bridge::UiState;
 
@@ -53,12 +55,6 @@ pub fn act(
             app.exit(0);
             Ok(())
         }
-        // The settings page's background row (design #377 §5.2); the
-        // status page never emits it.
-        UiAction::ToggleBackground => {
-            tx.0.send(Action::ToggleBackground)
-                .map_err(|e| e.to_string())
-        }
         // The settings page's `← Back to PeakBot` (0.24, spec §9.10):
         // the main window goes back to the live backend URL, or the
         // status page if the backend is not Ready.
@@ -87,4 +83,29 @@ pub fn settings_get(state: State<'_, Arc<UiState>>) -> SettingsView {
         .clone();
     let snapshot = state.snapshot.lock().expect("snapshot poisoned").clone();
     settings::settings_view(&tray, &snapshot)
+}
+
+/// Toggle the background service (design #377 §5.2; desktop-pane D3). The
+/// controller decides enable vs disable from its own `ServiceState` and
+/// confirms with a dialog, so a caller can only *ask*. A dedicated
+/// command (not an `act` action) so the remote web UI can be granted it
+/// without ever getting `act`.
+#[tauri::command]
+pub fn toggle_background(tx: State<'_, ActionTx>) -> Result<(), String> {
+    tx.0.send(Action::ToggleBackground)
+        .map_err(|e| e.to_string())
+}
+
+/// The web UI reports its current theme (desktop-pane design §3); the
+/// bundled pages read it back with `theme_get` so they match the app.
+#[tauri::command]
+pub fn theme_set(theme: Theme, state: State<'_, Arc<UiState>>) {
+    *state.theme.lock().expect("theme poisoned") = Some(theme);
+}
+
+/// The last reported theme, `None` until the web UI has reported one.
+/// Local pages only — the remote web UI never reads it.
+#[tauri::command]
+pub fn theme_get(state: State<'_, Arc<UiState>>) -> Option<Theme> {
+    *state.theme.lock().expect("theme poisoned")
 }

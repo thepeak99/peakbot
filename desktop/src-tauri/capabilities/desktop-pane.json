@@ -1,0 +1,16 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "desktop-pane",
+  "description": "The PeakBot web UI on the default loopback backend (Settings → Desktop pane): read the desktop view, toggle background (controller confirms), report the theme. Nothing else, ever.",
+  "local": false,
+  "windows": ["main"],
+  "remote": {
+    "urls": [
+      "http://127.0.0.1:7823/*",
+      "https://127.0.0.1:7823/*",
+      "http://localhost:7823/*",
+      "https://localhost:7823/*"
+    ]
+  },
+  "permissions": ["allow-settings-get", "allow-toggle-background", "allow-theme-set"]
+}
