@@ -118,9 +118,6 @@ pub enum UiAction {
     OpenLogs,
     ReinstallService,
     Quit,
-    /// The settings page's background row (design #377 §4.2); `status_view`
-    /// never emits it.
-    ToggleBackground,
     /// The settings page's `← Back to PeakBot` (0.24, spec §9.10): the
     /// main window goes back to the chat (or the status page).
     /// `status_view` never emits it.

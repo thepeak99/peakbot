@@ -4,9 +4,20 @@
 //! `general.web`, edited in PeakBot → Settings → General; the desktop
 //! owns no settings file.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::phase::{StatusView, TrayModel};
+
+/// The web UI's light/dark theme, as reported over the `theme_set`
+/// command and read back by the bundled pages via `theme_get`
+/// (desktop-pane design §3). Lowercase wire form; the web page's value is
+/// untrusted input, so nothing else deserializes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    Light,
+    Dark,
+}
 
 /// What the settings page renders: the live tray/status state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

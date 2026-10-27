@@ -103,20 +103,22 @@ fn head_includes_theme_script(html: &str) -> bool {
     head.contains("src=\"theme.js\"") || head.contains("src='theme.js'")
 }
 
-/// True if `theme.js` is the LAST child of `<head>`: after the LAST
-/// `<script` opening tag in the head, the only `</` closing tag before
-/// `</head>` is `</script>` (later tags in the head must not be closed
-/// after it).
+/// True if `theme.js` is the LAST child of `<head>`: the LAST
+/// `<script` opening tag in the head is the `theme.js` one, and after
+/// it the only `</` closing tag before `</head>` is its own
+/// `</script>` (later tags in the head must not be closed after it).
 fn theme_script_is_last_head_child(html: &str) -> bool {
     let head_end = html.find("</head>").expect("the page has a </head>");
     let head = &html[..head_end];
     let pos = head.rfind("<script").expect("the head has script tags");
     let tag_end = head[pos..].find('>').expect("the script tag is closed");
-    let after = &head[pos + tag_end..];
+    let tag = &head[pos..pos + tag_end + 1];
+    let after = &head[pos + tag_end + 1..];
     let next_close = after
         .find("</")
         .expect("the script tag is closed in the head");
-    after[..next_close].trim().is_empty() && after[next_close..].starts_with("/script")
+    let is_theme = tag.contains("src=\"theme.js\"") || tag.contains("src='theme.js'");
+    is_theme && after[..next_close].trim().is_empty() && after[next_close..].starts_with("</script")
 }
 
 // ── desktop-pane.json (the remote capability) ────────────────────────────

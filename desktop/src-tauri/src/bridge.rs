@@ -11,6 +11,7 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use peakbot_desktop_core::controller::Ui;
 use peakbot_desktop_core::nav::{NavDecision, classify_navigation};
 use peakbot_desktop_core::phase::{Dialog, Phase, StartStep, StatusView, TrayModel, status_view};
+use peakbot_desktop_core::settings::Theme;
 
 use crate::tray::{self, TrayItems};
 
@@ -50,6 +51,9 @@ pub struct UiState {
     /// Clones of the tray items that `TrayModel` updates (2.12's
     /// `TrayIcon` has no `get_menu()`, so the handles are kept here).
     pub tray_items: Mutex<Option<TrayItems>>,
+    /// The web UI's last reported theme (`theme_set`); `None` until it
+    /// reports one. Read back by the bundled pages via `theme_get`.
+    pub theme: Mutex<Option<Theme>>,
 }
 
 impl UiState {
@@ -66,6 +70,7 @@ impl UiState {
                 peakbot_desktop_core::phase::host_platform(),
             )),
             tray_items: Mutex::new(None),
+            theme: Mutex::new(None),
         }
     }
 }

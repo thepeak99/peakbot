@@ -7,6 +7,7 @@
 // subsequent toggles.
 
 import { useCallback, useEffect, useState } from "react";
+import { isDesktop, setDesktopTheme } from "./desktop";
 
 export type Theme = "light" | "dark";
 
@@ -30,6 +31,8 @@ export function useTheme() {
   useEffect(() => {
     apply(theme);
     localStorage.setItem(STORAGE_KEY, theme);
+    // The desktop app's bundled pages follow the web theme: report it.
+    if (isDesktop()) setDesktopTheme(theme).catch(() => {});
   }, [theme]);
 
   const toggle = useCallback(

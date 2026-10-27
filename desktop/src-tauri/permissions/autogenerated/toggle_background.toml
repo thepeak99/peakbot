@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-toggle-background"
+description = "Enables the toggle_background command without any pre-configured scope."
+commands.allow = ["toggle_background"]
+
+[[permission]]
+identifier = "deny-toggle-background"
+description = "Denies the toggle_background command without any pre-configured scope."
+commands.deny = ["toggle_background"]
