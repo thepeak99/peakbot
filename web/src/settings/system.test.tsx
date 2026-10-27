@@ -1,28 +1,22 @@
-// T30 — System pane (D7) + Desktop link (D8). Written BEFORE the code (TDD).
+// T30 — System pane (D7). Written BEFORE the code (TDD).
 //
 // Spec: make-config-great-again.md §9.10; contract: ./contract.ts
 // ("./system (T30)"). Pinned behaviours:
-//   - desktop_link_only_in_desktop   — `nav-desktop-link` in the Settings nav
-//     iff isDesktop() (globalThis.isTauri === true).
-//   - desktop_link_navigates_sentinel — click assigns
-//     window.location.href = "peakbot-desktop:settings" and does not switch
-//     the active pane.
 //   - system_shows_version_and_paths  — facts.version + the Locations rows.
 //   - service_install_calls_api       — "Enable at login" → POST
 //     /api/system/service; plus Disable (DELETE), Refresh (GET), binary
 //     install (POST /api/system/install) and error display.
 //
+// The D8 "Desktop app settings ↗" link tests lived here and are replaced
+// by the D10 Desktop PANE tests (./desktopPane.test.tsx).
+//
 // Harness: plain createRoot/act (project convention, no testing-library).
 // jsdom is enabled for `src/settings/**/*.test.tsx`; fetch is stubbed.
-//
-// Expected RED: `./system` does not exist yet → import error; the desktop
-// link tests fail on the missing `nav-desktop-link` testid.
 
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { SystemPane } from "./system";
-import { Settings } from "./Settings";
 import { SettingsCtx, type SettingsCtxValue } from "./context";
 import { parse } from "./yamlDoc";
 import { ToastProvider } from "./Toast";
@@ -181,78 +175,6 @@ function mountPane(m: SettingsMeta) {
     ),
   );
 }
-
-async function mountShell() {
-  host = document.createElement("div");
-  document.body.appendChild(host);
-  root = createRoot(host);
-  act(() => root!.render(<Settings convo={null} onClose={() => {}} />));
-  await flush();
-}
-
-const SHELL_ROUTES = {
-  "GET /api/settings": { json: meta() },
-  "GET /api/config": {
-    json: { scope: "global", path: "/home/u/.config/peakbot/config.yaml", exists: true, text: "", sha256: "abc" },
-  },
-  "GET /api/system/service": { json: report() },
-};
-
-// ── D8: Desktop link ───────────────────────────────────────────────────
-describe("Desktop app settings link (D8)", () => {
-  it("desktop_link_only_in_desktop", async () => {
-    stubFetch(SHELL_ROUTES);
-
-    // Browser: no globalThis.isTauri → no link at all.
-    await mountShell();
-    expect(has("nav-desktop-link")).toBe(false);
-    expect(host.textContent).not.toContain("Desktop app settings");
-
-    // Anything but a strict `true` is not the desktop app.
-    act(() => root!.unmount());
-    host.remove();
-    root = undefined;
-    (globalThis as { isTauri?: unknown }).isTauri = "true";
-    await mountShell();
-    expect(has("nav-desktop-link")).toBe(false);
-
-    // Desktop: the link is present, labelled per spec, in the MACHINE group
-    // after System.
-    act(() => root!.unmount());
-    host.remove();
-    root = undefined;
-    (globalThis as { isTauri?: unknown }).isTauri = true;
-    await mountShell();
-    const link = q("nav-desktop-link");
-    expect(link.textContent).toContain("Desktop app settings ↗");
-    const system = q("nav-system");
-    expect(
-      system.compareDocumentPosition(link) & Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
-  });
-
-  it("desktop_link_navigates_sentinel", async () => {
-    (globalThis as { isTauri?: unknown }).isTauri = true;
-    stubFetch(SHELL_ROUTES);
-    // jsdom cannot navigate to a custom scheme: replace location with a
-    // recorder so the assignment is observable.
-    const loc = { href: "http://localhost/" };
-    vi.stubGlobal("location", loc);
-
-    await mountShell();
-    click(q("nav-system"));
-    await flush();
-    expect(has("system-pane")).toBe(true);
-
-    const ev = new MouseEvent("click", { bubbles: true, cancelable: true });
-    act(() => {
-      q("nav-desktop-link").dispatchEvent(ev);
-    });
-    expect(loc.href).toBe("peakbot-desktop:settings");
-    // A link, not a pane: the System pane stays the active one.
-    expect(has("system-pane")).toBe(true);
-  });
-});
 
 // ── D7: System pane ────────────────────────────────────────────────────
 describe("SystemPane (D7)", () => {
