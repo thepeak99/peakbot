@@ -150,7 +150,10 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::status,
             commands::act,
-            commands::settings_get
+            commands::settings_get,
+            commands::toggle_background,
+            commands::theme_set,
+            commands::theme_get
         ])
         .setup(|app| {
             let handle = app.handle().clone();

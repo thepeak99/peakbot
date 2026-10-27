@@ -67,7 +67,7 @@ Dockerfile.desktop-macos
 | `core::sys` (`RealSys`) | The only place that spawns processes, opens sockets, sends signals, touches files | Injectable seam; tests use a `FakeSys` with a virtual clock. |
 | `src-tauri` glue | Window(s), navigation guard, tray, native dialogs, 4 IPC commands for the local pages, exit hook | Tauri-specific; deliberately logic-free. |
 | `core::settings` | The settings model (`Settings` sum type), boundary validation, `settings.json` parse/render/load, `settings_view` (#377) | Illegal combos (remote without HTTPS/token) are unrepresentable; validated once at the IPC edge. |
-| `ui/settings.*` settings page (main window) | Toggles background (`act`), `← Back to PeakBot` (`act` "back"); polled `settings_get` | Shown in the `main` window from tray / macOS menu / Ctrl+Shift+S / status-page link / the SPA's `Desktop app settings ↗` link (0.24, spec §9.10); IPC-gated to the bundled origin only. |
+| `ui/settings.*` settings page (main window) | Toggles background (`toggle_background`), `← Back to PeakBot` (`act` "back"); polled `settings_get`; follows the web theme (`theme.js` → `theme_get`) | Shown in the `main` window from tray / macOS menu / Ctrl+Shift+S / status-page link (0.24, spec §9.10); IPC-gated to the bundled origin only. The same options are also in the web UI's Settings → Desktop pane (§12). |
 | `ui/` status page | Shows `StatusView` (polled), buttons → `act` | The only thing shown when the backend isn't up. Plain HTML/JS, embedded via `frontendDist`. |
 | `macos/assemble-app.sh` | Builds the `.app` layout Tauri CLI can't build on Linux | Researcher: Tauri CLI cannot bundle `.app` on Linux. |
 | Dockerfiles + `build-desktop.sh` | Reproducible builds, same path locally (podman) and in CI (docker) | Follows the existing `Dockerfile.*` + `--output type=local` pattern. |
@@ -77,7 +77,7 @@ Dockerfile.desktop-macos
 - **No `tauri-plugin-shell`.** We spawn the sidecar with `std::process::Command` from Rust. `externalBin` is a *bundler* feature and works without the plugin. std gives us exact control over env, stdio, signals; the plugin would add a JS-facing capability surface we must then deny.
 - **No mode flag.** Mode is derived from `peakbot service status`. A stored flag could disagree with reality (user ran `peakbot service uninstall` in a terminal). The state files (§3.6) are caches of user *decisions*/process bookkeeping/launch parameters, never of mode. (Amended #377: `settings.json` exists but holds launch parameters only.)
 - **No HTTP version endpoint / no backend API change for versions.** `<exe> --version` already exists.
-- **No IPC for the remote origin, no `remote` capability, no `@tauri-apps/api` npm package, no frontend build.**
+- **(amended §12: the remote origin gets exactly three commands on loopback :7823.) No other IPC for the remote origin, no other `remote` capability, no `@tauri-apps/api` npm package, no frontend build.**
 - **No `PR_SET_PDEATHSIG`.** Linux-only, tied to the *spawning thread's* lifetime (subtle), and a second orphan mechanism. The pidfile reaper (§4.6) is portable and sufficient.
 - **No auto-updater, no code signing/notarization, no Windows build** (decision 4). Design stays portable: Windows differences are isolated in `RealSys` (`interrupt` = kill) and `paths::sidecar_file_name`.
 - **No "Restart backend" / "Open in browser" tray items.** Not requested (YAGNI).
@@ -288,7 +288,7 @@ macOS `X.app/Contents/MacOS/peakbot`; dev `desktop/target/debug/peakbot` (tauri-
 3. `Phase::Ready(Session)` ⇒ `session.is_some()` and child not yet observed exited.
 4. A pidfile exists ⇔ a session child was spawned and not yet confirmed exited (modulo crash).
 5. Mode is never stored; it is derived from `ServiceState` on every Start.
-6. The remote origin can never invoke IPC (no remote capability; app commands ACL-gated; §5.4).
+6. (**amended §12**) The remote origin may invoke ONLY `settings_get`, `toggle_background` and `theme_set`, and only when it is the loopback backend on port 7823 (`capabilities/desktop-pane.json`); every other command and plugin stays ACL-denied (§5.4, §12).
 7. Tokens never appear in argv, desktop logs, or `Debug` output (I7).
 8. (**I3**) The service protocol comes from `service status` (`TLS:` line), never from `settings.json`.
 9. (**I4**) The session protocol/bind/token come from `settings.json` at launch time.
@@ -379,7 +379,7 @@ pub enum Action { Start, ToggleBackground, ReinstallService, SaveSettings(Settin
 ```
 Mapping: app launch → `Start`; status page `Retry` → `Start`; `ReinstallService` → `ReinstallService`;
 tray checkbox click → `ToggleBackground` (controller decides enable vs disable from its own
-`ServiceState`); settings window background row → `act(toggle_background)` → `ToggleBackground`; settings window Save → `settings_set` → `SaveSettings` (§4.11); `RunEvent::Exit` → `Shutdown(ack)`. `OpenLogs`, `Quit`, "Open PeakBot" are handled
+`ServiceState`); settings page background row → `toggle_background` command (§12) → `ToggleBackground`; settings window Save → `settings_set` → `SaveSettings` (§4.11); `RunEvent::Exit` → `Shutdown(ack)`. `OpenLogs`, `Quit`, "Open PeakBot" are handled
 in glue without the controller.
 While `Phase::Starting`, `ToggleBackground`, `ReinstallService` and `SaveSettings` are ignored (tray item is disabled anyway).
 
@@ -965,7 +965,7 @@ Remote access [ ] Allow other devices    "Listens on all network interfaces. Req
 ---
 Background    [ ] Keep PeakBot running in background   "Applies immediately."
 ```
-Lifecycle: `settings_get` on start, then polled every 1000 ms (refreshes `saved`, the background row and `busy`; **never overwrites a dirty form**). Remote on ⇒ force HTTPS + token on and disable both controls (UX only — core validates); off ⇒ re-enable, keeping values. Save is enabled iff `dirty && !busy` → `settings_set`; `Err(msg)` is shown verbatim in `#error`, `Ok` shows `Applying…` until the file reflects the values. The background checkbox is enabled iff `background_enabled && !dirty && !busy` → `act(toggle_background)`; the existing enable/disable dialogs and flows run unchanged.
+Lifecycle: `settings_get` on start, then polled every 1000 ms (refreshes `saved`, the background row and `busy`; **never overwrites a dirty form**). Remote on ⇒ force HTTPS + token on and disable both controls (UX only — core validates); off ⇒ re-enable, keeping values. Save is enabled iff `dirty && !busy` → `settings_set`; `Err(msg)` is shown verbatim in `#error`, `Ok` shows `Applying…` until the file reflects the values. The background checkbox is enabled iff `background_enabled && !dirty && !busy` → `toggle_background` (§12); the existing enable/disable dialogs and flows run unchanged.
 
 ### 5.7 Build contracts
 - **Sidecar into `binaries/`:** `build-desktop.sh` first builds peakbot with the *existing*
@@ -1555,7 +1555,7 @@ Spec: `make-config-great-again.md` §8.4/§11.6. Supersedes §3.9, §4.11 and th
 - **T16 shell (wired).** ONE window: the settings window (`SETTINGS_LABEL`, `open_settings`) is
   deleted; `OpenSettings` (tray `Settings…`, macOS menu, Ctrl+Shift+S init script, status-page
   link, the SPA's `Desktop app settings ↗`) navigates `main` to the bundled `settings.html`
-  (`window::request_settings_page`, spawned on the async runtime). `peakbot-desktop:restart` →
+  (`window::request_settings_page`, spawned on the async runtime; the SPA's `Desktop app settings ↗` link was replaced by the Settings → Desktop pane, §12). `peakbot-desktop:restart` →
   `NavDecision::Restart` → `Action::Restart` (both nav callbacks); every other `peakbot-desktop:`
   URL stays `Block`. One capability `local-pages.json` for window `main` (`allow-status`,
   `allow-act`, `allow-settings-get`; no `remote` block) replaces `status-page.json` +
@@ -1566,3 +1566,32 @@ Spec: `make-config-great-again.md` §8.4/§11.6. Supersedes §3.9, §4.11 and th
 - Tests: `restart_session_rereads_bind`, `restart_service_reinstalls`, `ready_reread_picks_migrated_token`,
   `no_settings_json_or_web_token_io`, `busy_bind_fails_with_log_tail_without_fallback`, `t55b_*`;
   T16: `classify_restart`, `classify_settings`, `other_sentinel_blocked` (nav.rs).
+
+## 12. AMENDMENT (desktop pane) — scoped remote IPC + themed pages (2026-10-27)
+
+The web UI's Settings gains a **Desktop** pane (MACHINE group, desktop app only) that replaces the
+`Desktop app settings ↗` link. It needs IPC from the remote origin, so invariant 6 is amended: the
+remote origin may invoke **only** `settings_get`, `toggle_background` and `theme_set`, and only when
+it is the desktop's own loopback backend on port 7823 (`capabilities/desktop-pane.json`, `local: false`,
+window `main`, remote URLs `http(s)://127.0.0.1:7823/*` and `http(s)://localhost:7823/*`). The desktop
+always opens `127.0.0.1:<port>`; a backend on any other address/port gets no IPC and the pane falls
+back to a button that opens the bundled settings page.
+
+| Command | `local-pages.json` (bundled pages) | `desktop-pane.json` (remote, loopback :7823) |
+|---|---|---|
+| `status` | yes | **no** |
+| `act` (carries `quit`) | yes | **no** |
+| `settings_get` | yes | yes (read-only view) |
+| `toggle_background` | yes | yes (asks the controller, which confirms with a native dialog) |
+| `theme_get` | yes | **no** (the web UI only writes its theme) |
+| `theme_set` | no | yes (`Theme` = `"light"` \| `"dark"`, nothing else deserializes) |
+
+- `UiAction::ToggleBackground` is removed from `act`; `toggle_background` is its own command so the
+  remote grant never includes `act`. Permissions are autogenerated from `build.rs`'s command list.
+- **Theme.** The web UI (`useTheme`) reports its theme with `theme_set` → `UiState.theme`
+  (`Mutex<Option<Theme>>`, `None` until reported). The bundled pages load `theme.js` (last child of
+  `<head>`, CSP `script-src 'self'`), which applies `:root.light` from `theme_get`, falling back to
+  the OS `prefers-color-scheme` until a theme is reported. The CSS is dark by default, `:root.light`
+  overrides — mirroring the web UI.
+- `tauri.conf.json` lists both capabilities (`["local-pages", "desktop-pane"]`); an unlisted file is
+  silently inactive. `desktop/core/tests/ipc_surface.rs` pins the surface.

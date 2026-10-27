@@ -276,9 +276,12 @@ apply "on next /new" vs "restart required" (the server computes the boot-only
 list — the client keeps none). The gear is hidden when the active profile's
 `ui.tabs` filters out the `settings` tab, and the whole settings API is refused
 under a `--profile` pin. In the desktop app the machine group gains a
-"Desktop app settings ↗" link — the desktop's own option (keep running in
-background) lives in a separate window; the web-server settings live in
-Settings → General.
+"Desktop" pane (`settings/desktopPane.tsx`) — the desktop's own option (keep
+running in background), read and toggled through three scoped Tauri commands
+(`settings_get`, `toggle_background`, `theme_set`; only on the desktop's
+loopback `:7823` backend, otherwise the pane offers a button to the bundled
+settings page). The web theme is reported to the desktop so its bundled pages
+follow it. The web-server settings live in Settings → General.
 
 **First run**: with no global config (or a failed migration) the chat is
 replaced by a guided setup — Welcome → Provider → Agent → Web → Review →
