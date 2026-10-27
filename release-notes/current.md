@@ -16,3 +16,4 @@ This file is the working draft for the next release. When a version is tagged, t
 
 - Desktop: the desktop options (keep PeakBot running in background) now live in a Settings → Desktop tab inside the web UI, replacing the "Desktop app settings ↗" link; the bundled desktop pages (status and settings) now follow the app's light/dark theme.
 - Prompts: the closing prayer now follows the complete answer in the same message, the final `memory.md` update happens before the final reply, and the answer is never left only in the model's thinking. The `agent-dev-team` example lets the orchestrator manage `memory.md` itself.
+- Desktop: each conversation tab now keeps its own composer — draft text, attachments (including uploads still in flight) and slash-menu state survive switching tabs, just like separate browser tabs. The web build is unchanged.

@@ -95,7 +95,13 @@ const convo = (
 
 // ─── fixtures ────────────────────────────────────────────────────────────
 
-const tab = (convo: string | null, title = ""): ConvoTab => ({ convo, title });
+// Literal ids: `id-<convo>` (or `id-new` for a null-convo tab), so the tests can
+// assert exactly which tab a view / state entry is without depending on minting.
+const tab = (convo: string | null, title = ""): ConvoTab => ({
+  id: `id-${convo ?? "new"}`,
+  convo,
+  title,
+});
 const state = (tabs: ConvoTab[], active = 0): TabsState => ({ tabs, active }) as TabsState;
 
 // ─── harness ─────────────────────────────────────────────────────────────
@@ -237,8 +243,8 @@ describe("useConvoTabs — mount", () => {
     expect(api).not.toBeNull();
     const v = views();
     expect(v).toHaveLength(2);
-    expect(v[0]).toMatchObject({ key: "a", label: "A", active: true });
-    expect(v[1]).toMatchObject({ key: "b", label: "B", active: false });
+    expect(v[0]).toMatchObject({ key: "id-a", label: "A", active: true });
+    expect(v[1]).toMatchObject({ key: "id-b", label: "B", active: false });
     expect((api as { count: number }).count).toBe(2);
     // Mount must not re-attach: the URL already carries the active tab.
     expect(agent.switchConvo).not.toHaveBeenCalled();
@@ -310,7 +316,7 @@ describe("useConvoTabs — user ops", () => {
 
     expect(agent.switchConvo).toHaveBeenCalledWith("b");
     expect(views()).toHaveLength(2);
-    expect(views()[0].key).toBe("b");
+    expect(views()[0].key).toBe("id-b");
   });
 
   it("close() of an inactive tab does not switch", async () => {
@@ -340,7 +346,9 @@ describe("useConvoTabs — user ops", () => {
     expect(agent.switchConvo).toHaveBeenCalledWith(null);
     const v = views();
     expect(v).toHaveLength(1);
-    expect(v[0]).toMatchObject({ key: "new:0", label: "New conversation", untitled: true });
+    // The closed tab's id must not survive: the replacement is a NEW tab (I5).
+    expect(v[0]).toMatchObject({ label: "New conversation", untitled: true });
+    expect(v[0].key).not.toBe("id-a");
   });
 
   it("newTab() appends a fresh tab and switches to null", async () => {
@@ -356,7 +364,8 @@ describe("useConvoTabs — user ops", () => {
     expect(agent.switchConvo).toHaveBeenCalledWith(null);
     const v = views();
     expect(v).toHaveLength(2);
-    expect(v[1]).toMatchObject({ key: "new:1", active: true, untitled: true });
+    expect(v[1]).toMatchObject({ key: expect.any(String), active: true, untitled: true });
+    expect(v[1].key).not.toBe(v[0].key);
   });
 
   it("open() appends and activates an unopened convo, switching to it", async () => {
@@ -372,7 +381,10 @@ describe("useConvoTabs — user ops", () => {
     expect(agent.switchConvo).toHaveBeenCalledWith("d");
     const v = views();
     expect(v).toHaveLength(2);
-    expect(v[1]).toMatchObject({ key: "d", active: true });
+    // The key is the minted tab id (I5), not the convo.
+    expect(v[1]).toMatchObject({ key: expect.any(String), active: true });
+    expect(v[1].key).not.toBe("d");
+    expect(v[1].key).not.toBe(v[0].key);
   });
 
   it("open() of an already-open convo just activates it", async () => {
@@ -407,8 +419,10 @@ describe("useConvoTabs — the store follows the server binding", () => {
 
     expect(agent.switchConvo, "bound must never call switchConvo").not.toHaveBeenCalled();
     const v = views();
-    expect(v[1]).toMatchObject({ key: "d", active: true });
-    expect(v[0]).toMatchObject({ key: "a" });
+    // Binding keeps the active tab's id (I5): same key, new convo.
+    expect(v[1]).toMatchObject({ key: "id-new", active: true });
+    expect(v[0]).toMatchObject({ key: "id-a" });
+    expect((api as { state: { tabs: { convo: string | null }[] } }).state.tabs[1].convo).toBe("d");
   });
 
   it("retitle: activeTitle renames the active tab (hasTranscript path)", async () => {
@@ -583,7 +597,7 @@ describe("useConvoTabs — keyboard shortcuts", () => {
 
     expect(e.defaultPrevented).toBe(true);
     expect(views()).toHaveLength(2);
-    expect(views()[0].key).toBe("b"); // right neighbour
+    expect(views()[0].key).toBe("id-b"); // right neighbour
     expect(agent.switchConvo).toHaveBeenCalledWith("b");
   });
 
@@ -631,7 +645,7 @@ describe("bootDesktopTabs", () => {
   it("starts one tab for the URL convo when nothing is stored", () => {
     window.history.replaceState(null, "", "/?convo=abc");
     expect(bootDesktopTabs()).toEqual({
-      tabs: [{ convo: "abc", title: "" }],
+      tabs: [{ id: expect.any(String), convo: "abc", title: "" }],
       active: 0,
     });
     expect(new URLSearchParams(window.location.search).get("convo")).toBe("abc");
@@ -690,7 +704,7 @@ describe("bootDesktopTabs", () => {
     const s = bootDesktopTabs();
     expect(s.tabs).toHaveLength(2);
     expect(s.active).toBe(1);
-    expect(s.tabs[1]).toEqual({ convo: "c", title: "" });
+    expect(s.tabs[1]).toEqual({ id: expect.any(String), convo: "c", title: "" });
   });
 
   it("leaves no ?convo param when the active stored tab has no convo", () => {
@@ -730,7 +744,117 @@ describe("bootDesktopTabs", () => {
     // Appended and activated (design §4: URL wins), URL kept as-is.
     expect(s.tabs).toHaveLength(3);
     expect(s.active).toBe(2);
-    expect(s.tabs[2]).toEqual({ convo: "fromurl", title: "" });
+    expect(s.tabs[2]).toEqual({ id: expect.any(String), convo: "fromurl", title: "" });
     expect(new URLSearchParams(window.location.search).get("convo")).toBe("fromurl");
+  });
+});
+
+// ─── `state` + stable ids (desktop-tab-composers) ────────────────────────
+// `ConvoTabsApi.state` mirrors the store read-only: App maps it to one
+// keep-alive <ComposerSlot key={tab.id}> per tab, so the active tab's id must
+// not change when the server binds its conversation.
+
+type StateOf = { tabs: { id: string; convo: string | null; title: string }[]; active: number };
+const storeState = (): StateOf => (api as { state: StateOf }).state;
+
+describe("useConvoTabs — state mirror and id stability", () => {
+  it("exposes the store as `state` (tabs with ids, and the active index)", async () => {
+    const agent = makeAgent({ convo: "b" });
+    await renderHook(agent, state([tab("a", "A"), tab("b", "B")], 1));
+
+    expect(storeState().active).toBe(1);
+    expect(storeState().tabs.map((t) => [t.id, t.convo, t.title])).toEqual([
+      ["id-a", "a", "A"],
+      ["id-b", "b", "B"],
+    ]);
+  });
+
+  it("`state` follows user ops (activate / newTab / close)", async () => {
+    const agent = makeAgent({ convo: "a" });
+    await renderHook(agent, state([tab("a", "A"), tab("b", "B")], 0));
+
+    await act(async () => {
+      (api as { activate(i: number): void }).activate(1);
+    });
+    expect(storeState().active).toBe(1);
+
+    await act(async () => {
+      (api as { newTab(): void }).newTab();
+    });
+    expect(storeState().tabs).toHaveLength(3);
+    expect(storeState().active).toBe(2);
+    expect(storeState().tabs[2].convo).toBeNull();
+
+    await act(async () => {
+      (api as { close(i: number): void }).close(0);
+    });
+    expect(storeState().tabs.map((t) => t.id)).toEqual(["id-b", storeState().tabs[1].id]);
+  });
+
+  it("`state` and `views` describe the same tabs, view.key === tab.id", async () => {
+    const agent = makeAgent({ convo: "a" });
+    await renderHook(agent, state([tab("a", "A"), tab(null, ""), tab("c", "C")], 0));
+    expect(views().map((v) => v.key)).toEqual(storeState().tabs.map((t) => t.id));
+  });
+
+  it("the active tab's id is stable when agent.convo goes null -> 'u'", async () => {
+    const agent = makeAgent({ convo: null });
+    const initial = state([tab("a", "A"), tab(null, "")], 1);
+    await renderHook(agent, initial);
+    const before = storeState().tabs[1].id;
+
+    agent.convo = "u";
+    await rerender(agent, initial);
+
+    expect(storeState().tabs[1]).toMatchObject({ id: before, convo: "u" });
+  });
+
+  it("the active tab's id is stable when the server rebinds it X -> Y", async () => {
+    const agent = makeAgent({ convo: "a" });
+    const initial = state([tab("a", "A"), tab("b", "B")], 0);
+    await renderHook(agent, initial);
+    const before = storeState().tabs[0].id;
+
+    agent.convo = "zzz";
+    await rerender(agent, initial);
+
+    expect(storeState().tabs[0]).toMatchObject({ id: before, convo: "zzz" });
+    expect(storeState().tabs[1].id).toBe("id-b");
+  });
+
+  it("a merge (server binds the active tab to another open tab's convo) keeps the OTHER tab's id", async () => {
+    const agent = makeAgent({ convo: "a" });
+    const initial = state([tab("a", "A"), tab("b", "B")], 0);
+    await renderHook(agent, initial);
+
+    agent.convo = "b";
+    await rerender(agent, initial);
+
+    expect(storeState().tabs).toHaveLength(1);
+    expect(storeState().tabs[0]).toMatchObject({ id: "id-b", convo: "b" });
+  });
+
+  it("closing the last tab mints a NEW id (the old composer slot is not reused)", async () => {
+    const agent = makeAgent({ convo: "a" });
+    await renderHook(agent, state([tab("a", "A")], 0));
+
+    await act(async () => {
+      (api as { close(i: number): void }).close(0);
+    });
+
+    expect(storeState().tabs).toHaveLength(1);
+    expect(storeState().tabs[0].id).not.toBe("id-a");
+  });
+
+  it("`api` is null (no state) in a browser", async () => {
+    await renderHook(makeAgent(), null);
+    expect(api).toBeNull();
+  });
+
+  it("persists {convo,title} only: no `id` key in storage", async () => {
+    const agent = makeAgent({ convo: "a" });
+    await renderHook(agent, state([tab("a", "A"), tab("b", "B")], 0));
+    const raw = JSON.parse(localStorage.getItem("peakbot.desktop.tabs")!);
+    for (const t of raw.tabs) expect(Object.keys(t).sort()).toEqual(["convo", "title"]);
   });
 });

@@ -6,11 +6,16 @@
 //   I3 non-null `convo` values are unique (several `null` tabs are allowed)
 //   I4 ops share structure: tabs that don't change keep their object identity,
 //      so `activeTab(prev) === activeTab(next)` means "same active tab"
+//   I5 tab ids are unique and never change for the life of a tab; `freshTab`
+//      is the only place they are minted (they key the per-tab composers)
 // An invalid index returns the state unchanged (same reference).
 
 import type { ConversationSummary } from "./state";
 
+export type TabId = string;
+
 export interface ConvoTab {
+  readonly id: TabId;
   /** `null` = a new conversation the server has not bound an id to yet. */
   readonly convo: string | null;
   /** Last known title; "" = untitled. */
@@ -32,7 +37,13 @@ export type StatusMap = Readonly<Record<string, TabStatus>>;
 
 export const NEW_TAB_LABEL = "New conversation";
 
-const FRESH: ConvoTab = { convo: null, title: "" };
+let nextTabId = 0;
+
+/** The only id mint site (I5). */
+export function freshTab(convo: string | null = null, title = ""): ConvoTab {
+  nextTabId += 1;
+  return { id: `t${nextTabId}`, convo, title };
+}
 
 const validIndex = (s: TabsState, i: number): boolean =>
   Number.isInteger(i) && i >= 0 && i < s.tabs.length;
@@ -50,14 +61,14 @@ export function initialTabs(
   urlConvo: string | null,
 ): TabsState {
   if (!stored) {
-    return { tabs: [{ convo: urlConvo, title: "" }], active: 0 };
+    return { tabs: [freshTab(urlConvo)], active: 0 };
   }
   if (urlConvo === null) return stored;
   return openConvo(stored, urlConvo);
 }
 
 export function newTab(s: TabsState): TabsState {
-  return { tabs: [...s.tabs, { convo: null, title: "" }], active: s.tabs.length };
+  return { tabs: [...s.tabs, freshTab()], active: s.tabs.length };
 }
 
 export function activate(s: TabsState, index: number): TabsState {
@@ -67,7 +78,7 @@ export function activate(s: TabsState, index: number): TabsState {
 
 export function closeTab(s: TabsState, index: number): TabsState {
   if (!validIndex(s, index)) return s;
-  if (s.tabs.length === 1) return { tabs: [{ ...FRESH }], active: 0 };
+  if (s.tabs.length === 1) return { tabs: [freshTab()], active: 0 };
   const tabs = s.tabs.filter((_, i) => i !== index);
   let active = s.active;
   if (index < active) active -= 1;
@@ -92,7 +103,7 @@ export function jumpTo(s: TabsState, n: number): TabsState {
 export function openConvo(s: TabsState, convo: string, title = ""): TabsState {
   const i = indexOfConvo(s, convo);
   if (i >= 0) return activate(s, i);
-  return { tabs: [...s.tabs, { convo, title }], active: s.tabs.length };
+  return { tabs: [...s.tabs, freshTab(convo, title)], active: s.tabs.length };
 }
 
 /** The server says the active tab's socket is bound to `convo`; follow it. */
@@ -101,11 +112,11 @@ export function bound(s: TabsState, convo: string): TabsState {
   if (current.convo === convo) return s;
   const other = indexOfConvo(s, convo);
   if (other < 0) {
-    return withActive(s, { convo, title: "" });
+    return withActive(s, { ...current, convo, title: "" });
   }
-  // Another tab already shows this conversation: it merges into the active
-  // tab (keeps I3), carrying its known title.
-  const merged: ConvoTab = { convo, title: s.tabs[other].title };
+  // Another tab already shows this conversation: it takes the active slot
+  // (keeps I3), so it keeps its own id, title and composer.
+  const merged = s.tabs[other];
   const tabs = s.tabs
     .map((t, i) => (i === s.active ? merged : t))
     .filter((_, i) => i !== other);
@@ -123,7 +134,7 @@ export function retitle(s: TabsState, convo: string, title: string): TabsState {
   const i = indexOfConvo(s, convo);
   if (i < 0 || s.tabs[i].title === title) return s;
   return {
-    tabs: s.tabs.map((t, j) => (j === i ? { convo, title } : t)),
+    tabs: s.tabs.map((t, j) => (j === i ? { ...t, title } : t)),
     active: s.active,
   };
 }
@@ -203,7 +214,7 @@ export function tabViews(
     const st = t.convo !== null ? status[t.convo] : undefined;
     const label = t.title || NEW_TAB_LABEL;
     return {
-      key: t.convo ?? `new:${i}`,
+      key: t.id,
       label,
       tooltip: label,
       untitled: t.title === "",

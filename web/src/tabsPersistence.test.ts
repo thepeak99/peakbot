@@ -15,7 +15,12 @@
 //
 // `loadTabs`: `restore=false` → null (the future setting hooks in here,
 // nowhere else); a throwing storage → null.
-// `saveTabs`: writes `{v:1, tabs, active}`; never throws.
+// `saveTabs`: writes `{v:1, tabs:[{convo,title}], active}`; never throws.
+//
+// Tab ids (desktop-tab-composers, I5): ids are RUNTIME-only React keys. The
+// stored format is unchanged — `saveTabs` writes exactly `{convo, title}` per
+// tab (no `id` key) and `parseStored` mints fresh unique ids via `freshTab`,
+// ignoring any `id` found in storage.
 //
 // RED before implementation: `./tabsPersistence` does not exist yet, so this
 // file fails at import — the right reason (feature absent).
@@ -32,6 +37,16 @@ import {
   saveTabs,
 } from "./tabsPersistence";
 import type { TabsState } from "./convoTabs";
+
+/** A parsed tab: `{convo, title}` plus the runtime id minted at parse time. */
+const parsed = (convo: string | null, title: string) => ({
+  id: expect.any(String),
+  convo,
+  title,
+});
+/** The `{convo, title}` projection of parsed tabs (drops the minted id). */
+const stripIds = (s: TabsState | null) =>
+  s?.tabs.map((t) => ({ convo: t.convo, title: t.title }));
 
 // ─── fake Storage (node env: no DOM) ─────────────────────────────────────
 
@@ -85,7 +100,7 @@ const asStorage = (s: FakeStorage | ThrowingStorage): Storage => s as unknown as
 // ─── fixtures ────────────────────────────────────────────────────────────
 
 const state = (tabs: { convo: string | null; title: string }[], active = 0): TabsState =>
-  ({ tabs, active }) as TabsState;
+  ({ tabs: tabs.map((t, i) => ({ id: `rt-${i}`, ...t })), active }) as TabsState;
 
 // ─── constants ───────────────────────────────────────────────────────────
 
@@ -149,7 +164,7 @@ describe("parseStored — entry validation", () => {
       active: 0,
     };
     const s = parseStored(JSON.stringify(raw));
-    expect(s?.tabs).toEqual([{ convo: "a", title: "good" }, { convo: null, title: "" }]);
+    expect(s?.tabs).toEqual([parsed("a", "good"), parsed(null, "")]);
   });
 
   it("drops entries whose title is not a string (including a missing title)", () => {
@@ -163,7 +178,7 @@ describe("parseStored — entry validation", () => {
       active: 0,
     };
     const s = parseStored(JSON.stringify(raw));
-    expect(s?.tabs).toEqual([{ convo: "c", title: "ok" }]);
+    expect(s?.tabs).toEqual([parsed("c", "ok")]);
   });
 
   it("returns null when every entry is dropped", () => {
@@ -201,10 +216,7 @@ describe("parseStored — entry validation", () => {
       active: 0,
     };
     const s = parseStored(JSON.stringify(raw));
-    expect(s?.tabs).toEqual([
-      { convo: "a", title: "first" },
-      { convo: "b", title: "b" },
-    ]);
+    expect(s?.tabs).toEqual([parsed("a", "first"), parsed("b", "b")]);
   });
 
   it("trims a title to exactly 200 chars", () => {
@@ -231,8 +243,8 @@ describe("parseStored — entry validation", () => {
     }));
     const s = parseStored(JSON.stringify({ v: 1, tabs, active: 0 }));
     expect(s?.tabs).toHaveLength(100);
-    expect(s?.tabs[0]).toEqual({ convo: "c0", title: "t0" });
-    expect(s?.tabs[99]).toEqual({ convo: "c99", title: "t99" });
+    expect(s?.tabs[0]).toEqual(parsed("c0", "t0"));
+    expect(s?.tabs[99]).toEqual(parsed("c99", "t99"));
   });
 
   it("keeps exactly 100 tabs when there are exactly 100", () => {
@@ -296,8 +308,8 @@ describe("parseStored — the design schema", () => {
     );
     expect(s).toEqual({
       tabs: [
-        { convo: "6f1c0000-1111-4111-8111-111111111111", title: "Fix login bug" },
-        { convo: null, title: "" },
+        parsed("6f1c0000-1111-4111-8111-111111111111", "Fix login bug"),
+        parsed(null, ""),
       ],
       active: 0,
     });
@@ -318,7 +330,7 @@ describe("loadTabs", () => {
       JSON.stringify({ v: 1, tabs: [{ convo: "a", title: "A" }], active: 0 }),
     );
     expect(loadTabs(asStorage(storage))).toEqual({
-      tabs: [{ convo: "a", title: "A" }],
+      tabs: [parsed("a", "A")],
       active: 0,
     });
   });
@@ -340,7 +352,7 @@ describe("loadTabs", () => {
 // ─── saveTabs ────────────────────────────────────────────────────────────
 
 describe("saveTabs", () => {
-  it("writes {v:1, tabs, active} under TABS_STORAGE_KEY", () => {
+  it("writes {v:1, tabs:[{convo,title}], active} under TABS_STORAGE_KEY", () => {
     const storage = new FakeStorage();
     saveTabs(asStorage(storage), state([{ convo: "a", title: "A" }, { convo: null, title: "" }], 1));
 
@@ -357,16 +369,117 @@ describe("saveTabs", () => {
     });
   });
 
-  it("round-trips through parseStored", () => {
+  it("round-trips convo, title and active through parseStored (ids are re-minted)", () => {
     const storage = new FakeStorage();
     const s = state([{ convo: "a", title: "A" }, { convo: null, title: "" }], 1);
     saveTabs(asStorage(storage), s);
-    expect(parseStored(storage.getItem(TABS_STORAGE_KEY))).toEqual(s);
+    const back = parseStored(storage.getItem(TABS_STORAGE_KEY));
+    expect(back).not.toBeNull();
+    expect(stripIds(back)).toEqual(stripIds(s));
+    expect(back!.active).toBe(1);
   });
 
   it("never throws when the storage throws (quota / disabled)", () => {
     expect(() =>
       saveTabs(asStorage(new ThrowingStorage()), state([{ convo: null, title: "" }])),
     ).not.toThrow();
+  });
+});
+
+// ─── tab ids (I5): runtime-only, never persisted ─────────────────────────
+
+describe("saveTabs — ids are not persisted", () => {
+  it("writes exactly {convo, title} per tab: no `id` key anywhere", () => {
+    const storage = new FakeStorage();
+    saveTabs(asStorage(storage), state([{ convo: "a", title: "A" }, { convo: null, title: "" }], 0));
+    const written = JSON.parse(storage.getItem(TABS_STORAGE_KEY)!) as {
+      tabs: Record<string, unknown>[];
+    };
+    for (const t of written.tabs) {
+      expect(Object.keys(t).sort()).toEqual(["convo", "title"]);
+    }
+    expect(storage.getItem(TABS_STORAGE_KEY)).not.toContain("rt-0");
+  });
+
+  it("keeps the top-level shape exactly {v, tabs, active}", () => {
+    const storage = new FakeStorage();
+    saveTabs(asStorage(storage), state([{ convo: "a", title: "A" }], 0));
+    const written = JSON.parse(storage.getItem(TABS_STORAGE_KEY)!) as Record<string, unknown>;
+    expect(Object.keys(written).sort()).toEqual(["active", "tabs", "v"]);
+    expect(written.v).toBe(1);
+  });
+});
+
+describe("parseStored — ids are minted fresh", () => {
+  const raw = (tabs: unknown[]) => JSON.stringify({ v: 1, tabs, active: 0 });
+
+  it("gives every parsed tab a non-empty string id", () => {
+    const s = parseStored(raw([{ convo: "a", title: "A" }, { convo: null, title: "" }]));
+    for (const t of s!.tabs) {
+      expect(typeof t.id).toBe("string");
+      expect(t.id.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("gives every parsed tab a distinct id, including several null-convo tabs", () => {
+    const s = parseStored(
+      raw([
+        { convo: null, title: "" },
+        { convo: null, title: "" },
+        { convo: "a", title: "A" },
+        { convo: "b", title: "B" },
+      ]),
+    );
+    const ids = s!.tabs.map((t) => t.id);
+    expect(new Set(ids).size).toBe(4);
+  });
+
+  it("ignores an `id` present in storage (even a colliding one)", () => {
+    const s = parseStored(
+      raw([
+        { id: "dup", convo: "a", title: "A" },
+        { id: "dup", convo: "b", title: "B" },
+      ]),
+    );
+    const ids = s!.tabs.map((t) => t.id);
+    expect(ids).not.toContain("dup");
+    expect(new Set(ids).size).toBe(2);
+  });
+
+  it("does not let a non-string stored id break the entry", () => {
+    const s = parseStored(raw([{ id: 42, convo: "a", title: "A" }]));
+    expect(stripIds(s)).toEqual([{ convo: "a", title: "A" }]);
+    expect(typeof s!.tabs[0].id).toBe("string");
+  });
+
+  it("mints different ids on every parse of the same payload", () => {
+    const body = raw([{ convo: "a", title: "A" }]);
+    expect(parseStored(body)!.tabs[0].id).not.toBe(parseStored(body)!.tabs[0].id);
+  });
+
+  it("dropped entries do not leave holes: surviving tabs still all have ids", () => {
+    const s = parseStored(
+      raw([{ convo: 1, title: "bad" }, { convo: "ok", title: "ok" }, { convo: "ok", title: "dup" }]),
+    );
+    expect(s!.tabs).toHaveLength(1);
+    expect(typeof s!.tabs[0].id).toBe("string");
+  });
+});
+
+describe("saveTabs → loadTabs round trip", () => {
+  it("keeps convo, title and active for a multi-tab state", () => {
+    const storage = new FakeStorage();
+    const s = state(
+      [
+        { convo: "a", title: "Alpha" },
+        { convo: null, title: "" },
+        { convo: "c", title: "Gamma ünïcødé ✓" },
+      ],
+      2,
+    );
+    saveTabs(asStorage(storage), s);
+    const back = loadTabs(asStorage(storage));
+    expect(stripIds(back)).toEqual(stripIds(s));
+    expect(back!.active).toBe(2);
   });
 });

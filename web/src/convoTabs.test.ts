@@ -8,14 +8,17 @@
 //   tabViews
 //
 // Invariants every op must keep:
-//   I1 tabs.length >= 1 — closing the last tab gives [{convo:null,title:""}]
+//   I1 tabs.length >= 1 — closing the last tab gives one fresh null-convo tab
 //   I2 0 <= active < tabs.length
 //   I3 non-null convo values are unique (several null tabs allowed)
 //   I4 pure + structural sharing: unchanged tabs keep object identity
 //
-// RED before implementation: `./convoTabs` does not exist yet, so this file
-// fails at import — the right reason (feature absent). The type-only import
-// is erased at runtime and adds nothing to the failure.
+//   I5 (desktop-tab-composers) ids are unique and never change for the life
+//      of a tab. `freshTab(convo?, title?)` is the ONLY place ids are minted.
+//
+// Fixtures below carry LITERAL ids (not `freshTab`) so the pre-existing
+// behaviour tests don't depend on the new minting code; the "tab ids (I5)"
+// block at the bottom is the executable contract for the new behaviour.
 //
 // Runs under `node` (pure logic, no DOM).
 
@@ -31,6 +34,7 @@ import {
   closeTab,
   cycle,
   enter,
+  freshTab,
   initialTabs,
   jumpTo,
   leave,
@@ -42,13 +46,18 @@ import {
 
 // ─── fixtures ────────────────────────────────────────────────────────────
 
-const tab = (convo: string | null, title = ""): ConvoTab => ({ convo, title });
+/** Literal-id fixture: the id defaults to `id-<convo>` (unique per convo). */
+const tab = (convo: string | null, title = "", id = `id-${convo}`): ConvoTab => ({
+  id,
+  convo,
+  title,
+});
 const state = (tabs: ConvoTab[], active = 0): TabsState => ({ tabs, active });
 
-const A = tab("a", "Fix login bug");
-const B = tab("b", "Refactor parser");
-const C = tab("c", "Write tests");
-const FRESH = tab(null, "");
+const A = tab("a", "Fix login bug", "id-A");
+const B = tab("b", "Refactor parser", "id-B");
+const C = tab("c", "Write tests", "id-C");
+const FRESH = tab(null, "", "id-FRESH");
 
 /** A conversation summary; `running` is the field this feature adds to
  * `state.ts` (design §5 backend), so fixtures may carry it while the type
@@ -81,12 +90,18 @@ describe("NEW_TAB_LABEL", () => {
 describe("initialTabs", () => {
   it("gives one tab for the URL convo when nothing is stored", () => {
     const s = initialTabs(null, "abc-123");
-    expect(s).toEqual({ tabs: [{ convo: "abc-123", title: "" }], active: 0 });
+    expect(s).toEqual({
+      tabs: [{ id: expect.any(String), convo: "abc-123", title: "" }],
+      active: 0,
+    });
   });
 
   it("gives one fresh null-convo tab when nothing is stored and no URL convo", () => {
     const s = initialTabs(null, null);
-    expect(s).toEqual({ tabs: [{ convo: null, title: "" }], active: 0 });
+    expect(s).toEqual({
+      tabs: [{ id: expect.any(String), convo: null, title: "" }],
+      active: 0,
+    });
   });
 
   it("leaves stored state unchanged (same reference) when there is no URL convo", () => {
@@ -108,7 +123,7 @@ describe("initialTabs", () => {
     const s = initialTabs(stored, "d");
     expect(s.tabs).toHaveLength(3);
     expect(s.active).toBe(2);
-    expect(s.tabs[2]).toEqual({ convo: "d", title: "" });
+    expect(s.tabs[2]).toEqual({ id: expect.any(String), convo: "d", title: "" });
     // Earlier tabs keep their identity (I4).
     expect(s.tabs[0]).toBe(A);
     expect(s.tabs[1]).toBe(B);
@@ -135,7 +150,7 @@ describe("newTab", () => {
   it("appends a null-convo untitled tab and activates it", () => {
     const s = newTab(state([A, B], 0));
     expect(s.tabs).toHaveLength(3);
-    expect(s.tabs[2]).toEqual({ convo: null, title: "" });
+    expect(s.tabs[2]).toEqual({ id: expect.any(String), convo: null, title: "" });
     expect(s.active).toBe(2);
   });
 
@@ -198,7 +213,7 @@ describe("closeTab", () => {
 
   it("gives a fresh empty tab when the last tab is closed (I1)", () => {
     const s = closeTab(state([A], 0), 0);
-    expect(s.tabs).toEqual([{ convo: null, title: "" }]);
+    expect(s.tabs).toEqual([{ id: expect.any(String), convo: null, title: "" }]);
     expect(s.active).toBe(0);
   });
 
@@ -277,12 +292,16 @@ describe("openConvo", () => {
     const s = openConvo(state([A], 0), "d", "Fresh convo");
     expect(s.tabs).toHaveLength(2);
     expect(s.active).toBe(1);
-    expect(s.tabs[1]).toEqual({ convo: "d", title: "Fresh convo" });
+    expect(s.tabs[1]).toEqual({
+      id: expect.any(String),
+      convo: "d",
+      title: "Fresh convo",
+    });
   });
 
   it("stores an empty title when none is given", () => {
     const s = openConvo(state([A], 0), "d");
-    expect(s.tabs[1]).toEqual({ convo: "d", title: "" });
+    expect(s.tabs[1]).toEqual({ id: expect.any(String), convo: "d", title: "" });
   });
 });
 
@@ -312,7 +331,8 @@ describe("bound", () => {
 
   it("binds the active tab and resets its title when no other tab holds the convo", () => {
     const next = bound(state([A, C], 0), "d");
-    expect(next.tabs[0]).toEqual({ convo: "d", title: "" });
+    // Binding keeps the active tab's identity (I5): only convo/title change.
+    expect(next.tabs[0]).toEqual({ id: "id-A", convo: "d", title: "" });
     expect(next.tabs).toHaveLength(2);
   });
 
@@ -462,21 +482,21 @@ describe("leave", () => {
 });
 
 // ─── tabViews ────────────────────────────────────────────────────────────
-// key = convo ?? `new:${i}`; label = title || NEW_TAB_LABEL; tooltip = label;
+// key = tab id (I5, replaces convo ?? `new:${i}`); label = title || NEW_TAB_LABEL; tooltip = label;
 // active tab: running = activeRunning, unread = false.
 
 describe("tabViews", () => {
   it("derives key, label, tooltip and untitled per tab", () => {
     const views = tabViews(state([A, FRESH], 0), {}, false);
     expect(views[0]).toMatchObject({
-      key: "a",
+      key: "id-A",
       label: "Fix login bug",
       tooltip: "Fix login bug",
       untitled: false,
       active: true,
     });
     expect(views[1]).toMatchObject({
-      key: "new:1",
+      key: "id-FRESH",
       label: "New conversation",
       tooltip: "New conversation",
       untitled: true,
@@ -512,5 +532,260 @@ describe("tabViews", () => {
   it("defaults a missing status entry to not running, no unread", () => {
     const views = tabViews(state([A, B], 0), {}, false);
     expect(views[1]).toMatchObject({ running: false, unread: false });
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════
+// I5 — tab ids (desktop-tab-composers). Every tab has a stable, unique `id`;
+// `freshTab` is the only minting site. These are the keep-alive composers'
+// React keys, so an id that changes (or is reused) would remount or cross
+// the wires of a composer.
+// ═════════════════════════════════════════════════════════════════════════
+
+const ids = (s: TabsState): string[] => s.tabs.map((t: ConvoTab) => t.id);
+const allUnique = (xs: readonly string[]): boolean => new Set(xs).size === xs.length;
+
+describe("freshTab", () => {
+  it("defaults to a null-convo, untitled tab with a non-empty string id", () => {
+    const t = freshTab();
+    expect(t.convo).toBeNull();
+    expect(t.title).toBe("");
+    expect(typeof t.id).toBe("string");
+    expect(t.id.length).toBeGreaterThan(0);
+  });
+
+  it("carries the convo and title it is given", () => {
+    expect(freshTab("abc", "My chat")).toMatchObject({ convo: "abc", title: "My chat" });
+  });
+
+  it("defaults the title to '' when only a convo is given", () => {
+    expect(freshTab("abc")).toMatchObject({ convo: "abc", title: "" });
+  });
+
+  it("mints a different id on every call, even for identical arguments", () => {
+    const a = freshTab("same", "same");
+    const b = freshTab("same", "same");
+    expect(a.id).not.toBe(b.id);
+    expect(a).not.toBe(b);
+  });
+
+  it("never repeats an id across 1000 calls", () => {
+    const minted = Array.from({ length: 1000 }, () => freshTab().id);
+    expect(allUnique(minted)).toBe(true);
+  });
+});
+
+describe("tab ids — minting sites (I5)", () => {
+  it("newTab gives the new tab an id distinct from every existing tab", () => {
+    const prev = state([A, B], 0);
+    const next = newTab(prev);
+    expect(typeof next.tabs[2].id).toBe("string");
+    expect(allUnique(ids(next))).toBe(true);
+    expect(ids(next).slice(0, 2)).toEqual(["id-A", "id-B"]);
+  });
+
+  it("repeated newTab calls mint a distinct id each time", () => {
+    let s = state([A], 0);
+    for (let i = 0; i < 20; i++) s = newTab(s);
+    expect(s.tabs).toHaveLength(21);
+    expect(allUnique(ids(s))).toBe(true);
+  });
+
+  it("openConvo mints a unique id when it adds a tab and leaves existing ids alone", () => {
+    const next = openConvo(state([A, B], 0), "d");
+    expect(ids(next).slice(0, 2)).toEqual(["id-A", "id-B"]);
+    expect(allUnique(ids(next))).toBe(true);
+    expect(typeof next.tabs[2].id).toBe("string");
+  });
+
+  it("openConvo on an already-open convo keeps every id (it only activates)", () => {
+    const next = openConvo(state([A, B, C], 0), "c");
+    expect(ids(next)).toEqual(["id-A", "id-B", "id-C"]);
+  });
+
+  it("initialTabs mints a string id for the single boot tab", () => {
+    const s = initialTabs(null, "u");
+    expect(typeof s.tabs[0].id).toBe("string");
+    expect(s.tabs[0].id.length).toBeGreaterThan(0);
+  });
+
+  it("two independent boots never share an id", () => {
+    expect(initialTabs(null, null).tabs[0].id).not.toBe(initialTabs(null, null).tabs[0].id);
+  });
+
+  it("initialTabs with a URL convo not yet open mints an id distinct from the stored ones", () => {
+    const s = initialTabs(state([A, B], 0), "zzz");
+    expect(ids(s).slice(0, 2)).toEqual(["id-A", "id-B"]);
+    expect(allUnique(ids(s))).toBe(true);
+  });
+
+  it("initialTabs with a URL convo already open keeps the stored ids", () => {
+    const s = initialTabs(state([A, B, C], 0), "b");
+    expect(ids(s)).toEqual(["id-A", "id-B", "id-C"]);
+  });
+});
+
+describe("tab ids — closeTab (I5)", () => {
+  it("closing a middle tab leaves the other ids unchanged", () => {
+    const next = closeTab(state([A, B, C], 0), 1);
+    expect(ids(next)).toEqual(["id-A", "id-C"]);
+  });
+
+  it("closing the active tab leaves the survivors' ids unchanged", () => {
+    const next = closeTab(state([A, B, C], 1), 1);
+    expect(ids(next)).toEqual(["id-A", "id-C"]);
+  });
+
+  it("closing the LAST remaining tab gives a fresh tab with a NEW id", () => {
+    const s = closeTab(state([A], 0), 0);
+    expect(s.tabs).toHaveLength(1);
+    expect(typeof s.tabs[0].id).toBe("string");
+    expect(s.tabs[0].id).not.toBe("id-A");
+  });
+
+  it("closing the last remaining fresh tab again still mints a new id each time", () => {
+    const first = closeTab(state([FRESH], 0), 0);
+    const second = closeTab(first, 0);
+    expect(first.tabs[0].id).not.toBe("id-FRESH");
+    expect(second.tabs[0].id).not.toBe(first.tabs[0].id);
+  });
+
+  it("a closed tab's id is never handed to a later tab", () => {
+    let s = state([A, B], 1);
+    s = closeTab(s, 1); // B gone
+    s = newTab(s);
+    s = openConvo(s, "q");
+    expect(ids(s)).not.toContain("id-B");
+    expect(allUnique(ids(s))).toBe(true);
+  });
+});
+
+describe("tab ids — retitle / activate / cycle / jumpTo keep ids (I5)", () => {
+  it("retitle keeps every id, including the retitled tab's", () => {
+    const next = retitle(state([A, B, C], 0), "b", "Renamed");
+    expect(ids(next)).toEqual(["id-A", "id-B", "id-C"]);
+    expect(next.tabs[1].title).toBe("Renamed");
+  });
+
+  it("activate keeps every id", () => {
+    expect(ids(activate(state([A, B, C], 0), 2))).toEqual(["id-A", "id-B", "id-C"]);
+  });
+
+  it("cycle keeps every id", () => {
+    expect(ids(cycle(state([A, B, C], 2), 1))).toEqual(["id-A", "id-B", "id-C"]);
+    expect(ids(cycle(state([A, B, C], 0), -1))).toEqual(["id-A", "id-B", "id-C"]);
+  });
+
+  it("jumpTo keeps every id", () => {
+    expect(ids(jumpTo(state([A, B, C], 0), 9))).toEqual(["id-A", "id-B", "id-C"]);
+    expect(ids(jumpTo(state([A, B, C], 0), 2))).toEqual(["id-A", "id-B", "id-C"]);
+  });
+});
+
+describe("tab ids — bound (I5)", () => {
+  it("null → uuid keeps the ACTIVE tab's id (the composer must not remount)", () => {
+    const pending = tab(null, "", "id-pending");
+    const next = bound(state([A, pending], 1), "uuid-1");
+    expect(next.tabs[1]).toEqual({ id: "id-pending", convo: "uuid-1", title: "" });
+    expect(next.active).toBe(1);
+  });
+
+  it("X → Y without a merge keeps the ACTIVE tab's id and every other id", () => {
+    const next = bound(state([A, B, C], 1), "brand-new");
+    expect(ids(next)).toEqual(["id-A", "id-B", "id-C"]);
+    expect(next.tabs[1].convo).toBe("brand-new");
+  });
+
+  it("a merge takes the OTHER tab's id at the active index and removes the other tab", () => {
+    // Active A (index 0) binds to "b", which tab B (index 1) already shows.
+    const next = bound(state([A, B], 0), "b");
+    expect(next.tabs).toHaveLength(1);
+    expect(next.tabs[0]).toEqual({ id: "id-B", convo: "b", title: "Refactor parser" });
+    expect(next.active).toBe(0);
+  });
+
+  it("a merge with the other tab BEFORE the active one: the active slot takes the other id and indices shift", () => {
+    // [A, B, C], active C (2) binds to "a" which tab A (0) shows.
+    const next = bound(state([A, B, C], 2), "a");
+    expect(next.tabs).toHaveLength(2);
+    expect(ids(next)).toEqual(["id-B", "id-A"]);
+    expect(next.tabs[1]).toMatchObject({ convo: "a", title: "Fix login bug" });
+    expect(next.active).toBe(1);
+  });
+
+  it("a merge never leaves two tabs sharing an id, and the active tab's old id is retired", () => {
+    const next = bound(state([A, B, C], 0), "c");
+    expect(allUnique(ids(next))).toBe(true);
+    expect(ids(next)).not.toContain("id-A");
+    expect(ids(next)).toContain("id-C");
+    expect(ids(next)).toContain("id-B");
+  });
+
+  it("bound on an already-bound convo returns the same state (ids trivially unchanged)", () => {
+    const s = state([A, B], 1);
+    expect(bound(s, "b")).toBe(s);
+  });
+});
+
+describe("tabViews — key is the tab id (I5)", () => {
+  it("uses each tab's id as its key", () => {
+    const views = tabViews(state([A, B, FRESH], 0), {}, false);
+    expect(views.map((v) => v.key)).toEqual(["id-A", "id-B", "id-FRESH"]);
+  });
+
+  it("gives two null-convo tabs distinct keys without the old 'new:<i>' scheme", () => {
+    const n1 = tab(null, "", "id-n1");
+    const n2 = tab(null, "", "id-n2");
+    const keys = tabViews(state([n1, n2], 0), {}, false).map((v) => v.key);
+    expect(keys).toEqual(["id-n1", "id-n2"]);
+    expect(keys.some((k) => k.startsWith("new:"))).toBe(false);
+  });
+
+  it("keeps the active tab's key across null → uuid binding (the old scheme changed it)", () => {
+    const pending = tab(null, "", "id-pending");
+    const before = tabViews(state([pending], 0), {}, false)[0].key;
+    const after = tabViews(bound(state([pending], 0), "uuid-1"), {}, false)[0].key;
+    expect(after).toBe(before);
+  });
+
+  it("does not use the convo as the key", () => {
+    const views = tabViews(state([A], 0), {}, false);
+    expect(views[0].key).not.toBe("a");
+  });
+});
+
+describe("tab ids — invariant I5 over a deterministic op sequence", () => {
+  it("ids stay unique and a retired id never reappears", () => {
+    // Small LCG so the sequence is deterministic and reproducible.
+    let seed = 12345;
+    const rnd = (n: number): number => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed % n;
+    };
+    let s = initialTabs(null, null);
+    const retired = new Set<string>();
+    let convoSeq = 0;
+    for (let step = 0; step < 300; step++) {
+      const before = new Set(ids(s));
+      const op = rnd(7);
+      if (op === 0) s = newTab(s);
+      else if (op === 1) s = closeTab(s, rnd(s.tabs.length));
+      else if (op === 2) s = openConvo(s, `c${rnd(6)}`);
+      else if (op === 3) s = bound(s, `c${rnd(6)}`);
+      else if (op === 4) s = retitle(s, `c${rnd(6)}`, `t${step}`);
+      else if (op === 5) s = activate(s, rnd(s.tabs.length));
+      else s = bound(s, `fresh${(convoSeq += 1)}`);
+
+      const now = ids(s);
+      expect(allUnique(now), `duplicate ids after step ${step} (op ${op})`).toBe(true);
+      for (const id of now) {
+        expect(retired.has(id), `retired id ${id} reappeared at step ${step}`).toBe(false);
+      }
+      const nowSet = new Set(now);
+      for (const id of before) if (!nowSet.has(id)) retired.add(id);
+      expect(s.tabs.length).toBeGreaterThanOrEqual(1);
+      expect(s.active).toBeGreaterThanOrEqual(0);
+      expect(s.active).toBeLessThan(s.tabs.length);
+    }
   });
 });
