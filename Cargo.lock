@@ -3208,6 +3208,7 @@ dependencies = [
  "spider_transformations",
  "tempfile",
  "thiserror 2.0.18",
+ "time",
  "tokio",
  "tokio-util",
  "tracing",
@@ -3215,6 +3216,7 @@ dependencies = [
  "unicode-width",
  "uuid",
  "webpki-roots 1.0.6",
+ "x509-parser",
 ]
 
 [[package]]

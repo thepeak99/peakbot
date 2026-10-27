@@ -6,13 +6,18 @@ publish = false
 [dependencies]
 semver = "1.0.28"
 url = "2.5"
-ureq = { version = "3.4.2", default-features = false }
+ureq = { version = "3.4", default-features = false }
 directories-next = "2"      # same crate as peakbot's get_config_dir
 serde = { version = "1", features = ["derive"] }
 # Lenient general.web read (0.24 config, spec §8.4) — same version as the
 # root crate.
 serde_yaml = "0.9"
 log = "0.4"
+# CA-trust (design #376b): decode the CA PEM's base64 body (0.23 is
+# already in the desktop lock) and SHA-1 its DER for the Windows
+# thumbprint lookup (zero-dep; the one new crate).
+base64 = "0.23"
+sha1_smol = "1"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.190"
 [dev-dependencies]

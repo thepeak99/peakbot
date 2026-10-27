@@ -165,14 +165,26 @@ fn load_or_create_ca(tls_dir: &Path) -> Result<Ca> {
     })
 }
 
+/// The leaf's validity window: `now - 1 day` to `now + 365 days`.
+/// Apple (HT210176) rejects TLS server leaves valid for more than 825
+/// days, even under a user-trusted root — and the leaf is re-minted
+/// every boot, so a rolling year is all it needs.
+fn leaf_validity(now: time::OffsetDateTime) -> (time::OffsetDateTime, time::OffsetDateTime) {
+    (
+        now - time::Duration::days(1),
+        now + time::Duration::days(365),
+    )
+}
+
 /// Mint a leaf certificate for `sans`, signed by the CA. `CertificateParams::new`
 /// classifies each SAN string as an IP or DNS name automatically.
 fn mint_leaf(ca: &Ca, sans: &[String]) -> Result<Leaf> {
     let key = KeyPair::generate().context("generating leaf key pair")?;
     let mut params =
         CertificateParams::new(sans.to_vec()).context("building leaf certificate params")?;
-    params.not_before = date_time_ymd(2020, 1, 1);
-    params.not_after = date_time_ymd(2035, 1, 1);
+    let (not_before, not_after) = leaf_validity(time::OffsetDateTime::now_utc());
+    params.not_before = not_before;
+    params.not_after = not_after;
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     params
@@ -237,4 +249,72 @@ fn primary_lan_ip() -> Option<IpAddr> {
     let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
     sock.connect("8.8.8.8:80").ok()?;
     sock.local_addr().ok().map(|addr| addr.ip())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Desktop CA-trust design §1: the leaf's validity is a rolling window
+    // around mint time — `not_before = now - 1 day`, `not_after = now +
+    // 365 days` — so a freshly-minted leaf is always valid for a year and
+    // never backdated by 15 years (the old fixed 2020–2035 window).
+    #[test]
+    fn leaf_validity_is_now_minus_one_day_to_now_plus_365_days() {
+        let now = time::OffsetDateTime::now_utc();
+        let (not_before, not_after) = leaf_validity(now);
+        assert!(
+            not_after - not_before <= time::Duration::days(825),
+            "the window is one year, got {not_before:?} → {not_after:?}"
+        );
+        assert!(
+            not_before < now && now < not_after,
+            "the leaf must be valid at mint time; window {not_before:?} → {not_after:?}"
+        );
+        assert_eq!(
+            not_before,
+            now - time::Duration::days(1),
+            "not_before = now - 1 day"
+        );
+        assert_eq!(
+            not_after,
+            now + time::Duration::days(365),
+            "not_after = now + 365 days"
+        );
+    }
+
+    // Desktop CA-trust design §1 (end-to-end): the minted leaf actually
+    // carries the rolling window. Parsed with `x509-parser` (already in
+    // the lock via rcgen; dev-only edge) — no new crate.
+    #[test]
+    fn minted_leaf_carries_the_leaf_validity_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = load_or_create_ca(dir.path()).unwrap();
+        let leaf = mint_leaf(&ca, &["localhost".to_string()]).unwrap();
+
+        let der = rustls::pki_types::CertificateDer::from_pem_slice(leaf.cert_pem.as_bytes())
+            .expect("leaf PEM parses");
+        let (_, cert) = x509_parser::parse_x509_certificate(der.as_ref()).expect("leaf DER parses");
+        let not_before =
+            time::OffsetDateTime::from_unix_timestamp(cert.validity().not_before.timestamp())
+                .expect("unix seconds in range");
+        let not_after =
+            time::OffsetDateTime::from_unix_timestamp(cert.validity().not_after.timestamp())
+                .expect("unix seconds in range");
+        let now = time::OffsetDateTime::now_utc();
+
+        // Tolerance of a day each side: mint + parse happen a moment apart.
+        assert!(
+            not_before > now - time::Duration::days(2),
+            "not_before must be ~now - 1 day, got {not_before:?}"
+        );
+        assert!(
+            not_after < now + time::Duration::days(366),
+            "not_after must be ~now + 365 days, got {not_after:?}"
+        );
+        assert!(
+            not_after - not_before <= time::Duration::days(825),
+            "the leaf's window is one year, got {not_before:?} → {not_after:?}"
+        );
+    }
 }

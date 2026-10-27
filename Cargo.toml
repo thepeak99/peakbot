@@ -86,6 +86,9 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
 axum-server = { version = "0.8", default-features = false, features = ["tls-rustls"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+# Leaf validity window (src/ui/web/tls.rs `leaf_validity`): `time` is already
+# in the lock via rcgen/yasna — this only promotes the edge.
+time = "0.3"
 # Cross-platform browser launcher (xdg-open / open / cmd /c start).
 open = "5"
 # `rust-embed` embeds `web/dist/` at compile time. `release` builds inline
@@ -149,6 +152,10 @@ tokio = { version = "1", features = ["test-util"] }
 # without changing any test code. `sync` is in tokio-util's default features
 # (`tokio-util/src/lib.rs:57`), so no features need to be enabled.
 tokio-util = { version = "0.7" }
+# Leaf-validity test (src/ui/web/tls.rs): parse the minted leaf's
+# notBefore/notAfter. Already in the lock via rcgen — this only adds a
+# dev-only dependency edge, no new crate.
+x509-parser = "0.18"
 
 # No debuginfo for test builds: cold codegen of the large lib test binary
 # OOMs at debuginfo=2 (host and CI). Mirrors CI's CARGO_PROFILE_TEST_DEBUG=0.

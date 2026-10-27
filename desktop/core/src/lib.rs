@@ -8,6 +8,7 @@
 //! `FakeChild` / `FakeUi`); `tests/real_sys.rs` carries the C8
 //! integration cases (unix only).
 
+pub mod ca_trust;
 pub mod consts;
 pub mod controller;
 pub mod env;

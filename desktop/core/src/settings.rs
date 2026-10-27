@@ -22,9 +22,6 @@ pub enum Theme {
 /// What the settings page renders: the live tray/status state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SettingsView {
-    /// The app window can trust PeakBot's CA on Linux only (design
-    /// #377b §3.2): the page shows the macOS certificate note when true.
-    pub cert_warning: bool,
     /// The background row is shown only when true (Q1: hidden on
     /// Windows in v1); = `TrayModel.background_visible`.
     pub background_visible: bool,
@@ -36,7 +33,6 @@ pub struct SettingsView {
 
 pub fn settings_view(tray: &TrayModel, status: &StatusView) -> SettingsView {
     SettingsView {
-        cert_warning: !cfg!(target_os = "linux"),
         background_visible: tray.background_visible,
         background: tray.background_checked,
         background_enabled: tray.background_enabled,
@@ -70,7 +66,9 @@ mod tests {
 
     // Design #377 t74 (0.24: the view no longer carries settings.json,
     // a token or the web-token path): a pure mapping of tray + status;
-    // busy ⇔ kind == "starting"; the cert note on non-Linux only.
+    // busy ⇔ kind == "starting". CA-trust design §6: `cert_warning` is
+    // REMOVED — the CA is now trusted in the OS store on macOS/Windows
+    // and by the webview on Linux, so the page shows no certificate note.
     #[test]
     fn t74_settings_view_maps_tray_and_status() {
         let tray = tray();
@@ -80,12 +78,12 @@ mod tests {
         assert!(v.background, "= tray.background_checked");
         assert!(!v.background_enabled, "= tray.background_enabled");
         assert!(!v.busy, "kind \"ready\" ⇒ not busy");
-        assert_eq!(v.cert_warning, !cfg!(target_os = "linux"));
 
         let v = settings_view(&tray, &status("starting"));
         assert!(v.busy, "busy ⇔ status.kind == \"starting\"");
 
-        // The page gets exactly these keys — nothing web-related.
+        // The page gets exactly these keys — nothing web-related, no
+        // cert note.
         let json = serde_json::to_value(&v).expect("the view serialises");
         let mut keys: Vec<&str> = json
             .as_object()
@@ -100,8 +98,7 @@ mod tests {
                 "background",
                 "background_enabled",
                 "background_visible",
-                "busy",
-                "cert_warning"
+                "busy"
             ]
         );
     }
