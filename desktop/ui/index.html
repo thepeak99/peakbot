@@ -113,20 +113,6 @@
       .error {
         color: var(--danger);
       }
-      footer {
-        position: fixed;
-        bottom: 0.6rem;
-        left: 0;
-        right: 0;
-        text-align: center;
-        font-size: 0.85rem;
-      }
-      footer a {
-        color: var(--muted);
-      }
-      footer a:hover {
-        color: var(--accent);
-      }
     </style>
     <script src="theme.js"></script>
   </head>
@@ -137,8 +123,6 @@
       <pre id="detail" hidden></pre>
       <div id="actions"></div>
     </main>
-    <!-- The nav guard intercepts the sentinel (design #377 §4.1): no IPC. -->
-    <footer><a href="peakbot-desktop:settings">Settings (Ctrl+Shift+S)</a></footer>
     <script src="status.js"></script>
   </body>
 </html>

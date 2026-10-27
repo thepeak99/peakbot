@@ -350,3 +350,44 @@ describe("Fix scrolls the target field into view (T34b fix 5)", () => {
     expect(flashed !== null || red !== null).toBe(true);
   });
 });
+
+// ═══ Desktop pane removed: no `nav-desktop` ════════════════════════════════
+// The old D10 pane tests simulated the desktop app by setting
+// `globalThis.isTauri = true` (Tauri does it itself on every origin) and
+// stubbing `globalThis.__TAURI__.core.invoke`. Reuse that to pin the
+// removal: even under the desktop app the Desktop section is not in the
+// nav.
+
+describe("no Desktop section (close-to-tray removal)", () => {
+  it("nav_desktop_absent_in_browser", async () => {
+    stubApi();
+    mount(<Settings convo={null} onClose={() => {}} />);
+    await flush();
+
+    expect(has("nav-desktop")).toBe(false);
+    expect(has("nav-desktop-link")).toBe(false);
+    expect(
+      Array.from(host.querySelectorAll<HTMLOptionElement>("select option")).some((o) => o.value === "desktop"),
+    ).toBe(false);
+  });
+
+  it("nav_desktop_still_absent_under_tauri", async () => {
+    (globalThis as { isTauri?: unknown }).isTauri = true;
+    (globalThis as { __TAURI__?: { core?: { invoke?: unknown } } }).__TAURI__ = {
+      core: { invoke: vi.fn(() => Promise.reject(new Error("no route"))) },
+    };
+    stubApi();
+    mount(<Settings convo={null} onClose={() => {}} />);
+    await flush();
+
+    // No element with testid `nav-desktop` (nor the old `nav-desktop-link`),
+    // no "Desktop" option in the mobile select, and no "Desktop" text
+    // anywhere in the shell.
+    expect(has("nav-desktop")).toBe(false);
+    expect(has("nav-desktop-link")).toBe(false);
+    expect(
+      Array.from(host.querySelectorAll<HTMLOptionElement>("select option")).some((o) => o.value === "desktop"),
+    ).toBe(false);
+    expect(host.textContent).not.toContain("Desktop");
+  });
+});

@@ -6,55 +6,8 @@ use std::time::Duration;
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use url::Url;
 
-use crate::service::ServiceState;
 use crate::web_target::WebTarget;
-
-/// Where the webview points. Both modes carry the `WebTarget` read from
-/// config.yaml `general.web` (spec §8.4) — the desktop's only web config.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Mode {
-    /// The session child this app spawned.
-    Session(WebTarget),
-    /// The installed background service.
-    Service(WebTarget),
-}
-
-impl Mode {
-    pub fn target(&self) -> &WebTarget {
-        match self {
-            Mode::Session(t) | Mode::Service(t) => t,
-        }
-    }
-
-    pub fn port(&self) -> u16 {
-        self.target().bind.port()
-    }
-
-    /// `{url_base}/` [+ `?token=<percent-encoded>`].
-    pub fn url(&self) -> Url {
-        self.with_token(&format!("{}/", self.origin()))
-    }
-
-    /// `{url_base}/commands` [+ `?token=…`].
-    pub fn probe_url(&self) -> Url {
-        self.with_token(&format!("{}/commands", self.origin()))
-    }
-
-    /// `WebTarget::url_base` — `"{scheme}://{host}:{port}"`.
-    pub fn origin(&self) -> String {
-        self.target().url_base()
-    }
-
-    fn with_token(&self, base: &str) -> Url {
-        let mut u = Url::parse(base).expect("url_base is always a valid URL");
-        if let Some(tok) = &self.target().token {
-            u.query_pairs_mut().append_pair("token", tok.as_str());
-        }
-        u
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartStep {
@@ -65,9 +18,7 @@ pub enum StartStep {
     /// The system prompt to trust PeakBot's CA (macOS keychain /
     /// Windows certificate store) — the one start step with a `detail`.
     TrustingCertificate,
-    InstallingService,
     RemovingService,
-    ConnectingService,
     StoppingSession,
 }
 
@@ -90,14 +41,10 @@ pub enum StartError {
         waited: Duration,
     },
     /// Probe returned 401/403.
-    TokenRejected {
-        service: bool,
-    },
-    ServiceUnreachable {
-        waited: Duration,
-        /// `host:port` the desktop probed (from `general.web`).
-        addr: String,
-    },
+    TokenRejected,
+    /// The user declined removing the old background service (§4.3); it
+    /// would conflict with the session, so the start stops here.
+    ServiceInstalled,
     ServiceCommandFailed {
         command: String,
         output: String,
@@ -113,7 +60,7 @@ pub enum StartError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Phase {
     Starting(StartStep),
-    Ready(Mode),
+    Ready(WebTarget),
     Failed(StartError),
 }
 
@@ -124,12 +71,7 @@ pub enum Phase {
 pub enum UiAction {
     Retry,
     OpenLogs,
-    ReinstallService,
     Quit,
-    /// The settings page's `← Back to PeakBot` (0.24, spec §9.10): the
-    /// main window goes back to the chat (or the status page).
-    /// `status_view` never emits it.
-    Back,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -151,9 +93,7 @@ fn step_text(step: StartStep) -> &'static str {
         StartStep::StartingSession => "Starting PeakBot…",
         StartStep::WaitingForBackend => "Waiting for PeakBot to be ready…",
         StartStep::TrustingCertificate => "Approve PeakBot's certificate in the system prompt…",
-        StartStep::InstallingService => "Installing the background service…",
         StartStep::RemovingService => "Removing the background service…",
-        StartStep::ConnectingService => "Connecting to the background service…",
         StartStep::StoppingSession => "Stopping PeakBot…",
     }
 }
@@ -190,7 +130,6 @@ pub fn status_view(phase: &Phase) -> StatusView {
 
 fn failed_view(err: &StartError) -> StatusView {
     let retry_logs_quit = vec![UiAction::Retry, UiAction::OpenLogs, UiAction::Quit];
-    let retry_reinstall_quit = vec![UiAction::Retry, UiAction::ReinstallService, UiAction::Quit];
     match err {
         StartError::SidecarMissing { path } => StatusView {
             kind: "failed",
@@ -222,34 +161,26 @@ fn failed_view(err: &StartError) -> StatusView {
             detail: None,
             actions: retry_logs_quit,
         },
-        StartError::TokenRejected { service: false } => StatusView {
+        StartError::TokenRejected => StatusView {
             kind: "failed",
-            title: "Another program answered on PeakBot's port".into(),
+            title: "The backend rejected the access token".into(),
             detail: None,
             actions: vec![UiAction::Retry, UiAction::Quit],
         },
-        StartError::TokenRejected { service: true } => StatusView {
+        StartError::ServiceInstalled => StatusView {
             kind: "failed",
-            title: "The background service rejected the access token".into(),
-            detail: Some(crate::service::service_log_hint().to_string()),
-            actions: retry_reinstall_quit,
-        },
-        StartError::ServiceUnreachable { addr, .. } => StatusView {
-            kind: "failed",
-            title: format!("The background PeakBot service isn't responding on {addr}"),
-            detail: Some(crate::service::service_log_hint().to_string()),
-            actions: retry_reinstall_quit,
+            title: "The old PeakBot background service is still installed".into(),
+            detail: Some(
+                "PeakBot Desktop can't start PeakBot while it is installed. Press Retry to be asked again, or remove it yourself:\n\npeakbot service uninstall"
+                    .into(),
+            ),
+            actions: vec![UiAction::Retry, UiAction::Quit],
         },
         StartError::ServiceCommandFailed { command, output } => StatusView {
             kind: "failed",
             title: "A background-service command failed".into(),
             detail: Some(format!("$ {command}\n{output}")),
-            actions: vec![
-                UiAction::Retry,
-                UiAction::ReinstallService,
-                UiAction::OpenLogs,
-                UiAction::Quit,
-            ],
+            actions: retry_logs_quit,
         },
         StartError::CertificateNotTrusted { detail } => StatusView {
             kind: "failed",
@@ -264,11 +195,12 @@ fn failed_view(err: &StartError) -> StatusView {
 
 /// The host platform the app runs on. The glue decides it ONCE in
 /// `host_platform` (windows / macOS / everything else) and the pure
-/// core derives the visible features from it — so the decision is
-/// unit-testable on every host (`core/tests/background_platform.rs`).
+/// core derives its per-platform behaviour from it — so the decision is
+/// unit-testable on every host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
-    /// Background service is non-functional in v1 (Q1) — not offered.
+    /// No service migration check: the service never worked on Windows
+    /// (Q1), so `service status` is never run.
     Windows,
     /// Linux: the webview trusts the CA itself (design #377b) — no
     /// system-trust step is ever run.
@@ -279,7 +211,7 @@ pub enum Platform {
 
 /// The single place the compile target becomes a `Platform`: the Tauri
 /// glue calls it once and passes the result into the pure core
-/// (`Controller::new`, `tray_model`, the tray) — never a bare `cfg!`
+/// (`Controller::new`) — never a bare `cfg!`
 /// inside core. CA-trust design §2: Windows ⇒ `Windows`, macOS ⇒
 /// `MacOs`, everything else ⇒ `Linux`.
 pub fn host_platform() -> Platform {
@@ -292,61 +224,15 @@ pub fn host_platform() -> Platform {
     }
 }
 
-/// Q1: the background-service toggle is NOT offered on Windows in v1
-/// (it would advertise a feature that doesn't work: schtasks has no
-/// `/Run`, `run_state` is Unknown, a console window at logon); on
-/// Linux and macOS it stays offered, unchanged.
-pub fn background_offered(p: Platform) -> bool {
-    p != Platform::Windows
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TrayModel {
-    /// Disabled first item.
-    pub status: String,
-    /// The background checkbox item is shown only when true (Q1: hidden
-    /// on Windows in v1); derived from `background_offered`.
-    pub background_visible: bool,
-    pub background_checked: bool,
-    pub background_enabled: bool,
-    pub background_label: String,
-}
-
-pub fn tray_model(
-    phase: &Phase,
-    service: Option<&ServiceState>,
-    bundled: Option<&Version>,
-    platform: Platform,
-) -> TrayModel {
+/// The tray's disabled first item (§B).
+pub fn tray_status(phase: &Phase, bundled: Option<&Version>) -> String {
     let v = bundled
         .map(Version::to_string)
         .unwrap_or_else(|| "?".to_string());
-    let status = match phase {
+    match phase {
         Phase::Starting(_) => format!("PeakBot {v} · starting…"),
-        Phase::Ready(mode @ Mode::Session(_)) => {
-            format!("PeakBot {v} · running (port {})", mode.port())
-        }
-        Phase::Ready(Mode::Service(_)) => format!("PeakBot {v} · running in background"),
+        Phase::Ready(target) => format!("PeakBot {v} · running (port {})", target.bind.port()),
         Phase::Failed(_) => format!("PeakBot {v} · error"),
-    };
-    let background_label = match service {
-        Some(ServiceState::Unavailable { .. }) => {
-            "Keep PeakBot running in background (unavailable)".to_string()
-        }
-        _ => "Keep PeakBot running in background".to_string(),
-    };
-    let background_checked = matches!(service, Some(ServiceState::Installed(_)));
-    let background_enabled = matches!(phase, Phase::Ready(_) | Phase::Failed(_))
-        && matches!(
-            service,
-            Some(ServiceState::NotInstalled) | Some(ServiceState::Installed(_))
-        );
-    TrayModel {
-        status,
-        background_visible: background_offered(platform),
-        background_checked,
-        background_enabled,
-        background_label,
     }
 }
 
@@ -359,10 +245,20 @@ pub struct Dialog {
     pub cancel: Option<String>,
 }
 
+/// Shown on ✕ when no tray host can bring the window back (§B): closing
+/// then quits, which stops the server.
+pub fn close_app_dialog() -> Dialog {
+    Dialog {
+        title: "Close PeakBot?".into(),
+        body: "Closing PeakBot will stop the server and any running jobs. Close anyway?".into(),
+        ok: "Close PeakBot".into(),
+        cancel: Some("Cancel".into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::service::{InstalledService, RunState};
     use crate::token::Token;
 
     fn target(bind: &str, tls: bool, token: Option<Token>) -> WebTarget {
@@ -373,91 +269,16 @@ mod tests {
         }
     }
 
-    // §9.1 case 28 (updated for #377: `Mode` carries the protocol; the
-    // session token is optional).
-    #[test]
-    fn t28_mode_session_url_and_probe_url() {
-        let tok = Token::parse("tok+en&1").expect("token with + & parses");
-        let m = Mode::Session(target("127.0.0.1:7824", false, Some(tok)));
-        assert_eq!(m.port(), 7824);
-        let url = m.url();
-        assert_eq!(
-            url.to_string(),
-            "http://127.0.0.1:7824/?token=tok%2Ben%261",
-            "the token must be percent-encoded"
-        );
-        let probe = m.probe_url();
-        assert_eq!(probe.path(), "/commands");
-        assert_eq!(
-            probe.to_string(),
-            "http://127.0.0.1:7824/commands?token=tok%2Ben%261"
-        );
-    }
-
-    // Design #377 t73: the https variants and the tokenless session.
-    #[test]
-    fn t73_mode_https_urls_and_tokenless_session() {
-        let tok = Token::parse("tok+en&1").expect("token with + & parses");
-
-        // https session.
-        let m = Mode::Session(target("127.0.0.1:7824", true, Some(tok.clone())));
-        assert_eq!(
-            m.url().to_string(),
-            "https://127.0.0.1:7824/?token=tok%2Ben%261"
-        );
-        assert_eq!(
-            m.probe_url().to_string(),
-            "https://127.0.0.1:7824/commands?token=tok%2Ben%261"
-        );
-        assert_eq!(m.origin(), "https://127.0.0.1:7824");
-
-        // Tokenless session: no `?token=` anywhere.
-        let m = Mode::Session(target("127.0.0.1:7824", false, None));
-        assert_eq!(m.url().to_string(), "http://127.0.0.1:7824/");
-        assert_eq!(m.probe_url().to_string(), "http://127.0.0.1:7824/commands");
-        assert_eq!(m.origin(), "http://127.0.0.1:7824");
-
-        // https service, tokened and tokenless.
-        let m = Mode::Service(target("127.0.0.1:7823", true, Some(tok)));
-        assert_eq!(m.port(), 7823);
-        assert_eq!(
-            m.url().to_string(),
-            "https://127.0.0.1:7823/?token=tok%2Ben%261"
-        );
-        assert_eq!(
-            m.probe_url().to_string(),
-            "https://127.0.0.1:7823/commands?token=tok%2Ben%261"
-        );
-        assert_eq!(m.origin(), "https://127.0.0.1:7823");
-        let m = Mode::Service(target("127.0.0.1:7823", true, None));
-        assert_eq!(m.url().to_string(), "https://127.0.0.1:7823/");
-        assert_eq!(m.probe_url().to_string(), "https://127.0.0.1:7823/commands");
-    }
-
-    // §9.1 case 29 (updated for #377: `Mode` carries the protocol).
-    #[test]
-    fn t29_mode_service_url_and_origin() {
-        let m = Mode::Service(target("127.0.0.1:7823", false, None));
-        assert_eq!(m.port(), 7823);
-        assert_eq!(m.url().to_string(), "http://127.0.0.1:7823/");
-        assert_eq!(m.origin(), "http://127.0.0.1:7823");
-
-        // 0.24 (spec §8.4): the host follows general.web.bind —
-        // unspecified ⇒ 127.0.0.1, a concrete LAN IP ⇒ that IP.
-        let m = Mode::Session(target("0.0.0.0:9000", false, None));
-        assert_eq!(m.url().to_string(), "http://127.0.0.1:9000/");
-        let m = Mode::Service(target("192.168.1.5:9000", true, None));
-        assert_eq!(
-            m.probe_url().to_string(),
-            "https://192.168.1.5:9000/commands"
-        );
-        assert_eq!(m.origin(), "https://192.168.1.5:9000");
-    }
-
-    // §9.1 case 30 — one case per row of the §3.5 locked table.
+    // §9.1 case 30 — one case per row of the §3.5 locked table
+    // (close-to-tray plan: the service-mode rows are gone — no
+    // `InstallingService`/`ConnectingService` steps, no
+    // `ServiceUnreachable`, no `ReinstallService` action;
+    // `TokenRejected` is a unit variant; the new `ServiceInstalled`
+    // declined view has its locked strings).
     #[test]
     fn t30_status_view_titles_and_actions_per_locked_table() {
-        // Starting — exact step texts.
+        // Starting — exact step texts (the seven surviving steps;
+        // TrustingCertificate, the one with a detail, is checked below).
         let start_steps = [
             (StartStep::CheckingBundled, "Checking the bundled PeakBot…"),
             (
@@ -470,16 +291,8 @@ mod tests {
                 "Waiting for PeakBot to be ready…",
             ),
             (
-                StartStep::InstallingService,
-                "Installing the background service…",
-            ),
-            (
                 StartStep::RemovingService,
                 "Removing the background service…",
-            ),
-            (
-                StartStep::ConnectingService,
-                "Connecting to the background service…",
             ),
             (StartStep::StoppingSession, "Stopping PeakBot…"),
         ];
@@ -494,8 +307,7 @@ mod tests {
             );
         }
 
-        // CA-trust design §3: TrustingCertificate is the ONE start step
-        // with a detail — the exact locked strings.
+        // TrustingCertificate is the ONE start step with a detail.
         let sv = status_view(&Phase::Starting(StartStep::TrustingCertificate));
         assert_eq!(sv.kind, "starting");
         assert_eq!(
@@ -510,21 +322,9 @@ mod tests {
         );
         assert!(sv.actions.is_empty(), "no actions while starting");
 
-        // Ready.
+        // Ready(WebTarget) — the service mode is gone, there is one shape.
         let tok = Token::parse("t").expect("parses");
-        let sv = status_view(&Phase::Ready(Mode::Session(target(
-            "127.0.0.1:7824",
-            false,
-            Some(tok),
-        ))));
-        assert_eq!(sv.kind, "ready");
-        assert_eq!(sv.title, "Opening PeakBot…");
-        assert!(sv.actions.is_empty());
-        let sv = status_view(&Phase::Ready(Mode::Service(target(
-            "127.0.0.1:7823",
-            false,
-            None,
-        ))));
+        let sv = status_view(&Phase::Ready(target("127.0.0.1:7824", false, Some(tok))));
         assert_eq!(sv.kind, "ready");
         assert_eq!(sv.title, "Opening PeakBot…");
         assert!(sv.actions.is_empty());
@@ -591,61 +391,51 @@ mod tests {
             vec![UiAction::Retry, UiAction::OpenLogs, UiAction::Quit]
         );
 
-        let sv = failed(StartError::TokenRejected { service: false });
-        assert_eq!(sv.title, "Another program answered on PeakBot's port");
+        // TokenRejected is a unit variant: one locked title, one action
+        // row (no service-mode twin, no `ReinstallService`).
+        let sv = failed(StartError::TokenRejected);
+        assert_eq!(sv.title, "The backend rejected the access token");
         assert_eq!(sv.actions, vec![UiAction::Retry, UiAction::Quit]);
 
-        let sv = failed(StartError::TokenRejected { service: true });
-        assert_eq!(sv.title, "The background service rejected the access token");
+        // The declined-migration view (§B): the exact locked title,
+        // detail and [Retry, Quit] actions.
+        let sv = failed(StartError::ServiceInstalled);
+        assert_eq!(sv.kind, "failed");
         assert_eq!(
-            sv.actions,
-            vec![UiAction::Retry, UiAction::ReinstallService, UiAction::Quit]
+            sv.title, "The old PeakBot background service is still installed",
+            "the exact locked title"
         );
-        assert!(
-            sv.detail.is_some(),
-            "service-mode rejection carries the service log hint"
-        );
-
-        let sv = failed(StartError::ServiceUnreachable {
-            waited: Duration::from_secs(30),
-            addr: "127.0.0.1:7823".into(),
-        });
         assert_eq!(
-            sv.title,
-            "The background PeakBot service isn't responding on 127.0.0.1:7823"
+            sv.detail.as_deref(),
+            Some(
+                "PeakBot Desktop can't start PeakBot while it is installed. Press Retry to be asked again, or remove it yourself:\n\npeakbot service uninstall"
+            ),
+            "the exact locked detail"
         );
         assert_eq!(
             sv.actions,
-            vec![UiAction::Retry, UiAction::ReinstallService, UiAction::Quit]
-        );
-        assert!(
-            sv.detail.is_some(),
-            "ServiceUnreachable carries the service log hint"
+            vec![UiAction::Retry, UiAction::Quit],
+            "declined view: [Retry, Quit] — no OpenLogs, no ReinstallService"
         );
 
         let sv = failed(StartError::ServiceCommandFailed {
-            command: "peakbot service install".into(),
+            command: "service uninstall".into(),
             output: "boom".into(),
         });
         assert_eq!(sv.title, "A background-service command failed");
         assert_eq!(
             sv.actions,
-            vec![
-                UiAction::Retry,
-                UiAction::ReinstallService,
-                UiAction::OpenLogs,
-                UiAction::Quit
-            ]
+            vec![UiAction::Retry, UiAction::OpenLogs, UiAction::Quit],
+            "ServiceCommandFailed: [Retry, OpenLogs, Quit] — no ReinstallService"
         );
         assert!(
             sv.detail
                 .as_deref()
-                .is_some_and(|d| d.contains("$ peakbot service install")),
+                .is_some_and(|d| d.contains("$ service uninstall")),
             "detail is `$ <command>` + output; {:?}",
             sv.detail
         );
 
-        // CA-trust design §3: the exact locked failed view.
         let sv = failed(StartError::CertificateNotTrusted {
             detail: "macOS refused the certificate".into(),
         });
@@ -682,109 +472,56 @@ mod tests {
         );
     }
 
-    // CA-trust design §2: the offer decision over the three-way platform.
+    // §B: the tray's disabled first item, per phase. `TrayModel` is gone —
+    // `tray_status` returns the String the tray applies.
     #[test]
-    fn background_offered_per_platform() {
-        assert!(background_offered(Platform::Linux), "Linux: offered");
-        assert!(background_offered(Platform::MacOs), "macOS: offered");
-        assert!(
-            !background_offered(Platform::Windows),
-            "Windows: NOT offered in v1 (Q1)"
-        );
-    }
-
-    // §9.1 case 31.
-    #[test]
-    fn t31_tray_model() {
+    fn t31_tray_status() {
         let v = Version::parse("0.23.0").unwrap();
         let tok = Token::parse("t").expect("parses");
-        let ready_session = Phase::Ready(Mode::Session(target("127.0.0.1:7824", false, Some(tok))));
-        let ready_service = Phase::Ready(Mode::Service(target("127.0.0.1:7823", false, None)));
-        let installed = ServiceState::Installed(InstalledService {
-            exe: None,
-            run: RunState::Running,
-            tls: false,
-        });
+        let ready = Phase::Ready(target("127.0.0.1:7824", false, Some(tok)));
 
-        // Starting → background disabled.
-        let t = tray_model(
-            &Phase::Starting(StartStep::CheckingBundled),
-            Some(&ServiceState::NotInstalled),
-            Some(&v),
-            Platform::Linux,
-        );
-        assert_eq!(t.status, "PeakBot 0.23.0 · starting…");
-        assert!(!t.background_checked);
-        assert!(!t.background_enabled);
-        assert_eq!(t.background_label, "Keep PeakBot running in background");
-
-        // Ready(Session) + NotInstalled → unchecked, enabled.
-        let t = tray_model(
-            &ready_session,
-            Some(&ServiceState::NotInstalled),
-            Some(&v),
-            Platform::Linux,
-        );
-        assert_eq!(t.status, "PeakBot 0.23.0 · running (port 7824)");
-        assert!(!t.background_checked);
-        assert!(t.background_enabled);
-
-        // Ready(Service) + Installed → checked, enabled.
-        let t = tray_model(&ready_service, Some(&installed), Some(&v), Platform::Linux);
-        assert_eq!(t.status, "PeakBot 0.23.0 · running in background");
-        assert!(t.background_checked);
-        assert!(t.background_enabled);
-
-        // Failed + Installed → checked, enabled.
-        let t = tray_model(
-            &Phase::Failed(StartError::NotReady {
-                waited: Duration::from_secs(30),
-            }),
-            Some(&installed),
-            Some(&v),
-            Platform::Linux,
-        );
-        assert_eq!(t.status, "PeakBot 0.23.0 · error");
-        assert!(t.background_checked);
-        assert!(t.background_enabled);
-
-        // Unavailable → label suffix + disabled.
-        let unavail = ServiceState::Unavailable {
-            reason: "no bus".into(),
-        };
-        let t = tray_model(&ready_session, Some(&unavail), Some(&v), Platform::Linux);
         assert_eq!(
-            t.background_label,
-            "Keep PeakBot running in background (unavailable)"
+            tray_status(&Phase::Starting(StartStep::CheckingBundled), Some(&v)),
+            "PeakBot 0.23.0 · starting…"
         );
-        assert!(!t.background_enabled);
-
-        // service None → disabled.
-        let t = tray_model(&ready_service, None, Some(&v), Platform::Linux);
-        assert!(!t.background_enabled);
+        assert_eq!(
+            tray_status(&Phase::Starting(StartStep::RemovingService), Some(&v)),
+            "PeakBot 0.23.0 · starting…"
+        );
+        assert_eq!(
+            tray_status(&ready, Some(&v)),
+            "PeakBot 0.23.0 · running (port 7824)"
+        );
+        assert_eq!(
+            tray_status(
+                &Phase::Failed(StartError::NotReady {
+                    waited: Duration::from_secs(30)
+                }),
+                Some(&v)
+            ),
+            "PeakBot 0.23.0 · error"
+        );
 
         // bundled None → `?`.
-        let t = tray_model(
-            &Phase::Starting(StartStep::CheckingBundled),
-            None,
-            None,
-            Platform::Linux,
+        assert_eq!(
+            tray_status(&Phase::Starting(StartStep::CheckingBundled), None),
+            "PeakBot ? · starting…"
         );
-        assert_eq!(t.status, "PeakBot ? · starting…");
+        assert_eq!(tray_status(&ready, None), "PeakBot ? · running (port 7824)");
+        assert_eq!(
+            tray_status(&Phase::Failed(StartError::ServiceInstalled), None),
+            "PeakBot ? · error"
+        );
     }
 
-    // §9.1 case 32 (0.24: + `back`; desktop-pane design D3: the settings
-    // page's background toggle is its own `toggle_background` COMMAND, no
-    // longer an `act` action — so the capability that lets the web UI call
-    // `toggle_background` never also exposes `act`).
+    // §C: `UiAction` lost `ReinstallService` and `Back` — exactly
+    // retry / open_logs / quit remain, and nothing else deserializes.
     #[test]
     fn t32_ui_action_serde_wire_names() {
         for (wire, action) in [
             ("retry", UiAction::Retry),
             ("open_logs", UiAction::OpenLogs),
-            ("reinstall_service", UiAction::ReinstallService),
             ("quit", UiAction::Quit),
-            ("back", UiAction::Back),
         ] {
             let d: UiAction = serde_json::from_str(&format!("\"{wire}\""))
                 .unwrap_or_else(|e| panic!("{wire}: {e}"));
@@ -794,13 +531,24 @@ mod tests {
                 format!("\"{wire}\"")
             );
         }
-        assert!(
-            serde_json::from_str::<UiAction>("\"rm_rf\"").is_err(),
-            "unknown actions must not deserialize"
+        for gone in ["reinstall_service", "back", "toggle_background", "rm_rf"] {
+            assert!(
+                serde_json::from_str::<UiAction>(&format!("\"{gone}\"")).is_err(),
+                "\"{gone}\" must not deserialize (the action was removed)"
+            );
+        }
+    }
+
+    // §B: the close-without-tray dialog's locked strings.
+    #[test]
+    fn close_app_dialog_locked_strings() {
+        let d = close_app_dialog();
+        assert_eq!(d.title, "Close PeakBot?");
+        assert_eq!(
+            d.body,
+            "Closing PeakBot will stop the server and any running jobs. Close anyway?"
         );
-        assert!(
-            serde_json::from_str::<UiAction>("\"toggle_background\"").is_err(),
-            "toggle_background is a dedicated command now, not an `act` action"
-        );
+        assert_eq!(d.ok, "Close PeakBot");
+        assert_eq!(d.cancel.as_deref(), Some("Cancel"));
     }
 }

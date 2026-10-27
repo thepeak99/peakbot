@@ -2,15 +2,10 @@
 
 use url::Url;
 
-/// Reserved URL the bundled settings page is navigated to (0.24, spec
-/// §9.10): any origin navigating to it gets the settings page in the
-/// SAME main window, and the navigation itself is blocked.
-pub const SETTINGS_URL: &str = "peakbot-desktop:settings";
-
 /// Reserved URL that restarts only the PeakBot server (0.24, spec
 /// §8.4): the navigation is blocked and the desktop sends
-/// `Action::Restart` (session child relaunch / service reinstall —
-/// never the desktop app itself).
+/// `Action::Restart` (session child relaunch — never the desktop app
+/// itself).
 pub const RESTART_URL: &str = "peakbot-desktop:restart";
 
 /// What to do about a webview navigation.
@@ -20,9 +15,6 @@ pub enum NavDecision {
     Allow,
     /// Open in the external browser and block in-app (other http(s)/mailto).
     OpenExternal,
-    /// The reserved settings sentinel: show the bundled settings page in
-    /// the main window, block the navigation (0.24, spec §9.10).
-    OpenSettings,
     /// The reserved restart sentinel: restart only the PeakBot server
     /// (`Action::Restart`), block the navigation (0.24, spec §8.4).
     Restart,
@@ -31,10 +23,7 @@ pub enum NavDecision {
 }
 
 pub fn classify_navigation(url: &Url, backend_origin: Option<&str>) -> NavDecision {
-    // The sentinels win over everything, incl. the allowed backend origin.
-    if url.as_str() == SETTINGS_URL {
-        return NavDecision::OpenSettings;
-    }
+    // The sentinel wins over everything, incl. the allowed backend origin.
     if url.as_str() == RESTART_URL {
         return NavDecision::Restart;
     }
@@ -133,23 +122,10 @@ mod tests {
             "backend URL with no allowed origin opens externally"
         );
 
-        // The reserved settings sentinel (design #377 §4.1; 0.24 §9.10:
-        // in-window page, not a second window).
-        assert_eq!(SETTINGS_URL, "peakbot-desktop:settings");
-        assert_eq!(
-            classify_navigation(&u(SETTINGS_URL), None),
-            NavDecision::OpenSettings,
-            "the sentinel shows the settings page in the main window"
-        );
         assert_eq!(
             classify_navigation(&u("peakbot-desktop:other"), None),
             NavDecision::Block,
             "other peakbot-desktop: URLs are blocked"
-        );
-        assert_eq!(
-            classify_navigation(&u(SETTINGS_URL), Some("http://127.0.0.1:7824")),
-            NavDecision::OpenSettings,
-            "the sentinel wins over the allowed backend origin"
         );
     }
 
@@ -170,29 +146,35 @@ mod tests {
         );
     }
 
-    // 0.24 (spec §9.10, T16): the settings sentinel now means "show the
-    // bundled settings page in the same main window" — no second window.
+    // Close-to-tray plan (§A.7): the settings page is gone, so the old
+    // `peakbot-desktop:settings` sentinel is just another unknown
+    // `peakbot-desktop:` URL — blocked, even when it names the backend
+    // origin as the allowed one. (The literal is spelled out: the
+    // `SETTINGS_URL` constant no longer exists.)
     #[test]
-    fn classify_settings() {
-        assert_eq!(SETTINGS_URL, "peakbot-desktop:settings");
+    fn settings_sentinel_is_blocked() {
         assert_eq!(
-            classify_navigation(&u(SETTINGS_URL), None),
-            NavDecision::OpenSettings,
-            "the sentinel ⇒ OpenSettings (in-window settings page)"
+            classify_navigation(&u("peakbot-desktop:settings"), None),
+            NavDecision::Block,
+            "the removed settings sentinel falls through to Block"
         );
         assert_eq!(
-            classify_navigation(&u(SETTINGS_URL), Some("http://127.0.0.1:7824")),
-            NavDecision::OpenSettings,
-            "the sentinel wins over the allowed backend origin"
+            classify_navigation(
+                &u("peakbot-desktop:settings"),
+                Some("http://127.0.0.1:7824")
+            ),
+            NavDecision::Block,
+            "an allowed backend origin does not revive the settings sentinel"
         );
     }
 
-    // 0.24 (spec §8.4/§9.10, T16): every other `peakbot-desktop:` URL is
+    // 0.24 (spec §8.4, T16): every other `peakbot-desktop:` URL is
     // an unknown sentinel and stays blocked.
     #[test]
     fn other_sentinel_blocked() {
         for other in [
             "peakbot-desktop:other",
+            "peakbot-desktop:settings",
             "peakbot-desktop:settings2",
             "peakbot-desktop:restart/extra",
         ] {
