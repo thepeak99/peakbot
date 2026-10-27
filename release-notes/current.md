@@ -10,6 +10,7 @@ This file is the working draft for the next release. When a version is tagged, t
 - An empty final reply from the model is now re-requested automatically once (the nudge is never shown in the transcript); if the model is still blank, a ⚠ warning appears instead of an empty message.
 - Web: focus mode no longer picks a blank message as the turn's answer, and no longer hides the orchestrator's reply to a `[bg output]` turn (e.g. the final summary after a background build finished).
 - Desktop: the app settings page opened blank under the heading; the form is now revealed once the first `settings_get` load succeeds.
+- PeakBot Desktop (macOS, Windows): with HTTPS on (`general.web.tls: true`) the app window no longer hangs on 'Opening PeakBot…'. On the first start the app adds PeakBot's own certificate authority to your user's trusted certificates (the system asks you to approve); if you decline, the window explains why and offers Retry. Server: the HTTPS leaf certificate is now valid for one year (re-minted every start), as macOS requires.
 
 ### Features
 

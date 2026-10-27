@@ -1188,17 +1188,17 @@ Order matters: T-tasks (tests) precede the C-tasks they cover (RED → GREEN).
 
 **What changed.**
 - **§3.2 (`core::token`):** `TOKEN_MIN_LEN`/`TOKEN_MAX_LEN` (16/256), `TokenError` (`BadChars`/`TooShort`/`TooLong`, locked messages) + `parse_new_token` — the boundary rule for a **user-entered** token: trim, `""` ⇒ `Ok(None)` (keep/generate), charset `[A-Za-z0-9._-]` checked FIRST, then the length. Required because the desktop form-encodes the token (`append_pair`) and the backend compares the raw query value + raw `Set-Cookie`. `impl Serialize for Token` (raw string) so `SettingsView` can carry it; `Debug` stays `Token(***)`.
-- **§3.9 (`core::settings`):** `SaveRequest { settings, new_token }` — THE validated save payload (fields private; `parse(wire, token)`: settings error wins; token off ⇒ field ignored, never an error; token on ⇒ `parse_new_token`). `new_token` `Some` ⇒ `settings.token()`. `From<Settings>` = "save these, keep the token". `SettingsView` +`token: Option<Token>` (Some iff token on ∧ file parses; JSON `string`/`null`) and +`cert_warning: bool` (`= !cfg!(target_os = "linux")`); `settings_view` takes the file token.
+- **§3.9 (`core::settings`):** `SaveRequest { settings, new_token }` — THE validated save payload (fields private; `parse(wire, token)`: settings error wins; token off ⇒ field ignored, never an error; token on ⇒ `parse_new_token`). `new_token` `Some` ⇒ `settings.token()`. `From<Settings>` = "save these, keep the token". `SettingsView` +`token: Option<Token>` (Some iff token on ∧ file parses; JSON `string`/`null`); `settings_view` takes the file token.
 - **§3.8 (invariants):** I2 amended (the web-token holds the user's last saved value, or the value the desktop generated when none existed; written only by the controller thread). **I8:** the token value exists only in `web-token`, the session env, the webview URL/cookie, and the `settings_get` response to the `settings` window — never in `settings.json`, argv, unit/plist/task files, or logs (the TLS handler must not log the failing URI, it carries `?token=`). **I9 (Linux):** the app webview trusts a certificate only if (a) the failing URL is the **current** backend origin over https on `127.0.0.1` and (b) the presented certificate verifies against `~/.cache/peakbot/tls/ca-cert.pem` with **no** flags.
 - **§4.11 (save flow):** `handle_save_settings(SaveRequest)`: `new == current ∧ tok_new None` → return (no dialog); confirm (unchanged strings); **web-token written FIRST** (0600; failure → `save_failed_dialog(web-token path)`, nothing else written); then `settings.json` (only if changed; failure → `save_failed_dialog(settings path)`); then the existing `reconfigure_service()` / `handle_start()` — `sync_token` re-reads the file, so the new value goes live. `reconfigure_service` **is** the restart for a token-only change in service mode (no `service restart` verb exists; T-A5).
 - **§5.2/§5.4 (new, `core::nav` + `src-tauri/tls_trust.rs`, Linux-only):** `may_trust_peakbot_cert(failing, backend_origin)` — the pure trust gate (https ∧ host `127.0.0.1` ∧ same origin as the live `UiState.nav`). One `load-failed-with-tls-errors` handler on the main webview: gate → **CA signature check** (`gio::TlsCertificate::verify(None, Some(CA from `peakbot_ca_cert()`))` with no flags — an issuer-DN compare is forgeable, T-B2) → `allow_tls_certificate_for_host(cert, "127.0.0.1")` → `load_uri` on the next main-loop **idle** (re-checking the origin; not `reload()` — the committed page is still the status page) with a **same-certificate loop guard**. Everything else falls through to WebKit's error page. `core::paths::peakbot_ca_cert()` = `BaseDirs::cache_dir()/peakbot/tls/ca-cert.pem` (same base dir + file name as the backend's `dirs::cache_dir()` CA — `src/ui/web/tls.rs` documents the coupling).
 - **§5.4 (IPC):** `settings_get` reads the token file into the view; `settings_set(settings, token)` parses both into `SaveRequest` (the command names are unchanged; only the arg list grew — capabilities untouched).
 - **§5.5 (manifest):** `src-tauri` gains Linux-only `webkit2gtk = { version = "2.0.2", features = ["v2_6"] }` and `gio = "0.18"` — both already in `Cargo.lock` (pulled by wry 0.57); the lockfile gains only the two dep lines on `peakbot-desktop`.
-- **§6 (tradeoffs):** T-A1 (extra `token` arg on `settings_set`, not a wire field — the wire is the file body) / T-A2 (empty = keep/generate) / T-A3 (Generate is client-side) / T-A4 (one 16–256 rule for loopback + remote) / T-A5 (`reconfigure_service` as the restart) / **T-B1 (signal-driven trust ONLY — no backend `leaf-cert.pem`, no pre-pin: the one failing handshake covers stale leaves, restarts and re-mints; the backend is unchanged)** / T-B2 (signature, not DN) / T-B3 (live origin only) / T-B4 (macOS deferred; the cert note shows on macOS only).
+- **§6 (tradeoffs):** T-A1 (extra `token` arg on `settings_set`, not a wire field — the wire is the file body) / T-A2 (empty = keep/generate) / T-A3 (Generate is client-side) / T-A4 (one 16–256 rule for loopback + remote) / T-A5 (`reconfigure_service` as the restart) / **T-B1 (signal-driven trust ONLY — no backend `leaf-cert.pem`, no pre-pin: the one failing handshake covers stale leaves, restarts and re-mints; the backend is unchanged)** / T-B2 (signature, not DN) / T-B3 (live origin only) / T-B4 (macOS deferred; the cert note shows on macOS only) — **superseded by the #376b amendment** (the CA now goes into the OS user store; the cert note is gone).
 - **§8:** **R-B1** the signal path misbehaves on some WebKitGTK build → L6 decides; contingency = the researcher's steps 1–2 (backend `leaf-cert.pem` + pre-pin before `navigate`, handler kept as fallback). **R-B2** `XDG_CACHE_HOME` differs between the app and the systemd user manager → different/missing CA → the error page (fails closed; README note). **R-B3** CA deleted/rotated while a backend runs → its leaf won't verify → the error page until the backend restarts (fails closed). **R-A1** the token is visible in the settings window (the requirement). **R-A2** legacy file tokens with characters outside the set already 401 today; kept untouched (follow-up: percent-decode `token_from_query`). **R-A3** clipboard on the `tauri://` origin (secure scheme) with the `execCommand` fallback.
 - **§9.1/§9.3:** tests t90–t102; manual L1–L10 (Linux AppImage).
 
-**Out of scope (separate tickets).** #374 (CA-verified readiness probe — can reuse `peakbot_ca_cert()`), #378 (Origin validation), macOS Keychain trust (practical route: `security add-trusted-cert -r trustRoot -p ssl -k login.keychain-db`).
+**Out of scope (separate tickets).** #374 (CA-verified readiness probe — can reuse `peakbot_ca_cert()`), #378 (Origin validation), macOS Keychain trust — **done in the #376b amendment** (`security add-trusted-cert -r trustRoot -p ssl -k <login keychain>`, plus the Windows `certutil` store).
 
 ### Amendment (auto-replace) — silent replace of a stale background service (2026-10-17)
 
@@ -1520,10 +1520,10 @@ contents, not paths.
 The background-service mode is non-functional on Windows in v1 (schtasks has no `/Run`, `run_state` is
 Unknown, a console window would appear at logon). The app advertises nothing it doesn't deliver: the tray
 checkbox and the settings row are hidden on Windows. The decision lives in core as a pure,
-platform-parameterized function — `phase::Platform { Windows, Unix }` + `phase::background_offered(p)`
-(Windows → `false`, Unix → `true`, pinned by `core/tests/background_platform.rs`) — and `TrayModel` carries
+platform-parameterized function — `phase::Platform { Windows, Linux, MacOs }` + `phase::background_offered(p)`
+(Windows → `false`, Linux/macOS → `true`, pinned by `core/tests/background_platform.rs`) — and `TrayModel` carries
 a `background_visible` flag derived from it; the glue (tray + settings view) hides the item/row when it is
-`false`. Unix behaviour is byte-identical (existing `t31`/`t74` tests pin it). Follow-up ticket: make it
+`false`. Linux/macOS behaviour is byte-identical (existing `t31`/`t74` tests pin it). Follow-up ticket: make it
 work (hidden window + `/Run`).
 
 ## 11. AMENDMENT (0.24 config) — `general.web` is the desktop's web config (2026-10-24)
@@ -1550,8 +1550,9 @@ Spec: `make-config-great-again.md` §8.4/§11.6. Supersedes §3.9, §4.11 and th
 - **`Action::Restart`** (sentinel `peakbot-desktop:restart`, wired by the glue in T16): service installed ⇒
   `reconfigure_service` (uninstall + bare install; binary not replaced — the reinstall is the restart);
   otherwise ⇒ the full start path (stop child, re-read, relaunch). No dialog; the app never restarts.
-- **`SettingsView`** = `{cert_warning, background_visible, background, background_enabled, busy}` (the
-  spec's list plus `background_visible`, kept for the §10.5 Windows rule). `settings_set` is gone.
+- **`SettingsView`** = `{background_visible, background, background_enabled, busy}` (the
+  spec's list plus `background_visible`, kept for the §10.5 Windows rule; the former
+  cert note is gone — #376b). `settings_set` is gone.
 - **T16 shell (wired).** ONE window: the settings window (`SETTINGS_LABEL`, `open_settings`) is
   deleted; `OpenSettings` (tray `Settings…`, macOS menu, Ctrl+Shift+S init script, status-page
   link, the SPA's `Desktop app settings ↗`) navigates `main` to the bundled `settings.html`
@@ -1595,3 +1596,75 @@ back to a button that opens the bundled settings page.
   overrides — mirroring the web UI.
 - `tauri.conf.json` lists both capabilities (`["local-pages", "desktop-pane"]`); an unlisted file is
   silently inactive. `desktop/core/tests/ipc_surface.rs` pins the surface.
+
+## 13. AMENDMENT #376b — OS trust: PeakBot's CA in the macOS/Windows user store (2026-10-27)
+
+**Reason.** On macOS and Windows the webview rejects PeakBot's self-signed CA, so in HTTPS
+mode the window hung on "Opening PeakBot…" (#376, deferred since #377b). Apple HT210176
+also rejects TLS server leaves valid for more than 825 days — even under a user-trusted
+root — so the server's leaf validity had to change with it.
+
+**What changed.**
+- **Server (`src/ui/web/tls.rs`):** the leaf is minted with `not_before = now - 1 day`,
+  `not_after = now + 365 days` (`leaf_validity`, re-minted every boot); the CA validity is
+  unchanged. `time` becomes a root dep (already in the lock via rcgen — no new version).
+- **`core::phase`:** `Platform { Windows, Unix }` → `Platform { Linux, MacOs, Windows }`;
+  `host_platform()` remains the ONLY `cfg!` → `Platform` point (windows /
+  `target_os = "macos"` / else), `background_offered(p) = p != Windows` unchanged in
+  effect. New `StartStep::TrustingCertificate` (the one start step with a `detail`) and
+  `StartError::CertificateNotTrusted { detail }` — locked strings asserted by `t30`.
+- **`core::ca_trust` (new, pure):** `PeakbotCa::parse` (the FIRST `BEGIN/END
+  CERTIFICATE` block, all whitespace stripped, base64 STANDARD, SHA-1 of the DER as 40
+  UPPERCASE hex — the Windows thumbprint), `TrustStore::for_platform` (Linux ⇒ `None`,
+  Windows ⇒ `Windows`, MacOs ⇒ the login keychain under home) and the `check`/`add`
+  commands below. No `#[cfg]` in production code. Deps: `base64` (already in the desktop
+  lock) + `sha1_smol` (the one new crate).
+- **`core::controller`:** `enter_ready(mode)` is THE single exit into `Phase::Ready`
+  (replaces both former sites). For an HTTPS target it runs `ensure_ca_trusted()`
+  first: Linux ⇒ `Ok` (the webview trusts the CA itself — nothing touched); else read
+  `paths::peakbot_ca_cert()` (`Ok(None)` ⇒ `"{path} not found"`, `Err(e)` ⇒
+  `"{path}: {e}"`), parse it, run the store's `check`; a failed check sets
+  `Starting(TrustingCertificate)` and runs the `add` (the OS prompt); `add` failure ⇒
+  `Failed(CertificateNotTrusted { detail: "$ <add>\n<combined output>" })`.
+- **`core::settings`:** `SettingsView.cert_warning` is REMOVED (the OS store / webview
+  trust replaces the note; `t74` pins the key list).
+
+**Invariants.**
+1. `Phase::Ready` is reached only via `enter_ready` — no bare `set_phase(Ready)`.
+2. The OS prompt (the `add` command) runs only after a FAILED `check` — a trusted CA is
+   never re-added.
+3. The trust step sits after backend readiness, before the webview navigates to the
+   https URL (Ready is the navigation trigger, §4.8).
+4. A trust failure keeps the session child alive (no interrupt, pidfile stays); Retry
+   (`Action::Start`) interrupts the old pid before respawning.
+5. No new `cfg!` in core: the platform arrives as a `Platform` value from
+   `host_platform()` (one point).
+
+**Commands (locked, asserted by `tests/ca_trust.rs`).** `<ca>` = `paths::peakbot_ca_cert()`.
+
+| Store | check | trusted iff | add |
+|---|---|---|---|
+| MacOs | `/usr/bin/security verify-cert -c <ca> -p ssl -l -L -R offline` | exit code 0 | `/usr/bin/security add-trusted-cert -r trustRoot -p ssl -k <home>/Library/Keychains/login.keychain-db <ca>` |
+| Windows | `certutil.exe -user -store Root <thumbprint>` | exit code 0 AND stdout (whitespace-stripped, uppercased) contains `<thumbprint>` | `certutil.exe -user -addstore Root <ca>` |
+
+**Status view rows (locked, asserted by `t30`).**
+- `Starting(TrustingCertificate)`: title `Approve PeakBot's certificate in the system prompt…`,
+  the one start step with a `detail` ("PeakBot serves HTTPS with its own certificate
+  authority (\"PeakBot Local CA\"). Approving adds it to this user account's trusted
+  certificates so this window can open PeakBot."), actions `[]`.
+- `Failed(CertificateNotTrusted)`: title `PeakBot's HTTPS certificate isn't trusted`,
+  detail = locked prefix ("This window opens PeakBot over HTTPS (general.web.tls: true)
+  and needs PeakBot's certificate authority in your trusted certificates. Press Retry to
+  be asked again, or set general.web.tls: false in config.yaml and press Retry.\n\n") +
+  the raw failure detail, actions `Retry, Quit`.
+
+**Tests.** `tests/ca_trust.rs` (20: parse/thumbprint, `for_platform`, the four commands,
+`is_trusted`, `Display`), `t30` (the two new rows), `t74` (key list minus the cert note),
+`host_platform_follows_the_build_target`, `background_offered_per_platform`,
+`tests/background_platform.rs` (Linux/macOS), controller `ct1`–`ct13` (the trust flow
+over `FakeSys`: already trusted, add-then-ready, add failure + retry, check error,
+Windows thumbprint match, tls off, Linux no-op, missing/garbage CA, service mode),
+`tls.rs` in-module tests (the rolling window; the minted leaf parsed via `x509-parser`).
+
+**Supersedes.** T-B4 (macOS deferred; the cert note) — done. Closes the Keychain line of
+#377b's "Out of scope". The Linux webview trust of #377b (I9) is unchanged.

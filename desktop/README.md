@@ -73,30 +73,25 @@ on every launch.
 **Setting your own token.** Type it into the field and press **Save**. A token may
 contain only letters, digits, `-`, `_` and `.`, and must be **16 to 256 characters**
 (this applies to loopback as well — a short token on this computer is guessable by
-any web page, #378). The token is written to `web-token` (mode `0600`) and never to
-`settings.json`, the service unit or the command line. Saving a new token restarts
-PeakBot (or reinstalls the background service) after a confirm dialog, like any
-other setting.
+any web page, #378).
 
 ### HTTPS
 
-PeakBot signs its own certificate with its own CA
-(`~/.cache/peakbot/tls/ca-cert.pem`). Other browsers and phones work after you
-accept it once.
+When HTTPS is on — `general.web.tls: true` in PeakBot's `config.yaml`
+(PeakBot → Settings → General) — the backend serves with a certificate signed by
+its own CA ("PeakBot Local CA", `~/.cache/peakbot/tls/ca-cert.pem`).
 
-- **Linux:** the app window trusts the certificate **automatically** — only when it
-  is presented by PeakBot's own backend on this computer and is cryptographically
-  signed by that CA. Anything else still gets the normal certificate error page. If
-  the CA file is missing, the app window shows the certificate error; restore the
-  file (or switch to HTTP in Settings) and press Retry.
-- **macOS:** not yet. The app window **shows a certificate error** until the
-  certificate is trusted (#376, deferred). Open Settings (tray, menu, or
-  Cmd+Shift+S) and switch back to HTTP, or reset the settings (below).
+- **Linux:** the app window trusts the CA **automatically** — no system prompt.
+- **macOS / Windows:** on the first HTTPS start, the app adds "PeakBot Local CA"
+  to this user account's trusted certificates. The system asks you to approve
+  (Touch ID or password on macOS; a "Security Warning" on Windows) while the
+  window shows "Approve PeakBot's certificate in the system prompt…". Declining
+  leaves the window on a page that explains why and offers **Retry** — the
+  alternative is `general.web.tls: false` in `config.yaml`.
 
-If you set `web.tls: true` in PeakBot's `config.yaml`, PeakBot serves HTTPS no
-matter what the Settings page says, and the app (which then probes plain HTTP)
-reports that PeakBot did not start. Remove `web.tls` from `config.yaml` and let
-the Settings page control the protocol.
+To remove the CA again: macOS → Keychain Access → **login** → delete
+"PeakBot Local CA"; Windows → `certmgr.msc` → **Current User** →
+**Trusted Root Certification Authorities** → delete "PeakBot Local CA".
 
 If `XDG_CACHE_HOME` differs between the app and the background service's
 environment, they use different CAs and the Linux app window shows the certificate
