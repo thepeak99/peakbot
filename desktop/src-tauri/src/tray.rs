@@ -1,16 +1,18 @@
-//! The tray menu (DESIGN §5.4). Item ids are locked: `status`, `open`,
-//! `logs`, `quit`.
+//! The tray menu (DESIGN §5.4). Item ids are locked: `status`,
+//! `update`, `open`, `logs`, `quit`.
 
 use std::sync::Arc;
 
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, Wry};
 use tauri_plugin_opener::OpenerExt;
 
 use peakbot_desktop_core::paths::DesktopPaths;
+use peakbot_desktop_core::update;
 
 use crate::bridge::UiState;
+use crate::commands::UpdateTx;
 use crate::window;
 
 pub const TRAY_ID: &str = "peakbot-tray";
@@ -28,21 +30,32 @@ fn status_item(app: &AppHandle) -> tauri::Result<MenuItem<Wry>> {
     MenuItem::with_id(app, "status", "PeakBot", false, None::<&str>)
 }
 
-/// Build the tray icon + menu and stash the status item in `state`.
+/// The `update` item (initial label per `core::update::menu_label(Idle)`;
+/// the updater thread rewrites it on every state change).
+fn update_item(app: &AppHandle) -> tauri::Result<MenuItem<Wry>> {
+    MenuItem::with_id(app, "update", "Check for updates…", true, None::<&str>)
+}
+
+/// Build the tray icon + menu and stash the status + update items in
+/// `state` (the `update` item only when this build is updatable).
 pub fn create(app: &AppHandle, state: &Arc<UiState>) -> tauri::Result<()> {
     let status = status_item(app)?;
     let (open, logs, quit) = static_items(app)?;
-    let menu = Menu::with_items(
-        app,
-        &[
-            &status,
-            &PredefinedMenuItem::separator(app)?,
-            &open,
-            &logs,
-            &PredefinedMenuItem::separator(app)?,
-            &quit,
-        ],
-    )?;
+    let sep1 = PredefinedMenuItem::separator(app)?;
+    let sep2 = PredefinedMenuItem::separator(app)?;
+    let update = crate::updater::supported()
+        .then(|| update_item(app))
+        .transpose()?;
+    let mut items: Vec<&dyn IsMenuItem<Wry>> = vec![&status];
+    if let Some(ref u) = update {
+        items.push(u);
+    }
+    items.push(&sep1);
+    items.push(&open);
+    items.push(&logs);
+    items.push(&sep2);
+    items.push(&quit);
+    let menu = Menu::with_items(app, &items)?;
 
     let Some(icon) = app.default_window_icon().cloned() else {
         log::error!("no default window icon; tray not created");
@@ -75,6 +88,13 @@ pub fn create(app: &AppHandle, state: &Arc<UiState>) -> tauri::Result<()> {
                 .tray_status_item
                 .lock()
                 .expect("tray_status_item poisoned") = Some(status);
+            if let Some(u) = update {
+                state
+                    .update_items
+                    .lock()
+                    .expect("update_items poisoned")
+                    .push(u);
+            }
         }
         // The app must still work without a tray (DESIGN risk R6); ✕ then
         // asks before quitting (`is_visible`).
@@ -142,6 +162,12 @@ fn host_present() -> bool {
 pub fn handle_menu_event(app: &AppHandle, id: &str) {
     match id {
         "open" => window::focus_main(app),
+        "update" => {
+            // `UpdateTx` is managed only on updatable builds.
+            if let Some(tx) = app.try_state::<UpdateTx>() {
+                let _ = tx.0.send(update::Event::Click);
+            }
+        }
         "logs" => {
             if let Some(paths) = app.try_state::<DesktopPaths>() {
                 let _ = app
@@ -156,19 +182,38 @@ pub fn handle_menu_event(app: &AppHandle, id: &str) {
 
 /// macOS only: the `PeakBot` app submenu (same locked ids as the tray
 /// menu), used by `menu::app_menu` (issue #373). Its status item is a
-/// static placeholder: only the tray's copy is updated.
+/// static placeholder: only the tray's copy is updated. Its `update`
+/// item is kept in sync — the updater thread renders every stored
+/// item.
 #[cfg(target_os = "macos")]
-pub fn build_app_submenu(app: &AppHandle) -> tauri::Result<tauri::menu::Submenu<tauri::Wry>> {
+pub fn build_app_submenu(
+    app: &AppHandle,
+    state: &Arc<UiState>,
+) -> tauri::Result<tauri::menu::Submenu<tauri::Wry>> {
     use tauri::menu::Submenu;
 
+    let status = status_item(app)?;
     let (open, logs, quit) = static_items(app)?;
+    let sep = PredefinedMenuItem::separator(app)?;
+    let update = crate::updater::supported()
+        .then(|| update_item(app))
+        .transpose()?;
+    let mut items: Vec<&dyn IsMenuItem<Wry>> = vec![&status];
+    if let Some(ref u) = update {
+        items.push(u);
+    }
+    items.push(&open);
+    items.push(&logs);
+    items.push(&sep);
+    items.push(&quit);
     let peakbot = Submenu::with_id(app, "peakbot", "PeakBot", true)?;
-    peakbot.append_items(&[
-        &status_item(app)?,
-        &open,
-        &logs,
-        &PredefinedMenuItem::separator(app)?,
-        &quit,
-    ])?;
+    peakbot.append_items(&items)?;
+    if let Some(u) = update {
+        state
+            .update_items
+            .lock()
+            .expect("update_items poisoned")
+            .push(u);
+    }
     Ok(peakbot)
 }

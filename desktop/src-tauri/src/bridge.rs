@@ -13,6 +13,7 @@ use peakbot_desktop_core::controller::Ui;
 use peakbot_desktop_core::nav::{NavDecision, classify_navigation};
 use peakbot_desktop_core::phase::{Dialog, Phase, StartStep, StatusView, status_view};
 use peakbot_desktop_core::theme::Theme;
+use peakbot_desktop_core::update::UpdateView;
 
 use crate::tray;
 
@@ -41,6 +42,12 @@ pub struct UiState {
     /// The web UI's last reported theme (`theme_set`); `None` until it
     /// reports one. Read back by the bundled pages via `theme_get`.
     pub theme: Mutex<Option<Theme>>,
+    /// The update banner view (`update_status`); `None` until the
+    /// updater thread renders something worth showing.
+    pub update: Mutex<Option<UpdateView>>,
+    /// The `update` menu items (tray menu + macOS app submenu); the
+    /// updater thread's `render` updates text+enabled on all of them.
+    pub update_items: Mutex<Vec<MenuItem<Wry>>>,
 }
 
 impl UiState {
@@ -51,6 +58,8 @@ impl UiState {
             nav: Arc::new(RwLock::new(None)),
             tray_status_item: Mutex::new(None),
             theme: Mutex::new(None),
+            update: Mutex::new(None),
+            update_items: Mutex::new(Vec::new()),
         }
     }
 }

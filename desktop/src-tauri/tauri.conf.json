@@ -11,7 +11,7 @@
     "withGlobalTauri": true,
     "security": {
       "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:",
-      "capabilities": ["local-pages", "remote-theme"]
+      "capabilities": ["local-pages", "remote-web"]
     }
   },
   "bundle": {
@@ -42,6 +42,13 @@
     "windows": {
       "webviewInstallMode": { "type": "downloadBootstrapper", "silent": true },
       "nsis": { "installMode": "currentUser" }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEE1RjNEMDk1Njg2NTFERjEKUldUeEhXVm9sZER6cFZWWTNUd3loNnJuZy9UaGN1TW9uTlg4bjZtSzJBK0JMYlg1aEV4WWttY2sK",
+      "endpoints": ["https://github.com/thepeak99/peakbot/releases/latest/download/latest.json"],
+      "windows": { "installMode": "passive" }
     }
   }
 }

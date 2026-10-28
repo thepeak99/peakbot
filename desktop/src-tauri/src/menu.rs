@@ -7,20 +7,27 @@
 //
 // The PeakBot app submenu is built here (not in `tray::create`) because the
 // builder menu is set at `build()` time and `tray::create` runs in `setup`,
-// where a `set_menu` would overwrite it and bring "Close Window" back.
+// where a `set_menu` would overwrite it and bring "Close Window" back. It
+// therefore runs BEFORE `setup`: `UiState` is created ahead of the builder
+// and passed in so the submenu's `update` item can be stored for the
+// updater thread.
 //
 // Never on Linux: `Builder::menu` would add a GTK menubar there.
 
+use std::sync::Arc;
+
 use tauri::AppHandle;
 use tauri::menu::{Menu, PredefinedMenuItem, Submenu};
+
+use crate::bridge::UiState;
 
 /// The macOS menu: the PeakBot app submenu, then Tauri 2's default submenus
 /// with File dropped and `Window` reduced to minimize/maximize (no "Close
 /// Window", so Cmd+W reaches the page and the tab bar closes a conversation
 /// tab).
-pub fn app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
-    let mut menu = Menu::new(app)?;
-    menu.append_items(&[&crate::tray::build_app_submenu(app)?])?;
+pub fn app_menu(app: &AppHandle, state: &Arc<UiState>) -> tauri::Result<Menu<tauri::Wry>> {
+    let menu = Menu::new(app)?;
+    menu.append_items(&[&crate::tray::build_app_submenu(app, state)?])?;
 
     for item in Menu::default(app)?.items()? {
         // The default menu's top level is submenus only (App, File, Edit,

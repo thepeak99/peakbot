@@ -23,6 +23,7 @@ pub mod session;
 pub mod sys;
 pub mod theme;
 pub mod token;
+pub mod update;
 pub mod version;
 pub mod web_target;
 
