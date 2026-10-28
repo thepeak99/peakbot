@@ -4,7 +4,7 @@
 #
 # Written BEFORE the implementation: expect RED until the developer lands
 #   - the Makefile contract: RELEASE_VERSION, release-check, explicit
-#     sequential release recipe, 7-asset draft-first release-publish with
+#     sequential release recipe, 8-asset draft-first release-publish with
 #     DELETE-on-failure, no-prompt release-bump with notes promotion,
 #     dumb release-tag (no PR automation), and the removal of
 #     .release-version / NOTES / ALLOW_DIRTY everywhere
@@ -126,7 +126,15 @@ else
 fi
 
 grep_ok "T12 release.yml: runs-on: dind" 'runs-on: dind' "$RY"
-grep_ok "T13 release.yml: timeout-minutes: 180" 'timeout-minutes: 180' "$RY"
+# T13: the release job gets a 300-minute budget and publishes 8 assets
+# (the Windows desktop artifact split into portable exe + NSIS installer).
+if grep -qF 'timeout-minutes: 300' "$RY" 2>/dev/null \
+    && grep -qF '(8 assets)' "$RY" 2>/dev/null; then
+    ok "T13 release.yml: timeout-minutes: 300 + '(8 assets)'"
+else
+    bad "T13 release.yml: timeout-minutes: 300 + '(8 assets)'"
+fi
+
 grep_bad "T14 release.yml: no container: key" 'container:' "$RY"
 
 # T15: secret RELEASE_TOKEN mapped to env GITEA_TOKEN.
@@ -247,7 +255,7 @@ exit 0
 FAKECURL
 chmod +x "$D/bin/curl"
 
-make_assets() { # $1 = output dir: create all 7 release assets
+make_assets() { # $1 = output dir: create all 8 release assets
     mkdir -p "$1/desktop"
     printf x > "$1/peakbot-$V-linux-amd64"
     printf x > "$1/peakbot-$V-windows-amd64.exe"
@@ -255,7 +263,8 @@ make_assets() { # $1 = output dir: create all 7 release assets
     printf x > "$1/peakbot-$V-android-arm64"
     printf x > "$1/desktop/PeakBot-Desktop-$V-linux-x86_64.AppImage"
     printf x > "$1/desktop/PeakBot-Desktop-$V-macos-universal.zip"
-    printf x > "$1/desktop/PeakBot-Desktop-$V-windows-x86_64.exe"
+    printf x > "$1/desktop/PeakBot-Desktop-$V-windows-x86_64-portable.exe"
+    printf x > "$1/desktop/PeakBot-Desktop-$V-windows-x86_64-setup.exe"
 }
 
 # run_publish <logfile> [FAIL_UPLOAD] → sets P_RC / P_OUT
@@ -282,7 +291,7 @@ else
     bad "T26 release-publish: missing asset → fails, names it, zero HTTP (rc=$P_RC, log lines=$logstate)"
 fi
 
-# T27: happy path — draft create, 7 exact uploads, final PATCH, no DELETE,
+# T27: happy path — draft create, 8 exact uploads, final PATCH, no DELETE,
 # and the explicit GITEA_URL/OWNER/REPO vars are used (override origin).
 make_assets "$D/out"
 run_publish "$D/log-happy"
@@ -290,7 +299,7 @@ t27=1; why=""
 fail27() { t27=0; why="${why}${why:+; }$1"; }
 [ "$P_RC" -eq 0 ] || fail27 "rc=$P_RC: $(printf '%s' "$P_OUT" | grep '❌' | head -1)"
 lines=$(wc -l < "$D/log-happy" | tr -d ' ')
-[ "$lines" = "9" ] || fail27 "log has $lines lines, want 9 (create+7 uploads+patch)"
+[ "$lines" = "10" ] || fail27 "log has $lines lines, want 10 (create+8 uploads+patch)"
 grep -qF "POST $API/releases " "$D/log-happy" 2>/dev/null || fail27 "no create POST to $API/releases"
 grep -qF '"draft":true' "$D/log-happy" 2>/dev/null || fail27 "create body lacks draft:true"
 grep -qF "\"tag_name\":\"$V\"" "$D/log-happy" 2>/dev/null || fail27 "create body lacks tag_name=$V"
@@ -302,19 +311,24 @@ notes_word=$(grep -m1 -oE '[A-Za-z]{8,}' "release-notes/$V.md" 2>/dev/null)
 grep -qF "$notes_word" "$D/log-happy" 2>/dev/null || fail27 "create body lacks release-notes/$V.md content"
 grep -qF 'prerelease' "$D/log-happy" 2>/dev/null && fail27 "prerelease flag present"
 upl=$(grep -cF 'assets?name=' "$D/log-happy" 2>/dev/null || true)
-[ "$upl" = "7" ] || fail27 "$upl asset uploads, want 7"
+[ "$upl" = "8" ] || fail27 "$upl asset uploads, want 8"
 for n in peakbot-$V-linux-amd64 peakbot-$V-windows-amd64.exe peakbot-$V-macos-universal2 \
          peakbot-$V-android-arm64 PeakBot-Desktop-$V-linux-x86_64.AppImage \
-         PeakBot-Desktop-$V-macos-universal.zip PeakBot-Desktop-$V-windows-x86_64.exe; do
+         PeakBot-Desktop-$V-macos-universal.zip \
+         PeakBot-Desktop-$V-windows-x86_64-portable.exe \
+         PeakBot-Desktop-$V-windows-x86_64-setup.exe; do
     c=$(grep -cF "name=$n " "$D/log-happy" 2>/dev/null || true)
     [ "$c" = "1" ] || fail27 "upload of $n: $c occurrence(s), want 1"
 done
+# The old bare Windows desktop name must never be uploaded.
+bare=$(grep -cF "name=PeakBot-Desktop-$V-windows-x86_64.exe " "$D/log-happy" 2>/dev/null || true)
+[ "$bare" = "0" ] || fail27 "bare PeakBot-Desktop-$V-windows-x86_64.exe uploaded $bare times, want 0"
 grep -qF "PATCH $API/releases/42" "$D/log-happy" 2>/dev/null \
     && grep -F 'PATCH ' "$D/log-happy" | grep -qF '"draft":false' \
     || fail27 "no final PATCH /releases/42 with draft:false"
 grep -q '^DELETE' "$D/log-happy" 2>/dev/null && fail27 "DELETE present on happy path"
 if [ "$t27" -eq 1 ]; then
-    ok "T27 release-publish: happy path (draft create, 7 exact uploads, PATCH, no DELETE)"
+    ok "T27 release-publish: happy path (draft create, 8 exact uploads, PATCH, no DELETE)"
 else
     bad "T27 release-publish: happy path ($why)"
 fi

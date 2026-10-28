@@ -167,8 +167,8 @@ desktop-linux:
 desktop-macos:
 	sh desktop/scripts/build-desktop.sh macos
 
-## desktop-windows: Build the Windows x86_64 portable exe (→
-##                  output/desktop/PeakBot-Desktop-<v>-windows-x86_64.exe)
+## desktop-windows: Build the Windows x86_64 portable exe + NSIS installer (→
+##                  output/desktop/PeakBot-Desktop-<v>-windows-x86_64-{portable,setup}.exe)
 desktop-windows:
 	sh desktop/scripts/build-desktop.sh windows
 
@@ -206,7 +206,7 @@ release-check:
 	fi; \
 	echo "✅ release-check passed: TAG=$(TAG)"
 
-## release: Full release pipeline — check, build all 7 assets, publish to
+## release: Full release pipeline — check, build all 8 assets, publish to
 ##          Gitea. CI runs this on tag push: make release TAG=<v>.
 ##          Explicit sequential recipe of sub-make calls: the per-platform
 ##          targets (release-build-*, desktop-*) are the single source of
@@ -358,7 +358,7 @@ release-build-android:
 	ls -lh $(OUTPUT_DIR)/peakbot-$(RELEASE_VERSION)-android-arm64
 
 ## release-publish: Create a DRAFT Gitea release (name = body source = the
-##              version), upload all 7 assets, then finalize (draft:false).
+##              version), upload all 8 assets, then finalize (draft:false).
 ##              Any failure DELETEs the draft. Requires TAG, GITEA_TOKEN and
 ##              release-notes/<TAG>.md; GITEA_URL/OWNER/REPO default to the
 ##              origin remote, OUTPUT_DIR stays overridable.
@@ -384,7 +384,8 @@ release-publish:
 	  $(OUTPUT_DIR)/peakbot-$$v-android-arm64 \
 	  $(OUTPUT_DIR)/desktop/PeakBot-Desktop-$$v-linux-x86_64.AppImage \
 	  $(OUTPUT_DIR)/desktop/PeakBot-Desktop-$$v-macos-universal.zip \
-	  $(OUTPUT_DIR)/desktop/PeakBot-Desktop-$$v-windows-x86_64.exe "; \
+	  $(OUTPUT_DIR)/desktop/PeakBot-Desktop-$$v-windows-x86_64-portable.exe \
+	  $(OUTPUT_DIR)/desktop/PeakBot-Desktop-$$v-windows-x86_64-setup.exe "; \
 	for f in $$assets; do \
 	  if [ ! -f "$$f" ]; then \
 	    echo "❌ Missing release asset: $$f"; exit 1; \
@@ -440,7 +441,7 @@ help:
 	@echo "Release usage (bump → PR → merge → tag; CI runs 'make release TAG=<v>'):"
 	@echo "  make release-bump VERSION=0.2.0   # cut release/0.2.0 from origin/master, bump, promote notes, push — open a PR"
 	@echo "  make release-tag                  # after the PR merges: annotated tag from release-notes/<v>.md + push"
-	@echo "  make release TAG=0.2.0            # full pipeline: release-check, build all 7 assets, publish to Gitea"
+	@echo "  make release TAG=0.2.0            # full pipeline: release-check, build all 8 assets, publish to Gitea"
 	@echo "  make release TAG=0.2.0 PRUNE=1    # as above, pruning the container builder between platforms"
 	@echo "  GITEA_TOKEN                       # required for release-publish (env var or make variable)"
 	@echo ""
