@@ -1,39 +1,69 @@
-# PeakBot Desktop — Windows single self-extracting portable exe (DESIGN
-# §5.7, amendment (windows-portable) 2026-10-17).
+# PeakBot Desktop — Windows portable exe + NSIS installer (DESIGN
+# §5.7, amendment (windows-nsis) 2026-10-27).
 #
-# Cross-builds the Tauri desktop app for x86_64-pc-windows-msvc with
-# `cargo xwin` — NO Tauri CLI, no NSIS, no Node (the macOS pipeline proves
-# tauri-build + tauri/custom-protocol does everything the CLI did: ACL,
-# externalBin check, icon/version .rc, static vcruntime, embedded ui/).
+# ONE image cross-builds the Tauri desktop app for x86_64-pc-windows-msvc
+# and exports TWO artifacts:
+#   1. the self-extracting portable exe — plain `cargo xwin`, NO Tauri CLI
+#      (the macOS pipeline proves tauri-build + tauri/custom-protocol does
+#      everything the CLI did: ACL, externalBin check, icon/version .rc,
+#      static vcruntime, embedded ui/).
+#   2. the per-user NSIS installer — the pinned Tauri CLI (same pin as
+#      Dockerfile.desktop-linux) run with `--bundles nsis --runner cargo-xwin`
+#      on the SAME warm target/ (I-C: the portable is copied out first,
+#      because the CLI patches target/…/peakbot-desktop.exe in place).
 # The peakbot sidecar is staged into src-tauri/binaries/ and embedded as a
 # zstd payload by src-tauri/build.rs; the app extracts it on first launch.
+#
+# The base image is rust:1.91-trixie (not bookworm): trixie's NSIS 3.11
+# ships Include/Win/RestartManager.nsh, which Tauri's installer.nsi
+# includes. The RestartManager.nsh guard below is the real requirement.
 #
 # Usage: podman build --build-arg VERSION=<v> \
 #          --output type=local,dest=output/desktop \
 #          -f Dockerfile.desktop-windows .
 #
-# The S-W1..S-W4 smoke checks (desktop/scripts/smoke-windows.sh) run on the
-# real artifact BEFORE the scratch export; any failure fails this build.
+# The S-W1..S-W6 smoke checks (desktop/scripts/smoke-windows.sh) run on
+# BOTH artifacts BEFORE the scratch export; any failure fails this build.
 
-FROM ghcr.io/rust-lang/rust:1.91-bookworm AS build
+FROM ghcr.io/rust-lang/rust:1.91-trixie AS build
 
 # clang lld llvm: xwin C/link + llvm-rc (tauri_winres compiles the
 # icon/version .rc into .rsrc) + llvm-objdump (the S-W3 import-table
-# smoke check). file: S-W2.
+# smoke check). file: S-W2/S-W5. nsis: makensis. 7zip: S-W6 inspects
+# the NSIS installer archive (7z).
+# libayatana-appindicator3-dev: the Tauri CLI (host-side) probes for an
+# appindicator library before bundling and ABORTS without it — measured
+# failure on trixie: `thread '<unnamed>' panicked at
+# crates/tauri-cli/src/interface/rust.rs:1702:17: Can't detect any
+# appindicator library` (Tauri CLI 2.12.3, 2026-10-28). Nothing in the
+# Windows-target build links it; the probe is a Linux-host artifact.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         clang \
         lld \
         llvm \
         file \
+        nsis \
+        7zip \
+        libayatana-appindicator3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Fail fast (right after the layer that installs them) if the toolchain is
 # missing: a future base-image/package change must surface here with a
 # clear message, not deep inside the cargo build. NOTE: Debian's
 # llvm-rc has NO --version subcommand (it exits 1), so the guard is
-# `command -v` + a version line from llvm-objdump.
-RUN command -v llvm-rc && command -v llvm-objdump \
-    && llvm-objdump --version | head -1
+# `command -v` + a version line from llvm-objdump. The RestartManager.nsh
+# test pins the real NSIS requirement (a package pin would only
+# duplicate it).
+RUN command -v llvm-rc && command -v llvm-objdump && command -v makensis && command -v 7z \
+    && llvm-objdump --version | head -1 \
+    && test -f /usr/share/nsis/Include/Win/RestartManager.nsh \
+    || { echo "toolchain/NSIS guard failed (need llvm-rc, llvm-objdump, makensis, 7z and NSIS >= 3.09 RestartManager.nsh)" >&2; exit 1; }
+
+# Node 22 (nodesource) — runs the pinned Tauri CLI via npx (same pin as
+# Dockerfile.desktop-linux).
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
 
 RUN rustup target add x86_64-pc-windows-msvc
 
@@ -82,11 +112,36 @@ WORKDIR /src/desktop
 RUN cargo xwin build --release --locked -p peakbot-desktop \
         --target x86_64-pc-windows-msvc --features tauri/custom-protocol
 
-# Name the artifact per DESIGN §5.7 and smoke it (S-W1..S-W4) before
-# exporting. The staged sidecar is passed so S-W4 can verify the embedded
-# payload id matches the payload's content.
-RUN mkdir -p /out && cp target/x86_64-pc-windows-msvc/release/peakbot-desktop.exe /out/PeakBot-Desktop-${VERSION}-windows-x86_64.exe && sh scripts/smoke-windows.sh /out/PeakBot-Desktop-${VERSION}-windows-x86_64.exe ${VERSION} src-tauri/binaries/peakbot-x86_64-pc-windows-msvc.exe
+# Name the portable per DESIGN §5.7 and copy it out BEFORE the CLI step
+# (I-C: the CLI patches + rebuilds target/…/peakbot-desktop.exe in place,
+# so the portable must be captured while it is still the plain cargo xwin
+# output — byte-identical to the proven pipeline).
+RUN mkdir -p /out && cp target/x86_64-pc-windows-msvc/release/peakbot-desktop.exe /out/PeakBot-Desktop-${VERSION}-windows-x86_64-portable.exe
 
-# Single-file export.
+# NSIS installer (per-user install + WebView2 downloadBootstrapper, per
+# tauri.conf.json's bundle.windows): the pinned Tauri CLI bundles the same
+# warm target/ with makensis. `--config` drops externalBin for THIS build
+# only (I-B: the installer must not carry a second, unused peakbot.exe;
+# build.rs still embeds the staged sidecar — S-W6 proves both on the
+# artifact).
+WORKDIR /src/desktop/src-tauri
+RUN npx --yes @tauri-apps/cli@2.12.3 build --ci --bundles nsis --runner cargo-xwin \
+        --target x86_64-pc-windows-msvc --config '{"bundle":{"externalBin":[]}}' -- --locked
+
+# Exactly one installer: glob the bundle output, count, copy under the
+# contract name.
+RUN set -eu; set -- ../target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe; [ "$#" -eq 1 ] && [ -f "$1" ] \
+    || { echo "expected exactly one NSIS installer, got: $*" >&2; exit 1; }; \
+    cp "$1" /out/PeakBot-Desktop-${VERSION}-windows-x86_64-setup.exe
+
+# Smoke BOTH artifacts (S-W1..S-W6) before exporting. The staged sidecar is
+# passed so S-W4/S-W6 can verify the embedded payload id matches the
+# payload's content (I-D: one identity in both artifacts).
+WORKDIR /src/desktop
+RUN sh scripts/smoke-windows.sh /out/PeakBot-Desktop-${VERSION}-windows-x86_64-portable.exe \
+        /out/PeakBot-Desktop-${VERSION}-windows-x86_64-setup.exe ${VERSION} \
+        src-tauri/binaries/peakbot-x86_64-pc-windows-msvc.exe
+
+# Two-file export.
 FROM scratch
 COPY --from=build /out/ /

@@ -462,7 +462,7 @@ make release TAG=0.3.0 PRUNE=1 CONTAINER_BUILDER=docker GITEA_URL=… OWNER=ai-b
 
 `make release` = `release-check` (TAG == Cargo version == desktop version, `release-notes/<TAG>.md` exists) → per platform: `release-build-<p>` → `desktop-<p>` → prune, for linux, macos, windows → `release-build-android` → `release-publish`. Sequential by design — never run with `-j`.
 
-`release-publish` asserts all 7 assets exist **before** any API call — server: `peakbot-<v>-{linux-amd64, windows-amd64.exe, macos-universal2, android-arm64}`; desktop: `PeakBot-Desktop-<v>-{linux-x86_64.AppImage, macos-universal.zip, windows-x86_64.exe}` — then creates a DRAFT release, uploads all 7, and publishes; any failure deletes the draft, so a release is complete or absent, never partial.
+`release-publish` asserts all 8 assets exist **before** any API call — server: `peakbot-<v>-{linux-amd64, windows-amd64.exe, macos-universal2, android-arm64}`; desktop: `PeakBot-Desktop-<v>-{linux-x86_64.AppImage, macos-universal.zip, windows-x86_64-portable.exe, windows-x86_64-setup.exe}` — then creates a DRAFT release, uploads all 8, and publishes; any failure deletes the draft, so a release is complete or absent, never partial.
 
 Release body + tag message = `release-notes/<v>.md` (read via `jq --rawfile` — any Markdown is safe). No `NOTES=` override, no fallback. Local re-run of the CI job: `make release TAG=X.Y.Z GITEA_TOKEN=…` (if the tag already went out, delete it locally + from origin first). Host needs: git, cargo, podman/docker, curl, jq, awk.
 
