@@ -83,8 +83,9 @@ trap cleanup EXIT
 #   api.github.com     — GET git/ref/tags/<v>: 404 twice, then 200 (poll
 #                        counter in $CURL_LOG.refpoll); GH_REF_ALWAYS_404=1
 #                        keeps it at 404. GET releases/tags/<v>: 404, or
-#                        200 per GH_REL_MODE=done|draft (done lists the
-#                        asset names from $CURL_LOG.doneassets, one/line).
+#                        200 per GH_REL_MODE=done|draft (done builds
+#                        assets: [{name:…}] from the JSON-string lines in
+#                        $CURL_LOG.doneassets — real GitHub's shape).
 #                        POST releases → 201 {"id":77,"draft":true};
 #                        DELETE releases/<id> → 204; PATCH → 200.
 #   uploads.github.com — POST …/releases/<id>/assets?name=<f> → 201, or
@@ -153,7 +154,7 @@ case "$url" in
             case "${GH_REL_MODE:-none}" in
               done)
                 status=200
-                resp=$(jq -nc '{id:77, draft:false, tag_name:"", assets: [inputs]}' < "$CURL_LOG.doneassets") ;;
+                resp=$(jq -nc '{id:77, draft:false, tag_name:"", assets: [inputs | {name: .}]}' < "$CURL_LOG.doneassets") ;;
               draft)
                 status=200; resp='{"id":77,"draft":true,"tag_name":"","assets":[]}' ;;
               *)
@@ -214,17 +215,18 @@ PeakBot-Desktop-$V-windows-x86_64-portable.exe
 PeakBot-Desktop-$V-windows-x86_64-setup.exe
 latest.json"
 
-make_assets() { # $1 = output dir: create all 10 release assets
+make_assets() { # $1 = output dir, $2 = version (default: $V): create all 10 release assets
+    ma_ver=${2:-$V}
     mkdir -p "$1/desktop"
-    for n in peakbot-$V-linux-amd64 peakbot-$V-windows-amd64.exe \
-             peakbot-$V-macos-universal2 peakbot-$V-android-arm64; do
+    for n in peakbot-$ma_ver-linux-amd64 peakbot-$ma_ver-windows-amd64.exe \
+             peakbot-$ma_ver-macos-universal2 peakbot-$ma_ver-android-arm64; do
         printf x > "$1/$n"
     done
-    for n in PeakBot-Desktop-$V-linux-x86_64.AppImage \
-             PeakBot-Desktop-$V-macos-universal.zip \
-             PeakBot-Desktop-$V-macos-universal.app.tar.gz \
-             PeakBot-Desktop-$V-windows-x86_64-portable.exe \
-             PeakBot-Desktop-$V-windows-x86_64-setup.exe latest.json; do
+    for n in PeakBot-Desktop-$ma_ver-linux-x86_64.AppImage \
+             PeakBot-Desktop-$ma_ver-macos-universal.zip \
+             PeakBot-Desktop-$ma_ver-macos-universal.app.tar.gz \
+             PeakBot-Desktop-$ma_ver-windows-x86_64-portable.exe \
+             PeakBot-Desktop-$ma_ver-windows-x86_64-setup.exe latest.json; do
         printf x > "$1/desktop/$n"
     done
 }
@@ -243,9 +245,13 @@ run_publish() {
 # run_gh <cwd> <logfile> <tag> [TOKEN] → sets G_RC / G_OUT.
 # The fake's knobs (GH_FAIL_UPLOAD, GH_REF_ALWAYS_404, GH_REL_MODE,
 # GH_TAG_WAIT_TRIES) are read from the caller's environment.
+# TOKEN uses ${4-…} (not ${4:-…}) so an EXPLICIT empty token stays empty
+# (T45 must really pass an empty GH_RELEASE_TOKEN).
 run_gh() {
-    gh_cwd=$1; gh_log=$2; gh_tag=$3; gh_tok=${4:-ghsecret-token-123}
-    rm -f "$gh_log" "$gh_log.refpoll" "$gh_log.doneassets"; : > "$gh_log"
+    gh_cwd=$1; gh_log=$2; gh_tag=$3; gh_tok=${4-ghsecret-token-123}
+    # NOTE: $gh_log.doneassets is seeded by the test (T49) and only ever
+    # READ by the fake — do not rm it here, or the seed is wiped.
+    rm -f "$gh_log" "$gh_log.refpoll"; : > "$gh_log"
     G_OUT=$( cd "$gh_cwd" && \
       CURL_LOG="$gh_log" FAIL_UPLOAD="${GH_FAIL_UPLOAD:-}" \
       GH_REF_ALWAYS_404="${GH_REF_ALWAYS_404:-0}" \
@@ -306,6 +312,9 @@ grep -qF '"prerelease":true' "$D/log-t08-stable" 2>/dev/null \
     && { t08=0; why="${why}${why:+; }stable create body has \"prerelease\":true"; }
 git clone -q --depth 1 "$root" "$D/pre" 2>/dev/null || { t08=0; why="${why}${why:+; }prerelease clone failed"; }
 [ -d "$D/pre" ] && printf 'prerelease notes\n' > "$D/pre/release-notes/0.9.0-rc.1.md"
+# The rc run looks for TAG-named assets (release-publish derives names from
+# TAG) — create the 0.9.0-rc.1 set alongside the $V set.
+[ -d "$D/pre" ] && make_assets "$D/out" 0.9.0-rc.1
 [ -d "$D/pre" ] && run_publish "$D/log-t08-pre" "" 0.9.0-rc.1 "$D/pre"
 if [ -d "$D/pre" ]; then
     grep -qF '"prerelease":true' "$D/log-t08-pre" 2>/dev/null \
@@ -865,6 +874,8 @@ fi
 # final PATCH make_latest:"false" (same 10-asset path otherwise). Runs in the
 # T08 clone, which has release-notes/0.9.0-rc.1.md.
 make_assets "$D/out"
+# The rc run looks for TAG-named assets — create the 0.9.0-rc.1 set too.
+make_assets "$D/out" 0.9.0-rc.1
 run_gh "$D/pre" "$D/log-gh-pre" 0.9.0-rc.1
 L=$D/log-gh-pre
 t47=1; why=""
@@ -903,8 +914,10 @@ fi
 
 # T49: idempotent — a published release for the tag already exists with all
 # 10 asset names → exit 0 with NO create, NO uploads, NO PATCH.
+# doneassets holds one JSON STRING per line (jq -R .): the fake maps them to
+# {name:…} objects — the shape real GitHub returns in .assets[].
 make_assets "$D/out"
-printf '%s\n' "$ASSET10" > "$D/log-gh-idem.doneassets"
+printf '%s\n' "$ASSET10" | jq -R . > "$D/log-gh-idem.doneassets"
 GH_REL_MODE=done run_gh "$root" "$D/log-gh-idem" "$V"
 L=$D/log-gh-idem
 t49=1; why=""
@@ -1002,7 +1015,13 @@ grep -qF 'secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD' "$RY" 2>/dev/null \
     || fail54 "no secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD mapping"
 mr_line=$(grep -nF -- 'make release' "$RY" 2>/dev/null | head -n 1 | cut -d: -f1)
 for var in GH_RELEASE_TOKEN TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD; do
-    vl=$(grep -nE -- "-[nz][[:space:]]+\"\$\{?$var\}?" "$RY" 2>/dev/null | head -n 1 | cut -d: -f1)
+    # Single-quoted like T43's tok_re: the pattern must keep \$ (escaped
+    # dollar) and \{? / \}? — a double-quoted pattern would turn \$ into a
+    # bare mid-pattern $ (an anchor in grep's ERE) and never match.
+    pre='-[nz][[:space:]]+"\$\{?'
+    suf='\}?"'
+    re="${pre}${var}${suf}"
+    vl=$(grep -nE -- "$re" "$RY" 2>/dev/null | head -n 1 | cut -d: -f1)
     [ -n "$vl" ] || { fail54 "no non-empty test on $var"; continue; }
     if [ -n "$mr_line" ] && [ "$vl" -ge "$mr_line" ]; then
         fail54 "$var non-empty test is not before make release"
