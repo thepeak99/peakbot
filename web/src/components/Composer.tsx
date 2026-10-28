@@ -30,9 +30,10 @@
 // input still goes to the orchestrator.
 //
 // Attachments: 📎, paste, or drop (DropOverlay, owned by App) add files of any
-// type. Each uploads immediately (`useAttachments`, lifted into App) and shows
-// as a chip above the input; submit sends only the uploaded ids, never bytes.
-// Send is blocked until every chip is done and none is in error.
+// type. Each uploads immediately (`useAttachments`, owned by ComposerSlot — one
+// per tab) and shows as a chip above the input; submit sends only the uploaded
+// ids, never bytes. Send is blocked until every chip is done and none is in
+// error.
 
 import { useRef, useState, useLayoutEffect } from "react";
 import type { SlashCommand } from "../state";
@@ -62,23 +63,7 @@ const NO_ATTACHMENTS: Attachments = {
   ready: true,
 };
 
-export function Composer({
-  isRunning,
-  connected,
-  commands,
-  onSend,
-  onStop,
-  subAgent = null,
-  onPause,
-  onResume,
-  watchingRole,
-  onClearWatch,
-  pendingInput,
-  attachments = NO_ATTACHMENTS,
-  supportsVision = true,
-  settingsEnabled = true,
-  stopPending = false,
-}: {
+export interface ComposerProps {
   isRunning: boolean;
   connected: boolean;
   commands: SlashCommand[];
@@ -101,7 +86,7 @@ export function Composer({
   /** Server-side queue depth (`AppState.pending_input_count`). While running,
    * >0 means stopping would drop queued sends, so Stop warns about it. */
   pendingInput: number;
-  /** Upload state, owned by App so the drop overlay shares it. */
+  /** Upload state, owned by ComposerSlot (one per tab). */
   attachments?: Attachments;
   /** `AppState.supports_vision` — drives the ⚠ on image chips. */
   supportsVision?: boolean;
@@ -113,7 +98,28 @@ export function Composer({
    * press). The Stop control takes the escalation label and a subtle
    * pulse; a second press aborts immediately (the backend decides). */
   stopPending?: boolean;
-}) {
+  /** Parked tab: stay mounted (keeps text and palette state) but not shown. */
+  hidden?: boolean;
+}
+
+export function Composer({
+  isRunning,
+  connected,
+  commands,
+  onSend,
+  onStop,
+  subAgent = null,
+  onPause,
+  onResume,
+  watchingRole,
+  onClearWatch,
+  pendingInput,
+  attachments = NO_ATTACHMENTS,
+  supportsVision = true,
+  settingsEnabled = true,
+  stopPending = false,
+  hidden = false,
+}: ComposerProps) {
   const [text, setText] = useState("");
   const [selected, setSelected] = useState(0);
   const [dismissed, setDismissed] = useState(false);
@@ -127,12 +133,13 @@ export function Composer({
   // Grow the textarea with its content between `MIN_H` (one row) and `MAX_H`;
   // past the cap it scrolls. Runs on every value change and after submit clears
   // the field, so the box always snaps back to its single-row resting height.
+  // Skipped while hidden: a display:none textarea measures 0 and would collapse.
   useLayoutEffect(() => {
     const el = textareaRef.current;
-    if (!el) return;
+    if (!el || hidden) return;
     el.style.height = "auto";
     el.style.height = `${Math.min(Math.max(el.scrollHeight, MIN_H), MAX_H)}px`;
-  }, [text]);
+  }, [text, hidden]);
 
   // Palette shows only while typing a bare command name (`/foo`, no space).
   const query = text.startsWith("/") && !text.includes(" ") ? text.slice(1) : null;
@@ -249,7 +256,7 @@ export function Composer({
       : "Stop";
 
   return (
-    <div className="border-t border-zinc-800 bg-zinc-950 p-3 pr-12">
+    <div hidden={hidden} className="border-t border-zinc-800 bg-zinc-950 p-3 pr-12">
       <div className="mx-auto max-w-3xl">
         <div className="relative">
           {showPalette && (

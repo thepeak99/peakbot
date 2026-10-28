@@ -12,7 +12,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Transcript, type TranscriptHandle } from "./components/Transcript";
 import { EmptyTranscript } from "./components/EmptyTranscript";
 import { BashPanel } from "./components/BashPanel";
-import { Composer } from "./components/Composer";
+import {
+  ComposerSlot,
+  type ComposerLive,
+  type ComposerSlotHandle,
+} from "./components/ComposerSlot";
+import { DEFAULT_UPLOAD_LIMITS } from "./useAttachments";
 import { DropOverlay } from "./components/DropOverlay";
 import { TopBar } from "./components/TopBar";
 import { ConvoTabBar } from "./components/ConvoTabBar";
@@ -28,7 +33,6 @@ import { Settings, useSettingsToggle } from "./settings/Settings";
 import { useAgent } from "./useAgent";
 import { useConvoTabs } from "./useConvoTabs";
 import type { TabsState } from "./convoTabs";
-import { useAttachments } from "./useAttachments";
 import { useTaskNotifications } from "./useTaskNotifications";
 import { useFavicon } from "./useFavicon";
 import { useFocusMode } from "./useFocusMode";
@@ -36,7 +40,6 @@ import { focusView } from "./focus";
 import { epochKey, nextEpoch, type EpochState } from "./transcriptEpoch";
 import { filterTabs, resolveActiveTab, settingsGearEnabled } from "./tabs";
 import type { ViewFilter } from "./types";
-import { type UploadLimits } from "./state";
 import {
   adaptBashPanel,
   adaptBg,
@@ -60,9 +63,6 @@ import {
   viewLabel,
 } from "./adapt";
 
-// Matches the server default (`uploads:` config) until the first state frame.
-const DEFAULT_UPLOAD_LIMITS: UploadLimits = { max_file_mb: 50, max_files: 10 };
-
 export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) {
   const agent = useAgent();
   const {
@@ -80,11 +80,8 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
     switchConvo,
   } = agent;
 
-  // Lifted out of Composer so the drop overlay on <main> feeds the same chips.
-  const attachments = useAttachments(
-    state?.conversation?.id ?? null,
-    state?.upload_limits ?? DEFAULT_UPLOAD_LIMITS,
-  );
+  // The drop overlay on <main> feeds the active tab's composer slot.
+  const activeSlot = useRef<ComposerSlotHandle>(null);
 
   // Swap favicon to a spinning loader while the agent is working
   const isRunning = state?.is_running ?? false;
@@ -298,6 +295,28 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
     }
   }, [drawerTab, visibleTabIds]);
 
+  const live: ComposerLive = {
+    isRunning,
+    connected,
+    commands,
+    onSend: (text, ids) => {
+      // Sending always re-pins: you expect to see your own message.
+      send({ type: "send_message", text, attachments: ids });
+      transcriptRef.current?.jumpToLatest();
+    },
+    onStop: () => send({ type: "stop" }),
+    subAgent,
+    onPause: () => send({ type: "pause" }),
+    onResume: () => send({ type: "resume" }),
+    watchingRole: scopeLabel,
+    onClearWatch: () => setView("global"),
+    pendingInput,
+    supportsVision: state?.supports_vision ?? true,
+    settingsEnabled,
+    stopPending: state?.stop_pending ?? false,
+    uploadLimits: state?.upload_limits ?? DEFAULT_UPLOAD_LIMITS,
+  };
+
   return (
     <div className="flex h-dvh w-full flex-col overflow-hidden bg-zinc-950 text-zinc-100">
     <TopBar
@@ -344,7 +363,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
       )}
 
       <div className="flex min-h-0 flex-1">
-        <DropOverlay onAdd={attachments.add}>
+        <DropOverlay onAdd={(f) => activeSlot.current?.add(f)}>
           {/* The scope banner is a static bar above the transcript: the
               scrolling element's only child must be the virtualizer's sized
               container, or the row offsets stop matching the scroll offset. */}
@@ -384,27 +403,27 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
 
           {focusing && isRunning && <ActivityRow step={focused?.activity ?? null} />}
 
-          <Composer
-            isRunning={isRunning}
-            connected={connected}
-            commands={commands}
-            onSend={(text, ids) => {
-              // Sending always re-pins: you expect to see your own message.
-              send({ type: "send_message", text, attachments: ids });
-              transcriptRef.current?.jumpToLatest();
-            }}
-            onStop={() => send({ type: "stop" })}
-            subAgent={subAgent}
-            onPause={() => send({ type: "pause" })}
-            onResume={() => send({ type: "resume" })}
-            watchingRole={scopeLabel}
-            onClearWatch={() => setView("global")}
-            pendingInput={pendingInput}
-            attachments={attachments}
-            supportsVision={state?.supports_vision ?? true}
-            settingsEnabled={settingsEnabled}
-            stopPending={state?.stop_pending ?? false}
-          />
+          {convoTabs ? (
+            // Keep-alive: every tab's composer stays mounted, only the active
+            // one is shown and wired to live state.
+            convoTabs.state.tabs.map((t, i) => {
+              const on = i === convoTabs.state.active;
+              return (
+                <ComposerSlot
+                  key={t.id}
+                  convo={t.convo}
+                  live={on ? live : null}
+                  ref={on ? activeSlot : undefined}
+                />
+              );
+            })
+          ) : (
+            <ComposerSlot
+              ref={activeSlot}
+              convo={state?.conversation?.id ?? null}
+              live={live}
+            />
+          )}
         </DropOverlay>
       </div>
 

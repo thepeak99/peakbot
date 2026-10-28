@@ -1,10 +1,13 @@
 // Composer attachment state: pre-checks, one XHR upload per file, object-URL
-// previews. Lives in App (not Composer) so the drop overlay shares it.
+// previews. Lives in ComposerSlot, one per desktop tab; the per-convo reset
+// below follows that slot's own tab convo.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { uploadFile } from "./uploads";
 import { formatSize, isThumbnailable } from "./fileTypes";
 import type { UploadLimits, WireAttachment } from "./state";
+// Matches the server default (`uploads:` config) until the first state frame.
+export const DEFAULT_UPLOAD_LIMITS: UploadLimits = { max_file_mb: 50, max_files: 10 };
 
 export type Pending = { key: string; file: File; preview?: string } & (
   | { state: "uploading"; progress: number; abort: () => void }

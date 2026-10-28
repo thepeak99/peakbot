@@ -1160,3 +1160,238 @@ describe("Composer — buttons keep textarea focus on pointerdown (mobile)", () 
     expect(props.onStop).toHaveBeenCalledTimes(1);
   });
 });
+
+// ─── `hidden` prop (desktop-tab-composers, keep-alive) ───────────────────
+//
+// Contract: `hidden?: boolean` (default false) sets the `hidden` ATTRIBUTE on
+// the composer's root element and nothing else — the component stays mounted,
+// so typed text and the slash-palette state (`selected`, `dismissed`) survive
+// a hidden→visible round trip. The textarea auto-grow layout effect depends
+// on `[text, hidden]` and returns early while hidden (a `display:none`
+// textarea measures `scrollHeight === 0`, which would collapse it to MIN_H);
+// when un-hidden the height is re-measured.
+//
+// jsdom has no layout, so `scrollHeight` is stubbed on the prototype and
+// restored in afterEach.
+
+const SLASH_COMMANDS: SlashCommand[] = [
+  { name: "help", description: "Show help", takes_args: false },
+  { name: "history", description: "Show history", takes_args: false },
+  { name: "hooks", description: "List hooks", takes_args: false },
+];
+
+/** Re-render the CURRENT root with new props (keeps component state). */
+async function rerenderComposer(props: ComposerProps & { hidden?: boolean }): Promise<void> {
+  await act(async () => {
+    root!.render(<Composer {...(props as ComposerProps)} />);
+  });
+}
+
+const composerRoot = (el: HTMLElement): HTMLElement => el.firstElementChild as HTMLElement;
+const textareaOf = (el: HTMLElement): HTMLTextAreaElement => el.querySelector("textarea")!;
+/** Palette rows are the only buttons whose text starts with "/". */
+const paletteRows = (el: HTMLElement): HTMLButtonElement[] =>
+  allButtons(el).filter((b) => (b.textContent ?? "").trim().startsWith("/"));
+const highlightedRow = (el: HTMLElement): string | null =>
+  paletteRows(el).find((b) => b.classList.contains("bg-zinc-800"))?.textContent?.trim() ?? null;
+
+let scrollHeightNow = 0;
+function stubScrollHeight(): void {
+  Object.defineProperty(HTMLTextAreaElement.prototype, "scrollHeight", {
+    configurable: true,
+    get: () => scrollHeightNow,
+  });
+}
+afterEach(() => {
+  delete (HTMLTextAreaElement.prototype as unknown as Record<string, unknown>)["scrollHeight"];
+  scrollHeightNow = 0;
+});
+
+const keydown = async (el: HTMLElement, key: string): Promise<void> => {
+  await act(async () => {
+    el.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
+  });
+};
+
+describe("Composer — hidden prop: root attribute", () => {
+  it("renders the root WITHOUT a hidden attribute when the prop is omitted", async () => {
+    const el = await mount(makeProps());
+    expect(composerRoot(el).hasAttribute("hidden")).toBe(false);
+  });
+
+  it("renders the root WITHOUT a hidden attribute when hidden={false}", async () => {
+    const el = await mount({ ...makeProps(), hidden: false } as unknown as ComposerProps);
+    expect(composerRoot(el).hasAttribute("hidden")).toBe(false);
+  });
+
+  it("sets the hidden attribute on the root element when hidden={true}", async () => {
+    const el = await mount({ ...makeProps(), hidden: true } as unknown as ComposerProps);
+    expect(composerRoot(el).hasAttribute("hidden")).toBe(true);
+  });
+
+  it("stays mounted while hidden: the textarea and attach input are still in the DOM", async () => {
+    const el = await mount({ ...makeProps(), hidden: true } as unknown as ComposerProps);
+    expect(el.querySelector("textarea")).not.toBeNull();
+    expect(el.querySelector('input[type="file"]')).not.toBeNull();
+  });
+
+  it("toggling hidden false → true → false flips the attribute each time", async () => {
+    const props = makeProps();
+    const el = await mount({ ...props, hidden: false } as unknown as ComposerProps);
+    expect(composerRoot(el).hasAttribute("hidden")).toBe(false);
+    await rerenderComposer({ ...props, hidden: true });
+    expect(composerRoot(el).hasAttribute("hidden")).toBe(true);
+    await rerenderComposer({ ...props, hidden: false });
+    expect(composerRoot(el).hasAttribute("hidden")).toBe(false);
+  });
+
+  it("keeps the existing root classes (pr-12 clearance) alongside hidden", async () => {
+    const el = await mount({ ...makeProps(), hidden: true } as unknown as ComposerProps);
+    expect(composerRoot(el).classList.contains("pr-12")).toBe(true);
+  });
+});
+
+describe("Composer — hidden prop: state survives hide/show", () => {
+  it("keeps the typed text across hidden true → false", async () => {
+    const props = makeProps();
+    const el = await mount({ ...props, hidden: false } as unknown as ComposerProps);
+    const ta = textareaOf(el);
+    await typeInto(ta, "half-written thought");
+
+    await rerenderComposer({ ...props, hidden: true });
+    expect(textareaOf(el)).toBe(ta); // same node: not remounted
+    expect(ta.value).toBe("half-written thought");
+
+    await rerenderComposer({ ...props, hidden: false });
+    expect(textareaOf(el)).toBe(ta);
+    expect(ta.value).toBe("half-written thought");
+  });
+
+  it("keeps multi-line and unicode text intact across hide/show", async () => {
+    const props = makeProps();
+    const el = await mount({ ...props, hidden: false } as unknown as ComposerProps);
+    const text = "línea 1\nline 2 — ✓ 日本語 🚀";
+    await typeInto(textareaOf(el), text);
+    await rerenderComposer({ ...props, hidden: true });
+    await rerenderComposer({ ...props, hidden: false });
+    expect(textareaOf(el).value).toBe(text);
+  });
+
+  it("keeps the highlighted palette row (selected index) across hide/show", async () => {
+    const props = makeProps({ commands: SLASH_COMMANDS });
+    const el = await mount({ ...props, hidden: false } as unknown as ComposerProps);
+    const ta = textareaOf(el);
+    await typeInto(ta, "/h");
+    expect(paletteRows(el)).toHaveLength(3);
+    await keydown(ta, "ArrowDown");
+    await keydown(ta, "ArrowDown");
+    expect(highlightedRow(el)).toContain("/hooks");
+
+    await rerenderComposer({ ...props, hidden: true });
+    await rerenderComposer({ ...props, hidden: false });
+
+    expect(ta.value).toBe("/h");
+    expect(paletteRows(el)).toHaveLength(3);
+    expect(highlightedRow(el)).toContain("/hooks");
+  });
+
+  it("keeps a dismissed palette dismissed across hide/show (Esc is remembered)", async () => {
+    const props = makeProps({ commands: SLASH_COMMANDS });
+    const el = await mount({ ...props, hidden: false } as unknown as ComposerProps);
+    const ta = textareaOf(el);
+    await typeInto(ta, "/h");
+    expect(paletteRows(el)).toHaveLength(3);
+    await keydown(ta, "Escape");
+    expect(paletteRows(el)).toHaveLength(0);
+
+    await rerenderComposer({ ...props, hidden: true });
+    await rerenderComposer({ ...props, hidden: false });
+
+    expect(ta.value).toBe("/h");
+    expect(paletteRows(el), "dismissal must survive a tab switch").toHaveLength(0);
+  });
+
+  it("keeps an OPEN palette open across hide/show", async () => {
+    const props = makeProps({ commands: SLASH_COMMANDS });
+    const el = await mount({ ...props, hidden: false } as unknown as ComposerProps);
+    await typeInto(textareaOf(el), "/he");
+    expect(paletteRows(el).map((b) => b.textContent)).toHaveLength(1);
+
+    await rerenderComposer({ ...props, hidden: true });
+    await rerenderComposer({ ...props, hidden: false });
+
+    expect(paletteRows(el)).toHaveLength(1);
+    expect(paletteRows(el)[0].textContent).toContain("/help");
+  });
+});
+
+describe("Composer — hidden prop: textarea auto-grow", () => {
+  it("does not measure or resize the textarea while hidden (mount hidden, type)", async () => {
+    stubScrollHeight();
+    scrollHeightNow = 0; // what a display:none textarea reports
+    const el = await mount({ ...makeProps(), hidden: true } as unknown as ComposerProps);
+    const ta = textareaOf(el);
+
+    expect(ta.style.height, "no height may be written on a hidden mount").toBe("");
+    await typeInto(ta, "typed while hidden");
+    expect(ta.style.height, "typing while hidden must not collapse the box to MIN_H").toBe("");
+  });
+
+  it("re-measures when un-hidden: height follows scrollHeight", async () => {
+    stubScrollHeight();
+    scrollHeightNow = 0;
+    const props = makeProps();
+    const el = await mount({ ...props, hidden: true } as unknown as ComposerProps);
+    const ta = textareaOf(el);
+    await typeInto(ta, "line1\nline2\nline3\nline4");
+
+    scrollHeightNow = 96; // now visible, so the real height is measurable
+    await rerenderComposer({ ...props, hidden: false });
+
+    expect(ta.style.height).toBe("96px");
+  });
+
+  it("clamps the re-measured height to the 192px cap", async () => {
+    stubScrollHeight();
+    scrollHeightNow = 0;
+    const props = makeProps();
+    const el = await mount({ ...props, hidden: true } as unknown as ComposerProps);
+    await typeInto(textareaOf(el), "x");
+    scrollHeightNow = 900;
+    await rerenderComposer({ ...props, hidden: false });
+    expect(textareaOf(el).style.height).toBe("192px");
+  });
+
+  it("clamps the re-measured height up to the 40px minimum", async () => {
+    stubScrollHeight();
+    scrollHeightNow = 0;
+    const props = makeProps();
+    const el = await mount({ ...props, hidden: true } as unknown as ComposerProps);
+    await typeInto(textareaOf(el), "x");
+    scrollHeightNow = 12;
+    await rerenderComposer({ ...props, hidden: false });
+    expect(textareaOf(el).style.height).toBe("40px");
+  });
+
+  it("hiding does not clobber the last measured height (no 0 → MIN_H collapse)", async () => {
+    stubScrollHeight();
+    scrollHeightNow = 120;
+    const props = makeProps();
+    const el = await mount({ ...props, hidden: false } as unknown as ComposerProps);
+    await typeInto(textareaOf(el), "a\nb\nc");
+    expect(textareaOf(el).style.height).toBe("120px");
+
+    scrollHeightNow = 0; // display:none
+    await rerenderComposer({ ...props, hidden: true });
+
+    expect(textareaOf(el).style.height).toBe("120px");
+  });
+
+  it("without the hidden prop the textarea still grows on text change (unchanged)", async () => {
+    stubScrollHeight();
+    scrollHeightNow = 64;
+    const el = await mount(makeProps());
+    await typeInto(textareaOf(el), "grow me");
+    expect(textareaOf(el).style.height).toBe("64px");
+  });
+});

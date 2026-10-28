@@ -1,7 +1,8 @@
 // localStorage boundary for the desktop tab list. `parseStored` validates once
-// at load; everything downstream trusts the result.
+// at load; everything downstream trusts the result. Tab ids are runtime-only:
+// never written, always re-minted on load.
 
-import type { ConvoTab, TabsState } from "./convoTabs";
+import { freshTab, type ConvoTab, type TabsState } from "./convoTabs";
 
 export const TABS_STORAGE_KEY = "peakbot.desktop.tabs";
 /** A future "restore tabs on launch" setting hooks in here, nowhere else. */
@@ -34,7 +35,7 @@ export function parseStored(raw: string | null): TabsState | null {
       if (seen.has(convo)) continue;
       seen.add(convo);
     }
-    tabs.push({ convo, title: title.slice(0, MAX_TITLE) });
+    tabs.push(freshTab(convo, title.slice(0, MAX_TITLE)));
   }
   if (tabs.length === 0) return null;
 
@@ -60,7 +61,11 @@ export function saveTabs(storage: Storage, s: TabsState): void {
   try {
     storage.setItem(
       TABS_STORAGE_KEY,
-      JSON.stringify({ v: 1, tabs: s.tabs, active: s.active }),
+      JSON.stringify({
+        v: 1,
+        tabs: s.tabs.map(({ convo, title }) => ({ convo, title })),
+        active: s.active,
+      }),
     );
   } catch {
     // quota / disabled storage: the tab list simply isn't remembered

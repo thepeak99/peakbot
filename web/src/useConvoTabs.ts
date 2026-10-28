@@ -55,6 +55,8 @@ export function bootDesktopTabs(): TabsState {
 }
 
 export interface ConvoTabsApi {
+  /** Read-only mirror of the store; App keys one composer slot per tab id. */
+  state: TabsState;
   views: TabView[];
   count: number;
   activate(i: number): void;
@@ -202,6 +204,7 @@ export function useConvoTabs(
     () =>
       tabs
         ? {
+            state: tabs,
             views,
             count: tabs.tabs.length,
             activate: (i) => dispatch((s) => activate(s, i)),
