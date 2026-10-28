@@ -11,6 +11,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Transcript, type TranscriptHandle } from "./components/Transcript";
 import { EmptyTranscript } from "./components/EmptyTranscript";
+import { UpdateBanner } from "./components/UpdateBanner";
 import { BashPanel } from "./components/BashPanel";
 import {
   ComposerSlot,
@@ -347,6 +348,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
         onToast={showToast}
         stopPending={state?.stop_pending ?? false}
       />
+      <UpdateBanner />
       {convoTabs && (
         <ConvoTabBar
           tabs={convoTabs.views}

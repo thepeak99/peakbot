@@ -9,10 +9,15 @@
 //
 // Runs under `node` (no jsdom needed): the only globals involved are
 // `globalThis.isTauri` (set and deleted per test) and the
-// `globalThis.__TAURI__.core.invoke` stub for the single theme command.
+// `globalThis.__TAURI__.core.invoke` stub for the theme and update commands.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { isDesktop, setDesktopTheme } from "./desktop";
+import {
+  getUpdateStatus,
+  installUpdate,
+  isDesktop,
+  setDesktopTheme,
+} from "./desktop";
 
 type WithTauri = { isTauri?: unknown };
 const g = globalThis as WithTauri;
@@ -51,9 +56,11 @@ describe("isDesktop", () => {
   });
 });
 
-// ── desktop IPC seam (one command: theme_set) ─────────────────────────────
+// ── desktop IPC seam (theme_set + update commands) ───────────────────────
 // The web page's ONLY way to talk to the desktop app is the seam in
-// desktop.ts: setDesktopTheme(theme) → invoke("theme_set", { theme }). The
+// desktop.ts: setDesktopTheme(theme) → invoke("theme_set", { theme }),
+// getUpdateStatus() → invoke("update_status"), installUpdate() →
+// invoke("update_install"). The
 // stub is installed by setting globalThis.__TAURI__ = { core: { invoke } }
 // and deleted after every test.
 
@@ -97,14 +104,93 @@ describe("desktop IPC seam", () => {
   });
 });
 
-// ── module surface (close-to-tray removal) ─────────────────────────────────
+// ── update IPC seam (desktop auto-update) ────────────────────────────────
+// Two more commands ride the same `__TAURI__.core.invoke` seam
+// (desktop/src-tauri/capabilities/remote-web.json):
+//   update_status  → null | {state:"available";version} | {state:"installing"}
+//                    | {state:"failed";version}
+//   update_install → resolves (the app is restarting) or rejects with a
+//                    string (the failure reason)
+//
+// RED today: desktop.ts exports neither getUpdateStatus nor installUpdate,
+// so this whole file fails at import — the right reason (feature absent).
+
+describe("update IPC seam", () => {
+  afterEach(() => {
+    delete tg.__TAURI__;
+  });
+
+  it.each([
+    ["null", null],
+    ["available", { state: "available", version: "0.25.0" }],
+    ["installing", { state: "installing" }],
+    ["failed", { state: "failed", version: "0.25.0" }],
+  ] as const)(
+    "getUpdateStatus passes through invoke's %s value unchanged",
+    async (_label, value) => {
+      const invoke = vi.fn(async () => value);
+      tg.__TAURI__ = { core: { invoke } };
+
+      await expect(getUpdateStatus()).resolves.toEqual(value);
+
+      expect(invoke).toHaveBeenCalledTimes(1);
+      expect(invoke).toHaveBeenCalledWith("update_status");
+    },
+  );
+
+  it("installUpdate invokes update_install and resolves undefined", async () => {
+    const invoke = vi.fn(async () => undefined);
+    tg.__TAURI__ = { core: { invoke } };
+
+    await expect(installUpdate()).resolves.toBeUndefined();
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith("update_install");
+  });
+
+  it("installUpdate resolves undefined even when the command resolves with a value", async () => {
+    const invoke = vi.fn(async () => "done");
+    tg.__TAURI__ = { core: { invoke } };
+
+    await expect(installUpdate()).resolves.toBeUndefined();
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it("installUpdate rejects with the command's string reason", async () => {
+    const invoke = vi.fn(async () => {
+      throw "download failed";
+    });
+    tg.__TAURI__ = { core: { invoke } };
+
+    await expect(installUpdate()).rejects.toBe("download failed");
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["getUpdateStatus", () => getUpdateStatus()],
+    ["installUpdate", () => installUpdate()],
+  ] as [string, () => Promise<unknown>][])(
+    "%s rejects with 'no desktop IPC' when __TAURI__ is absent",
+    async (_name, call) => {
+      await expect(call()).rejects.toThrow("no desktop IPC");
+    },
+  );
+});
+
+// ── module surface (close-to-tray removal + auto-update) ─────────────────
 // The Desktop pane is gone: `DesktopView`, `getDesktopSettings` and
-// `toggleDesktopBackground` are no longer exported; `setDesktopTheme` is
-// the only remaining command.
+// `toggleDesktopBackground` are no longer exported. The seam now carries
+// exactly four exports: detection, the theme command, and the two update
+// commands.
 
 describe("module surface", () => {
-  it("exports only isDesktop and setDesktopTheme", async () => {
+  it("exports exactly isDesktop, setDesktopTheme, getUpdateStatus, installUpdate", async () => {
     const mod = await import("./desktop");
-    expect(Object.keys(mod).sort()).toEqual(["isDesktop", "setDesktopTheme"]);
+    expect(Object.keys(mod).sort()).toEqual([
+      "getUpdateStatus",
+      "installUpdate",
+      "isDesktop",
+      "setDesktopTheme",
+    ]);
   });
 });
