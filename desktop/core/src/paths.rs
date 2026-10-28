@@ -61,11 +61,6 @@ impl DesktopPaths {
         self.data_dir.join("sidecar.pid")
     }
 
-    /// `data_dir/declined-replace`.
-    pub fn declined_file(&self) -> PathBuf {
-        self.data_dir.join("declined-replace")
-    }
-
     /// `log_dir/peakbot-session.log`.
     pub fn session_log(&self) -> PathBuf {
         self.log_dir.join("peakbot-session.log")
@@ -98,7 +93,6 @@ mod tests {
 
         let d = paths();
         assert_eq!(d.pidfile(), PathBuf::from("/data/sidecar.pid"));
-        assert_eq!(d.declined_file(), PathBuf::from("/data/declined-replace"));
         assert_eq!(d.session_log(), PathBuf::from("/logs/peakbot-session.log"));
         assert_eq!(d.peakbot_config(), PathBuf::from("/cfg/config.yaml"));
     }

@@ -4,7 +4,7 @@
 //! and an ordered event log of every side effect), `FakeChild` (exit
 //! after N `try_wait`s / on interrupt / never; shared interrupt/kill
 //! counters), `FakeUi` (scripted confirm answers, recorded
-//! phases/dialogs).
+//! phases/dialogs; the tray status string of each phase).
 //!
 //! These fakes are FULLY implemented; the production code behind them
 //! is real, not stubs.
@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use url::Url;
 
 use crate::controller::Ui;
-use crate::phase::{Dialog, Phase, TrayModel};
+use crate::phase::{Dialog, Phase};
 use crate::sys::{Child, Probe, RunOutput, Signal, SpawnSpec, Sys};
 
 // ---------------------------------------------------------------------------
@@ -50,11 +50,6 @@ pub enum Effect {
     },
     Remove {
         path: PathBuf,
-    },
-    /// `same_contents(a, b)` was called (design auto-replace §3.3).
-    SameContents {
-        a: PathBuf,
-        b: PathBuf,
     },
     Probe {
         url: Url,
@@ -96,7 +91,6 @@ pub(crate) struct FakeSysState {
     pub private_files: HashSet<PathBuf>,
     /// Paths where `write_private` fails (design #377 t83).
     pub fail_writes: HashSet<PathBuf>,
-    pub port_free: HashMap<u16, bool>,
     pub cmdline: HashMap<u32, String>,
     /// Children `spawn` returns, in order (default: `never`).
     pub children: VecDeque<FakeChildSpec>,
@@ -154,10 +148,6 @@ impl FakeSys {
 
     pub fn set_default_probe(&self, probes: Vec<Probe>) {
         self.state.lock().unwrap().default_probe = probes;
-    }
-
-    pub fn set_port_free(&self, port: u16, free: bool) {
-        self.state.lock().unwrap().port_free.insert(port, free);
     }
 
     pub fn set_cmdline(&self, pid: u32, cmd: impl Into<String>) {
@@ -328,16 +318,6 @@ impl Sys for FakeSys {
         probe
     }
 
-    fn port_is_free(&self, port: u16) -> bool {
-        self.state
-            .lock()
-            .unwrap()
-            .port_free
-            .get(&port)
-            .copied()
-            .unwrap_or(true)
-    }
-
     fn read(&self, path: &Path) -> io::Result<Option<String>> {
         let mut st = self.state.lock().unwrap();
         st.reads.push(path.to_path_buf());
@@ -365,31 +345,6 @@ impl Sys for FakeSys {
             path: path.to_path_buf(),
         });
         Ok(())
-    }
-
-    /// Design auto-replace §5.1: `a == b` ⇒ true (a file always equals
-    /// itself); otherwise the seeded contents are compared; an
-    /// unseeded file is `Err(NotFound)`.
-    fn same_contents(&self, a: &Path, b: &Path) -> io::Result<bool> {
-        self.events.lock().unwrap().push(Effect::SameContents {
-            a: a.into(),
-            b: b.into(),
-        });
-        if a == b {
-            return Ok(true); // a path always equals itself
-        }
-        let st = self.state.lock().unwrap();
-        match (st.files.get(a), st.files.get(b)) {
-            (Some(x), Some(y)) => Ok(x == y),
-            _ => Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "FakeSys: file not seeded",
-            )),
-        }
-    }
-
-    fn exists(&self, path: &Path) -> bool {
-        self.state.lock().unwrap().files.contains_key(path)
     }
 
     fn cmdline_of(&self, pid: u32) -> Option<String> {
@@ -516,6 +471,14 @@ impl FakeChild {
         )
     }
 
+    /// Standalone, never-exits-on-its-own child: the stand-in for the
+    /// `wait_ready` calls that used to pass `child: None` (the service
+    /// mode with no child is gone; the parameter is a plain
+    /// `&mut dyn Child` now).
+    pub fn never() -> Self {
+        Self::new(FakeChildSpec::never())
+    }
+
     pub(crate) fn with_shared(
         spec: FakeChildSpec,
         state: Arc<Mutex<FakeSysState>>,
@@ -602,10 +565,11 @@ impl Child for FakeChild {
 
 #[derive(Default)]
 pub(crate) struct FakeUiState {
-    /// (phase, tray) pairs from `phase_changed`, in order.
-    pub phases: Vec<(Phase, TrayModel)>,
+    /// (phase, tray status) pairs from `phase_changed`, in order. The
+    /// tray status is the plain `String` of `phase::tray_status` (the
+    /// `TrayModel` struct is gone).
+    pub phases: Vec<(Phase, String)>,
     pub confirms: Vec<Dialog>,
-    pub messages: Vec<Dialog>,
     /// Scripted confirm answers (FIFO); falls back to `confirm_default`.
     pub confirm_answers: VecDeque<bool>,
     pub confirm_default: bool,
@@ -627,7 +591,7 @@ impl FakeUi {
         self.inner.lock().unwrap().confirm_answers.push_back(answer);
     }
 
-    pub fn phases(&self) -> Vec<(Phase, TrayModel)> {
+    pub fn phases(&self) -> Vec<(Phase, String)> {
         self.inner.lock().unwrap().phases.clone()
     }
 
@@ -641,7 +605,8 @@ impl FakeUi {
             .collect()
     }
 
-    pub fn last_tray(&self) -> TrayModel {
+    /// The tray status string of the most recent `phase_changed`.
+    pub fn last_tray(&self) -> String {
         self.inner
             .lock()
             .unwrap()
@@ -654,28 +619,20 @@ impl FakeUi {
     pub fn confirms(&self) -> Vec<Dialog> {
         self.inner.lock().unwrap().confirms.clone()
     }
-
-    pub fn messages(&self) -> Vec<Dialog> {
-        self.inner.lock().unwrap().messages.clone()
-    }
 }
 
 impl Ui for FakeUi {
-    fn phase_changed(&self, phase: &Phase, tray: &TrayModel) {
+    fn phase_changed(&self, phase: &Phase, tray_status: &str) {
         self.inner
             .lock()
             .unwrap()
             .phases
-            .push((phase.clone(), tray.clone()));
+            .push((phase.clone(), tray_status.to_string()));
     }
 
     fn confirm(&self, d: &Dialog) -> bool {
         let mut st = self.inner.lock().unwrap();
         st.confirms.push(d.clone());
         st.confirm_answers.pop_front().unwrap_or(st.confirm_default)
-    }
-
-    fn message(&self, d: &Dialog) {
-        self.inner.lock().unwrap().messages.push(d.clone());
     }
 }

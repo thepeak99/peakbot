@@ -9,19 +9,20 @@ Base: peakbot 0.23.0 @ `772aee9`. Owner of this doc: Architect. Changes after lo
 
 PeakBot Desktop is a Tauri v2 window that shows the **existing** PeakBot web UI by navigating a
 webview to `http(s)://127.0.0.1:<port>/[?token=<token>]`, served by a peakbot binary that ships inside the
-app (the *sidecar*). By default the desktop app owns the backend's lifetime (**session mode**: spawn
-on launch, SIGINT→wait→SIGKILL on exit). Optionally the user ticks "Keep PeakBot running in
-background" and the app installs the bundled binary as the user's systemd/launchd service through
-peakbot's own `install` / `service …` verbs (**service mode**) and simply connects to
-`127.0.0.1:7823`. The web UI is never rebuilt, never bundled, never given IPC; the only local UI is
-a small local UI (the status page "starting… / error + Retry / Open logs", and the settings page in the
-main window, #377, in-window since 0.24).
+app (the *sidecar*). The desktop app always owns the backend's lifetime (spawns the sidecar on
+launch; SIGINT/SIGTERM → wait → SIGKILL on exit). Closing the window does **not** quit: it hides the
+window to the tray (macOS: menu bar icon) while the server keeps running, and only **Quit PeakBot**
+in the tray menu (Cmd+Q on macOS) stops the server. On Linux desktops with no tray host, closing the
+window asks first; Cancel keeps PeakBot running. On start, if an old PeakBot background service is
+installed (running or stopped) the app offers to remove it. The web UI is never rebuilt, never bundled,
+never given IPC; the only local UI is the small local status page ("starting… / error + Retry /
+Open logs").
 
 **The one key idea:** *the desktop app is a thin, stateless launcher — every decision is a pure
 function in a Tauri-free crate (`peakbot-desktop-core`), every fact comes from peakbot itself.*
-The service manager is the single source of truth for the mode (service installed ⇔ service mode;
-mode is never stored — a single `settings.json` stores launch parameters only: protocol/token/remote), `peakbot --version` is the single source of truth for versions, and
-peakbot's own `install`/`service` verbs are the only code that touches systemd/launchd. The Tauri
+`peakbot service status` is the single source of truth for whether an old service is installed (the
+app only ever asks to remove it — never installs), `peakbot --version` is the single source of truth
+for versions, and peakbot's own `service` verbs are the only code that touches systemd/launchd. The Tauri
 crate only paints windows, menus and dialogs.
 
 ---
@@ -31,11 +32,11 @@ crate only paints windows, menus and dialogs.
 ```
 desktop/
 ├── DESIGN.md                      this file
-├── README.md                      user doc: install, Gatekeeper, background mode, manual removal
+├── README.md                      user doc: install, Gatekeeper, tray/quit, migration, manual removal
 ├── Cargo.toml                     Cargo workspace (members: core, src-tauri), shared version
 ├── Cargo.lock                     committed; all builds use --locked
 ├── core/                          crate `peakbot-desktop-core` (lib, NO tauri dep)
-│   └── src/{lib,consts,token,version,paths,env,nav,service,session,ready,phase,settings,sys,controller}.rs
+│   └── src/{lib,consts,token,version,paths,env,nav,service,session,ready,phase,theme,sys,controller}.rs
 ├── src-tauri/                     crate `peakbot-desktop` (bin) — thin glue
 │   ├── build.rs                   tauri_build with app-manifest (command ACL)
 │   ├── tauri.conf.json
@@ -45,9 +46,7 @@ desktop/
 │   └── src/{main,window,tray,bridge,commands}.rs
 ├── ui/                            frontendDist — bundled local pages, no build step
 │   ├── index.html
-│   ├── status.js
-│   ├── settings.html              settings page of the main window (#377; in-window since 0.24)
-│   └── settings.js
+│   └── status.js
 ├── macos/
 │   ├── Info.plist.in              template (@VERSION@)
 │   └── assemble-app.sh            hand-assembles + ad-hoc signs + zips the .app
@@ -66,8 +65,7 @@ Dockerfile.desktop-macos
 | `core::controller` | The startup/mode state machine; owns the session child process | One owner of the child + phase ⇒ no locks, no races. Runs on one dedicated thread. |
 | `core::sys` (`RealSys`) | The only place that spawns processes, opens sockets, sends signals, touches files | Injectable seam; tests use a `FakeSys` with a virtual clock. |
 | `src-tauri` glue | Window(s), navigation guard, tray, native dialogs, 4 IPC commands for the local pages, exit hook | Tauri-specific; deliberately logic-free. |
-| `core::settings` | The settings model (`Settings` sum type), boundary validation, `settings.json` parse/render/load, `settings_view` (#377) | Illegal combos (remote without HTTPS/token) are unrepresentable; validated once at the IPC edge. |
-| `ui/settings.*` settings page (main window) | Toggles background (`toggle_background`), `← Back to PeakBot` (`act` "back"); polled `settings_get`; follows the web theme (`theme.js` → `theme_get`) | Shown in the `main` window from tray / macOS menu / Ctrl+Shift+S / status-page link (0.24, spec §9.10); IPC-gated to the bundled origin only. The same options are also in the web UI's Settings → Desktop pane (§12). |
+| `core::theme` | `Theme` sum type + serde validation (was `core::settings`, #377) | Validated once at the IPC edge; last of the desktop's own settings (the `Settings` model and `settings.json` are gone). |
 | `ui/` status page | Shows `StatusView` (polled), buttons → `act` | The only thing shown when the backend isn't up. Plain HTML/JS, embedded via `frontendDist`. |
 | `macos/assemble-app.sh` | Builds the `.app` layout Tauri CLI can't build on Linux | Researcher: Tauri CLI cannot bundle `.app` on Linux. |
 | Dockerfiles + `build-desktop.sh` | Reproducible builds, same path locally (podman) and in CI (docker) | Follows the existing `Dockerfile.*` + `--output type=local` pattern. |
@@ -75,15 +73,13 @@ Dockerfile.desktop-macos
 
 **Deliberately NOT added (and why):**
 - **No `tauri-plugin-shell`.** We spawn the sidecar with `std::process::Command` from Rust. `externalBin` is a *bundler* feature and works without the plugin. std gives us exact control over env, stdio, signals; the plugin would add a JS-facing capability surface we must then deny.
-- **No mode flag.** Mode is derived from `peakbot service status`. A stored flag could disagree with reality (user ran `peakbot service uninstall` in a terminal). The state files (§3.6) are caches of user *decisions*/process bookkeeping/launch parameters, never of mode. (Amended #377: `settings.json` exists but holds launch parameters only.)
+- **No mode flag.** The desktop is always session mode; on every start it reads `peakbot service status` only to detect an old background service and offer its removal. The state files (§3.6) are process bookkeeping only, never a mode.
 - **No HTTP version endpoint / no backend API change for versions.** `<exe> --version` already exists.
-- **(amended §12: the remote origin gets exactly three commands on loopback :7823.) No other IPC for the remote origin, no other `remote` capability, no `@tauri-apps/api` npm package, no frontend build.**
+- **(amended §12: the remote origin gets exactly one command on loopback :7823 — `theme_set`.) No other IPC for the remote origin, no other `remote` capability, no `@tauri-apps/api` npm package, no frontend build.**
 - **No `PR_SET_PDEATHSIG`.** Linux-only, tied to the *spawning thread's* lifetime (subtle), and a second orphan mechanism. The pidfile reaper (§4.6) is portable and sufficient.
 - **No auto-updater, no code signing/notarization, no Windows build** (decision 4). Design stays portable: Windows differences are isolated in `RealSys` (`interrupt` = kill) and `paths::sidecar_file_name`.
 - **No "Restart backend" / "Open in browser" tray items.** Not requested (YAGNI).
 - **No custom app menu on Linux.** Tray only (see risk R6). macOS keeps Tauri's default menu (needed for ⌘C/⌘V/⌘Q) plus our "PeakBot" submenu.
-- **No `tauri-plugin-global-shortcut` (#377).** It grabs the key system-wide even when the app is unfocused and does not work on Wayland. The settings shortcut is a macOS menu accelerator plus, on every platform, an init-script `keydown` that navigates to a reserved URL the nav guard intercepts (no IPC).
-- **No drift detection (#377).** A CLI `service install` that changes the service is not reflected in `settings.json`; connecting still works (the service protocol comes from the `TLS:` status line), and the next Save re-applies the desktop's values.
 - **No process-group for the sidecar.** Not setting it means Ctrl+C on a terminal-launched desktop app also SIGINTs the sidecar (graceful), instead of orphaning it.
 
 ---
@@ -94,9 +90,7 @@ All types live in `core`. Field privacy enforces invariants; constructors are th
 
 ### 3.1 Constants (`core::consts`)
 ```rust
-pub const SERVICE_PORT: u16 = 7823;            // peakbot default; desktop-installed service always binds 127.0.0.1:7823
-pub const SESSION_PREFERRED_PORT: u16 = 7824;  // tried first so the webview origin (localStorage/cookies) is stable across launches
-pub const PORT_ATTEMPTS: u32 = 3;              // session spawn retries on "already in use"
+pub const SERVICE_PORT: u16 = 7823;            // peakbot default; the desktop no longer owns a fixed port (§11: bind comes from general.web)
 pub const READY_TIMEOUT: Duration = Duration::from_secs(30);
 pub const POLL_INTERVAL: Duration = Duration::from_millis(150);
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -123,68 +117,51 @@ Generated tokens = 32 random bytes, lowercase hex (64 chars).
 ### 3.3 Versions (`core::version`)
 ```rust
 pub fn parse_version_output(stdout: &str) -> Option<semver::Version>; // exactly "peakbot <semver>" (trimmed, first line)
-pub enum InstalledVersion { Known(semver::Version), Unknown }        // Unknown = exe missing/failed/unparseable
-pub struct DeclinedReplace { pub installed: InstalledVersion, pub bundled: semver::Version }
-impl DeclinedReplace {
-    pub fn render(&self) -> String;               // "installed=<ver|unknown>\nbundled=<ver>\n"
-    pub fn parse(s: &str) -> Option<DeclinedReplace>;
-    pub fn matches(&self, installed: &InstalledVersion, bundled: &semver::Version) -> bool; // exact pair equality
-}
 ```
 
 ### 3.4 Service (`core::service`)
 ```rust
-pub enum RunState { Running, Stopped, Unknown }
-pub struct InstalledService { pub exe: Option<PathBuf>, pub run: RunState, pub tls: bool } // `TLS:       on` ⇒ true; off/missing ⇒ false (#377)
-pub enum ServiceState {
-    Unavailable { reason: String },   // `service status` exited non-zero (no systemd user bus, unsupported OS, …)
-    NotInstalled,
-    Installed(InstalledService),
-}
-pub enum LaunchPlan {
-    Session,
-    ConnectService { start_first: bool },       // start_first ⇔ run == Stopped
-    AskReplace { installed: InstalledVersion }, // versions differ (or unknown) and not previously declined
-}
+pub fn status_args() -> [&'static str; 2];            // ["service","status"]
+pub fn service_uninstall_args() -> [&'static str; 2]; // ["service","uninstall"]
+pub fn is_service_installed(out: &RunOutput) -> bool; // exit 0 AND a trimmed line `Installed: true` (any State)
+pub fn remove_old_service_dialog() -> Dialog;         // §5.2, shown on start when is_service_installed
 ```
+The service code is now only *detection* (`service status`) and *removal* (`service uninstall`) for
+the one-off migration: an installed old service (running or stopped) is asked to be removed on every
+start — there is no `Install`, no plan, no policy, no version compare, no declined-file.
 
 ### 3.5 Phase, errors, views (`core::phase`)
 ```rust
-pub enum Mode {                            // amended #377: scheme-aware, session token optional
-    Session { port: u16, protocol: Protocol, token: Option<Token> },
-    Service { protocol: Protocol, token: Option<Token> },   // None ⇔ web-token file absent
-}
-impl Mode {
-    pub fn port(&self) -> u16;             // Service ⇒ SERVICE_PORT
-    pub fn url(&self) -> url::Url;         // {scheme}://127.0.0.1:<port>/ [+ ?token=<percent-encoded>]
-    pub fn probe_url(&self) -> url::Url;   // {scheme}://127.0.0.1:<port>/commands [+ ?token=…]
-    pub fn origin(&self) -> String;        // "{scheme}://127.0.0.1:<port>" — always 127.0.0.1, even when remote
+pub struct WebTarget;                       // port/scheme/token from `general.web` (§11); host 127.0.0.1
+impl WebTarget {
+    pub fn url(&self) -> url::Url;          // {scheme}://127.0.0.1:<port>/ [+ ?token=<percent-encoded>]
+    pub fn probe_url(&self) -> url::Url;    // {scheme}://127.0.0.1:<port>/commands [+ ?token=…]
+    pub fn origin(&self) -> String;         // "{scheme}://127.0.0.1:<port>"
 }
 
 pub enum StartStep {
     CheckingBundled, CheckingService, StartingSession, WaitingForBackend,
-    InstallingService, RemovingService, ConnectingService, StoppingSession,
+    TrustingCertificate, RemovingService, StoppingSession,
 }
 
 pub enum StartError {
     SidecarMissing { path: PathBuf },
     SidecarBroken { detail: String },                       // --version failed or unparseable
-    PortUnavailable,                                        // PORT_ATTEMPTS exhausted
-    SessionExited { code: Option<i32>, log_tail: String },  // died during startup OR while Ready
+    SessionExited { code: Option<i32>, log_tail: String },  // died during startup OR while Ready (also a busy bind, §11)
     NotReady { waited: Duration },                          // session readiness timeout
-    TokenRejected { service: bool },                        // probe returned 401/403
-    ServiceUnreachable { waited: Duration },
+    TokenRejected,                                          // probe returned 401/403
+    ServiceInstalled,                                       // old background service present; removal declined
     ServiceCommandFailed { command: String, output: String },
 }
 
-pub enum Phase { Starting(StartStep), Ready(Mode), Failed(StartError) }
+pub enum Phase { Starting(StartStep), Ready(WebTarget), Failed(StartError) }
 ```
 `Cancelled` is not a `StartError`: cancellation (quitting) is a control-flow outcome internal to the
 controller and never becomes a visible phase.
 
 ```rust
 #[derive(Serialize)] #[serde(rename_all = "snake_case")]
-pub enum UiAction { Retry, OpenLogs, ReinstallService, Quit, ToggleBackground, Back }   // also Deserialize: the `act` command's input; status_view never emits ToggleBackground (settings page only, #377) or Back (settings page's `← Back to PeakBot`, 0.24)
+pub enum UiAction { Retry, OpenLogs, Quit }   // also Deserialize: the `act` command's input
 
 #[derive(Serialize)]
 pub struct StatusView {
@@ -195,13 +172,9 @@ pub struct StatusView {
 }
 pub fn status_view(phase: &Phase) -> StatusView;
 
-pub struct TrayModel {
-    pub status: String,            // disabled first item
-    pub background_checked: bool,
-    pub background_enabled: bool,
-    pub background_label: String,
-}
-pub fn tray_model(phase: &Phase, service: Option<&ServiceState>, bundled: Option<&semver::Version>) -> TrayModel;
+pub fn tray_status(phase: &Phase, bundled: Option<&semver::Version>) -> String; // `PeakBot {v} · starting…`
+                                                                                 // / `· running (port N)` / `· error`
+                                                                                 // (`{v}` = `?` when unknown)
 
 pub struct Dialog { pub title: String, pub body: String, pub ok: String, pub cancel: Option<String> } // cancel None ⇒ info dialog
 ```
@@ -211,40 +184,32 @@ pub struct Dialog { pub title: String, pub body: String, pub ok: String, pub can
 | Phase | `tray.status` | `status_view.title` | actions |
 |---|---|---|---|
 | Starting(step) | `PeakBot {v} · starting…` | step text (below) | `[]` |
-| Ready(Session{port}) | `PeakBot {v} · running (port {port})` | `Opening PeakBot…` | `[]` |
-| Ready(Service) | `PeakBot {v} · running in background` | `Opening PeakBot…` | `[]` |
+| Ready | `PeakBot {v} · running (port {port})` | `Opening PeakBot…` | `[]` |
 | Failed(SidecarMissing) | `PeakBot {v} · error` | `The PeakBot backend is missing from this app` | Quit |
 | Failed(SidecarBroken) | 〃 | `The bundled PeakBot backend failed to run` | Retry, OpenLogs, Quit |
-| Failed(PortUnavailable) | 〃 | `Couldn't find a free local port` | Retry, Quit |
 | Failed(SessionExited) | 〃 | `PeakBot stopped unexpectedly` | Retry, OpenLogs, Quit |
 | Failed(NotReady) | 〃 | `PeakBot didn't start within {secs} s` | Retry, OpenLogs, Quit |
-| Failed(TokenRejected{service:false}) | 〃 | `Another program answered on PeakBot's port` | Retry, Quit |
-| Failed(TokenRejected{service:true}) | 〃 | `The background service rejected the access token` | Retry, ReinstallService, Quit |
-| Failed(ServiceUnreachable) | 〃 | `The background PeakBot service isn't responding on 127.0.0.1:7823` | Retry, ReinstallService, Quit |
-| Failed(ServiceCommandFailed) | 〃 | `A background-service command failed` | Retry, ReinstallService, OpenLogs, Quit |
+| Failed(TokenRejected) | 〃 | `Another program answered on PeakBot's port` | Retry, Quit |
+| Failed(ServiceInstalled) | 〃 | `The old PeakBot background service is still installed` | Retry, Quit |
+| Failed(ServiceCommandFailed) | 〃 | `A background-service command failed` | Retry, OpenLogs, Quit |
 
 Details: `SessionExited` → `"exit code {n}"`/`"killed by a signal"` + `\n\n` + log tail;
-`ServiceUnreachable`/`TokenRejected{service:true}` → service log hint:
-Linux `journalctl --user -u peakbot.service`, macOS `~/Library/Logs/peakbot.log`;
+`ServiceInstalled` → `PeakBot Desktop can't start PeakBot while it is installed. Press Retry to
+be asked again, or remove it yourself:\n\npeakbot service uninstall`;
 `ServiceCommandFailed` → `"$ {command}\n{output}"`; `SidecarMissing` → the path.
 
 StartStep texts: CheckingBundled `Checking the bundled PeakBot…`, CheckingService `Looking for a
 background service…`, StartingSession `Starting PeakBot…`, WaitingForBackend `Waiting for PeakBot to
-be ready…`, InstallingService `Installing the background service…`, RemovingService `Removing the
-background service…`, ConnectingService `Connecting to the background service…`, StoppingSession
+be ready…`, TrustingCertificate `Approve PeakBot's certificate in the system prompt…` (the one
+start step with a `detail`, §13), RemovingService `Removing the
+background service…`, StoppingSession
 `Stopping PeakBot…`.
-
-Tray background item: label always `Keep PeakBot running in background`, except
-`ServiceState::Unavailable` → `Keep PeakBot running in background (unavailable)`.
-`checked = service == Some(Installed(_))`; `enabled = phase is Ready|Failed && service is Some(NotInstalled|Installed)`.
 
 ### 3.6 Files the desktop app owns (in `DesktopPaths.data_dir`)
 
 | File | Content | Lifetime |
 |---|---|---|
 | `sidecar.pid` | `pid=<u32>\nport=<u16>\n` | Written right after session spawn; removed after the child is confirmed exited. A leftover = previous crash. |
-| `declined-replace` | `DeclinedReplace::render()` | Written when the user clicks "Keep"; only suppresses the dialog for the *exact* (installed, bundled) pair. |
-| `settings.json` | `{"v":1,"protocol":"http\|https","token":bool,"remote":bool}` (§3.9) | Written (0600, atomic) by the controller only, on a confirmed Save. Missing/corrupt/`v≠1` loads as defaults and is never rewritten on load. Reset = delete the file. |
 
 Files peakbot owns that the desktop reads/writes: `<peakbot_config_dir>/web-token` (read; written
 0600 / removed by the desktop at every session launch and service (re)install to match `settings.token` — invariant I2), `<peakbot_config_dir>/config.yaml`
@@ -268,11 +233,9 @@ pub fn peakbot_config_dir() -> Option<PathBuf>;       // directories_next::Proje
                                                       // — SAME crate + args as peakbot's get_config_dir(), so paths match by construction
 impl DesktopPaths {
     pub fn pidfile(&self) -> PathBuf;          // data_dir/sidecar.pid
-    pub fn declined_file(&self) -> PathBuf;    // data_dir/declined-replace
     pub fn session_log(&self) -> PathBuf;      // log_dir/peakbot-session.log
-    pub fn web_token(&self) -> PathBuf;        // peakbot_config_dir/web-token
+    pub fn web_token(&self) -> PathBuf;        // peakbot_config_dir/web-token (read-only, §11 legacy)
     pub fn peakbot_config(&self) -> PathBuf;   // peakbot_config_dir/config.yaml
-    pub fn settings_file(&self) -> PathBuf;    // data_dir/settings.json (#377)
 }
 ```
 Sidecar location at runtime: AppImage `$APPDIR/usr/bin/peakbot` next to `usr/bin/peakbot-desktop`;
@@ -287,79 +250,12 @@ macOS `X.app/Contents/MacOS/peakbot`; dev `desktop/target/debug/peakbot` (tauri-
 2. At most one sidecar child exists, owned by the controller thread (`Option<Session>`).
 3. `Phase::Ready(Session)` ⇒ `session.is_some()` and child not yet observed exited.
 4. A pidfile exists ⇔ a session child was spawned and not yet confirmed exited (modulo crash).
-5. Mode is never stored; it is derived from `ServiceState` on every Start.
-6. (**amended §12**) The remote origin may invoke ONLY `settings_get`, `toggle_background` and `theme_set`, and only when it is the loopback backend on port 7823 (`capabilities/desktop-pane.json`); every other command and plugin stays ACL-denied (§5.4, §12).
+5. The app keeps no mode state: whether an old background service exists is read from `peakbot service status` on each Start, and only ever leads to an offer to remove it.
+6. (**amended §12**) The remote origin may invoke ONLY `theme_set` (`capabilities/remote-theme.json`, the four loopback :7823 URLs); every other command and plugin stays ACL-denied (§5.4, §12).
 7. Tokens never appear in argv, desktop logs, or `Debug` output (I7).
-8. (**I3**) The service protocol comes from `service status` (`TLS:` line), never from `settings.json`.
-9. (**I4**) The session protocol/bind/token come from `settings.json` at launch time.
-10. (**I5**) Only the controller thread writes `settings.json` and `web-token`; writes are atomic (`write_private`).
-
-### 3.9 Settings (`core::settings`) — amendment #377
-> **Superseded by §11 (0.24 config).** `settings.json`, `SaveRequest`, the web-token file and `Action::SaveSettings` are gone.
-
-```rust
-pub const SETTINGS_VERSION: u32 = 1;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Protocol { Http, Https }
-impl Protocol { pub fn scheme(self) -> &'static str; } // "http" | "https"
-
-/// The validated model. Illegal combos are unrepresentable:
-/// Remote ⇒ HTTPS ∧ token by construction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Settings {
-    Loopback { protocol: Protocol, token: bool },
-    Remote,
-}
-impl Default for Settings { /* Loopback { protocol: Http, token: true } — today's behaviour */ }
-impl Settings {
-    pub fn protocol(self) -> Protocol;      // Remote ⇒ Https
-    pub fn token(self) -> bool;             // Remote ⇒ true
-    pub fn remote(self) -> bool;
-    pub fn bind_host(self) -> &'static str; // "127.0.0.1" | "0.0.0.0"
-}
-
-/// Untrusted flat shape: IPC payload (both directions) and the file body.
-/// Unknown fields are IGNORED (serde default), so newer files with extra
-/// keys still load. Missing fields are a parse error, so the file loads as defaults.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SettingsWire { pub protocol: Protocol, pub token: bool, pub remote: bool }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SettingsError { RemoteNeedsHttps, RemoteNeedsToken }
-impl fmt::Display for SettingsError { /* exact strings below */ }
-impl std::error::Error for SettingsError {}
-
-impl TryFrom<SettingsWire> for Settings { type Error = SettingsError; } // THE boundary check
-impl From<Settings> for SettingsWire {}
-
-// file = {"v":1, ...SettingsWire}  (private struct SettingsFile { v: u32, #[serde(flatten)] s: SettingsWire })
-pub fn render_settings_file(s: Settings) -> String;              // compact JSON + "\n"
-pub fn parse_settings_file(text: &str) -> Result<Settings, String>; // json err | "unsupported settings version {v}" | SettingsError text
-pub fn load_settings(text: Option<&str>) -> Settings;            // None ⇒ default; Err ⇒ log::warn! + default
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct SettingsView {
-    pub settings: SettingsWire,     // what is saved
-    pub background: bool,           // = tray.background_checked
-    pub background_enabled: bool,   // = tray.background_enabled
-    pub busy: bool,                 // = status.kind == "starting"
-    pub web_token_path: String,     // shown under the token row
-}
-pub fn settings_view(s: Settings, tray: &TrayModel, status: &StatusView, web_token: &Path) -> SettingsView;
-```
-
-**Exact strings (locked, asserted by tests):**
-- `SettingsError::RemoteNeedsHttps` → `Remote access requires HTTPS.`
-- `SettingsError::RemoteNeedsToken` → `Remote access requires the access token.`
-- Check order: if HTTPS is missing, that error wins. (`remote ∧ http ∧ ¬token` → the HTTPS message.)
-- `render_settings_file(Settings::default())` == `{"v":1,"protocol":"http","token":true,"remote":false}\n`
-- `render_settings_file(Settings::Remote)` == `{"v":1,"protocol":"https","token":true,"remote":true}\n`
-
-**Load policy (criterion 9):** any of these makes `load_settings` return the default and log
-one warning: missing file, non-JSON, `null`, a missing field, `v != 1`, an illegal combination.
-Unknown extra keys are ignored. Load never writes.
+8. The desktop never runs `service install` and never touches `~/.local/bin/peakbot`; its only service commands are `service status` (detection) and `service uninstall` (after a confirmed Remove).
+9. The session's bind/port/token/TLS come from `general.web` in `config.yaml` at launch time (§11); the desktop never writes it.
+10. Only the controller thread writes files (`sidecar.pid`); `web-token` and `settings.json` are no longer written by the desktop.
 
 ---
 
@@ -375,114 +271,48 @@ Unknown extra keys are ignored. Load never writes.
 
 ### 4.2 Actions
 ```rust
-pub enum Action { Start, ToggleBackground, ReinstallService, SaveSettings(Settings), Shutdown(std::sync::mpsc::Sender<()>) }
+pub enum Action { Start, Restart, Shutdown(std::sync::mpsc::Sender<()>) }
 ```
-Mapping: app launch → `Start`; status page `Retry` → `Start`; `ReinstallService` → `ReinstallService`;
-tray checkbox click → `ToggleBackground` (controller decides enable vs disable from its own
-`ServiceState`); settings page background row → `toggle_background` command (§12) → `ToggleBackground`; settings window Save → `settings_set` → `SaveSettings` (§4.11); `RunEvent::Exit` → `Shutdown(ack)`. `OpenLogs`, `Quit`, "Open PeakBot" are handled
-in glue without the controller.
-While `Phase::Starting`, `ToggleBackground`, `ReinstallService` and `SaveSettings` are ignored (tray item is disabled anyway).
+Mapping: app launch → `Start`; status page `Retry` → `Start`; `Restart` (sentinel
+`peakbot-desktop:restart`, §4.8) → the full start path (stop child, re-read, relaunch);
+`RunEvent::Exit` → `Shutdown(ack)`. `OpenLogs`, `Quit`, "Open PeakBot" are handled in glue
+without the controller.
+While `Phase::Starting`, `Restart` is ignored.
 
 ### 4.3 Startup state machine (`Action::Start`)
 
 ```
-        ┌──────────────────────────────────────────────────────────────────────┐
-Start ──► stop existing session (if any) ─► reap stale pidfile (§4.6)          │
-        ► Starting(CheckingBundled): run `<sidecar> --version`                 │
-             not found ─────────────────────────────► Failed(SidecarMissing)   │
-             error / unparseable ───────────────────► Failed(SidecarBroken)    │
-        ► Starting(CheckingService): run `<sidecar> service status` → ServiceState
-        ► plan_launch(state, version_of, bundled, declined) ─┬─ Session ───────► LAUNCH_SESSION
-                                                             ├─ ConnectService{start_first} ─► CONNECT
-                                                             └─ AskReplace ─► dialog(replace_dialog)
-                                                                   Replace ─► REPLACE ─► CONNECT{false}
-                                                                   Keep ────► write declined-replace ─► CONNECT{start_first}
-                                                                                                        │
-LAUNCH_SESSION (attempt 1..=PORT_ATTEMPTS):                                                             │
-   Starting(StartingSession): port = 7824 if free else sys.free_port()   (err ► Failed(PortUnavailable))│
-     (amended #377) s = settings(); token = sync_token(s) once per launch (§4.11)                      │
-     spawn `<sidecar> --bind {127.0.0.1|0.0.0.0}:<port> [--tls]`                                       │
-       env: sanitized parent env + [PEAKBOT_WEB_TOKEN=<token> iff token on] + PEAKBOT_NO_OPEN=1        │
-       stdin null, stdout+stderr → peakbot-session.log (truncate, 0600)                                 │
-       spawn io error ─► Failed(SidecarBroken)                                                          │
-     write pidfile                                                                                      │
-   Starting(WaitingForBackend): wait_ready(probe_url, READY_TIMEOUT, Some(child))                       │
-     Ready ─► Phase::Ready(Session{port,protocol,token})                                                          │
-     ChildExited(code) & classify_early_exit == PortTaken & attempts left ─► next attempt               │
-     ChildExited(code) ─► Failed(SessionExited{code, log_tail})                                         │
-     Timeout ─► stop child ─► Failed(NotReady)                                                          │
-     TokenRejected ─► stop child ─► Failed(TokenRejected{service:false})                                │
-   attempts exhausted ─► Failed(PortUnavailable)                                                        │
-                                                                                                        │
-CONNECT{start_first}:  ◄────────────────────────────────────────────────────────────────────────────────┘
-   Starting(ConnectingService)
-   token = Token::parse(read(web-token))   (absent ⇒ None; NEVER generated here — would not match the running service)
-   protocol = Https iff service is Installed{tls:true} (`TLS:` status line, I3), else Http   (amended #377)
-   if start_first: run `<sidecar> service install --bind 127.0.0.1:7823` (+ `--tls` per settings; idempotent; starts it)
-       non-zero ─► Failed(ServiceCommandFailed)
-   wait_ready(Mode::Service{token}.probe_url(), READY_TIMEOUT, None)
-     Ready ─► Phase::Ready(Service{protocol,token})
-     Timeout ─► Failed(ServiceUnreachable)      TokenRejected ─► Failed(TokenRejected{service:true})
-
-REPLACE (also = Action::ReinstallService):
-   Starting(RemovingService):   `<sidecar> service uninstall`  (non-zero tolerated: may not be loaded)
-   Starting(InstallingService): sync_token(settings())   (amended #377; was ensure_token)
-                                `<sidecar> install`                     non-zero ─► Failed(ServiceCommandFailed)
-                                `<sidecar> service install --bind {host}:7823 [--tls]`   non-zero ─► Failed(ServiceCommandFailed)
-   then CONNECT{start_first:false}; refresh ServiceState via `service status`; delete declined-replace
+Start ──► stop existing session (if any) ─► reap stale pidfile (§4.6)
+        ► Starting(CheckingBundled): run `<sidecar> --version`
+             not found ─────────────────────────────► Failed(SidecarMissing)
+             error / unparseable ───────────────────► Failed(SidecarBroken)
+        ► Starting(CheckingService): run `<sidecar> service status`
+             (Windows: never run; no background service exists there)
+             installed (running or stopped) ─┬─ confirm `remove_old_service_dialog()` (§5.2)
+                                              │ Remove service (ok)
+                                              ├─► Starting(RemovingService): `<sidecar> service uninstall`
+                                              │      non-zero ─► Failed(ServiceCommandFailed
+                                              │                             {command:"service uninstall"})
+                                              │      ok        ─► LAUNCH_SESSION
+                                              └─ Not now ──────────────────────────► Failed(ServiceInstalled)
+                                                                                    (Retry asks again)
+             not installed or unavailable ─────────────────────► LAUNCH_SESSION
+LAUNCH_SESSION (session only):
+   Starting(StartingSession): read general.web (§11) → bind/port/tls/token (no port fallback)
+     spawn `<sidecar>` (argv []) — bind is the configured `general.web.bind`
+       env: sanitized parent env + PEAKBOT_NO_OPEN=1 (PEAKBOT_WEB_TOKEN is no longer set)
+       stdin null, stdout+stderr → peakbot-session.log (truncate, 0600)
+       spawn io error ─► Failed(SidecarBroken)
+     write pidfile
+   Starting(WaitingForBackend): wait_ready(probe_url, READY_TIMEOUT, child)
+     Ready ─► Phase::Ready(WebTarget)
+     ChildExited(code) (e.g. busy bind) ─► Failed(SessionExited{code, log_tail})
+     Timeout ─► stop child ─► Failed(NotReady)
+     TokenRejected ─► stop child ─► Failed(TokenRejected)
 ```
-Why uninstall-then-install for replace: `systemctl --user enable --now` does **not** restart a
-running unit, so a plain re-install would leave the old binary running. Uninstall (`disable --now`
-/ `bootout`) + install is the portable "restart with new binary" using only peakbot verbs.
-
-### 4.4 `plan_launch` truth table (locked)
-
-| ServiceState | installed version vs bundled | declined pair matches | → LaunchPlan |
-|---|---|---|---|
-| Unavailable | – | – | Session |
-| NotInstalled | – | – | Session |
-| Installed(run) | equal | – | ConnectService{start_first: run==Stopped} |
-| Installed | different `Known` | no | AskReplace |
-| Installed | different `Known` | yes | ConnectService{start_first: run==Stopped} |
-| Installed | `Unknown` | no | AskReplace |
-| Installed | `Unknown` | yes | ConnectService{…} |
-
-`version_of(installed)` = `exe` is `None` → `Unknown`; else run `<exe> --version` → `parse_version_output` → `Known`/`Unknown`.
-`RunState::Unknown` counts as running (`start_first = false`).
-
-**Decision (requirement 3): the service's version = `<Exec path from service status> --version`.**
-Rejected: `/api/setup` `exe_path` — needs the service to be *running* and a valid token, and is one
-more HTTP contract. `service status` works when the service is stopped, broken, or tokenless, and
-`--version` is the binary's own truth. Known gap: if someone overwrote the binary without
-restarting the service, the on-disk version may differ from the running process — harmless,
-because Replace restarts it anyway.
-
-Port-7823 probing is **not** used for detection: a peakbot answering on 7823 without an installed
-service is a user-run foreground instance; session mode uses its own port and ignores it.
-
-### 4.5 Mode toggle (`Action::ToggleBackground`)
-
-**Enable** (ServiceState = NotInstalled):
-1. `!sys.exists(paths.peakbot_config())` → info dialog `Finish setup first` (§5.6) → return (no state change).
-   Reason: a service started without config + without DISPLAY refuses to start and crash-loops.
-2. `!sys.port_is_free(7823)` → info dialog `Port 7823 is busy` → return.
-3. confirm dialog `Keep PeakBot running in background?` → Cancel → return.
-4. stop session (Starting(StoppingSession)) — **before** installing, so two backends never share the config/DB.
-5. REPLACE steps minus the uninstall (sync_token(settings()) → `install` → `service install`) → CONNECT{false}.
-6. On any failure in 5: best-effort `service uninstall`, refresh ServiceState, error dialog with the
-   command output, then LAUNCH_SESSION (the user is back where they were).
-
-**Disable** (ServiceState = Installed):
-1. confirm dialog `Remove background service?` → Cancel → return.
-2. Starting(RemovingService): `service uninstall`; non-zero → error dialog, refresh state, CONNECT{false} again (unchanged mode).
-3. refresh ServiceState → LAUNCH_SESSION.
-Leaves `~/.local/bin/peakbot` and `web-token` in place (stated in the dialog).
-
-**This unchecking is the explicit "Remove background service" action** (requirement 2). Because
-AppImage/zip have no uninstall hooks, honoring "uninstall removes service" = (a) this item, (b) the
-README's manual-removal section (§5.8), (c) by design the service runs from the *stable copy*
-`~/.local/bin/peakbot`, so deleting the app never leaves a crash-looping service pointing at a
-vanished `/tmp/.mount_*` or `.app` path.
+The desktop never touches `~/.local/bin/peakbot` and never runs `service install`: the only
+service commands it ever issues are `service status` (migration detection) and `service
+uninstall` (after a confirmed Remove).
 
 ### 4.6 Shutdown and orphans
 > **0.24 (§11):** the reaper's identity check is the recorded sidecar path (pidfile `pid=…\nexe=…`), not `--bind`.
@@ -492,7 +322,11 @@ vanished `/tmp/.mount_*` or `.app` path.
 `child.interrupt()` (SIGINT to the pid) → poll `try_wait` every `POLL_INTERVAL` up to `STOP_GRACE`
 → if still alive `child.kill()` (SIGKILL) + `try_wait` → remove pidfile → `session = None`.
 
-`Action::Shutdown(ack)`: `stop_session()` if any, send `ack`, return from the loop. Service mode: nothing to stop.
+`Action::Shutdown(ack)`: `stop_session()` if any, send `ack`, return from the loop.
+SIGINT/SIGTERM (unix): both are registered on the same self-pipe in `main.rs`; either
+`handle.exit(0)` → `Shutdown` — a killed desktop (Ctrl+C, `kill`, logout) stops the sidecar
+gracefully exactly as tray Quit does. Only SIGKILL/crash bypasses this (R11: the stale
+sidecar reaper covers it on the next launch).
 
 Glue `RunEvent::Exit`: set `quitting = true`; send `Shutdown(ack)`; `ack_rx.recv_timeout(6 s)`; then let
 the process exit. The timeout bounds the case where the controller is stuck in a modal dialog.
@@ -516,8 +350,7 @@ loop:
   sys.sleep(POLL_INTERVAL)
 ```
 `Probe::Listening` (a bare TCP connect, https URLs only) counts as Ready because core's `ureq` has no TLS — until #374 swaps it for a CA-verified GET. Cost: no 401 detection over https meanwhile (R15).
-`classify_early_exit(code, log_tail)`: log tail contains `already in use` → `PortTaken`, else `Crashed`.
-(The TOCTOU window between `free_port()` and the child's bind is closed by this retry.)
+`classify_early_exit` is removed with the port retry (§11): a busy bind is an ordinary `SessionExited` with the log tail.
 
 ### 4.8 Webview navigation
 - Window `main` starts on the local page (`WebviewUrl::App("index.html")`).
@@ -529,8 +362,7 @@ loop:
   anything else (`file:`, `data:`, `javascript:` …) → Block.
 - `on_new_window(url, _)` → same classifier, but Allow is treated as OpenExternal; always
   `NewWindowResponse::Deny` (no popups inside the app).
-- (amended #377, in-window since 0.24) Reserved URL `peakbot-desktop:settings` → `NavDecision::OpenSettings` (wins over the allowed backend origin): the navigation/new-window is blocked and `window::request_settings_page` navigates the SAME `main` window to `WebviewUrl::App("settings.html")` (show + unminimize + focus) — there is no second settings window (spec §9.10). Entry points: tray / macOS PeakBot submenu item `settings` (macOS accelerator `CmdOrCtrl+Shift+S`), the main window's init-script `keydown` (Ctrl/Cmd+Shift+S → `location.href = sentinel`, works on every origin incl. the remote UI, no IPC), a status-page footer link, and the SPA's `Desktop app settings ↗` link. `request_settings_page` spawns on the async runtime — never navigate from inside a nav/menu callback. The page's `← Back to PeakBot` sends `act` "back": the `main` window navigates back to the live backend URL the phase machine last set (`UiState.backend_url`), or the status page while not Ready.
-- (0.24, spec §8.4) Reserved URL `peakbot-desktop:restart` → `NavDecision::Restart` (wins over the allowed backend origin): the navigation is blocked and the glue sends `Action::Restart` to the controller (session child relaunch / service reinstall — never the desktop app). Every other `peakbot-desktop:` URL stays `Block`.
+- (amended #377, in-window since 0.24) Reserved URL `peakbot-desktop:restart` → `NavDecision::Restart` (wins over the allowed backend origin): the navigation is blocked and the glue sends `Action::Restart` to the controller (session child relaunch — never the desktop app). Every other `peakbot-desktop:` URL stays `Block`.
 
 ### 4.9 Environment for every sidecar invocation
 `sanitize_env(parent)` (pure): if `APPDIR` is set, drop `APPDIR, APPIMAGE, ARGV0, OWD`; for
@@ -547,65 +379,6 @@ short-lived commands add `PEAKBOT_NO_OPEN=1` only.
 First statement of `main()` (before any thread): if Linux and `WEBKIT_DISABLE_DMABUF_RENDERER` is
 unset → set it to `1` (`unsafe { std::env::set_var }`, edition 2024). Decision fn
 `core::env::webkit_dmabuf_default(existing: Option<&OsStr>) -> Option<(&'static str, &'static str)>`.
-
-### 4.11 Saving settings (`Action::SaveSettings`) — amendment #377
-> **Superseded by §11 (0.24 config).** `settings.json`, `SaveRequest`, the web-token file and `Action::SaveSettings` are gone.
-
-
-**`SaveSettings(new)`** (controller thread; ignored while `Starting`, like its siblings):
-```
-current = load_settings(read(settings_file))
-new == current                       → return (nothing to apply; no dialog)
-service_mode = self.service is Some(Installed(_))
-confirm(service_mode ? settings_reinstall_dialog() : settings_relaunch_dialog())
-    Cancel                           → return (nothing written, nothing stopped)
-write_private(settings_file, render_settings_file(new))
-    Err(e)                           → message(save_failed_dialog(path, e)); return
-service_mode ? reconfigure_service() : handle_start()
-```
-- **Session = `handle_start()`.** The existing, fully tested "stop child → reap → version →
-  status → plan → launch" path; the plan is `Session` (no service installed) →
-  LAUNCH_SESSION with the new settings.
-- **Write-then-apply.** The file is the desired state. If the apply fails, the app ends in
-  `Failed(…)` with Retry/Reinstall, and both of those re-apply the new file. No rollback
-  machinery.
-
-**LAUNCH_SESSION (changes only):**
-```
-s = settings(); token = sync_token(s)           // once, before the port loop
-spawn args = session_args(port, s)              // ["--bind","{bind_host}:{port}"] + ["--tls"]?
-      env  = session_env(token.as_ref())        // [("PEAKBOT_WEB_TOKEN",t)]? + ("PEAKBOT_NO_OPEN","1")
-Session { child, port, protocol: s.protocol(), token }  →  Mode::Session{port, protocol, token}
-wait_ready(mode.probe_url())  // https ⇒ Listening counts as Ready
-```
-`sync_token(s) -> Option<Token>` (private; replaces `ensure_token`):
-- `s.token()`: if `Token::parse(read(web-token))` is `Some(t)` → `Some(t)`; else generate →
-  `write_private` (0600) → `Some(new)`. A write error logs a warning and still returns
-  `Some(new)` — the session uses the env token.
-- `!s.token()`: `remove(web-token)`; an error logs a warning → `None`.
-
-**Service flows** (all use `service_install_args(settings())`):
-- **`reconfigure_service()`** (SaveSettings in service mode). The binary is NOT replaced, so
-  a kept older/newer installed version stays as it is:
-  ```
-  Starting(RemovingService):   run service uninstall            (non-zero tolerated)
-  Starting(InstallingService): sync_token(s)
-                               run service install --bind {host}:7823 [--tls]   non-zero → Failed(ServiceCommandFailed)
-  refresh_service(); connect_service(false)
-  ```
-  Ordering matters: `sync_token` runs before `service install` — a remote plan needs the
-  file (the backend's `build_plan_for_install` reads it); token off removes the file before
-  the restarted service reads it.
-- **`replace_service()`**: unchanged except `ensure_token(None)` → `sync_token(settings())`
-  and the new args.
-- **`enable_background()`**: unchanged except `ensure_token(session_token)` →
-  `sync_token(settings())` and the new args (the `preferred` parameter is deleted); the
-  session already uses the file token, so the webview token stays stable across the switch
-  with no extra code.
-- **`connect_service(start_first)`**: `protocol = Https` iff
-  `self.service == Some(Installed{tls: true, ..})`, else `Http` (the `TLS:` status line,
-  invariant I3 — never `settings.json`); the token is still read-only from the file (never
-  generated); `start_first` uses `service_install_args(settings())`.
 
 ### 4.12 Font isolation (bundled CBDT emoji, AppImage only)
 
@@ -681,13 +454,9 @@ pub trait Sys: Send {
     fn run(&self, program: &Path, args: &[&str]) -> std::io::Result<RunOutput>; // RUN_TIMEOUT; NotFound if program missing
     fn spawn(&self, spec: SpawnSpec) -> std::io::Result<Box<dyn Child>>;
     fn probe(&self, url: &url::Url) -> Probe;                 // GET, PROBE_TIMEOUT, no redirects followed
-    fn free_port(&self) -> std::io::Result<u16>;              // bind 127.0.0.1:0, read port, drop
-    fn port_is_free(&self, port: u16) -> bool;                // bind 127.0.0.1:port succeeds
-    fn random_token(&self) -> Token;
     fn read(&self, path: &Path) -> std::io::Result<Option<String>>;  // Ok(None) if NotFound
     fn write_private(&self, path: &Path, contents: &str) -> std::io::Result<()>; // mkdir -p, tmp+rename, 0600
     fn remove(&self, path: &Path) -> std::io::Result<()>;     // NotFound = Ok
-    fn exists(&self, path: &Path) -> bool;
     fn cmdline_of(&self, pid: u32) -> Option<String>;         // `ps -o command= -p <pid>`; None if not alive
     fn signal(&self, pid: u32, sig: Signal);
     fn sleep(&self, d: Duration);
@@ -707,19 +476,9 @@ piped and drained on two reader threads, `try_wait` poll until `RUN_TIMEOUT` the
 pub fn parse_version_output(stdout: &str) -> Option<semver::Version>;
 // service
 pub fn status_args() -> [&'static str; 2];            // ["service","status"]
-pub fn service_install_args(s: Settings) -> Vec<String>;   // ["service","install","--bind","{host}:7823"] + ["--tls"]? (amended #377)
 pub fn service_uninstall_args() -> [&'static str; 2]; // ["service","uninstall"]
-pub fn install_args() -> [&'static str; 1];           // ["install"]
-pub fn parse_service_status(out: &RunOutput) -> ServiceState;
-pub fn plan_launch(state: &ServiceState, version_of: impl FnOnce(&InstalledService) -> InstalledVersion,
-                   bundled: &semver::Version, declined: Option<&DeclinedReplace>) -> LaunchPlan;
-pub fn replace_dialog(installed: &InstalledVersion, bundled: &semver::Version) -> Dialog;
-pub fn enable_dialog() -> Dialog; pub fn disable_dialog() -> Dialog;
-pub fn finish_setup_dialog() -> Dialog; pub fn port_busy_dialog() -> Dialog;
-pub fn command_failed_dialog(command: &str, output: &str) -> Dialog;
-pub fn service_log_hint() -> &'static str;            // per target_os
-pub fn settings_relaunch_dialog() -> Dialog; pub fn settings_reinstall_dialog() -> Dialog;   // #377
-pub fn save_failed_dialog(path: &Path, err: &str) -> Dialog;
+pub fn is_service_installed(out: &RunOutput) -> bool;  // exit 0 AND a trimmed line `Installed: true` (any State)
+pub fn remove_old_service_dialog() -> Dialog;          // shown on start when is_service_installed
 // session
 pub fn session_args(port: u16, s: Settings) -> Vec<String>;        // ["--bind", "{bind_host}:<port>"] + ["--tls"]? (amended #377)
 pub fn session_env(token: Option<&Token>) -> Vec<(String,String)>; // [("PEAKBOT_WEB_TOKEN",tok)]? + ("PEAKBOT_NO_OPEN","1")
@@ -732,52 +491,52 @@ pub fn tail_lines(text: &str, n: usize) -> String;
 // ready
 pub enum ReadyOutcome { Ready, ChildExited(Option<i32>), Timeout, TokenRejected, Cancelled }
 pub fn wait_ready(sys: &impl Sys, url: &url::Url, timeout: Duration,
-                  child: Option<&mut dyn Child>, quitting: &AtomicBool) -> ReadyOutcome;
+                  child: &mut dyn Child, quitting: &AtomicBool) -> ReadyOutcome;
 // env / nav / paths
 pub fn sanitize_env(parent: impl IntoIterator<Item=(OsString,OsString)>) -> Vec<(OsString,OsString)>;
 pub fn webkit_dmabuf_default(existing: Option<&OsStr>) -> Option<(&'static str, &'static str)>;
-pub enum NavDecision { Allow, OpenExternal, OpenSettings, Block }   // OpenSettings: #377
+pub enum NavDecision { Allow, OpenExternal, Block }
 pub fn classify_navigation(url: &url::Url, backend_origin: Option<&str>) -> NavDecision;
 // phase
 pub fn status_view(phase: &Phase) -> StatusView;
-pub fn tray_model(phase: &Phase, service: Option<&ServiceState>, bundled: Option<&semver::Version>) -> TrayModel;
+pub fn tray_status(phase: &Phase, bundled: Option<&semver::Version>) -> String;
+pub fn close_app_dialog() -> Dialog;
 ```
 
-**`parse_service_status` contract** (input = stdout of peakbot's `print_service_report`, pinned by backend task B5):
-non-zero exit → `Unavailable{reason: first non-empty line of stderr, else stdout, else "service status failed"}`;
-line `Installed: true` → Installed, `Installed: false` → NotInstalled, missing → `Unavailable{"unrecognised service status output"}`;
-`Exec:   <path>` (value trimmed) → `exe`; `State: running|stopped|unknown` → RunState (missing/other → Unknown); `TLS:       on` → `tls = true`, `off`/missing → false (#375/#377).
+**`is_service_installed`** (input = `RunOutput` of `service status`): true iff exit code is 0 AND a
+trimmed line equals `Installed: true` (any `State:` — running or stopped); non-zero exit or missing
+`Installed:` line (or `Installed: false`) ⇒ false. `service status` is never run on Windows.
 
-**Dialog texts** (locked; `{b}` bundled, `{i}` installed or `an unknown version`):
-- replace: title `Replace PeakBot background service?`; body `A PeakBot background service ({i}) is already installed. This app includes PeakBot {b}.\n\nReplace the service with {b}? This also replaces ~/.local/bin/peakbot (your "peakbot" command).` + if Known(i) > b: `\n\nWarning: {b} is OLDER than the installed {i}.`; ok `Replace`, cancel `Keep {i}` (Unknown → `Keep current`).
-- enable: `Keep PeakBot running in background?` / `PeakBot will be installed to ~/.local/bin/peakbot and start automatically when you log in. It keeps running after you close this window.` / `Enable` / `Cancel`.
-- disable: `Remove background service?` / `PeakBot will stop running in the background and will only run while this window is open. ~/.local/bin/peakbot and your settings are kept.` / `Remove` / `Cancel`.
-- finish setup: `Finish setup first` / `Complete the PeakBot setup in this window, then enable background mode.` / `OK`.
-- port busy: `Port 7823 is busy` / `Another program (maybe a PeakBot started from a terminal) is using 127.0.0.1:7823. Stop it and try again.` / `OK`.
-- command failed: `Background service error` / `$ {command}\n{output}` / `OK`.
-- settings relaunch (#377): `Apply settings?` / `PeakBot will restart with the new settings. Conversations that are running now will be interrupted.` / `Restart` / `Cancel`.
-- settings reinstall (#377): `Apply settings?` / `The background service will be reinstalled with the new settings and restarted. Conversations that are running now will be interrupted.` / `Reinstall` / `Cancel`.
-- save failed (#377): `Couldn't save settings` / `{path}\n{err}` / `OK`.
+**Dialog texts** (locked; asserted verbatim by tests):
+- close (shown on window close when no tray host): title `Close PeakBot?` · body `Closing PeakBot
+will stop the server and any running jobs. Close anyway?` · ok `Close PeakBot` · cancel `Cancel`.
+- migration (shown on start when an old service is installed): title `Remove the old background
+service?` · body `PeakBot Desktop now runs PeakBot itself and keeps it running while the app is
+open. The old background service would conflict with it.\n\nYour settings, conversations and the
+peakbot command are kept.` · ok `Remove service` · cancel `Not now`.
+- declined view (`StartError::ServiceInstalled`, shown after `Not now`): title `The old PeakBot
+background service is still installed` · detail `PeakBot Desktop can't start PeakBot while it is
+installed. Press Retry to be asked again, or remove it yourself:\n\npeakbot service uninstall` ·
+actions [Retry, Quit].
 
 ### 5.3 Controller
 ```rust
 pub trait Ui: Send {
-    fn phase_changed(&self, phase: &Phase, tray: &TrayModel);
+    fn phase_changed(&self, phase: &Phase, tray_status: &str);
     fn confirm(&self, d: &Dialog) -> bool;  // ok → true
-    fn message(&self, d: &Dialog);
 }
-pub struct Controller<S: Sys, U: Ui> { /* sys, ui, paths, quitting, phase, bundled: Option<Version>,
-                                          service: Option<ServiceState>, session: Option<Session{child,port,token}> */ }
+pub struct Controller<S: Sys, U: Ui> { /* sys, ui, paths, quitting, platform, phase,
+                                          bundled: Option<Version>, session: Option<Session{child,port,token}> */ }
 impl<S: Sys, U: Ui> Controller<S, U> {
-    pub fn new(sys: S, ui: U, paths: DesktopPaths, quitting: Arc<AtomicBool>) -> Self; // phase = Starting(CheckingBundled)
+    pub fn new(sys: S, ui: U, paths: DesktopPaths, quitting: Arc<AtomicBool>, platform: Platform) -> Self; // phase = Starting(CheckingBundled)
     pub fn handle(&mut self, action: Action) -> std::ops::ControlFlow<()>;            // Break after Shutdown
     pub fn tick(&mut self);
     pub fn phase(&self) -> &Phase;
 }
 pub fn run_loop<S: Sys, U: Ui>(ctrl: Controller<S, U>, rx: std::sync::mpsc::Receiver<Action>);
 ```
-Every phase assignment goes through one private `set_phase(p)` which calls `ui.phase_changed(&p, &tray_model(..))`.
-Same for every `service` refresh (so the tray checkbox always mirrors the last `service status`).
+Every phase assignment goes through one private `set_phase(p)` which calls
+`ui.phase_changed(&p, tray_status)`.
 
 ### 5.4 Tauri glue (`src-tauri`)
 
@@ -791,69 +550,70 @@ fn main() {
     //      .plugin(tauri_plugin_window_state::Builder::default().build())
     //      .plugin(tauri_plugin_opener::init())
     //      .plugin(tauri_plugin_dialog::init())
-    //      .invoke_handler(tauri::generate_handler![commands::status, commands::act, commands::settings_get, commands::settings_set])
+    //      .invoke_handler(tauri::generate_handler![commands::status, commands::act, commands::theme_set, commands::theme_get])
     //      .setup(|app| { paths; window::create_main; tray::create; spawn controller thread; send Action::Start })
     //      .build(ctx)?.run(|app, ev| match ev { RunEvent::Exit => shutdown(app), RunEvent::Reopen{..} => focus_main, _ => {} })
 }
 ```
-- `window.rs`: `create_main(app, nav: Arc<RwLock<Option<String>>>)` — label `main`, title `PeakBot`, 1200×800, min 800×500, `WebviewUrl::App("index.html")`, `.on_navigation(...)`, `.on_new_window(...)`; `CloseRequested` → `app.exit(0)` (closing the window quits the app on every OS). `focus_main(app)` = show + unminimize + set_focus.
-- `tray.rs`: `create(app)` builds menu; `apply(app, &TrayModel)` updates text/checked/enabled (always re-applied after a click because muda auto-toggles check items). On macOS the same submenu `PeakBot` is appended to `Menu::default(app)` as the app menu.
+- `window.rs`: `create_main(app, nav: Arc<RwLock<Option<String>>>)` — label `main`, title `PeakBot`, 1200×800, min 800×500, `WebviewUrl::App("index.html")`, `.on_navigation(...)`, `.on_new_window(...)`; `CloseRequested`: closing the window **never quits** — `api.prevent_close()`, then: tray visible (`tray::is_visible(&app)`) → `win.hide()`; otherwise a non-blocking confirm `close_app_dialog()` parented to the window (never `blocking_show` here — main thread ⇒ deadlock): OK → `app.exit(0)` → `RunEvent::Exit` → `Shutdown`; Cancel → nothing. `focus_main(app)` = show + unminimize + set_focus.
+- `tray.rs`: `create(app)` builds menu (status item stored on `UiState.tray_status_item`); `apply(app, status)` updates the status text. `is_visible(app)` = icon created AND (Linux) `NameHasOwner("org.kde.StatusNotifierWatcher")` via `gio` D-Bus, 500 ms timeout, any error ⇒ false (macOS/Windows: icon created suffices). Left-click: macOS/Linux → show menu; Windows → `focus_main` (`show_menu_on_left_click(!cfg!(windows))`). Quit label **`Quit PeakBot`** (no confirm). Menu: status (disabled), sep, `Open PeakBot`, `Open logs folder`, sep, `Quit PeakBot`. On macOS the same submenu `PeakBot` is appended to `Menu::default(app)` as the app menu.
 - `menu.rs` (macOS only, issue #373): `app_menu(app)` is the Tauri default menu **minus "Close Window"** (File submenu dropped, Window = minimize/maximize only), with the `PeakBot` app submenu (ids as above) first; set via `builder.menu(menu::app_menu)` in `main.rs` so Cmd+W reaches the page and the in-app tab bar closes a conversation tab instead of quitting. Never on Linux (no GTK menubar).
-- `bridge.rs`: `struct TauriUi { app: AppHandle, snapshot: Arc<Mutex<StatusView>>, nav: Arc<RwLock<Option<String>>> }` implements `core::Ui` — dialogs via `app.dialog().message(..).title(..).buttons(MessageDialogButtons::OkCancelCustom(ok,cancel) | OkCustom(ok)).blocking_show()`; `phase_changed` updates snapshot, nav origin, navigates, `tray::apply`.
+- `bridge.rs`: `struct TauriUi { app, snapshot, nav, tray_status_item: Mutex<Option<MenuItem<Wry>>>, theme: Mutex<Option<Theme>> }` implements `core::Ui` — controller-thread dialogs via `bridge::native_dialog(app, d)` (OkCancelCustom/OkCustom mapping).`blocking_show()` (legal off the main thread); window-parented confirms use `.show()` (non-blocking). `phase_changed` updates snapshot, nav origin (`target.url_base()`), navigates (`target.url()`), `tray::apply`.
 - `commands.rs`:
   ```rust
   #[tauri::command] fn status(state: State<Snapshot>) -> StatusView;
   #[tauri::command] fn act(action: UiAction, app: AppHandle, tx: State<ActionTx>) -> Result<(), String>;
-  // Retry→Action::Start, ReinstallService→Action::ReinstallService, OpenLogs→opener.open_path(log_dir), Quit→app.exit(0),
-  // ToggleBackground→Action::ToggleBackground (#377)
-  #[tauri::command] fn settings_get(state: State<UiState>, paths: State<DesktopPaths>) -> SettingsView;   // read-only file + tray/status snapshot (#377)
-  #[tauri::command] fn settings_set(settings: SettingsWire, tx: State<ActionTx>) -> Result<(), String>;   // Settings::try_from → Action::SaveSettings; error text returned verbatim
+  // Retry→Action::Start, OpenLogs→opener.open_path(log_dir), Quit→app.exit(0)
+  #[tauri::command] fn theme_set(state: State<UiState>, t: Theme) -> Result<(), String>;   // web UI reports its theme; core validates
+  #[tauri::command] fn theme_get(state: State<UiState>) -> Option<Theme>;                 // bundled pages read it (theme.js)
   ```
 
 **Tray / macOS submenu items (ids locked):**
 
 | id | kind | label | behaviour |
 |---|---|---|---|
-| `status` | text, disabled | `TrayModel.status` | – |
-| `open` | text | `Open PeakBot` | `focus_main` |
-| `settings` | text | `Settings…` (macOS submenu: accelerator `CmdOrCtrl+Shift+S`) | `window::request_settings` (#377) |
+| `status` | text, disabled | `tray_status` (`PeakBot {v} · starting…` / `· running (port N)` / `· error`) | – |
 | — | separator | | |
-| `background` | check | `TrayModel.background_label` | `Action::ToggleBackground` |
+| `open` | text | `Open PeakBot` | `focus_main` |
 | `logs` | text | `Open logs folder` | opener `open_path(log_dir)` |
 | — | separator | | |
-| `quit` | text | `Quit PeakBot Desktop` | `app.exit(0)` |
+| `quit` | text | `Quit PeakBot` | `app.exit(0)` (graceful shutdown; no confirm) |
 
-Tray icon = `app.default_window_icon()`; tooltip `PeakBot`. Left-click on Linux shows the menu (appindicator); on macOS shows the menu.
+Tray icon = `app.default_window_icon()`; tooltip `PeakBot`. Left-click: macOS/Linux → show menu;
+Windows → `focus_main`.
 
 **`build.rs`** (command ACL — makes app commands require explicit permission):
 ```rust
 tauri_build::try_build(tauri_build::Attributes::new()
-    .app_manifest(tauri_build::AppManifest::new().commands(&["status", "act", "settings_get", "settings_set"])))
+    .app_manifest(tauri_build::AppManifest::new().commands(&["status", "act", "theme_set", "theme_get"])))
 ```
-**`capabilities/status-page.json`**:
+**`capabilities/local-pages.json`** (window `main`, bundled origin only; no `remote` key):
 ```json
 { "$schema": "../gen/schemas/desktop-schema.json",
-  "identifier": "status-page",
-  "description": "Bundled local status page only. No remote origins, ever.",
+  "identifier": "local-pages",
+  "description": "Bundled local pages of the main window (status page). No remote origins, ever.",
   "windows": ["main"],
-  "permissions": ["allow-status", "allow-act"] }
+  "permissions": ["allow-status", "allow-act", "allow-theme-get"] }
 ```
-**`capabilities/settings-page.json`** (#377):
+**`capabilities/remote-theme.json`** (#376, §12 — renamed from `desktop-pane.json`):
 ```json
 { "$schema": "../gen/schemas/desktop-schema.json",
-  "identifier": "settings-page",
-  "description": "Bundled local settings window only. No remote origins, ever.",
-  "windows": ["settings"],
-  "permissions": ["allow-settings-get", "allow-settings-set", "allow-act"] }
+  "identifier": "remote-theme",
+  "description": "The PeakBot web UI on the default loopback backend: report its theme only. Nothing else, ever.",
+  "local": false,
+  "windows": ["main"],
+  "remote": { "urls": ["http://127.0.0.1:7823/*", "https://127.0.0.1:7823/*", "http://localhost:7823/*", "https://localhost:7823/*"] },
+  "permissions": ["allow-theme-set"] }
 ```
-No `remote` key ⇒ the capabilities apply to the bundled origin only; the PeakBot web UI origin
-(`http(s)://127.0.0.1:*`) has **zero** permissions (no core, no plugins, no app commands).
+No `remote` key on `local-pages` ⇒ it applies to the bundled origin only; the PeakBot web UI origin
+(`http(s)://127.0.0.1:*`) gets **only** `theme_set` via `remote-theme` (§12) — no core, no plugins,
+no other app commands.
 
 | Command | Granted to | Capability file |
 |---|---|---|
-| `status`, `act` | window `main`, local origin | `status-page.json` |
-| `settings_get`, `settings_set`, `act` | window `settings`, local origin | `settings-page.json` |
-| anything | remote PeakBot origin | none |
+| `status`, `act`, `theme_get` | window `main`, local origin | `local-pages.json` |
+| `theme_set` | window `main`, remote loopback :7823 origin | `remote-theme.json` |
+| anything else | remote PeakBot origin | none |
 
 **`tauri.conf.json`** (locked keys):
 ```json
@@ -868,7 +628,7 @@ No `remote` key ⇒ the capabilities apply to the bundled origin only; the PeakB
     "withGlobalTauri": true,
     "security": {
       "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:",
-      "capabilities": ["status-page", "settings-page"]
+      "capabilities": ["local-pages", "remote-theme"]
     }
   },
   "bundle": {
@@ -887,7 +647,7 @@ No `remote` key ⇒ the capabilities apply to the bundled origin only; the PeakB
 - No `devUrl`, no `beforeDevCommand`/`beforeBuildCommand` (nothing to build for the UI).
 - `windows: []` because the window must be built in Rust to attach `on_navigation`/`on_new_window`.
 - `capabilities` lists every capability file explicitly — **a capability file missing from this list is silently inactive** (#377).
-- `withGlobalTauri: true` so `status.js` / `settings.js` can call `window.__TAURI__.core.invoke` with no build step. The object is also visible on the remote page but inert (ACL denies everything) — verified in the manual checklist.
+- `withGlobalTauri: true` so `status.js` / `theme.js` can call `window.__TAURI__.core.invoke` with no build step. The object is also visible on the remote page but inert (ACL denies everything except `theme_set`) — verified in the manual checklist.
 
 **Custom-protocol (devUrl vs embedded) — addressed:** tauri's build script sets `cfg(dev)` iff the
 `tauri/custom-protocol` feature is OFF. `tauri build` (Linux) enables it automatically. The macOS
@@ -946,26 +706,14 @@ Tauri CLI: `npx --yes @tauri-apps/cli@2.12.3` (no `package.json`; pinned on the 
 ### 5.6 Status page (`ui/`)
 `index.html`: `<!-- peakbot-desktop-status-page -->`, inline `<style>`, elements
 `#title`, `#detail` (`<pre>`, hidden when null), `#spinner` (shown iff kind ≠ failed), `#actions`
-(container), `<script src="status.js">`. Dark/light via `prefers-color-scheme`. No external resources.
+(container), `<script src="theme.js">` (last child of `<head>`, CSP `script-src 'self'`; applies
+`:root.light` from `theme_get`, falling back to `prefers-color-scheme` until a theme is reported —
+§12), `<script src="status.js">`. Dark by default, `:root.light` overrides. No external resources.
+There is **no settings page** and no settings footer link (removed with the background mode).
 `status.js` (≈40 lines): every 500 ms `invoke('status')` → render; buttons from `actions` with
-labels `Retry`, `Open logs`, `Reinstall background service`, `Quit`; click →
-`invoke('act', { action: 'retry' | 'open_logs' | 'reinstall_service' | 'quit' })`. If
-`window.__TAURI__` is missing, render "Internal error: no Tauri API". (#377) A footer link
-`<a href="peakbot-desktop:settings">Settings (Ctrl+Shift+S)</a>` opens the settings window through the nav guard (no IPC).
-
-**Settings page (#377)** — `settings.html` (copies the `:root` theme block of `index.html`; two static pages, no shared CSS) + `settings.js` (no build step):
-```
-Protocol      (•) HTTP  ( ) HTTPS        #protocol-note (HTTPS only): "PeakBot uses its own certificate. The app window may
-                                          show a certificate warning until that certificate is trusted; browsers and phones
-                                          work after you accept it once."
-Access token  [x] Require access token   #token-note: on → "Stored in {web_token_path}"
-                                                       off → "Without a token, any program or web page on this computer can control PeakBot."
-Remote access [ ] Allow other devices    "Listens on all network interfaces. Requires HTTPS and the access token."
-<p id="error" role="alert">  <p id="state">  [Save]
----
-Background    [ ] Keep PeakBot running in background   "Applies immediately."
-```
-Lifecycle: `settings_get` on start, then polled every 1000 ms (refreshes `saved`, the background row and `busy`; **never overwrites a dirty form**). Remote on ⇒ force HTTPS + token on and disable both controls (UX only — core validates); off ⇒ re-enable, keeping values. Save is enabled iff `dirty && !busy` → `settings_set`; `Err(msg)` is shown verbatim in `#error`, `Ok` shows `Applying…` until the file reflects the values. The background checkbox is enabled iff `background_enabled && !dirty && !busy` → `toggle_background` (§12); the existing enable/disable dialogs and flows run unchanged.
+labels `Retry`, `Open logs`, `Quit`; click →
+`invoke('act', { action: 'retry' | 'open_logs' | 'quit' })`. If
+`window.__TAURI__` is missing, render "Internal error: no Tauri API".
 
 ### 5.7 Build contracts
 - **Sidecar into `binaries/`:** `build-desktop.sh` first builds peakbot with the *existing*
@@ -1089,7 +837,7 @@ optional `rm ~/.local/bin/peakbot`, `rm -r ~/.local/share/com.peakbot.desktop`; 
 macOS: `~/.local/bin/peakbot service uninstall` (or `launchctl bootout gui/$(id -u)/com.peakbot.agent; rm ~/Library/LaunchAgents/com.peakbot.agent.plist`);
 optional `rm ~/.local/bin/peakbot`, `rm -r ~/Library/Application\ Support/com.peakbot.desktop ~/Library/Logs/com.peakbot.desktop`.
 First launch on macOS: `xattr -dr com.apple.quarantine "/Applications/PeakBot Desktop.app"` (unsigned build).
-Note: "Before deleting the app, untick *Keep PeakBot running in background* if you don't want PeakBot to keep running."
+Note: quit PeakBot (tray **Quit PeakBot** / Cmd+Q) before deleting the app; the server stops with it.
 
 ---
 
@@ -1098,29 +846,23 @@ Note: "Before deleting the app, untick *Keep PeakBot running in background* if y
 | Decision | Chosen | Rejected | Why |
 |---|---|---|---|
 | UI delivery | navigate webview to `http://127.0.0.1:<port>/?token=` | bundle web/ into Tauri | Researcher: UI is strictly same-origin; zero frontend/CORS changes. |
-| Mode storage | derived from `service status` | settings file | Single source of truth; CLI changes are reflected automatically. (#377: `settings.json` stores launch *parameters* only, never mode.) |
+| Mode storage | derived from `peakbot service status` (migration detection only) | settings file | Single source of truth; the app keeps no mode state at all. |
 | Sidecar spawning | `std::process::Command` | tauri-plugin-shell | Need SIGINT, env control, no JS surface. `externalBin` bundling works without the plugin. |
 | Token delivery | `PEAKBOT_WEB_TOKEN` env | `--token` argv | Human decision 1; argv is visible in `ps`. |
-| Service token | desktop writes `web-token` 0600 itself | `service install --token` | Same file peakbot reads; keeps the secret out of argv. |
-| Installed-service version | `<Exec> --version` | `/api/setup` exe_path | Works when service is stopped/broken/tokenless; no extra HTTP contract (§4.4). |
-| Replace | `service uninstall` → `install` → `service install` | re-run `service install` | `enable --now` doesn't restart a running unit (old binary would keep running). |
 | Session port | 7824 if free, else random | always random | Researcher: `--bind :0` unusable; stable origin keeps webview localStorage/cookies across launches. |
 | Port race | retry ≤3 on "already in use" | lock/handshake | Backend exits 1 with that message (Researcher) — cheap, deterministic. |
 | Orphan handling | pidfile reaper on next launch | PR_SET_PDEATHSIG | Portable, one mechanism; PDEATHSIG is Linux-only and thread-lifetime-subtle. |
+| Shutdown signals | SIGINT/SIGTERM → graceful shutdown (same pipe) | PDEATHSIG; Windows Job Object | Covers Linux logout and `kill`; crash/SIGKILL is covered by the reaper (R11). |
 | Logic placement | separate `core` crate | `src-tauri/src/core` module | tauri-build fails without the sidecar file and needs webkit; `core` tests run in the existing `rust:1.95` CI container. |
 | Concurrency | one controller thread + channel | async tasks + Mutex | Child process + phase have one owner; no locks; blocking dialogs are legal there. |
 | Readiness | `GET /commands?token=` 200 | parse stdout URL | Researcher-verified; 401 distinguishes "wrong server/token". |
 | macOS arch | universal zip | per-arch zips | One download; mirrors existing `peakbot-macos-universal2`; zigbuild `universal2` already proven in `Dockerfile.macos`. |
 | macOS min OS | 11.0 | 13.0 (spike) | Matches the SDK 11.3 in the zigbuild image and widens reach; Tauri needs ≥10.15. Untested either way (R1). |
 | macOS bundling | hand-assembled `.app` + rcodesign ad-hoc | Tauri bundler | Tauri CLI cannot bundle `.app` on Linux (Researcher); no mac runner. |
-| Window close | quits the app (all OSes) | hide to tray | Session lifetime = window lifetime is the least surprising; service mode keeps running by design. |
+| Window close | hide to tray; quit only via tray **Quit PeakBot** / Cmd+Q; confirm when there is no tray host | quits the app on ✕ | The server keeps running while the window is hidden (the app is the server's owner); a no-tray Linux desktop has no way to get the app back, so ✕ asks first (R6). |
+| Background service | removed; the app owns a session sidecar only | keep the systemd/launchd service mode | One owner, one process: a second backend on the same config/DB was the source of conflicts (R8). The old service is offered for removal at start; the `peakbot` command and settings are kept. |
 | Linux menu | tray only | in-window menubar | Menubar costs UI space on every launch for a GNOME-without-appindicator edge case (R6). |
 | Remote page IPC | none (ACL) + `withGlobalTauri` | `__TAURI_INTERNALS__` hack | Stable API, no build step; remote calls are denied by capabilities. |
-| Token on/off (#377, T1) | "token on" ⇔ `web-token` file exists; the session uses the file's token | fresh env token every launch, env unset for "off" | The backend token chain is flag > env > **file**, so "off" silently does nothing while the file exists (always true after background mode was used once). A rotating, never-shown remote token is useless for a phone. Cost: tokens no longer rotate per launch (R12 amended); the first launch creates `web-token`. |
-| Settings model (#377, T2) | `Settings` sum type + `TryFrom<SettingsWire>` at the IPC edge | 3 bools + `validate()` in the controller | Illegal states are unrepresentable; one check, at the edge. |
-| https readiness (#377, T3) | `Probe::Listening` (TCP connect) | real TLS GET now | Core `ureq` has no TLS, so every https probe would be `Unreachable` and every HTTPS launch would die after 30 s. A TCP connect needs no deps and sends no token to an unverified peer; #374 replaces it with a CA-verified GET. |
-| Service protocol (#377, T4) | from the `TLS:` status line | from `settings.json` | Facts come from peakbot (§1); a CLI-modified service still connects. |
-| Settings shortcut (#377, T8) | macOS accelerator + init-script keydown → reserved URL | global-shortcut plugin; Linux menubar; IPC from the remote origin | Global grabs surprise users and break on Wayland; a menubar was rejected (R6); remote IPC would break I6. A reserved URL needs zero permissions. |
 | Build entry | `build-desktop.sh` called by Make AND CI | Make in CI | Runner image tooling unknown; script needs only `sh` + docker. Smoke runs inside build images (all tools present). |
 
 ---
@@ -1178,20 +920,18 @@ Order matters: T-tasks (tests) precede the C-tasks they cover (RED → GREEN).
 - **R3 macOS GUI PATH.** Apps launched from Finder get a minimal PATH (`/usr/bin:/bin:/usr/sbin:/sbin`); the agent's shell tools (Homebrew) may be missing in session mode. The launchd service has the same pre-existing limitation. Checklist MAC10 verifies; if confirmed, add login-shell PATH resolution before spawn (e.g. `fix-path-env`) as a follow-up.
 - **R4 Tauri on zigbuild universal2** might fail (objc/framework linking per arch). Fallback recipe is specified (two single-arch builds + `rcodesign macho-universal-create`).
 - **R5 CI disk (~25 GB)** for 4 container builds. Mitigated by `PRUNE=1`; if insufficient, split into two jobs (linux, macos) with artifacts passed between them.
-- **R6 GNOME without AppIndicator** shows no tray → no way to toggle background mode. Accepted for v1; follow-up: Linux in-window menu or a status-page link.
-- **R7 Backend-text contract.** `parse_service_status` parses CLI text; B4 pins the labels on the backend side.
-- **R8 Two backends on one config.** Session sidecar + a foreground CLI peakbot (or a declined, different-version service) can run simultaneously on the same config/DB. Pre-existing peakbot behaviour; the desktop avoids it only during its own mode switches (stop session before install).
-- **R9 Custom-bind CLI services.** A pre-existing service bound elsewhere than 127.0.0.1:7823 → `ServiceUnreachable`; "Reinstall background service" rebinds it to 7823 (desktop owns the service config). Documented in README.
+- **R6 No SNI host → ✕ asks before quitting.** On Linux desktops with no StatusNotifier/AppIndicator host (e.g. GNOME without the extension) there is no tray, so closing the window shows the `Close PeakBot?` confirm (Cancel keeps PeakBot running). XEmbed-only trays count as "no tray". Accepted; follow-up: Linux in-window menu.
+- **R7 Backend-text contract.** `is_service_installed` parses the `service status` text (`Installed: true`); B4 pins the labels on the backend side.
+- **R8 Two backends on one config.** Session sidecar + a foreground CLI peakbot (or a still-installed old service the user declined to remove) can run simultaneously on the same config/DB. Pre-existing peakbot behaviour; the desktop asks to remove an installed service on every start (§4.3) and never starts one.
 - **R10 `withGlobalTauri` on the remote page.** The API object exists there but has no permissions; checklist L11 verifies denial in a debug build.
-- **R11 Desktop killed by SIGTERM/crash** leaves the session sidecar running until the next launch (pidfile reaper). Accepted.
+- **R11 Desktop killed by SIGKILL/crash** leaves the session sidecar running until the next launch (pidfile reaper). SIGTERM/SIGINT/logout run the graceful shutdown (§4.6). Accepted; PDEATHSIG and a Windows Job Object were considered and rejected.
 - **R12 Token in `PEAKBOT_WEB_TOKEN` is inherited by agent shells** spawned by peakbot. Same trust domain (the agent can read `web-token` anyway). (Amended #377: the session now uses the persistent `web-token` file's token, T1 — tokens no longer rotate per launch.) Accepted.
-- **R13 HTTPS before #376 (#377).** The in-window view shows a certificate error until the webview trusts PeakBot's CA. Accepted; recovery: tray / macOS menu / Ctrl+Shift+S (manual M5 records whether the shortcut survives the WebKit error page) / delete `settings.json` (README).
+- **R13 HTTPS before #376 (#377).** Superseded by #376b (§13): PeakBot's CA is trusted by the OS store on macOS/Windows and by the webview on Linux.
 - **R14 `config.yaml` `web.tls: true` (#377).** The backend ORs it with `--tls`; if set while the desktop says HTTP, the session/service serves https and the desktop probes http → 30 s timeout. Pre-existing (#374 territory); the desktop cannot force http. Documented in the README.
 - **R15 No 401 detection over https (#377)** until #374 (`Listening` ≠ authenticated). The window for another TLS process answering on the port is narrow (the child-exit check runs first on each poll).
 - **R16 Origin change (#377).** Switching http↔https changes the webview origin, so the web UI's localStorage (tabs, theme) starts fresh. Accepted; conversations live server-side.
 - **R17 Behaviour change (#377, T1).** The first launch now creates `web-token`, so a terminal-launched `peakbot` starts requiring the token (it prints/opens a tokened URL, so mostly transparent). Called out in the release notes.
-- **R4b Drift (#377).** A CLI `service install` changes the service without touching `settings.json`; connecting still works (I3), the page shows the desktop's desired values, and the next Save re-applies them.
-- **R18 Token-off on loopback (#377, #378).** Without a token any local program or web page can drive the agent over `ws://127.0.0.1:<port>/ws` until Origin validation (#378) lands. The settings page says so on the token row.
+- **R18 Token-off on loopback (#377, #378).** Without a token any local program or web page can drive the agent over `ws://127.0.0.1:<port>/ws` until Origin validation (#378) lands. Set the token in `general.web.token` (PeakBot → Settings → General).
 
 **Open questions (none block Phase 0–3)**
 - **Q1 (human, before P4.4):** does the `dind` runner job (no `container:`) have `docker`, `git`, `sh`, and node for `actions/upload-artifact@v3`? If not, P4.4 adds a `container: docker:27-cli` with the docker socket — requires runner config confirmation.
@@ -1611,6 +1351,8 @@ Spec: `make-config-great-again.md` §8.4/§11.6. Supersedes §3.9, §4.11 and th
   T16: `classify_restart`, `classify_settings`, `other_sentinel_blocked` (nav.rs).
 
 ## 12. AMENDMENT (desktop pane) — scoped remote IPC + themed pages (2026-10-27)
+
+> **Superseded in part (close-to-tray, 2026-10-27):** the Settings → Desktop pane, `settings_get`, `toggle_background`, `desktop-pane.json` and the bundled settings page are removed. Remaining in force: `theme_set` (renamed `remote-theme.json`) and the themed status page. Kept below as history.
 
 The web UI's Settings gains a **Desktop** pane (MACHINE group, desktop app only) that replaces the
 `Desktop app settings ↗` link. It needs IPC from the remote origin, so invariant 6 is amended: the

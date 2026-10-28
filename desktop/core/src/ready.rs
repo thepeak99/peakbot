@@ -23,7 +23,7 @@ pub fn wait_ready(
     sys: &impl Sys,
     url: &Url,
     timeout: Duration,
-    mut child: Option<&mut dyn Child>,
+    child: &mut dyn Child,
     quitting: &AtomicBool,
 ) -> ReadyOutcome {
     use std::sync::atomic::Ordering;
@@ -33,10 +33,7 @@ pub fn wait_ready(
         if quitting.load(Ordering::Relaxed) {
             return ReadyOutcome::Cancelled;
         }
-        if let Some(exit) = child
-            .as_deref_mut()
-            .and_then(|c| c.try_wait().ok().flatten())
-        {
+        if let Some(exit) = child.try_wait().ok().flatten() {
             return ReadyOutcome::ChildExited(exit);
         }
         match sys.probe(url) {
@@ -62,6 +59,9 @@ mod tests {
     use std::sync::{Arc, atomic::AtomicBool};
     use std::time::Duration;
 
+    // Close-to-tray plan §C: `wait_ready` takes the child as a plain
+    // `&mut dyn Child` (the service mode that had no child is gone), so the
+    // tests that used to pass `None` now pass `FakeChild::never()`.
     fn probe_url() -> Url {
         Url::parse("http://127.0.0.1:7824/commands").unwrap()
     }
@@ -82,7 +82,13 @@ mod tests {
         );
         let quitting = Arc::new(AtomicBool::new(false));
         let start = sys.now();
-        let out = wait_ready(&sys, &url, READY_TIMEOUT, None, &quitting);
+        let out = wait_ready(
+            &sys,
+            &url,
+            READY_TIMEOUT,
+            &mut FakeChild::never(),
+            &quitting,
+        );
         assert_eq!(out, ReadyOutcome::Ready);
         assert_eq!(
             sys.now() - start,
@@ -99,7 +105,13 @@ mod tests {
         sys.set_probe(url.to_string().as_str(), vec![Probe::Unreachable]);
         let quitting = Arc::new(AtomicBool::new(false));
         let start = sys.now();
-        let out = wait_ready(&sys, &url, READY_TIMEOUT, None, &quitting);
+        let out = wait_ready(
+            &sys,
+            &url,
+            READY_TIMEOUT,
+            &mut FakeChild::never(),
+            &quitting,
+        );
         assert_eq!(out, ReadyOutcome::Timeout);
         let elapsed = sys.now() - start;
         assert!(
@@ -117,7 +129,13 @@ mod tests {
         sys.set_probe(url.to_string().as_str(), vec![Probe::Status(401)]);
         let quitting = Arc::new(AtomicBool::new(false));
         let start = sys.now();
-        let out = wait_ready(&sys, &url, READY_TIMEOUT, None, &quitting);
+        let out = wait_ready(
+            &sys,
+            &url,
+            READY_TIMEOUT,
+            &mut FakeChild::never(),
+            &quitting,
+        );
         assert_eq!(out, ReadyOutcome::TokenRejected);
         assert_eq!(
             sys.now() - start,
@@ -133,7 +151,13 @@ mod tests {
             vec![Probe::Status(503), Probe::Status(200)],
         );
         let quitting = Arc::new(AtomicBool::new(false));
-        let out = wait_ready(&sys, &url, READY_TIMEOUT, None, &quitting);
+        let out = wait_ready(
+            &sys,
+            &url,
+            READY_TIMEOUT,
+            &mut FakeChild::never(),
+            &quitting,
+        );
         assert_eq!(out, ReadyOutcome::Ready);
     }
 
@@ -149,7 +173,7 @@ mod tests {
             ..Default::default()
         });
         let quitting = Arc::new(AtomicBool::new(false));
-        let out = wait_ready(&sys, &url, READY_TIMEOUT, Some(&mut child), &quitting);
+        let out = wait_ready(&sys, &url, READY_TIMEOUT, &mut child, &quitting);
         assert_eq!(out, ReadyOutcome::ChildExited(Some(1)));
     }
 
@@ -159,7 +183,13 @@ mod tests {
         let sys = FakeSys::new();
         let url = probe_url();
         let quitting = Arc::new(AtomicBool::new(true));
-        let out = wait_ready(&sys, &url, READY_TIMEOUT, None, &quitting);
+        let out = wait_ready(
+            &sys,
+            &url,
+            READY_TIMEOUT,
+            &mut FakeChild::never(),
+            &quitting,
+        );
         assert_eq!(out, ReadyOutcome::Cancelled);
     }
 
@@ -176,7 +206,13 @@ mod tests {
         );
         let quitting = Arc::new(AtomicBool::new(false));
         let start = sys.now();
-        let out = wait_ready(&sys, &url, READY_TIMEOUT, None, &quitting);
+        let out = wait_ready(
+            &sys,
+            &url,
+            READY_TIMEOUT,
+            &mut FakeChild::never(),
+            &quitting,
+        );
         assert_eq!(out, ReadyOutcome::Ready, "Listening ⇒ Ready");
         assert_eq!(
             sys.now() - start,

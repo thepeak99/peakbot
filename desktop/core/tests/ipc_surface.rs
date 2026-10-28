@@ -1,47 +1,49 @@
-//! Static surface test for the scoped-remote-IPC design (desktop-pane
-//! design §5 item 3, facts F1–F3): the web UI (Settings → Desktop pane)
-//! runs on the default loopback backend and must be able to do exactly
-//! three things — read the desktop view, toggle the background service,
-//! report the theme — and NOTHING ELSE, ever.
+//! Static surface test for the scoped-remote-IPC design (close-to-tray
+//! plan §C: the web UI's desktop pane is gone — the ONLY remote IPC left
+//! is reporting the theme): the PeakBot web UI runs on the default
+//! loopback backend and must be able to do exactly ONE thing from a
+//! remote origin — `theme_set` — and NOTHING ELSE, ever.
 //!
 //! The enforcement lives in the committed Tauri files, so this test reads
 //! them as text/JSON (no Tauri, no GUI, no network, no wall-clock):
 //!
-//!   `desktop/src-tauri/capabilities/desktop-pane.json`  (new)
-//!     - `local: false` (remote capability; F3), `windows: ["main"]`
+//!   `desktop/src-tauri/capabilities/remote-theme.json`
+//!     - `local: false` (remote capability), `windows: ["main"]`
+//!     - identifier `remote-theme` (renamed from `desktop-pane`)
 //!     - remote URLs: exactly the four loopback URLPattern entries on the
-//!       desktop's fixed port (F2: `…:7823/*`, never `/**`; F5: the
-//!       desktop always opens 127.0.0.1:<port>)
-//!     - permissions: exactly `allow-settings-get`, `allow-toggle-background`,
-//!       `allow-theme-set` — never `allow-act` / `allow-status` (the
-//!       status page stays a local page; `act` carries `quit`)
+//!       desktop's fixed port (`…:7823/*`, never `/**`)
+//!     - permissions: exactly `allow-theme-set` — never `allow-act` /
+//!       `allow-status` (the status page stays a local page; `act`
+//!       carries `quit`), never the deleted `allow-settings-get` /
+//!       `allow-toggle-background`
 //!
 //!   `desktop/src-tauri/capabilities/local-pages.json`
 //!     - NO `remote` key (local-only capability)
 //!     - permissions: exactly `allow-status`, `allow-act`,
-//!       `allow-settings-get`, `allow-toggle-background`, `allow-theme-get`
-//!       (`theme_get` stays local: the bundled pages read it, the remote
-//!       web UI only ever WRITES its theme)
+//!       `allow-theme-get`
 //!
 //!   `desktop/src-tauri/tauri.conf.json`
-//!     - `app.security.capabilities == ["local-pages", "desktop-pane"]`
-//!       (F1: an unlisted capability file is silently ignored — the new
+//!     - `app.security.capabilities == ["local-pages", "remote-theme"]`
+//!       (an unlisted capability file is silently ignored — the new
 //!       file must be listed to be active)
 //!
-//!   `desktop/ui/{index.html,settings.html}` + `theme.js` + `settings.js`
-//!     - `theme.js` is loaded as the LAST child of `<head>` in both pages
-//!       (F9: CSP `script-src 'self'` — no inline scripts)
-//!     - the CSS stops keying on `prefers-color-scheme` (the theme comes
-//!       from the desktop's reported theme now)
-//!     - `theme.js` reads the theme via `invoke("theme_get")`
-//!     - `settings.js` toggles the background via the dedicated
-//!       `invoke("toggle_background")` command — never through `act`
-//!       (design D3).
+//!   `desktop/ui/index.html` + `theme.js`
+//!     - `theme.js` is loaded as the LAST child of `<head>` (CSP
+//!       `script-src 'self'` — no inline scripts)
+//!     - no settings page: `settings.html`/`settings.js` are gone, the
+//!       index page links no `peakbot-desktop:settings` sentinel, and
+//!       the settings permission files are deleted
 //!
-//! RED before implementation: `desktop-pane.json` does not exist, the
-//! `local-pages.json` permission set and the `tauri.conf.json` capability
-//! list are unchanged, and no `theme.js` is wired in — so the assertions
-//! below fail for exactly the "feature absent" reasons, file by file.
+//!   `desktop/src-tauri/build.rs`
+//!     - AppManifest commands: exactly `status`, `act`, `theme_set`,
+//!       `theme_get`
+//!
+//! RED before implementation: `remote-theme.json` does not exist yet
+//! (the old `desktop-pane.json` still does), `local-pages.json` and
+//! `tauri.conf.json` are unchanged, `index.html` still links the
+//! settings page, `settings.{html,js}` still exist, and `build.rs`
+//! still lists `settings_get` + `toggle_background` — so the assertions
+//! below fail for exactly the "change absent" reasons, file by file.
 
 use std::path::Path;
 
@@ -121,16 +123,16 @@ fn theme_script_is_last_head_child(html: &str) -> bool {
     is_theme && after[..next_close].trim().is_empty() && after[next_close..].starts_with("</script")
 }
 
-// ── desktop-pane.json (the remote capability) ────────────────────────────
+// ── remote-theme.json (the remote capability) ────────────────────────────
 
 #[test]
-fn desktop_pane_capability_is_remote_main_only() {
-    let cap = read_json("src-tauri/capabilities/desktop-pane.json");
+fn remote_theme_capability_is_remote_main_only() {
+    let cap = read_json("src-tauri/capabilities/remote-theme.json");
 
     assert_eq!(
         cap.get("local").and_then(Value::as_bool),
         Some(false),
-        "F3: the remote capability sets \"local\": false"
+        "the remote capability sets \"local\": false"
     );
     assert_eq!(
         cap.get("windows"),
@@ -139,14 +141,14 @@ fn desktop_pane_capability_is_remote_main_only() {
     );
     assert_eq!(
         cap.get("identifier"),
-        Some(&Value::from("desktop-pane")),
-        "identifier names the file"
+        Some(&Value::from("remote-theme")),
+        "identifier names the file (renamed from desktop-pane)"
     );
 }
 
 #[test]
-fn desktop_pane_remote_urls_are_exactly_the_four_loopback_entries() {
-    let cap = read_json("src-tauri/capabilities/desktop-pane.json");
+fn remote_theme_urls_are_the_four_loopback_entries() {
+    let cap = read_json("src-tauri/capabilities/remote-theme.json");
     let urls = remote_urls(&cap).expect("the remote capability declares remote.urls");
 
     let mut expected = [
@@ -160,34 +162,44 @@ fn desktop_pane_remote_urls_are_exactly_the_four_loopback_entries() {
     got.sort_unstable();
     assert_eq!(
         got, expected,
-        "exactly the four loopback URLPattern entries (F2: `*`, not `/**`; F5: the desktop's fixed port)"
+        "exactly the four loopback URLPattern entries (`*`, not `/**`; the desktop's fixed port)"
     );
 }
 
 #[test]
-fn desktop_pane_permissions_are_exactly_the_three() {
-    let cap = read_json("src-tauri/capabilities/desktop-pane.json");
+fn remote_theme_permissions_are_exactly_theme_set() {
+    let cap = read_json("src-tauri/capabilities/remote-theme.json");
     let perms = permissions(&cap);
 
-    let mut expected = [
-        "allow-settings-get",
-        "allow-toggle-background",
-        "allow-theme-set",
-    ];
-    expected.sort_unstable();
-    let mut got = perms.clone();
-    got.sort_unstable();
     assert_eq!(
-        got, expected,
-        "exactly the three: allow-settings-get, allow-toggle-background, allow-theme-set — nothing else, ever"
+        perms,
+        vec!["allow-theme-set".to_string()],
+        "the remote web UI gets EXACTLY allow-theme-set — nothing else, ever"
     );
 
-    for forbidden in ["allow-act", "allow-status"] {
+    for forbidden in [
+        "allow-act",
+        "allow-status",
+        "allow-theme-get",
+        "allow-settings-get",
+        "allow-toggle-background",
+    ] {
         assert!(
             !perms.contains(&forbidden.to_string()),
-            "the remote web UI must never get {forbidden} (`act` carries quit; `status` is a local-page read)"
+            "the remote capability must not grant {forbidden}"
         );
     }
+}
+
+#[test]
+fn old_desktop_pane_capability_file_is_gone() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("src-tauri/capabilities/desktop-pane.json");
+    assert!(
+        !path.exists(),
+        "desktop-pane.json must be deleted (renamed to remote-theme.json)"
+    );
 }
 
 // ── local-pages.json (the local capability) ──────────────────────────────
@@ -208,36 +220,30 @@ fn local_pages_capability_stays_local_only() {
 }
 
 #[test]
-fn local_pages_permissions_are_exactly_the_five() {
+fn local_pages_permissions_are_exactly_the_three() {
     let cap = read_json("src-tauri/capabilities/local-pages.json");
     let perms = permissions(&cap);
 
-    let mut expected = [
-        "allow-status",
-        "allow-act",
-        "allow-settings-get",
-        "allow-toggle-background",
-        "allow-theme-get",
-    ];
+    let mut expected = ["allow-status", "allow-act", "allow-theme-get"];
     expected.sort_unstable();
     let mut got = perms.clone();
     got.sort_unstable();
     assert_eq!(
         got, expected,
-        "local pages keep status/act/settings_get and gain toggle_background + theme_get (theme_get stays local — the web UI only writes its theme)"
+        "local pages keep status/act + theme_get (theme_get stays local — the web UI only writes its theme); settings_get/toggle_background are gone"
     );
 }
 
-// ── tauri.conf.json (capability listing, F1) ─────────────────────────────
+// ── tauri.conf.json (capability listing) ─────────────────────────────────
 
 #[test]
-fn tauri_conf_lists_both_capabilities() {
+fn tauri_conf_lists_local_pages_and_remote_theme() {
     let conf = read_json("src-tauri/tauri.conf.json");
     let caps = conf
         .pointer("/app/security/capabilities")
         .and_then(Value::as_array)
         .expect("app.security.capabilities is an array");
-    let mut expected = ["local-pages", "desktop-pane"];
+    let mut expected = ["local-pages", "remote-theme"];
     expected.sort_unstable();
     let mut got: Vec<String> = caps
         .iter()
@@ -250,28 +256,45 @@ fn tauri_conf_lists_both_capabilities() {
     got.sort_unstable();
     assert_eq!(
         got, expected,
-        "F1: an unlisted capability file is silently ignored — desktop-pane must be listed to be active"
+        "an unlisted capability file is silently ignored — remote-theme must be listed to be active"
     );
 }
 
-// ── bundled pages: theme.js wired in, no prefers-color-scheme ────────────
+// ── bundled pages: theme.js wired in, settings page gone ─────────────────
 
 #[test]
-fn bundled_pages_load_theme_js_as_last_head_child() {
-    for name in ["index.html", "settings.html"] {
-        let html = read(&format!("ui/{name}"));
-        assert!(
-            head_includes_theme_script(&html),
-            "{name} must load theme.js in its <head> (CSP script-src 'self' — no inline scripts)"
-        );
-        assert!(
-            theme_script_is_last_head_child(&html),
-            "{name}: <script src=\"theme.js\"></script> must be the LAST child of <head> (it must apply after the CSS is parsed)"
-        );
-        assert!(
-            !html.contains("prefers-color-scheme"),
-            "{name} must stop keying the CSS on prefers-color-scheme (the theme comes from the desktop's reported theme)"
-        );
+fn index_html_loads_theme_js_last_and_has_no_settings_link() {
+    let html = read("ui/index.html");
+    assert!(
+        head_includes_theme_script(&html),
+        "index.html must load theme.js in its <head> (CSP script-src 'self' — no inline scripts)"
+    );
+    assert!(
+        theme_script_is_last_head_child(&html),
+        "index.html: <script src=\"theme.js\"></script> must be the LAST child of <head> (it must apply after the CSS is parsed)"
+    );
+    assert!(
+        !html.contains("peakbot-desktop:settings"),
+        "index.html must not link the settings sentinel (the settings page is gone)"
+    );
+    assert!(
+        !html.contains("settings.html"),
+        "index.html must not reference the deleted settings page"
+    );
+}
+
+#[test]
+fn settings_page_files_are_gone() {
+    for name in ["ui/settings.html", "ui/settings.js"] {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(name);
+        assert!(!path.exists(), "{name} must be deleted");
+    }
+    for name in [
+        "src-tauri/permissions/autogenerated/settings_get.toml",
+        "src-tauri/permissions/autogenerated/toggle_background.toml",
+    ] {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(name);
+        assert!(!path.exists(), "{name} must be deleted");
     }
 }
 
@@ -284,18 +307,31 @@ fn theme_js_reads_the_reported_theme() {
     );
 }
 
-// ── settings.js: the dedicated toggle command (D3) ───────────────────────
+// ── build.rs: the AppManifest command list ───────────────────────────────
 
 #[test]
-fn settings_js_uses_the_dedicated_toggle_background_command() {
-    let js = read("ui/settings.js");
-    assert!(
-        js.contains("invoke(\"toggle_background\")") || js.contains("invoke('toggle_background')"),
-        "settings.js must toggle the background via the dedicated toggle_background command"
-    );
-    assert!(
-        !js.contains("action: \"toggle_background\"")
-            && !js.contains("action: 'toggle_background'"),
-        "settings.js must no longer route the toggle through `act` (design D3)"
+fn build_rs_manifest_lists_exactly_four_commands() {
+    let build = read("src-tauri/build.rs");
+    // The `.commands(&[ ... ])` list: extract the slice body.
+    let start = build
+        .find(".commands(&[")
+        .expect("build.rs has an AppManifest .commands(&[ … ]) list");
+    let body_start = start + ".commands(&[".len();
+    let body_end = build[body_start..]
+        .find("])")
+        .expect("the commands list is closed")
+        + body_start;
+    let body = &build[body_start..body_end];
+    let mut got: Vec<String> = body
+        .split(',')
+        .map(|c| c.trim().trim_matches('"').to_string())
+        .filter(|c| !c.is_empty())
+        .collect();
+    got.sort_unstable();
+    let mut expected = ["act", "status", "theme_get", "theme_set"];
+    expected.sort_unstable();
+    assert_eq!(
+        got, expected,
+        "exactly status/act/theme_set/theme_get — settings_get and toggle_background are deleted"
     );
 }

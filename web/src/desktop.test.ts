@@ -3,24 +3,16 @@
 //   export function isDesktop(): boolean;
 //   // (globalThis as {isTauri?: unknown}).isTauri === true
 //
-// Tauri sets `window.isTauri` itself on every origin (main-frame init script),
-// so the check is a strict `=== true` comparison — no UA sniffing, no
-// `__TAURI__`, no `invoke`. In a browser the property is absent.
+// Tauri sets `window.isTauri` itself on every origin (main-frame init
+// script), so the check is a strict `=== true` comparison — no UA sniffing,
+// no `__TAURI__`, no `invoke`. In a browser the property is absent.
 //
-// RED before implementation: `./desktop` does not exist yet, so this file
-// fails at import — the right reason (feature absent).
-//
-// Runs under `node` (no jsdom needed): the only global involved is
-// `globalThis.isTauri`, set and deleted per test.
+// Runs under `node` (no jsdom needed): the only globals involved are
+// `globalThis.isTauri` (set and deleted per test) and the
+// `globalThis.__TAURI__.core.invoke` stub for the single theme command.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { isDesktop } from "./desktop";
-import {
-  getDesktopSettings,
-  setDesktopTheme,
-  toggleDesktopBackground,
-  type DesktopView,
-} from "./desktop";
+import { isDesktop, setDesktopTheme } from "./desktop";
 
 type WithTauri = { isTauri?: unknown };
 const g = globalThis as WithTauri;
@@ -59,23 +51,14 @@ describe("isDesktop", () => {
   });
 });
 
-// ── desktop IPC seam (design §5 item 5, D10) ─────────────────────────────
-// The DesktopPane's ONLY way to talk to the desktop app is the seam in
-// desktop.ts: getDesktopSettings() → invoke("settings_get"),
-// toggleDesktopBackground() → invoke("toggle_background"),
-// setDesktopTheme(theme) → invoke("theme_set", { theme }). The stub is
-// installed by setting globalThis.__TAURI__ = { core: { invoke } } and
-// deleted after every test.
+// ── desktop IPC seam (one command: theme_set) ─────────────────────────────
+// The web page's ONLY way to talk to the desktop app is the seam in
+// desktop.ts: setDesktopTheme(theme) → invoke("theme_set", { theme }). The
+// stub is installed by setting globalThis.__TAURI__ = { core: { invoke } }
+// and deleted after every test.
 
 type TauriGlobal = { __TAURI__?: { core?: { invoke?: unknown } } };
 const tg = globalThis as TauriGlobal;
-
-const VIEW: DesktopView = {
-  background_visible: true,
-  background: false,
-  background_enabled: true,
-  busy: false,
-};
 
 /** Install a fresh `__TAURI__.core.invoke` stub and return the mock. */
 function stubInvoke(): ReturnType<typeof vi.fn> {
@@ -89,31 +72,9 @@ describe("desktop IPC seam", () => {
     delete tg.__TAURI__;
   });
 
-  it("without __TAURI__ all three seam calls reject (browser)", async () => {
+  it("without __TAURI__ the seam rejects (browser)", async () => {
     // No property at all — the normal browser case.
-    await expect(getDesktopSettings()).rejects.toThrow("no desktop IPC");
-    await expect(toggleDesktopBackground()).rejects.toThrow("no desktop IPC");
     await expect(setDesktopTheme("dark")).rejects.toThrow("no desktop IPC");
-  });
-
-  it("getDesktopSettings invokes settings_get with no args", async () => {
-    const invoke = stubInvoke();
-    invoke.mockResolvedValueOnce(VIEW);
-
-    const view = await getDesktopSettings();
-
-    expect(invoke).toHaveBeenCalledTimes(1);
-    expect(invoke).toHaveBeenCalledWith("settings_get", undefined);
-    expect(view).toEqual(VIEW);
-  });
-
-  it("toggleDesktopBackground invokes toggle_background with no args", async () => {
-    const invoke = stubInvoke();
-
-    await expect(toggleDesktopBackground()).resolves.toBeUndefined();
-
-    expect(invoke).toHaveBeenCalledTimes(1);
-    expect(invoke).toHaveBeenCalledWith("toggle_background", undefined);
   });
 
   it("setDesktopTheme invokes theme_set with the theme argument", async () => {
@@ -131,9 +92,19 @@ describe("desktop IPC seam", () => {
     });
     tg.__TAURI__ = { core: { invoke } };
 
-    await expect(getDesktopSettings()).rejects.toThrow("boom");
-    await expect(toggleDesktopBackground()).rejects.toThrow("boom");
     await expect(setDesktopTheme("dark")).rejects.toThrow("boom");
-    expect(invoke).toHaveBeenCalledTimes(3);
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── module surface (close-to-tray removal) ─────────────────────────────────
+// The Desktop pane is gone: `DesktopView`, `getDesktopSettings` and
+// `toggleDesktopBackground` are no longer exported; `setDesktopTheme` is
+// the only remaining command.
+
+describe("module surface", () => {
+  it("exports only isDesktop and setDesktopTheme", async () => {
+    const mod = await import("./desktop");
+    expect(Object.keys(mod).sort()).toEqual(["isDesktop", "setDesktopTheme"]);
   });
 });

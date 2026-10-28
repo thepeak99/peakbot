@@ -1,4 +1,4 @@
-//! The startup/mode state machine (DESIGN §4.3–§4.6/§5.3). One owner of
+//! The startup state machine (DESIGN §4.3/§4.6/§5.3). One owner of
 //! the child + phase ⇒ no locks, no races.
 
 use std::io;
@@ -13,30 +13,26 @@ use semver::Version;
 use crate::ca_trust::{PeakbotCa, TrustStore};
 use crate::consts::{LOG_TAIL_LINES, POLL_INTERVAL, READY_TIMEOUT, STOP_GRACE, TICK};
 use crate::paths::DesktopPaths;
-use crate::phase::{Dialog, Mode, Phase, Platform, StartError, StartStep, TrayModel, tray_model};
+use crate::phase::{Dialog, Phase, Platform, StartError, StartStep, tray_status};
 use crate::ready::{ReadyOutcome, wait_ready};
-use crate::service::{self, InstalledService, LaunchPlan, ReplacePolicy, RunState, ServiceState};
+use crate::service;
 use crate::session::{self, PidRecord};
-use crate::sys::{Child, RunOutput, Signal, SpawnSpec, Sys};
-use crate::version::{DeclinedReplace, InstalledVersion, parse_version_output};
+use crate::sys::{Child, Signal, SpawnSpec, Sys};
+use crate::version::parse_version_output;
 use crate::web_target::{WebTarget, read_web_target};
 
 /// The UI surface the controller drives (the Tauri glue implements it).
 pub trait Ui: Send {
-    fn phase_changed(&self, phase: &Phase, tray: &TrayModel);
+    fn phase_changed(&self, phase: &Phase, tray_status: &str);
     /// ok → true.
     fn confirm(&self, d: &Dialog) -> bool;
-    fn message(&self, d: &Dialog);
 }
 
 #[derive(Debug, Clone)]
 pub enum Action {
     Start,
-    ToggleBackground,
-    ReinstallService,
     /// Restart only the PeakBot server so an edited `general.web` (or
-    /// any boot-only config) applies (spec §8.4): session mode relaunches
-    /// the child, service mode reinstalls the unit. Never the app.
+    /// any boot-only config) applies (spec §8.4). Never the app.
     Restart,
     Shutdown(std::sync::mpsc::Sender<()>),
 }
@@ -46,32 +42,25 @@ struct Session {
     child: Box<dyn Child>,
 }
 
-/// Owns `sys, ui, paths, quitting, policy, platform, phase, bundled,
-/// service, session` (DESIGN §5.3). Every phase assignment goes through
-/// `set_phase`, which is also where the tray model is (re)emitted — a
-/// `service` refresh always lands before the next `set_phase`, so the
-/// tray checkbox mirrors the last `service status`.
+/// Owns `sys, ui, paths, quitting, platform, phase, bundled, session`
+/// (DESIGN §5.3). Every phase assignment goes through `set_phase`, which
+/// is also where the tray status is (re)emitted.
 pub struct Controller<S: Sys, U: Ui> {
     sys: S,
     ui: U,
     paths: DesktopPaths,
     quitting: Arc<AtomicBool>,
-    /// How a build mismatch is resolved (design auto-replace §3.2): set
-    /// in `new`, never changes. Chosen at the binary boundary
-    /// (release ⇒ Auto, debug ⇒ Ask).
-    policy: ReplacePolicy,
     /// The host platform (Q1): set in `new`, never changes. Chosen once
     /// by the glue via `phase::host_platform()` (windows / macOS /
     /// everything else) — the pure core never reads `cfg!` itself. On
-    /// `Platform::Windows` the start path is session-only: the background
-    /// service is non-functional in v1 and is never detected.
+    /// `Platform::Windows` the start path is session-only: the old
+    /// background service never worked there and is never detected.
     platform: Platform,
     phase: Phase,
     /// The bundled (this app's) PeakBot version — the sidecar's
     /// `--version` output, parsed in CheckingBundled (DESIGN §1: the
     /// sidecar is the version source).
     bundled: Option<Version>,
-    service: Option<ServiceState>,
     session: Option<Session>,
 }
 
@@ -83,7 +72,6 @@ impl<S: Sys, U: Ui> Controller<S, U> {
         ui: U,
         paths: DesktopPaths,
         quitting: Arc<AtomicBool>,
-        policy: ReplacePolicy,
         platform: Platform,
     ) -> Self {
         Self {
@@ -91,11 +79,9 @@ impl<S: Sys, U: Ui> Controller<S, U> {
             ui,
             paths,
             quitting,
-            policy,
             platform,
             phase: Phase::Starting(StartStep::CheckingBundled),
             bundled: None,
-            service: None,
             session: None,
         }
     }
@@ -104,11 +90,10 @@ impl<S: Sys, U: Ui> Controller<S, U> {
     pub fn handle(&mut self, action: Action) -> ControlFlow<()> {
         match action {
             Action::Start => self.handle_start(),
-            Action::ToggleBackground if !self.is_starting() => self.handle_toggle_background(),
-            Action::ReinstallService if !self.is_starting() => self.replace_service(),
-            Action::Restart if !self.is_starting() => self.handle_restart(),
-            // While Starting the tray item is disabled; ignore.
-            Action::ToggleBackground | Action::ReinstallService | Action::Restart => {}
+            // The full start path: stops the child, re-reads `general.web`
+            // and relaunches. Ignored while a start is in flight.
+            Action::Restart if !self.is_starting() => self.handle_start(),
+            Action::Restart => {}
             Action::Shutdown(ack) => {
                 self.stop_session();
                 let _ = ack.send(());
@@ -119,9 +104,9 @@ impl<S: Sys, U: Ui> Controller<S, U> {
     }
 
     /// Liveness: a Ready session whose child exited →
-    /// Failed(SessionExited); a no-op otherwise (incl. service mode).
+    /// Failed(SessionExited); a no-op otherwise.
     pub fn tick(&mut self) {
-        if !matches!(self.phase, Phase::Ready(Mode::Session { .. })) {
+        if !matches!(self.phase, Phase::Ready(_)) {
             return;
         }
         let Some(exit) = self
@@ -149,15 +134,10 @@ impl<S: Sys, U: Ui> Controller<S, U> {
     // -------------------------------------------------------------------
 
     /// The single exit for phase changes: assign, then emit
-    /// `phase_changed` with a fresh tray model.
+    /// `phase_changed` with a fresh tray status.
     fn set_phase(&mut self, phase: Phase) {
         self.phase = phase;
-        let tray = tray_model(
-            &self.phase,
-            self.service.as_ref(),
-            self.bundled.as_ref(),
-            self.platform,
-        );
+        let tray = tray_status(&self.phase, self.bundled.as_ref());
         self.ui.phase_changed(&self.phase, &tray);
     }
 
@@ -172,14 +152,14 @@ impl<S: Sys, U: Ui> Controller<S, U> {
     /// THE single exit into `Phase::Ready` (design #376b): an HTTPS
     /// target needs PeakBot's CA trusted first. Everything that makes the
     /// window open goes through here — never a bare `set_phase(Ready)`.
-    fn enter_ready(&mut self, mode: Mode) {
-        if mode.target().tls
+    fn enter_ready(&mut self, target: WebTarget) {
+        if target.tls
             && let Err(detail) = self.ensure_ca_trusted()
         {
             self.fail(StartError::CertificateNotTrusted { detail });
             return;
         }
-        self.set_phase(Phase::Ready(mode));
+        self.set_phase(Phase::Ready(target));
     }
 
     /// macOS/Windows: PeakBot's CA must be in the user's trusted
@@ -235,57 +215,39 @@ impl<S: Sys, U: Ui> Controller<S, U> {
         self.reap_stale_pidfile();
 
         self.set_phase(Phase::Starting(StartStep::CheckingBundled));
-        let bundled = match self.check_bundled_sidecar() {
-            Ok(v) => v,
-            Err(err) => return self.fail(err),
-        };
+        if let Err(err) = self.check_bundled_sidecar() {
+            return self.fail(err);
+        }
 
-        // Q1 (WINDOWS-PLAN): the background service is non-functional on
-        // Windows in v1, so it is never detected on start: no
-        // `service status`, no identity/version checks, no
-        // AutoReplace/AskReplace/ConnectService, and no
-        // `Starting(CheckingService)` step ("Looking for a background
-        // service…" must never show on Windows). The session path is the
-        // only path — exactly as when no service is installed. An old
-        // installed service is left untouched (the VM finding: it used to
-        // be silently replaced, then the connect hung 30 s into a dead
-        // end).
+        // Q1 (WINDOWS-PLAN): the background service never worked on
+        // Windows, so it is never looked for there: no `service status`,
+        // no "Looking for a background service…" step, no prompt.
         if self.platform == Platform::Windows {
             self.launch_session();
             return;
         }
 
-        let state = self.query_service_status();
-        self.service = Some(state.clone());
+        // A failed or unrecognised status counts as "not installed": the
+        // session then reports a real port conflict itself.
+        let installed = self
+            .sys
+            .run(&self.paths.sidecar, &service::status_args())
+            .is_ok_and(|out| service::is_service_installed(&out));
         self.set_phase(Phase::Starting(StartStep::CheckingService));
-
-        let declined = self.read_declined();
-        let plan = service::plan_launch(
-            &state,
-            |svc| self.is_bundled_build(svc),
-            |svc| self.version_of(svc),
-            &bundled,
-            declined.as_ref(),
-            self.policy,
-        );
-        match plan {
-            LaunchPlan::Session => self.launch_session(),
-            LaunchPlan::ConnectService { start_first } => self.connect_service(start_first),
-            LaunchPlan::AutoReplace => self.replace_service(),
-            LaunchPlan::AskReplace { installed } => {
-                let dialog = service::replace_dialog(&installed, &bundled);
-                if self.ui.confirm(&dialog) {
-                    self.replace_service();
-                } else {
-                    self.write_declined(&installed, &bundled);
-                    let start_first = matches!(
-                        &state,
-                        ServiceState::Installed(svc) if svc.run == RunState::Stopped
-                    );
-                    self.connect_service(start_first);
-                }
-            }
+        if !installed {
+            self.launch_session();
+            return;
         }
+        // Asked on every start, never remembered: the old service would
+        // fight the session for the port and the config.
+        if !self.ui.confirm(&service::remove_old_service_dialog()) {
+            return self.fail(StartError::ServiceInstalled);
+        }
+        self.set_phase(Phase::Starting(StartStep::RemovingService));
+        if let Err((command, output)) = self.run_sidecar_cmd(&service::service_uninstall_args()) {
+            return self.fail(StartError::ServiceCommandFailed { command, output });
+        }
+        self.launch_session();
     }
 
     /// `<sidecar> --version`: NotFound → SidecarMissing; failed or
@@ -323,76 +285,6 @@ impl<S: Sys, U: Ui> Controller<S, U> {
         Ok(v)
     }
 
-    fn query_service_status(&self) -> ServiceState {
-        match self.sys.run(&self.paths.sidecar, &service::status_args()) {
-            Ok(out) => service::parse_service_status(&out),
-            Err(e) => ServiceState::Unavailable {
-                reason: e.to_string(),
-            },
-        }
-    }
-
-    fn refresh_service(&mut self) {
-        self.service = Some(self.query_service_status());
-    }
-
-    /// A6: exe None ⇒ false; `same_contents` Err ⇒ log::warn! + false.
-    fn is_bundled_build(&self, svc: &InstalledService) -> bool {
-        svc.exe.as_deref().is_some_and(|exe| {
-            self.sys
-                .same_contents(exe, &self.paths.sidecar)
-                .unwrap_or_else(|e| {
-                    log::warn!(
-                        "cannot compare {} with the bundled sidecar: {e}",
-                        exe.display()
-                    );
-                    false
-                })
-        })
-    }
-
-    /// The `TLS:` status line of the installed service: on only when
-    /// `--tls` is baked into the unit (a hand-made `service install
-    /// --tls`). The desktop installs bare units, which read `general.web`.
-    fn installed_tls(&self) -> bool {
-        matches!(&self.service, Some(ServiceState::Installed(svc)) if svc.tls)
-    }
-
-    /// `version_of(installed)` per design auto-replace §4.1: exe None →
-    /// Unknown, else `<exe> --version`.
-    fn version_of(&self, svc: &InstalledService) -> InstalledVersion {
-        let Some(exe) = &svc.exe else {
-            return InstalledVersion::Unknown;
-        };
-        match self.sys.run(exe, &["--version"]) {
-            Ok(out) if out.ok() => parse_version_output(&out.stdout)
-                .map(InstalledVersion::Known)
-                .unwrap_or(InstalledVersion::Unknown),
-            _ => InstalledVersion::Unknown,
-        }
-    }
-
-    fn read_declined(&self) -> Option<DeclinedReplace> {
-        self.sys
-            .read(&self.paths.declined_file())
-            .ok()
-            .flatten()
-            .and_then(|s| DeclinedReplace::parse(&s))
-    }
-
-    fn write_declined(&self, installed: &InstalledVersion, bundled: &Version) {
-        let d = DeclinedReplace {
-            installed: installed.clone(),
-            bundled: bundled.clone(),
-        };
-        if let Err(e) = self
-            .sys
-            .write_private(&self.paths.declined_file(), &d.render())
-        {
-            log::warn!("failed to write declined-replace: {e}");
-        }
-    }
-
     // -------------------------------------------------------------------
     // LAUNCH_SESSION (DESIGN §4.3)
     // -------------------------------------------------------------------
@@ -400,7 +292,7 @@ impl<S: Sys, U: Ui> Controller<S, U> {
     fn launch_session(&mut self) {
         // general.web is read on every launch (spec §8.4); the child gets
         // no web flags and reads the same file itself.
-        let mode = Mode::Session(self.read_web_target());
+        let target = self.read_web_target();
         self.set_phase(Phase::Starting(StartStep::StartingSession));
         let spec = SpawnSpec {
             program: self.paths.sidecar.clone(),
@@ -425,11 +317,11 @@ impl<S: Sys, U: Ui> Controller<S, U> {
         }
 
         self.set_phase(Phase::Starting(StartStep::WaitingForBackend));
-        let (outcome, mode) = self.await_backend(mode, Some(&mut child));
+        let (outcome, target) = self.await_backend(target, &mut child);
         match outcome {
             ReadyOutcome::Ready => {
                 self.session = Some(Session { child });
-                self.enter_ready(mode);
+                self.enter_ready(target);
             }
             // A busy bind lands here too: the child exits and the log
             // tail says why (spec §8.4 — no port fallback).
@@ -448,7 +340,7 @@ impl<S: Sys, U: Ui> Controller<S, U> {
             ReadyOutcome::TokenRejected => {
                 self.stop_child(&mut child);
                 self.remove_pidfile();
-                self.fail(StartError::TokenRejected { service: false });
+                self.fail(StartError::TokenRejected);
             }
             // Quitting: an internal control-flow outcome, never a
             // visible phase (§3.5).
@@ -456,34 +348,6 @@ impl<S: Sys, U: Ui> Controller<S, U> {
                 self.stop_child(&mut child);
                 self.remove_pidfile();
             }
-        }
-    }
-
-    // -------------------------------------------------------------------
-    // CONNECT (DESIGN §4.3)
-    // -------------------------------------------------------------------
-
-    fn connect_service(&mut self, start_first: bool) {
-        self.set_phase(Phase::Starting(StartStep::ConnectingService));
-        let mode = self.service_mode();
-        if start_first {
-            let args = service::service_install_args();
-            let args: Vec<&str> = args.iter().map(String::as_str).collect();
-            if let Err((command, output)) = self.run_sidecar_cmd(&args) {
-                return self.fail(StartError::ServiceCommandFailed { command, output });
-            }
-        }
-        match self.await_backend(mode, None) {
-            (ReadyOutcome::Ready, mode) => self.enter_ready(mode),
-            (ReadyOutcome::TokenRejected, _) => {
-                self.fail(StartError::TokenRejected { service: true })
-            }
-            (ReadyOutcome::Timeout, mode) => self.fail(StartError::ServiceUnreachable {
-                waited: READY_TIMEOUT,
-                addr: mode.target().host_port(),
-            }),
-            (ReadyOutcome::Cancelled, _) => {}
-            (ReadyOutcome::ChildExited(_), _) => {} // no child in service mode
         }
     }
 
@@ -500,219 +364,51 @@ impl<S: Sys, U: Ui> Controller<S, U> {
         read_web_target(text.as_deref())
     }
 
-    /// The service serves `general.web`, plus TLS when the unit itself
-    /// carries `--tls` (the server's rule is `--tls || general.web.tls`).
-    fn service_mode(&self) -> Mode {
-        let mut target = self.read_web_target();
-        target.tls |= self.installed_tls();
-        Mode::Service(target)
-    }
-
     /// Probe until the backend answers, then read `general.web` AGAIN
     /// (spec §8.4, Z8): the child's first boot may have auto-migrated a
     /// legacy config, moving the web-token into `general.web.token`, so
     /// the pre-launch read can be stale. A 401 also counts as "it
     /// answered". If the fresh read differs, probe once more with it and
-    /// return the fresh mode — that is the URL the bridge navigates to.
+    /// return the fresh target — that is the URL the bridge navigates to.
     fn await_backend(
         &self,
-        mode: Mode,
-        mut child: Option<&mut Box<dyn Child>>,
-    ) -> (ReadyOutcome, Mode) {
-        let outcome = self.wait_ready_on(&mode, child.as_deref_mut());
+        target: WebTarget,
+        child: &mut Box<dyn Child>,
+    ) -> (ReadyOutcome, WebTarget) {
+        let outcome = self.wait_ready_on(&target, child);
         if !matches!(outcome, ReadyOutcome::Ready | ReadyOutcome::TokenRejected) {
-            return (outcome, mode);
+            return (outcome, target);
         }
-        let fresh = match mode {
-            Mode::Session(_) => Mode::Session(self.read_web_target()),
-            Mode::Service(_) => self.service_mode(),
-        };
-        if fresh == mode {
-            return (outcome, mode);
+        let fresh = self.read_web_target();
+        if fresh == target {
+            return (outcome, target);
         }
         (self.wait_ready_on(&fresh, child), fresh)
     }
 
-    fn wait_ready_on(&self, mode: &Mode, child: Option<&mut Box<dyn Child>>) -> ReadyOutcome {
-        // Written as a match so the `Box<dyn Child + 'static>` borrow is
-        // coerced to the short-lived trait object `wait_ready` takes.
-        let child: Option<&mut dyn Child> = match child {
-            Some(c) => Some(c.as_mut()),
-            None => None,
-        };
+    fn wait_ready_on(&self, target: &WebTarget, child: &mut Box<dyn Child>) -> ReadyOutcome {
         wait_ready(
             &self.sys,
-            &mode.probe_url(),
+            &target.probe_url(),
             READY_TIMEOUT,
-            child,
+            child.as_mut(),
             &self.quitting,
         )
     }
 
     /// One short-lived sidecar command. Err = (command, output) for the
-    /// ServiceCommandFailed dialog/phase.
-    fn run_sidecar_cmd(&self, args: &[&str]) -> Result<RunOutput, (String, String)> {
+    /// ServiceCommandFailed phase.
+    fn run_sidecar_cmd(&self, args: &[&str]) -> Result<(), (String, String)> {
         let command = args.join(" ");
         let out = self
             .sys
             .run(&self.paths.sidecar, args)
             .map_err(|e| (command.clone(), e.to_string()))?;
         if out.ok() {
-            Ok(out)
+            Ok(())
         } else {
             Err((command, out.combined()))
         }
-    }
-
-    // -------------------------------------------------------------------
-    // REPLACE (design auto-replace §4.3) — also Action::ReinstallService
-    // -------------------------------------------------------------------
-
-    /// Replace the installed service with the bundled build (dialog
-    /// "Replace", tray ReinstallService, or a silent AutoReplace). A5:
-    /// the binary copy runs FIRST, so a failed copy leaves the service
-    /// and the old binary intact. `enable --now` doesn't restart a
-    /// running unit, so the uninstall + install pair is still what
-    /// restarts the service on the new binary. The install is bare: the
-    /// unit reads `general.web` (spec §8.4).
-    fn replace_service(&mut self) {
-        self.set_phase(Phase::Starting(StartStep::InstallingService));
-        if let Err((command, output)) = self.run_sidecar_cmd(&service::install_args()) {
-            return self.fail(StartError::ServiceCommandFailed { command, output });
-        }
-
-        self.set_phase(Phase::Starting(StartStep::RemovingService));
-        // Non-zero tolerated: the unit may not be loaded.
-        let _ = self
-            .sys
-            .run(&self.paths.sidecar, &service::service_uninstall_args());
-
-        self.set_phase(Phase::Starting(StartStep::InstallingService));
-        let args = service::service_install_args();
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        if let Err((command, output)) = self.run_sidecar_cmd(&args) {
-            return self.fail(StartError::ServiceCommandFailed { command, output });
-        }
-
-        self.refresh_service();
-        if let Err(e) = self.sys.remove(&self.paths.declined_file()) {
-            log::warn!("failed to remove declined-replace: {e}");
-        }
-        self.connect_service(false);
-    }
-
-    // -------------------------------------------------------------------
-    // Mode toggle (DESIGN §4.5)
-    // -------------------------------------------------------------------
-
-    fn handle_toggle_background(&mut self) {
-        match self.service.as_ref() {
-            Some(ServiceState::NotInstalled) => self.enable_background(),
-            Some(ServiceState::Installed(_)) => self.disable_background(),
-            // Unavailable (or no status yet): the tray item is disabled.
-            _ => {}
-        }
-    }
-
-    fn enable_background(&mut self) {
-        if !self.sys.exists(&self.paths.peakbot_config()) {
-            self.ui.message(&service::finish_setup_dialog());
-            return;
-        }
-        // The service will bind general.web.bind. Our own session holds
-        // that port right now and is stopped below, so only check it when
-        // there is no session.
-        let bind = self.read_web_target().bind;
-        if self.session.is_none() && !self.sys.port_is_free(bind.port()) {
-            self.ui.message(&service::port_busy_dialog(bind));
-            return;
-        }
-        if !self.ui.confirm(&service::enable_dialog()) {
-            return;
-        }
-        // Stop the session BEFORE installing: two backends must never
-        // share the config/DB.
-        self.stop_session();
-
-        // REPLACE steps minus the uninstall.
-        self.set_phase(Phase::Starting(StartStep::InstallingService));
-        let args = service::service_install_args();
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        if let Err((command, output)) = self
-            .run_sidecar_cmd(&service::install_args())
-            .and_then(|_| self.run_sidecar_cmd(&args))
-        {
-            return self.enable_failed(&command, &output);
-        }
-        self.refresh_service();
-        self.connect_service(false);
-    }
-
-    /// Enable failure: best-effort rollback, then the user is back where
-    /// they were (session mode).
-    fn enable_failed(&mut self, command: &str, output: &str) {
-        let _ = self
-            .sys
-            .run(&self.paths.sidecar, &service::service_uninstall_args());
-        self.refresh_service();
-        self.ui
-            .message(&service::command_failed_dialog(command, output));
-        self.launch_session();
-    }
-
-    fn disable_background(&mut self) {
-        if !self.ui.confirm(&service::disable_dialog()) {
-            return;
-        }
-        self.set_phase(Phase::Starting(StartStep::RemovingService));
-        match self.run_sidecar_cmd(&service::service_uninstall_args()) {
-            Ok(_) => {
-                self.refresh_service();
-                self.launch_session();
-            }
-            Err((command, output)) => {
-                self.refresh_service();
-                self.ui
-                    .message(&service::command_failed_dialog(&command, &output));
-                // Unchanged mode: reconnect to the still-installed service.
-                self.connect_service(false);
-            }
-        }
-    }
-
-    // -------------------------------------------------------------------
-    // Action::Restart (spec §8.4)
-    // -------------------------------------------------------------------
-
-    /// Service mode: `reconfigure_service` — there is no `service
-    /// restart` verb, the reinstall IS the restart. Otherwise (session
-    /// mode, or a failed start with no service): the full start path,
-    /// which stops the child, re-reads `general.web` and relaunches.
-    fn handle_restart(&mut self) {
-        if matches!(self.service, Some(ServiceState::Installed(_))) {
-            self.reconfigure_service();
-        } else {
-            self.handle_start();
-        }
-    }
-
-    /// Reinstall the installed unit so the restarted service reads the
-    /// current config. The binary is NOT replaced (design §6 T6).
-    fn reconfigure_service(&mut self) {
-        self.set_phase(Phase::Starting(StartStep::RemovingService));
-        // Non-zero tolerated: the unit may not be loaded.
-        let _ = self
-            .sys
-            .run(&self.paths.sidecar, &service::service_uninstall_args());
-
-        self.set_phase(Phase::Starting(StartStep::InstallingService));
-        let args = service::service_install_args();
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        if let Err((command, output)) = self.run_sidecar_cmd(&args) {
-            return self.fail(StartError::ServiceCommandFailed { command, output });
-        }
-        self.refresh_service();
-        self.connect_service(false);
     }
 
     // -------------------------------------------------------------------
@@ -815,12 +511,10 @@ mod tests {
     use super::*;
     use crate::consts::READY_TIMEOUT;
     use crate::paths::DesktopPaths;
-    use crate::phase::{Mode, Phase, Platform, StartError, StartStep};
-    use crate::service::ReplacePolicy;
+    use crate::service::remove_old_service_dialog;
     use crate::session::PidRecord;
     use crate::sys::{Probe, RunOutput, Signal};
     use crate::testing::{ChildMode, Effect, FakeSys, FakeUi};
-    use crate::version::{DeclinedReplace, InstalledVersion};
     use crate::web_target::WebTarget;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicBool;
@@ -829,7 +523,6 @@ mod tests {
     const SIDECAR: &str = "/app/peakbot";
     const PIDFILE: &str = "/data/sidecar.pid";
     const WEB_TOKEN: &str = "/cfg/web-token";
-    const DECLINED: &str = "/data/declined-replace";
     const CONFIG_YAML: &str = "/cfg/config.yaml";
     const SETTINGS_FILE: &str = "/data/settings.json";
 
@@ -862,112 +555,28 @@ mod tests {
         )
     }
 
-    /// Exec path of an installed service whose binary is NOT the bundled
-    /// sidecar. The file name is deliberately distinct: FakeSys scripts
-    /// `run` by (file name, args), so the installed binary can report a
-    /// `--version` different from the sidecar's.
-    const INSTALLED_EXE: &str = "/home/u/.local/bin/peakbot-0.22.0";
-
-    /// Design auto-replace §7.1 fixtures: installed exes, each with a
-    /// distinct file name because FakeSys keys `run` by file name.
-    /// `--version` → `peakbot 0.23.0` (same as the bundled sidecar).
-    const INSTALLED_SAME: &str = "/home/u/.local/bin/peakbot-same";
-    /// `--version` → `peakbot 0.24.0` (newer than the bundled 0.23.0).
-    const INSTALLED_NEWER: &str = "/home/u/.local/bin/peakbot-0.24.0";
-    /// `--version` → `hello` (unparseable ⇒ Unknown).
-    const INSTALLED_GARBAGE: &str = "/home/u/.local/bin/peakbot-garbage";
-
-    /// `service status` for a service whose Exec path is `exe`.
-    fn installed_status_at(exe: &str, state: &str) -> RunOutput {
-        run_out(
-            Some(0),
-            &format!("Installed: true\nExec:      {exe}\nState:     {state}\n"),
-            "",
-        )
-    }
-
-    /// `service status` with a `TLS:` line (added by #375; parsed into
-    /// `InstalledService.tls` by #377).
-    fn installed_status_tls(state: &str, tls: &str) -> RunOutput {
-        run_out(
-            Some(0),
-            &format!(
-                "Installed: true\nExec:      {SIDECAR}\nState:     {state}\nTLS:       {tls}\n"
-            ),
-            "",
-        )
-    }
-
-    const NOT_INSTALLED: &str = "Installed: false\n";
-
-    /// `Controller::new` + `handle(Start)`, asserting we land Ready.
-    /// Existing tests run under `ReplacePolicy::Ask` (the dev-build
-    /// policy): they exercise the prompt path, which is unchanged for
-    /// differing builds (design auto-replace §6 T6).
+    /// `Controller::new` + `handle(Start)` on `Platform::Linux` — every
+    /// session-path test pins this.
     fn started(sys: FakeSys, ui: FakeUi) -> Controller<FakeSys, FakeUi> {
-        started_with(sys, ui, ReplacePolicy::Ask)
+        started_on(sys, ui, Platform::Linux)
     }
 
-    /// `Controller::new(…, policy)` + `handle(Start)` on `Platform::Linux`
-    /// — the pre-Q1 behaviour every existing test pins.
-    fn started_with(
-        sys: FakeSys,
-        ui: FakeUi,
-        policy: ReplacePolicy,
-    ) -> Controller<FakeSys, FakeUi> {
-        started_on(sys, ui, policy, Platform::Linux)
-    }
-
-    /// `Controller::new(…, policy, platform)` + `handle(Start)`.
+    /// `Controller::new(…, platform)` + `handle(Start)`.
     ///
-    /// CONTRACT (Q1, RED until the developer lands it): the constructor
-    /// takes the host platform as its LAST parameter — the glue decides
-    /// it once via `phase::host_platform()` (windows / macOS /
-    /// everything else) and passes it into the pure core, exactly like
-    /// `policy`.
-    /// `pub fn new(sys, ui, paths, quitting, policy, platform: Platform)`.
-    fn started_on(
-        sys: FakeSys,
-        ui: FakeUi,
-        policy: ReplacePolicy,
-        platform: Platform,
-    ) -> Controller<FakeSys, FakeUi> {
-        let mut ctrl = Controller::new(
-            sys,
-            ui,
-            paths(),
-            Arc::new(AtomicBool::new(false)),
-            policy,
-            platform,
-        );
+    /// CONTRACT (close-to-tray plan §C, RED until the developer lands
+    /// it): the constructor takes NO replace policy and NO service
+    /// field — `pub fn new(sys, ui, paths, quitting, platform: Platform)`.
+    /// The glue decides the platform once via `phase::host_platform()`
+    /// (windows / macOS / everything else) and passes it into the pure
+    /// core.
+    fn started_on(sys: FakeSys, ui: FakeUi, platform: Platform) -> Controller<FakeSys, FakeUi> {
+        let mut ctrl =
+            Controller::new(sys, ui, paths(), Arc::new(AtomicBool::new(false)), platform);
         let _ = ctrl.handle(Action::Start);
         ctrl
     }
 
-    /// Design auto-replace §7.1 "Order OK" (invariant A5): in
-    /// `run_args()`, the binary copy (`install`) runs BEFORE
-    /// `service uninstall`, which runs before `service install`.
-    fn assert_order_ok(runs: &[Vec<String>]) {
-        let i_install = runs
-            .iter()
-            .position(|r| r == &["install".to_string()])
-            .expect("`install` (the binary copy) ran");
-        let i_uninstall = runs
-            .iter()
-            .position(|r| r == &["service".to_string(), "uninstall".to_string()])
-            .expect("`service uninstall` ran");
-        let i_svc = runs
-            .iter()
-            .position(|r| {
-                r.first().is_some_and(|s| s == "service")
-                    && r.get(1).is_some_and(|s| s == "install")
-            })
-            .expect("`service install` ran");
-        assert!(
-            i_install < i_uninstall && i_uninstall < i_svc,
-            "order must be install → service uninstall → service install; runs: {runs:?}"
-        );
-    }
+    const NOT_INSTALLED: &str = "Installed: false\n";
 
     // §9.1 case 38.
     #[test]
@@ -979,7 +588,6 @@ mod tests {
             ui.clone(),
             paths(),
             Arc::new(AtomicBool::new(false)),
-            ReplacePolicy::Ask,
             Platform::Linux,
         );
         let _ = ctrl.handle(Action::Start);
@@ -1010,7 +618,6 @@ mod tests {
             ui.clone(),
             paths(),
             Arc::new(AtomicBool::new(false)),
-            ReplacePolicy::Ask,
             Platform::Linux,
         );
         let _ = ctrl.handle(Action::Start);
@@ -1048,7 +655,7 @@ mod tests {
         assert!(
             matches!(
                 ctrl.phase(),
-                Phase::Ready(Mode::Session(WebTarget { bind, tls, token }))
+                Phase::Ready(WebTarget { bind, tls, token })
                     if bind.port() == 7823
                     && !*tls
                     && token.as_ref().map(|t| t.as_str()) == Some("seeded-token")
@@ -1151,7 +758,6 @@ mod tests {
             &["service", "status"],
             run_out(Some(0), NOT_INSTALLED, ""),
         );
-        sys.set_port_free(7823, false);
         sys.queue_child(crate::testing::FakeChildSpec {
             mode: ChildMode::ExitsAfter(1),
             exit: Some(1),
@@ -1244,855 +850,9 @@ mod tests {
         );
     }
 
-    // §9.1 case 45.
-    #[test]
-    fn t45_unavailable_service_falls_back_to_session_without_prompt() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            run_out(Some(1), "", "service status failed: no user bus\n"),
-        );
-        sys.set_default_probe(vec![Probe::Status(200)]);
-        sys.queue_child(crate::testing::FakeChildSpec::alive());
-        let ui = FakeUi::new();
-        let ctrl = started(sys.clone(), ui.clone());
-        assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
-            "got {:?}",
-            ctrl.phase()
-        );
-        assert!(ui.confirms().is_empty(), "no dialog may be shown");
-        assert_eq!(sys.spawned_specs().len(), 1);
-    }
-
-    // §9.1 case 46.
-    #[test]
-    fn t46_installed_same_version_running_connects_without_spawn() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            installed_status("running"),
-        );
-        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
-        sys.set_probe(
-            "http://127.0.0.1:7823/commands?token=svc-token",
-            vec![Probe::Status(200)],
-        );
-        let ui = FakeUi::new();
-        let ctrl = started(sys.clone(), ui);
-        match ctrl.phase() {
-            Phase::Ready(Mode::Service(WebTarget { token, .. })) => {
-                assert_eq!(
-                    token.as_ref().map(|t| t.as_str()),
-                    Some("svc-token"),
-                    "the token is exactly general.web.token"
-                );
-            }
-            other => panic!("expected Ready(Service), got {other:?}"),
-        }
-        assert!(
-            sys.spawned_specs().is_empty(),
-            "no sidecar spawn in service mode"
-        );
-        let runs = sys.run_args();
-        assert!(
-            !runs
-                .iter()
-                .any(|r| { r == &["service".to_string(), "install".to_string(),] }),
-            "a running same-version service must not be re-installed; runs: {runs:?}"
-        );
-    }
-
-    // §9.1 case 47.
-    #[test]
-    fn t47_installed_same_version_stopped_starts_then_connects() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            installed_status("stopped"),
-        );
-        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
-        sys.set_run(
-            "peakbot",
-            &["service", "install"],
-            run_out(Some(0), "ok\n", ""),
-        );
-        sys.set_probe(
-            "http://127.0.0.1:7823/commands?token=svc-token",
-            vec![Probe::Status(200)],
-        );
-        let ui = FakeUi::new();
-        let ctrl = started(sys.clone(), ui);
-        assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
-            "got {:?}",
-            ctrl.phase()
-        );
-        let runs = sys.run_args();
-        assert!(
-            runs.iter()
-                .any(|r| { r == &["service".to_string(), "install".to_string(),] }),
-            "bare `service install` must run; runs: {runs:?}"
-        );
-    }
-
-    // §9.1 case 48.
-    #[test]
-    fn t48_installed_tokenless_service_ready_without_general_web_token() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            installed_status("running"),
-        );
-        // No general.web.token.
-        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", None));
-        sys.set_probe("http://127.0.0.1:7823/commands", vec![Probe::Status(200)]);
-        let ui = FakeUi::new();
-        let ctrl = started(sys.clone(), ui);
-        match ctrl.phase() {
-            Phase::Ready(Mode::Service(WebTarget { token, .. })) => {
-                assert!(
-                    token.is_none(),
-                    "no general.web.token ⇒ Service with no token"
-                );
-            }
-            other => panic!("expected Ready(Service), got {other:?}"),
-        }
-        assert!(
-            sys.private_written().is_empty(),
-            "CONNECT writes nothing (a token is never minted by the desktop)"
-        );
-    }
-
-    // §9.1 case 49.
-    #[test]
-    fn t49_replace_flow_command_order_and_cleanup() {
-        let sys = FakeSys::new();
-        // Bundled version = the sidecar's `--version` output (DESIGN §1,
-        // §4.3 CheckingBundled) — scripted distinct from the app's crate
-        // version on purpose, so the test pins the source of truth.
-        sys.set_run("peakbot", &["--version"], versioned("0.24.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            installed_status_at(INSTALLED_EXE, "running"),
-        );
-        sys.set_run("peakbot-0.22.0", &["--version"], versioned("0.22.0"));
-        sys.seed_file(DECLINED, "installed=0.20.0\nbundled=0.21.0\n"); // stale; must be removed
-        sys.set_run(
-            "peakbot",
-            &["service", "uninstall"],
-            run_out(Some(0), "ok\n", ""),
-        );
-        sys.set_run("peakbot", &["install"], run_out(Some(0), "ok\n", ""));
-        sys.set_run(
-            "peakbot",
-            &["service", "install"],
-            run_out(Some(0), "ok\n", ""),
-        );
-        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("cfg-token")));
-        // CONNECT after a successful install is proven by the probe
-        // (DESIGN §4.3) — script a 200, never rely on the install command.
-        sys.set_default_probe(vec![Probe::Status(200)]);
-        let ui = FakeUi::new();
-        ui.answer_confirm(true); // Replace
-        let ctrl = started(sys.clone(), ui);
-
-        match ctrl.phase() {
-            Phase::Ready(Mode::Service(WebTarget { token, .. })) => {
-                assert_eq!(
-                    token.as_ref().map(|t| t.as_str()),
-                    Some("cfg-token"),
-                    "Ready with general.web.token"
-                );
-            }
-            other => panic!("expected Ready(Service), got {other:?}"),
-        }
-        assert!(
-            sys.events().iter().any(|e| {
-                matches!(e, Effect::Probe { url } if url.to_string().contains("cfg-token"))
-            }),
-            "the readiness probe must use general.web.token"
-        );
-
-        // Command order (invariant A5, design auto-replace §4.3): the
-        // binary copy runs FIRST, so a failed copy leaves the service
-        // untouched: install → service uninstall → service install.
-        assert_order_ok(&sys.run_args());
-
-        // The install is bare: the unit reads general.web itself.
-        assert!(
-            sys.run_args()
-                .iter()
-                .all(|r| r.first().map(String::as_str) != Some("service") || r.len() == 2),
-            "no web flags on any service verb; runs: {:?}",
-            sys.run_args()
-        );
-        // The stale declined file is removed.
-        assert!(!sys.has_file(Path::new(DECLINED)), "declined file removed");
-    }
-
-    // §9.1 case 50.
-    #[test]
-    fn t50_keep_flow_writes_declined_pair_and_silences_next_start() {
-        let sys = FakeSys::new();
-        // Bundled version = the sidecar's `--version` output (DESIGN §1),
-        // scripted distinct from the app's crate version on purpose.
-        sys.set_run("peakbot", &["--version"], versioned("0.24.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            installed_status_at(INSTALLED_EXE, "running"),
-        );
-        sys.set_run("peakbot-0.22.0", &["--version"], versioned("0.22.0"));
-        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
-        sys.set_probe(
-            "http://127.0.0.1:7823/commands?token=svc-token",
-            vec![Probe::Status(200)],
-        );
-        let ui = FakeUi::new();
-        ui.answer_confirm(false); // Keep
-        let mut ctrl = started(sys.clone(), ui.clone());
-        assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
-            "got {:?}",
-            ctrl.phase()
-        );
-
-        // The declined file carries the exact pair.
-        let content = sys
-            .file(Path::new(DECLINED))
-            .expect("declined-replace written");
-        let declined = DeclinedReplace::parse(&content).expect("declined file parses");
-        let v22 = semver::Version::parse("0.22.0").unwrap();
-        let v24 = semver::Version::parse("0.24.0").unwrap();
-        assert!(
-            declined.matches(&InstalledVersion::Known(v22.clone()), &v24.clone()),
-            "the exact (installed, bundled) pair must be recorded; bundled = the sidecar's --version"
-        );
-        assert!(
-            !sys.run_args()
-                .iter()
-                .any(|r| { r == &["service".to_string(), "install".to_string(),] }),
-            "Keep must not (re)install the service"
-        );
-
-        // Next Start: no dialog.
-        let _ = ctrl.handle(Action::Start);
-        assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
-            "got {:?}",
-            ctrl.phase()
-        );
-        assert_eq!(
-            ui.confirms().len(),
-            1,
-            "the second Start must not re-ask; got {:?}",
-            ui.confirms()
-        );
-    }
-
-    // §9.1 case 51.
-    #[test]
-    fn t51_stale_declined_pair_reasks() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.24.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            installed_status_at(INSTALLED_EXE, "running"),
-        );
-        sys.set_run("peakbot-0.22.0", &["--version"], versioned("0.22.0"));
-        // Declined for an OLDER bundled version — the pair no longer matches.
-        sys.seed_file(DECLINED, "installed=0.22.0\nbundled=0.21.0\n");
-        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
-        sys.set_probe(
-            "http://127.0.0.1:7823/commands?token=svc-token",
-            vec![Probe::Status(200)],
-        );
-        let ui = FakeUi::new();
-        ui.answer_confirm(false);
-        let ctrl = started(sys.clone(), ui.clone());
-        assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
-            "got {:?}",
-            ctrl.phase()
-        );
-        assert_eq!(
-            ui.confirms().len(),
-            1,
-            "a mismatched declined pair must re-ask the dialog"
-        );
-    }
-
-    // §9.1 case 52.
-    #[test]
-    fn t52_service_probe_401_and_timeout() {
-        // 401 → TokenRejected{service:true}.
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            installed_status("running"),
-        );
-        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
-        sys.set_probe(
-            "http://127.0.0.1:7823/commands?token=svc-token",
-            vec![Probe::Status(401)],
-        );
-        let ui = FakeUi::new();
-        let ctrl = started(sys.clone(), ui);
-        match ctrl.phase() {
-            Phase::Failed(StartError::TokenRejected { service }) => {
-                assert!(service, "service-mode rejection");
-            }
-            other => panic!("expected TokenRejected{{service:true}}, got {other:?}"),
-        }
-
-        // Always unreachable → ServiceUnreachable.
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            installed_status("running"),
-        );
-        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
-        // No probe script ⇒ Unreachable.
-        let ui = FakeUi::new();
-        let ctrl = started(sys.clone(), ui);
-        assert!(
-            matches!(
-                ctrl.phase(),
-                Phase::Failed(StartError::ServiceUnreachable { .. })
-            ),
-            "got {:?}",
-            ctrl.phase()
-        );
-    }
-
-    // DESIGN §4.3: CONNECT after a successful `service install` (Replace)
-    // still reaches Ready only via the probe — a probe timeout is
-    // Failed(ServiceUnreachable), NEVER Ready (the install command is not
-    // proof the service answers).
-    #[test]
-    fn t52b_post_install_probe_timeout_is_serviceunreachable() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.24.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            installed_status_at(INSTALLED_EXE, "running"),
-        );
-        sys.set_run("peakbot-0.22.0", &["--version"], versioned("0.22.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "uninstall"],
-            run_out(Some(0), "ok\n", ""),
-        );
-        sys.set_run("peakbot", &["install"], run_out(Some(0), "ok\n", ""));
-        sys.set_run(
-            "peakbot",
-            &["service", "install"],
-            run_out(Some(0), "ok\n", ""),
-        );
-        // No probe script ⇒ every probe Unreachable.
-        let ui = FakeUi::new();
-        ui.answer_confirm(true); // Replace
-        let ctrl = started(sys.clone(), ui);
-        assert!(
-            matches!(
-                ctrl.phase(),
-                Phase::Failed(StartError::ServiceUnreachable { .. })
-            ),
-            "a probe timeout after install must be ServiceUnreachable, never Ready; got {:?}",
-            ctrl.phase()
-        );
-    }
-
-    // §9.1 case 53.
-    #[test]
-    fn t53_replace_service_install_failure_is_servicecommandfailed() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.24.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            installed_status_at(INSTALLED_EXE, "running"),
-        );
-        sys.set_run("peakbot-0.22.0", &["--version"], versioned("0.22.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "uninstall"],
-            run_out(Some(0), "ok\n", ""),
-        );
-        sys.set_run("peakbot", &["install"], run_out(Some(0), "ok\n", ""));
-        sys.set_run(
-            "peakbot",
-            &["service", "install"],
-            run_out(Some(1), "", "unit failed to start\n"),
-        );
-        let ui = FakeUi::new();
-        ui.answer_confirm(true);
-        let ctrl = started(sys.clone(), ui);
-        match ctrl.phase() {
-            Phase::Failed(StartError::ServiceCommandFailed { command, output }) => {
-                assert!(
-                    command.contains("service install"),
-                    "command must name the failing verb; {command:?}"
-                );
-                assert!(
-                    output.contains("unit failed to start"),
-                    "output must carry the child's stderr; {output:?}"
-                );
-            }
-            other => panic!("expected ServiceCommandFailed, got {other:?}"),
-        }
-    }
-
-    // §9.1 case 54.
-    #[test]
-    fn t54_enable_without_config_shows_finish_setup_and_changes_nothing() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            run_out(Some(0), NOT_INSTALLED, ""),
-        );
-        sys.set_default_probe(vec![Probe::Status(200)]);
-        sys.queue_child(crate::testing::FakeChildSpec::alive());
-        let ui = FakeUi::new();
-        let mut ctrl = started(sys.clone(), ui.clone());
-        assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
-            "precondition; got {:?}",
-            ctrl.phase()
-        );
-        // config.yaml absent.
-        let _ = ctrl.handle(Action::ToggleBackground);
-        assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
-            "phase must be unchanged; got {:?}",
-            ctrl.phase()
-        );
-        assert!(
-            ui.messages()
-                .iter()
-                .any(|d| d.title == "Finish setup first"),
-            "the finish-setup info dialog must show; got {:?}",
-            ui.messages()
-        );
-        assert!(
-            !sys.run_args().iter().any(|r| r == &["install".to_string()]),
-            "no install may run; runs: {:?}",
-            sys.run_args()
-        );
-        assert_eq!(sys.spawned_specs().len(), 1, "no new session spawn");
-    }
-
-    // §9.1 case 55 (0.24: the service binds general.web.bind, the same
-    // port our session uses — so the check only applies when no session
-    // of ours holds it, e.g. after the session failed on a busy bind).
-    #[test]
-    fn t55_enable_with_busy_port_shows_port_busy() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            run_out(Some(0), NOT_INSTALLED, ""),
-        );
-        sys.queue_child(crate::testing::FakeChildSpec {
-            mode: ChildMode::ExitsAfter(1),
-            exit: Some(1),
-            log_write: Some("127.0.0.1:7823 is already in use".to_string()),
-            ..Default::default()
-        });
-        sys.seed_file(CONFIG_YAML, "provider:\n  type: openrouter\n");
-        sys.set_port_free(7823, false);
-        let ui = FakeUi::new();
-        let mut ctrl = started(sys.clone(), ui.clone());
-        assert!(
-            matches!(
-                ctrl.phase(),
-                Phase::Failed(StartError::SessionExited { .. })
-            ),
-            "precondition: the session failed on the busy bind; got {:?}",
-            ctrl.phase()
-        );
-        let _ = ctrl.handle(Action::ToggleBackground);
-        assert!(
-            matches!(
-                ctrl.phase(),
-                Phase::Failed(StartError::SessionExited { .. })
-            ),
-            "phase unchanged; got {:?}",
-            ctrl.phase()
-        );
-        assert!(
-            ui.messages().iter().any(|d| d.title == "Port 7823 is busy"),
-            "got {:?}",
-            ui.messages()
-        );
-        assert!(
-            !sys.run_args().iter().any(|r| r == &["install".to_string()]),
-            "no install may run"
-        );
-        assert_eq!(sys.spawned_specs().len(), 1, "no new session spawn");
-    }
-
-    // §9.1 case 55 (0.24 companion): our own running session holds
-    // general.web.bind — that is not "busy"; the enable proceeds.
-    #[test]
-    fn t55b_enable_from_session_ignores_its_own_port() {
-        let sys = FakeSys::new();
-        sys.set_port_free(7823, false); // held by our session
-        sys.seed_file(CONFIG_YAML, "provider:\n  type: openrouter\n");
-        let ui = FakeUi::new();
-        ui.answer_confirm(false); // stop at the confirm: the check passed
-        let mut ctrl = ready_session(sys.clone(), ui.clone());
-        let _ = ctrl.handle(Action::ToggleBackground);
-        assert!(
-            ui.messages().is_empty(),
-            "no port-busy dialog; got {:?}",
-            ui.messages()
-        );
-        assert_eq!(ui.confirms().len(), 1, "the enable confirm was reached");
-    }
-
-    // §9.1 case 56.
-    #[test]
-    fn t56_enable_confirm_cancel_does_nothing() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            run_out(Some(0), NOT_INSTALLED, ""),
-        );
-        sys.set_default_probe(vec![Probe::Status(200)]);
-        sys.queue_child(crate::testing::FakeChildSpec::alive());
-        sys.seed_file(CONFIG_YAML, "provider:\n  type: openrouter\n");
-        let ui = FakeUi::new();
-        ui.answer_confirm(false);
-        let mut ctrl = started(sys.clone(), ui.clone());
-        let _ = ctrl.handle(Action::ToggleBackground);
-        assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
-            "got {:?}",
-            ctrl.phase()
-        );
-        assert_eq!(ui.confirms().len(), 1, "the enable confirm was shown");
-        assert!(
-            !sys.run_args().iter().any(|r| r == &["install".to_string()]
-                || r == &["service".to_string(), "uninstall".to_string()]),
-            "no commands may run; runs: {:?}",
-            sys.run_args()
-        );
-        assert_eq!(sys.spawned_specs().len(), 1, "no stop, no new spawn");
-    }
-
-    // §9.1 case 57 (0.24: the enable installs a bare unit; the service
-    // reads general.web — the desktop passes and writes no token).
-    #[test]
-    fn t57_enable_happy_path() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        // Start sees NotInstalled; the post-enable refresh sees Installed.
-        sys.set_run_seq(
-            "peakbot",
-            &["service", "status"],
-            vec![
-                run_out(Some(0), NOT_INSTALLED, ""),
-                installed_status("running"),
-            ],
-        );
-        sys.set_default_probe(vec![Probe::Status(200)]);
-        sys.queue_child(crate::testing::FakeChildSpec {
-            mode: ChildMode::ExitsOnInterrupt,
-            exit: Some(0),
-            ..Default::default()
-        });
-        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("cfg-token")));
-        sys.set_run("peakbot", &["install"], run_out(Some(0), "ok\n", ""));
-        sys.set_run(
-            "peakbot",
-            &["service", "install"],
-            run_out(Some(0), "ok\n", ""),
-        );
-        let ui = FakeUi::new();
-        ui.answer_confirm(true);
-        let mut ctrl = started(sys.clone(), ui.clone());
-        let session_pid = sys.spawned_pids()[0];
-
-        let _ = ctrl.handle(Action::ToggleBackground);
-
-        match ctrl.phase() {
-            Phase::Ready(Mode::Service(WebTarget { token, .. })) => {
-                assert_eq!(
-                    token.as_ref().map(|t| t.as_str()),
-                    Some("cfg-token"),
-                    "Ready's service token is general.web.token"
-                );
-            }
-            other => panic!("expected Ready(Service), got {other:?}"),
-        }
-        // The session child was interrupted BEFORE `install` ran.
-        let evts = sys.events();
-        let i_int = evts
-            .iter()
-            .position(|e| matches!(e, Effect::ChildInterrupt { pid } if *pid == session_pid))
-            .expect("the session child was interrupted");
-        let i_install = evts
-            .iter()
-            .position(|e| matches!(e, Effect::Run { args, .. } if args == &["install".to_string()]))
-            .expect("`install` ran");
-        assert!(
-            i_int < i_install,
-            "the session must be stopped BEFORE installing (no two backends on one config); events: {evts:?}"
-        );
-        // The pidfile is gone; no new sidecar spawn; tray checked.
-        assert!(!sys.has_file(Path::new(PIDFILE)), "pidfile removed");
-        assert_eq!(
-            sys.spawned_specs().len(),
-            1,
-            "no new sidecar spawn in service mode"
-        );
-        assert!(ui.last_tray().background_checked, "tray checkbox checked");
-        // The install is bare: no --bind, no --tls, no --token.
-        assert!(
-            sys.run_args()
-                .iter()
-                .any(|r| { r == &["service".to_string(), "install".to_string(),] }),
-            "bare service install; runs: {:?}",
-            sys.run_args()
-        );
-    }
-
-    // §9.1 case 58.
-    #[test]
-    fn t58_enable_failure_falls_back_to_session() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        sys.set_run_seq(
-            "peakbot",
-            &["service", "status"],
-            vec![
-                run_out(Some(0), NOT_INSTALLED, ""),
-                run_out(Some(0), NOT_INSTALLED, ""), // after the failed enable
-            ],
-        );
-        sys.set_default_probe(vec![Probe::Status(200)]);
-        sys.queue_child(crate::testing::FakeChildSpec {
-            mode: ChildMode::ExitsOnInterrupt,
-            exit: Some(0),
-            ..Default::default()
-        });
-        sys.queue_child(crate::testing::FakeChildSpec::alive()); // fallback session
-        sys.seed_file(CONFIG_YAML, "provider:\n  type: openrouter\n");
-        sys.set_run("peakbot", &["install"], run_out(Some(0), "ok\n", ""));
-        sys.set_run(
-            "peakbot",
-            &["service", "install"],
-            run_out(Some(1), "", "enable --now failed\n"),
-        );
-        sys.set_run(
-            "peakbot",
-            &["service", "uninstall"],
-            run_out(Some(0), "ok\n", ""),
-        );
-        let ui = FakeUi::new();
-        ui.answer_confirm(true);
-        let mut ctrl = started(sys.clone(), ui.clone());
-        let _ = ctrl.handle(Action::ToggleBackground);
-
-        assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
-            "the user must be back in session mode; got {:?}",
-            ctrl.phase()
-        );
-        assert!(
-            sys.run_args()
-                .iter()
-                .any(|r| r == &["service".to_string(), "uninstall".to_string()]),
-            "the failed service must be uninstalled (best effort); runs: {:?}",
-            sys.run_args()
-        );
-        assert!(
-            ui.messages().iter().any(|d| {
-                d.title == "Background service error" && d.body.contains("enable --now failed")
-            }),
-            "the error dialog must show the command output; got {:?}",
-            ui.messages()
-        );
-        assert_eq!(sys.spawned_specs().len(), 2, "a new session was launched");
-    }
-
-    // §9.1 case 59.
-    #[test]
-    fn t59_disable_flow() {
-        // Happy: service mode → confirm → uninstall → session.
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        sys.set_run_seq(
-            "peakbot",
-            &["service", "status"],
-            vec![
-                installed_status("running"),
-                run_out(Some(0), NOT_INSTALLED, ""),
-            ],
-        );
-        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
-        sys.set_probe(
-            "http://127.0.0.1:7823/commands?token=svc-token",
-            vec![Probe::Status(200)],
-        );
-        sys.set_run(
-            "peakbot",
-            &["service", "uninstall"],
-            run_out(Some(0), "ok\n", ""),
-        );
-        sys.set_default_probe(vec![Probe::Status(200)]);
-        sys.queue_child(crate::testing::FakeChildSpec::alive());
-        let ui = FakeUi::new();
-        ui.answer_confirm(true);
-        let mut ctrl = started(sys.clone(), ui.clone());
-        assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
-            "precondition; got {:?}",
-            ctrl.phase()
-        );
-        let _ = ctrl.handle(Action::ToggleBackground);
-        assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
-            "got {:?}",
-            ctrl.phase()
-        );
-        assert!(
-            sys.run_args()
-                .iter()
-                .any(|r| r == &["service".to_string(), "uninstall".to_string()]),
-            "service uninstall ran"
-        );
-        assert_eq!(sys.spawned_specs().len(), 1, "the session spawn");
-        assert!(
-            !ui.last_tray().background_checked,
-            "tray checkbox unchecked"
-        );
-
-        // Cancel: nothing.
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            installed_status("running"),
-        );
-        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
-        sys.set_probe(
-            "http://127.0.0.1:7823/commands?token=svc-token",
-            vec![Probe::Status(200)],
-        );
-        let ui = FakeUi::new();
-        ui.answer_confirm(false);
-        let mut ctrl = started(sys.clone(), ui.clone());
-        let _ = ctrl.handle(Action::ToggleBackground);
-        assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
-            "got {:?}",
-            ctrl.phase()
-        );
-        assert!(
-            !sys.run_args()
-                .iter()
-                .any(|r| r == &["service".to_string(), "uninstall".to_string()]),
-            "Cancel must not uninstall; runs: {:?}",
-            sys.run_args()
-        );
-    }
-
-    // §9.1 case 60.
-    #[test]
-    fn t60_disable_uninstall_failure_reconnects_service() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        sys.set_run_seq(
-            "peakbot",
-            &["service", "status"],
-            vec![installed_status("running"), installed_status("running")],
-        );
-        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
-        sys.set_probe(
-            "http://127.0.0.1:7823/commands?token=svc-token",
-            vec![Probe::Status(200)],
-        );
-        sys.set_run(
-            "peakbot",
-            &["service", "uninstall"],
-            run_out(Some(1), "", "disable failed\n"),
-        );
-        let ui = FakeUi::new();
-        ui.answer_confirm(true);
-        let mut ctrl = started(sys.clone(), ui.clone());
-        let _ = ctrl.handle(Action::ToggleBackground);
-        assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
-            "unchanged mode; got {:?}",
-            ctrl.phase()
-        );
-        assert!(
-            ui.messages().iter().any(|d| {
-                d.title == "Background service error" && d.body.contains("disable failed")
-            }),
-            "the error dialog must show; got {:?}",
-            ui.messages()
-        );
-        assert_eq!(sys.spawned_specs().len(), 0, "no session spawn");
-    }
-
-    // §9.1 case 61.
-    #[test]
-    fn t61_toggle_and_reinstall_ignored_while_starting() {
-        let sys = FakeSys::new();
-        let ui = FakeUi::new();
-        let mut ctrl = Controller::new(
-            sys.clone(),
-            ui.clone(),
-            paths(),
-            Arc::new(AtomicBool::new(false)),
-            ReplacePolicy::Ask,
-            Platform::Linux,
-        );
-        let _ = ctrl.handle(Action::ToggleBackground);
-        let _ = ctrl.handle(Action::ReinstallService);
-        assert!(
-            matches!(ctrl.phase(), Phase::Starting(StartStep::CheckingBundled)),
-            "phase must be untouched; got {:?}",
-            ctrl.phase()
-        );
-        assert!(
-            sys.run_args().is_empty(),
-            "no commands may run; got {:?}",
-            sys.run_args()
-        );
-        assert!(sys.spawned_specs().is_empty());
-        assert!(ui.confirms().is_empty());
-        assert!(ui.messages().is_empty());
-    }
-
     // §9.1 case 62.
     #[test]
-    fn t62_tick_detects_session_death_and_is_a_noop_in_service() {
+    fn t62_tick_detects_session_death_and_is_a_noop_otherwise() {
         // (a) A session child that dies after Ready.
         let sys = FakeSys::new();
         sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
@@ -2111,7 +871,7 @@ mod tests {
         let ui = FakeUi::new();
         let mut ctrl = started(sys.clone(), ui.clone());
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
+            matches!(ctrl.phase(), Phase::Ready(_)),
             "precondition; got {:?}",
             ctrl.phase()
         );
@@ -2125,26 +885,36 @@ mod tests {
         }
         assert!(!sys.has_file(Path::new(PIDFILE)), "pidfile removed");
 
-        // (b) Service mode: tick is a no-op.
+        // (b) Ready with a LIVE child: tick is a no-op (no phase change,
+        // no side effects beyond the liveness poll).
         let sys = FakeSys::new();
         sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
         sys.set_run(
             "peakbot",
             &["service", "status"],
-            installed_status("running"),
+            run_out(Some(0), NOT_INSTALLED, ""),
         );
-        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
-        sys.set_probe(
-            "http://127.0.0.1:7823/commands?token=svc-token",
-            vec![Probe::Status(200)],
-        );
+        sys.set_default_probe(vec![Probe::Status(200)]);
+        sys.queue_child(crate::testing::FakeChildSpec::alive());
         let ui = FakeUi::new();
         let mut ctrl = started(sys.clone(), ui.clone());
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
-            "precondition; got {:?}",
+            matches!(ctrl.phase(), Phase::Ready(_)),
+            "{:?}",
             ctrl.phase()
         );
+        let phases_before = ui.phases().len();
+        ctrl.tick();
+        assert!(matches!(ctrl.phase(), Phase::Ready(_)), "still Ready");
+        assert_eq!(ui.phases().len(), phases_before, "no phase change");
+
+        // (c) Failed (declined migration): tick is a no-op — it must not
+        // poll, re-fail or touch anything.
+        let sys = migration_sys(Some(installed_status("running")), Some(ok_out()));
+        let ui = FakeUi::new();
+        ui.answer_confirm(false);
+        let mut ctrl = started(sys.clone(), ui.clone());
+        assert_eq!(ctrl.phase(), &Phase::Failed(StartError::ServiceInstalled));
         let phases_before = ui.phases().len();
         let events_before = sys.events().len();
         ctrl.tick();
@@ -2260,7 +1030,7 @@ mod tests {
         let ui = FakeUi::new();
         let ctrl = started(sys.clone(), ui);
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
+            matches!(ctrl.phase(), Phase::Ready(_)),
             "got {:?}",
             ctrl.phase()
         );
@@ -2302,7 +1072,7 @@ mod tests {
         let ui = FakeUi::new();
         let ctrl = started(sys.clone(), ui);
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
+            matches!(ctrl.phase(), Phase::Ready(_)),
             "got {:?}",
             ctrl.phase()
         );
@@ -2325,7 +1095,7 @@ mod tests {
         let ui = FakeUi::new();
         let ctrl = started(sys.clone(), ui);
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
+            matches!(ctrl.phase(), Phase::Ready(_)),
             "got {:?}",
             ctrl.phase()
         );
@@ -2358,7 +1128,7 @@ mod tests {
         let ui = FakeUi::new();
         let mut ctrl = started(sys.clone(), ui);
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
+            matches!(ctrl.phase(), Phase::Ready(_)),
             "precondition; got {:?}",
             ctrl.phase()
         );
@@ -2368,7 +1138,7 @@ mod tests {
         // pids[1] the fresh one it spawned.
         let (old_pid, new_pid) = (sys.spawned_pids()[0], sys.spawned_pids()[1]);
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
+            matches!(ctrl.phase(), Phase::Ready(_)),
             "got {:?}",
             ctrl.phase()
         );
@@ -2416,767 +1186,591 @@ mod tests {
         started(sys, ui)
     }
 
-    // Design #377 t84 (0.24): a unit with `--tls` baked in (`TLS: on`)
-    // serves https even when general.web.tls is false — the server's
-    // rule is `--tls || general.web.tls`.
-    #[test]
-    fn t84_start_with_tls_service_probes_https_and_ready_https() {
+    // -------------------------------------------------------------------
+    // Close-to-tray plan §B/§D — the old-service migration on Start.
+    //
+    // Rule: a service that is INSTALLED (running or stopped) ⇒ ask, on
+    // EVERY Start. Yes → `service uninstall` → session; No →
+    // Failed(ServiceInstalled). Not installed / status unavailable ⇒
+    // session, no prompt. The desktop NEVER installs anything: the
+    // `install` and `service install` verbs are deliberately left
+    // UNSCRIPTED in these fixtures, so a controller that tried them
+    // would also trip an io error, not just the m8 assertion.
+    // -------------------------------------------------------------------
+
+    /// A sidecar script for the migration scenarios: `--version`, the
+    /// given `service status` / `service uninstall` outputs (`None` ⇒
+    /// unscripted ⇒ the run fails with NotFound), a ready probe and one
+    /// live session child.
+    fn migration_sys(status: Option<RunOutput>, uninstall: Option<RunOutput>) -> FakeSys {
         let sys = FakeSys::new();
         sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            installed_status_tls("running", "on"),
-        );
-        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
-        sys.set_default_probe(vec![Probe::Status(200)]);
-        let ui = FakeUi::new();
-        let ctrl = started(sys.clone(), ui);
-        match ctrl.phase() {
-            Phase::Ready(Mode::Service(WebTarget { tls, token, .. })) => {
-                assert!(
-                    *tls,
-                    "the protocol comes from the TLS: line; got {:?}",
-                    ctrl.phase()
-                );
-                assert_eq!(
-                    token.as_ref().map(|t| t.as_str()),
-                    Some("svc-token"),
-                    "the token is general.web.token"
-                );
-            }
-            other => panic!("expected Ready(Service), got {other:?}"),
+        if let Some(s) = status {
+            sys.set_run("peakbot", &["service", "status"], s);
         }
-        assert!(
-            sys.events()
-                .iter()
-                .any(|e| matches!(e, Effect::Probe { url } if url.to_string().starts_with("https://127.0.0.1:7823/commands"))),
-            "the readiness probe must hit the https URL; events: {:?}",
-            sys.events()
-        );
+        if let Some(u) = uninstall {
+            sys.set_run("peakbot", &["service", "uninstall"], u);
+        }
+        sys.set_default_probe(vec![Probe::Status(200)]);
+        sys.queue_child(crate::testing::FakeChildSpec::alive());
+        sys
     }
 
-    // Design #377 t86 (0.24): Replace with `general.web.tls: true` — the
-    // binary IS replaced (unlike reconfigure), the unit is installed
-    // bare (it reads general.web itself) and the desktop connects https.
-    #[test]
-    fn t86_replace_with_tls_config_installs_bare_and_connects_https() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.24.0"));
-        // Start sees the OLD installed service; the post-replace refresh
-        // sees the bare unit (no TLS line).
-        sys.set_run_seq(
-            "peakbot",
-            &["service", "status"],
-            vec![
-                installed_status_at(INSTALLED_EXE, "running"),
-                installed_status("running"),
-            ],
+    fn ok_out() -> RunOutput {
+        run_out(Some(0), "ok\n", "")
+    }
+
+    fn arg_vec(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// m8's invariant, reusable: the desktop never ran `install` nor
+    /// `service install`, and never touched anything but the sidecar
+    /// (i.e. never `~/.local/bin/peakbot`).
+    fn assert_never_installs(sys: &FakeSys) {
+        let runs = sys.run_args();
+        assert!(
+            !runs.iter().any(|r| r == &arg_vec(&["install"])),
+            "the desktop must never run `install`; runs: {runs:?}"
         );
-        sys.set_run("peakbot-0.22.0", &["--version"], versioned("0.22.0"));
+        assert!(
+            !runs.iter().any(|r| r == &arg_vec(&["service", "install"])),
+            "the desktop must never run `service install`; runs: {runs:?}"
+        );
+        for e in sys.events() {
+            if let Effect::Run { program, .. } = e {
+                assert_eq!(
+                    program,
+                    PathBuf::from(SIDECAR),
+                    "only the bundled sidecar may be run (never ~/.local/bin/peakbot)"
+                );
+            }
+        }
+    }
+
+    fn position_of_run(sys: &FakeSys, args: &[&str]) -> Option<usize> {
+        let want = arg_vec(args);
+        sys.events()
+            .iter()
+            .position(|e| matches!(e, Effect::Run { args, .. } if *args == want))
+    }
+
+    // m1: installed + running, user says Yes ⇒ ask once, uninstall BEFORE
+    // the first spawn, RemovingService step shown, ends Ready.
+    #[test]
+    fn m1_installed_running_asks_then_uninstalls_then_session() {
+        let sys = migration_sys(Some(installed_status("running")), Some(ok_out()));
         sys.seed_file(
             CONFIG_YAML,
-            "general:\n  web:\n    tls: true\n    token: svc-token\n",
+            web_yaml("127.0.0.1:7823", Some("tok-000000001")),
         );
-        sys.set_run(
-            "peakbot",
-            &["service", "uninstall"],
-            run_out(Some(0), "ok\n", ""),
-        );
-        sys.set_run("peakbot", &["install"], run_out(Some(0), "ok\n", ""));
-        sys.set_run(
-            "peakbot",
-            &["service", "install"],
-            run_out(Some(0), "ok\n", ""),
-        );
-        sys.set_default_probe(vec![Probe::Status(200)]);
         let ui = FakeUi::new();
-        ui.answer_confirm(true); // Replace
-        let ctrl = started(sys.clone(), ui);
+        ui.answer_confirm(true);
+        let ctrl = started(sys.clone(), ui.clone());
 
-        // Command order (invariant A5, design auto-replace §4.3):
-        // install → service uninstall → service install.
-        assert_order_ok(&sys.run_args());
+        assert_eq!(
+            ui.confirms(),
+            vec![remove_old_service_dialog()],
+            "exactly one confirm, with the locked migration dialog"
+        );
+        let runs = sys.run_args();
         assert!(
-            sys.run_args()
-                .iter()
-                .any(|r| { r == &["service".to_string(), "install".to_string(),] }),
-            "a bare `service install`; runs: {:?}",
-            sys.run_args()
+            runs.contains(&arg_vec(&["service", "uninstall"])),
+            "Yes ⇒ `service uninstall` ran; runs: {runs:?}"
+        );
+        let i_status = position_of_run(&sys, &["service", "status"]).expect("status ran");
+        let i_uninstall = position_of_run(&sys, &["service", "uninstall"]).expect("uninstall ran");
+        let i_spawn = sys
+            .events()
+            .iter()
+            .position(|e| matches!(e, Effect::Spawn { .. }))
+            .expect("the session was spawned");
+        assert!(
+            i_status < i_uninstall && i_uninstall < i_spawn,
+            "status → uninstall → first spawn; events: {:?}",
+            sys.events()
+        );
+        assert_eq!(sys.spawned_specs().len(), 1, "exactly one session spawn");
+
+        let steps = ui.steps();
+        let pos = |want: Phase| steps.iter().position(|p| *p == want);
+        let i_check = pos(Phase::Starting(StartStep::CheckingService)).expect("CheckingService");
+        let i_remove = pos(Phase::Starting(StartStep::RemovingService)).expect("RemovingService");
+        let i_start = pos(Phase::Starting(StartStep::StartingSession)).expect("StartingSession");
+        assert!(
+            i_check < i_remove && i_remove < i_start,
+            "CheckingService → RemovingService → StartingSession; steps: {steps:?}"
+        );
+        assert!(
+            matches!(ctrl.phase(), Phase::Ready(t) if t.bind.port() == 7823),
+            "ends Ready(target); got {:?}",
+            ctrl.phase()
         );
         assert_eq!(
             ready_url(&ctrl).as_deref(),
-            Some("https://127.0.0.1:7823/?token=svc-token"),
-            "general.web.tls ⇒ https; got {:?}",
-            ctrl.phase()
+            Some("http://127.0.0.1:7823/?token=tok-000000001")
         );
+        assert_never_installs(&sys);
     }
 
-    // -------------------------------------------------------------------
-    // Design auto-replace §7.1 — t107–t120.
-    //
-    // Fixture conventions: `SIDECAR` is the bundled sidecar; the
-    // installed exe's file contents are seeded with `sys.seed_file`.
-    // "build-A" vs "build-B" ⇒ the builds differ; both "build-A" ⇒
-    // identical. "Replace scripts" = `install`, `service uninstall` and
-    // the bare `service install` scripted ok, plus
-    // `service status` as a [pre, post] sequence where post =
-    // `installed_status_tls("running", …)` (Exec = SIDECAR).
-    // -------------------------------------------------------------------
-
-    /// The three replace commands scripted ok (http, no TLS).
-    fn script_replace_http(sys: &FakeSys) {
-        sys.set_run("peakbot", &["install"], run_out(Some(0), "ok\n", ""));
-        sys.set_run(
-            "peakbot",
-            &["service", "uninstall"],
-            run_out(Some(0), "ok\n", ""),
-        );
-        sys.set_run(
-            "peakbot",
-            &["service", "install"],
-            run_out(Some(0), "ok\n", ""),
-        );
-    }
-
-    /// Seed the installed exe and the sidecar with DIFFERENT contents.
-    fn seed_builds_differ(sys: &FakeSys, installed_exe: &str) {
-        sys.seed_file(installed_exe, "build-A");
-        sys.seed_file(SIDECAR, "build-B");
-    }
-
-    /// Seed the installed exe and the sidecar with IDENTICAL contents.
-    fn seed_builds_identical(sys: &FakeSys, installed_exe: &str) {
-        sys.seed_file(installed_exe, "build-A");
-        sys.seed_file(SIDECAR, "build-A");
-    }
-
-    /// No `Effect::Run` whose program is `exe` (the installed binary
-    /// was never executed — e.g. no `--version` query).
-    fn assert_never_ran(sys: &FakeSys, exe: &str) {
-        assert!(
-            sys.events().iter().all(|e| {
-                !matches!(e, Effect::Run { program, .. } if program == Path::new(exe))
-            }),
-            "`{exe}` must never be executed; events: {:?}",
-            sys.events()
-        );
-    }
-
-    // Design auto-replace t107 (SC1): same version, DIFFERENT build,
-    // policy Auto ⇒ the replace runs silently — no dialog.
+    // m2: installed + STOPPED still asks (a stopped unit would still
+    // conflict at the next login) — exactly one confirm.
     #[test]
-    fn t107_auto_same_version_different_build_replaces_silently() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        let pre = installed_status_at(INSTALLED_SAME, "running");
-        sys.set_run_seq(
-            "peakbot",
-            &["service", "status"],
-            vec![pre, installed_status_tls("running", "off")],
-        );
-        sys.set_run("peakbot-same", &["--version"], versioned("0.23.0"));
-        seed_builds_differ(&sys, INSTALLED_SAME);
-        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
-        sys.seed_file(DECLINED, "installed=0.20.0\nbundled=0.21.0\n"); // stale; must be removed
-        script_replace_http(&sys);
-        sys.set_probe(
-            "http://127.0.0.1:7823/commands?token=svc-token",
-            vec![Probe::Status(200)],
-        );
+    fn m2_installed_stopped_still_asks() {
+        let sys = migration_sys(Some(installed_status("stopped")), Some(ok_out()));
         let ui = FakeUi::new();
-        let ctrl = started_with(sys.clone(), ui.clone(), ReplacePolicy::Auto);
+        ui.answer_confirm(true);
+        let ctrl = started(sys.clone(), ui.clone());
 
+        assert_eq!(ui.confirms().len(), 1, "a stopped service still asks");
+        assert_eq!(ui.confirms(), vec![remove_old_service_dialog()]);
         assert!(
-            ui.confirms().is_empty(),
-            "the silent replace must not show a dialog; got {:?}",
-            ui.confirms()
+            sys.run_args().contains(&arg_vec(&["service", "uninstall"])),
+            "Yes ⇒ uninstall ran"
         );
-        // A5: copy → uninstall → install.
-        assert_order_ok(&sys.run_args());
-        // The content comparison ran, and BEFORE the version query.
-        let evts = sys.events();
-        let i_same = evts
-            .iter()
-            .position(|e| {
-                matches!(e, Effect::SameContents { a, b }
-                    if a == Path::new(INSTALLED_SAME) && b == Path::new(SIDECAR))
-            })
-            .expect("same_contents(installed exe, sidecar) must run");
-        let i_version = evts
-            .iter()
-            .position(|e| {
-                matches!(e, Effect::Run { program, args }
-                    if program == Path::new(INSTALLED_SAME)
-                        && args == &["--version".to_string()])
-            })
-            .expect("the installed exe's --version ran (builds differ)");
         assert!(
-            i_same < i_version,
-            "identity is checked before the version; events: {evts:?}"
+            matches!(ctrl.phase(), Phase::Ready(_)),
+            "{:?}",
+            ctrl.phase()
         );
-        match ctrl.phase() {
-            Phase::Ready(Mode::Service(WebTarget { tls, token, .. })) => {
-                assert!(!*tls, "http service (no TLS line)");
-                assert_eq!(
-                    token.as_ref().map(|t| t.as_str()),
-                    Some("svc-token"),
-                    "the token is general.web.token"
-                );
-            }
-            other => panic!("expected Ready(Service), got {other:?}"),
-        }
-        assert!(!sys.has_file(Path::new(DECLINED)), "declined file removed");
+        assert_never_installs(&sys);
     }
 
-    // Design auto-replace t108 (SC2): identical build ⇒ connect,
-    // WITHOUT any replace — and without a version query.
+    // m2b: an `unknown` run state (exit 0, Installed: true) is installed.
     #[test]
-    fn t108_auto_identical_build_connects_without_replace() {
-        // (a) Running: no service install at all.
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            installed_status_at(INSTALLED_SAME, "running"),
-        );
-        seed_builds_identical(&sys, INSTALLED_SAME);
-        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
-        sys.set_probe(
-            "http://127.0.0.1:7823/commands?token=svc-token",
-            vec![Probe::Status(200)],
-        );
+    fn m2b_installed_unknown_state_still_asks() {
+        let sys = migration_sys(Some(installed_status("unknown")), Some(ok_out()));
         let ui = FakeUi::new();
-        let ctrl = started_with(sys.clone(), ui.clone(), ReplacePolicy::Auto);
+        ui.answer_confirm(true);
+        let ctrl = started(sys.clone(), ui.clone());
+        assert_eq!(ui.confirms().len(), 1);
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
-            "got {:?}",
+            matches!(ctrl.phase(), Phase::Ready(_)),
+            "{:?}",
             ctrl.phase()
         );
-        let runs = sys.run_args();
-        assert!(
-            !runs.iter().any(|r| r == &["install".to_string()]),
-            "no binary copy; runs: {runs:?}"
-        );
-        assert!(
-            !runs
-                .iter()
-                .any(|r| r == &["service".to_string(), "uninstall".to_string()]),
-            "no service uninstall; runs: {runs:?}"
-        );
-        assert!(
-            !runs.iter().any(|r| {
-                r.first().is_some_and(|s| s == "service")
-                    && r.get(1).is_some_and(|s| s == "install")
-            }),
-            "a running identical service must not be re-installed; runs: {runs:?}"
-        );
-        assert_never_ran(&sys, INSTALLED_SAME);
-        assert!(ui.confirms().is_empty(), "no dialog");
+        assert_never_installs(&sys);
+    }
 
-        // (b) Stopped: `service install` runs ONCE (start_first), no
-        // binary copy, no uninstall.
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            installed_status_at(INSTALLED_SAME, "stopped"),
-        );
-        seed_builds_identical(&sys, INSTALLED_SAME);
-        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
-        sys.set_run(
-            "peakbot",
-            &["service", "install"],
-            run_out(Some(0), "ok\n", ""),
-        );
-        sys.set_probe(
-            "http://127.0.0.1:7823/commands?token=svc-token",
-            vec![Probe::Status(200)],
-        );
+    // m3: user says No ⇒ Failed(ServiceInstalled): no spawn, no
+    // uninstall, tray shows the error, no pidfile written.
+    #[test]
+    fn m3_declined_fails_service_installed() {
+        let sys = migration_sys(Some(installed_status("running")), Some(ok_out()));
         let ui = FakeUi::new();
-        let ctrl = started_with(sys.clone(), ui.clone(), ReplacePolicy::Auto);
-        assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
-            "got {:?}",
-            ctrl.phase()
-        );
-        let runs = sys.run_args();
+        ui.answer_confirm(false);
+        let ctrl = started(sys.clone(), ui.clone());
+
         assert_eq!(
-            runs.iter()
-                .filter(|r| { *r == &["service".to_string(), "install".to_string(),] })
-                .count(),
-            1,
-            "a stopped identical service is (re)started once; runs: {runs:?}"
+            ctrl.phase(),
+            &Phase::Failed(StartError::ServiceInstalled),
+            "declining lands on the dedicated declined view"
         );
         assert!(
-            !runs.iter().any(|r| r == &["install".to_string()]),
-            "no binary copy; runs: {runs:?}"
+            sys.spawned_specs().is_empty(),
+            "no session may be spawned while the old service stays"
         );
         assert!(
-            !runs
-                .iter()
-                .any(|r| r == &["service".to_string(), "uninstall".to_string()]),
-            "no service uninstall; runs: {runs:?}"
-        );
-        assert_never_ran(&sys, INSTALLED_SAME);
-        assert!(ui.confirms().is_empty(), "no dialog");
-    }
-
-    // Design auto-replace t109 (SC3): an OLDER installed build is
-    // replaced silently under Auto.
-    #[test]
-    fn t109_auto_older_installed_replaces_silently() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.24.0")); // bundled
-        let pre = installed_status_at(INSTALLED_EXE, "running");
-        sys.set_run_seq(
-            "peakbot",
-            &["service", "status"],
-            vec![pre, installed_status_tls("running", "off")],
-        );
-        sys.set_run("peakbot-0.22.0", &["--version"], versioned("0.22.0"));
-        seed_builds_differ(&sys, INSTALLED_EXE);
-        script_replace_http(&sys);
-        sys.set_default_probe(vec![Probe::Status(200)]);
-        let ui = FakeUi::new();
-        let ctrl = started_with(sys.clone(), ui.clone(), ReplacePolicy::Auto);
-
-        assert!(
-            ui.confirms().is_empty(),
-            "an older installed build is replaced silently; got {:?}",
-            ui.confirms()
-        );
-        assert_order_ok(&sys.run_args());
-        assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
-            "got {:?}",
-            ctrl.phase()
-        );
-    }
-
-    // Design auto-replace t110 (SC4): a NEWER installed build is never
-    // silent — the OLDER warning dialog appears; confirming replaces.
-    #[test]
-    fn t110_auto_newer_installed_asks_then_replace() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0")); // bundled
-        let pre = installed_status_at(INSTALLED_NEWER, "running");
-        sys.set_run_seq(
-            "peakbot",
-            &["service", "status"],
-            vec![pre, installed_status_tls("running", "off")],
-        );
-        sys.set_run("peakbot-0.24.0", &["--version"], versioned("0.24.0"));
-        seed_builds_differ(&sys, INSTALLED_NEWER);
-        script_replace_http(&sys);
-        sys.set_default_probe(vec![Probe::Status(200)]);
-        let ui = FakeUi::new();
-        ui.answer_confirm(true); // Replace
-        let ctrl = started_with(sys.clone(), ui.clone(), ReplacePolicy::Auto);
-
-        let confirms = ui.confirms();
-        assert_eq!(confirms.len(), 1, "exactly one dialog; got {confirms:?}");
-        assert!(
-            confirms[0].body.contains("OLDER"),
-            "the downgrade warning must be shown; got {:?}",
-            confirms[0].body
-        );
-        assert_order_ok(&sys.run_args());
-        assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
-            "got {:?}",
-            ctrl.phase()
-        );
-    }
-
-    // Design auto-replace t111 (SC4): declining the NEWER dialog
-    // records the (installed, bundled) pair and silences the re-ask.
-    #[test]
-    fn t111_auto_newer_installed_keep_records_pair_and_does_not_reask() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0")); // bundled
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            installed_status_at(INSTALLED_NEWER, "running"),
-        );
-        sys.set_run("peakbot-0.24.0", &["--version"], versioned("0.24.0"));
-        seed_builds_differ(&sys, INSTALLED_NEWER);
-        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
-        sys.set_probe(
-            "http://127.0.0.1:7823/commands?token=svc-token",
-            vec![Probe::Status(200)],
-        );
-        let ui = FakeUi::new();
-        ui.answer_confirm(false); // Keep
-        let mut ctrl = started_with(sys.clone(), ui.clone(), ReplacePolicy::Auto);
-        assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
-            "got {:?}",
-            ctrl.phase()
-        );
-
-        // The declined file carries the exact (0.24.0, 0.23.0) pair.
-        let content = sys
-            .file(Path::new(DECLINED))
-            .expect("declined-replace written");
-        let declined = DeclinedReplace::parse(&content).expect("declined file parses");
-        let v24 = semver::Version::parse("0.24.0").unwrap();
-        let v23 = semver::Version::parse("0.23.0").unwrap();
-        assert!(
-            declined.matches(&InstalledVersion::Known(v24), &v23),
-            "the exact (installed 0.24.0, bundled 0.23.0) pair must be recorded"
-        );
-        assert!(
-            !sys.run_args().iter().any(|r| r == &["install".to_string()]),
-            "Keep must not copy a binary; runs: {:?}",
+            !sys.run_args().contains(&arg_vec(&["service", "uninstall"])),
+            "No ⇒ nothing is uninstalled; runs: {:?}",
             sys.run_args()
         );
+        assert!(!sys.has_file(Path::new(PIDFILE)), "no pidfile for no child");
+        assert_eq!(ui.confirms(), vec![remove_old_service_dialog()]);
+        assert_eq!(
+            ui.last_tray(),
+            "PeakBot 0.23.0 · error",
+            "the tray status shows the error"
+        );
+        assert_never_installs(&sys);
+    }
 
-        // Next Start: no dialog, connects.
+    // m4: the decline is NOT remembered — Retry (Start again) asks again.
+    #[test]
+    fn m4_retry_after_decline_asks_again() {
+        let sys = migration_sys(Some(installed_status("running")), Some(ok_out()));
+        let ui = FakeUi::new();
+        ui.answer_confirm(false);
+        ui.answer_confirm(false);
+        let mut ctrl = started(sys.clone(), ui.clone());
+        assert_eq!(ctrl.phase(), &Phase::Failed(StartError::ServiceInstalled));
+        assert_eq!(ui.confirms().len(), 1, "precondition: one ask so far");
+
+        let _ = ctrl.handle(Action::Start); // the Retry button
+        assert_eq!(ui.confirms().len(), 2, "Start asks on EVERY start");
+        assert_eq!(
+            ui.confirms()[0],
+            ui.confirms()[1],
+            "the same dialog both times"
+        );
+        assert_eq!(ctrl.phase(), &Phase::Failed(StartError::ServiceInstalled));
+        assert!(sys.spawned_specs().is_empty(), "still no spawn");
+        assert_never_installs(&sys);
+    }
+
+    // m4b: decline, then Retry + Yes ⇒ the migration completes.
+    #[test]
+    fn m4b_retry_after_decline_can_accept() {
+        let sys = migration_sys(Some(installed_status("running")), Some(ok_out()));
+        let ui = FakeUi::new();
+        ui.answer_confirm(false);
+        ui.answer_confirm(true);
+        let mut ctrl = started(sys.clone(), ui.clone());
+        assert_eq!(ctrl.phase(), &Phase::Failed(StartError::ServiceInstalled));
+
         let _ = ctrl.handle(Action::Start);
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
-            "got {:?}",
+            matches!(ctrl.phase(), Phase::Ready(_)),
+            "Yes on the retry reaches Ready; got {:?}",
             ctrl.phase()
         );
-        assert_eq!(
-            ui.confirms().len(),
-            1,
-            "the second Start must not re-ask; got {:?}",
-            ui.confirms()
-        );
+        assert_eq!(ui.confirms().len(), 2);
+        assert_eq!(sys.spawned_specs().len(), 1, "one spawn, after the Yes");
+        assert_never_installs(&sys);
     }
 
-    // Design auto-replace t112 (SC5a): an unparseable `--version`
-    // (Unknown) is replaced silently under Auto.
+    // m4c: Action::Restart from a Failed phase is the full start path —
+    // it asks again too.
     #[test]
-    fn t112_auto_unknown_version_different_build_replaces_silently() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        let pre = installed_status_at(INSTALLED_GARBAGE, "running");
-        sys.set_run_seq(
-            "peakbot",
-            &["service", "status"],
-            vec![pre, installed_status_tls("running", "off")],
-        );
-        sys.set_run(
-            "peakbot-garbage",
-            &["--version"],
-            run_out(Some(0), "hello\n", ""),
-        );
-        seed_builds_differ(&sys, INSTALLED_GARBAGE);
-        script_replace_http(&sys);
-        sys.set_default_probe(vec![Probe::Status(200)]);
+    fn m4c_restart_from_failed_reruns_start_and_asks_again() {
+        let sys = migration_sys(Some(installed_status("running")), Some(ok_out()));
         let ui = FakeUi::new();
-        let ctrl = started_with(sys.clone(), ui.clone(), ReplacePolicy::Auto);
+        ui.answer_confirm(false);
+        ui.answer_confirm(true);
+        let mut ctrl = started(sys.clone(), ui.clone());
+        assert_eq!(ctrl.phase(), &Phase::Failed(StartError::ServiceInstalled));
 
+        let flow = ctrl.handle(Action::Restart);
+        assert_eq!(flow, ControlFlow::Continue(()), "the app never exits");
+        assert_eq!(ui.confirms().len(), 2, "Restart re-runs handle_start");
         assert!(
-            ui.confirms().is_empty(),
-            "an unknown version is replaced silently under Auto; got {:?}",
-            ui.confirms()
-        );
-        assert_order_ok(&sys.run_args());
-        assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
-            "got {:?}",
+            matches!(ctrl.phase(), Phase::Ready(_)),
+            "{:?}",
             ctrl.phase()
         );
     }
 
-    // Design auto-replace t113 (SC5b): an unparseable `--version` on an
-    // IDENTICAL build ⇒ connect, with no version query at all.
+    // m5: `service uninstall` exits non-zero ⇒ ServiceCommandFailed with
+    // the command and the output; no session spawn.
     #[test]
-    fn t113_auto_unknown_version_identical_build_connects() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            installed_status_at(INSTALLED_GARBAGE, "running"),
-        );
-        seed_builds_identical(&sys, INSTALLED_GARBAGE);
-        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
-        sys.set_probe(
-            "http://127.0.0.1:7823/commands?token=svc-token",
-            vec![Probe::Status(200)],
+    fn m5_uninstall_failure_is_service_command_failed() {
+        let sys = migration_sys(
+            Some(installed_status("running")),
+            Some(run_out(Some(1), "", "permission denied\n")),
         );
         let ui = FakeUi::new();
-        let ctrl = started_with(sys.clone(), ui.clone(), ReplacePolicy::Auto);
-
-        assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
-            "got {:?}",
-            ctrl.phase()
-        );
-        assert_never_ran(&sys, INSTALLED_GARBAGE);
-        assert!(
-            !sys.run_args().iter().any(|r| r == &["install".to_string()]),
-            "no binary copy; runs: {:?}",
-            sys.run_args()
-        );
-        assert!(ui.confirms().is_empty(), "no dialog");
-    }
-
-    // Design auto-replace t114 (SC6/A4, 0.24): the silent replace
-    // installs a bare unit and the desktop writes nothing — the token is
-    // general.web.token; https follows the unit's `TLS:` line.
-    #[test]
-    fn t114_auto_replace_installs_bare_and_writes_nothing() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        let pre = run_out(
-            Some(0),
-            &format!(
-                "Installed: true\nExec:      {INSTALLED_SAME}\nState:     running\nTLS:       on\n"
-            ),
-            "",
-        );
-        sys.set_run_seq(
-            "peakbot",
-            &["service", "status"],
-            vec![pre, installed_status_tls("running", "on")],
-        );
-        sys.set_run("peakbot-same", &["--version"], versioned("0.23.0"));
-        seed_builds_differ(&sys, INSTALLED_SAME);
-        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
-        script_replace_http(&sys);
-        sys.set_probe(
-            "https://127.0.0.1:7823/commands?token=svc-token",
-            vec![Probe::Listening],
-        );
-        let ui = FakeUi::new();
-        let ctrl = started_with(sys.clone(), ui.clone(), ReplacePolicy::Auto);
-
-        let runs = sys.run_args();
-        assert!(
-            runs.iter()
-                .any(|r| r == &["service".to_string(), "install".to_string()]),
-            "a bare `service install`; runs: {runs:?}"
-        );
-        assert!(
-            runs.iter().all(|r| !r
-                .iter()
-                .any(|a| ["--bind", "--tls", "--token"].contains(&a.as_str()))),
-            "no --bind/--tls/--token on any command; runs: {runs:?}"
-        );
-        let writes: Vec<PathBuf> = sys
-            .events()
-            .iter()
-            .filter_map(|e| match e {
-                Effect::WritePrivate { path } => Some(path.clone()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            writes.is_empty(),
-            "the silent path writes no file; wrote {writes:?}"
-        );
-        match ctrl.phase() {
-            Phase::Ready(Mode::Service(WebTarget { tls, token, .. })) => {
-                assert!(*tls, "the TLS line ⇒ https");
-                assert_eq!(
-                    token.as_ref().map(|t| t.as_str()),
-                    Some("svc-token"),
-                    "the token is general.web.token"
-                );
-            }
-            other => panic!("expected Ready(Service), got {other:?}"),
-        }
-        assert!(ui.confirms().is_empty(), "no dialog");
-    }
-
-    // Design auto-replace t115 (SC7): a STOPPED service is replaced —
-    // each of the three commands runs exactly once, then it connects.
-    #[test]
-    fn t115_auto_replace_stopped_service_starts_and_connects() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        let pre = installed_status_at(INSTALLED_SAME, "stopped");
-        sys.set_run_seq(
-            "peakbot",
-            &["service", "status"],
-            vec![pre, installed_status_tls("running", "off")],
-        );
-        sys.set_run("peakbot-same", &["--version"], versioned("0.23.0"));
-        seed_builds_differ(&sys, INSTALLED_SAME);
-        script_replace_http(&sys);
-        sys.set_default_probe(vec![Probe::Status(200)]);
-        let ui = FakeUi::new();
-        let ctrl = started_with(sys.clone(), ui.clone(), ReplacePolicy::Auto);
-
-        let runs = sys.run_args();
-        assert_eq!(
-            runs.iter()
-                .filter(|r| *r == &["install".to_string()])
-                .count(),
-            1,
-            "the binary copy runs exactly once; runs: {runs:?}"
-        );
-        assert_eq!(
-            runs.iter()
-                .filter(|r| *r == &["service".to_string(), "uninstall".to_string()])
-                .count(),
-            1,
-            "service uninstall runs exactly once; runs: {runs:?}"
-        );
-        assert_eq!(
-            runs.iter()
-                .filter(|r| {
-                    r.first().is_some_and(|s| s == "service")
-                        && r.get(1).is_some_and(|s| s == "install")
-                })
-                .count(),
-            1,
-            "service install runs exactly once (it (re)starts the unit); runs: {runs:?}"
-        );
-        assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
-            "got {:?}",
-            ctrl.phase()
-        );
-        assert!(ui.confirms().is_empty(), "no dialog");
-    }
-
-    // Design auto-replace t116 (SC8): the COPY fails ⇒ the service is
-    // left running and untouched — no uninstall, no reinstall.
-    #[test]
-    fn t116_auto_replace_copy_failure_leaves_service_untouched() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            installed_status_at(INSTALLED_SAME, "running"),
-        );
-        sys.set_run("peakbot-same", &["--version"], versioned("0.23.0"));
-        seed_builds_differ(&sys, INSTALLED_SAME);
-        sys.set_run(
-            "peakbot",
-            &["install"],
-            run_out(
-                Some(1),
-                "",
-                "install failed: install I/O error: Permission denied (os error 13)\n",
-            ),
-        );
-        // `service uninstall` / `service install` are deliberately NOT
-        // scripted: if they ran, the failure would look different.
-        let ui = FakeUi::new();
-        let ctrl = started_with(sys.clone(), ui.clone(), ReplacePolicy::Auto);
+        ui.answer_confirm(true);
+        let ctrl = started(sys.clone(), ui.clone());
 
         match ctrl.phase() {
             Phase::Failed(StartError::ServiceCommandFailed { command, output }) => {
-                assert_eq!(
-                    command, "install",
-                    "the failing command is the copy; {command:?}"
-                );
+                assert_eq!(command, "service uninstall");
                 assert!(
-                    output.contains("Permission denied"),
-                    "the output must carry the copy's error; {output:?}"
-                );
-            }
-            other => panic!("expected ServiceCommandFailed{{\"install\"}}, got {other:?}"),
-        }
-        let runs = sys.run_args();
-        assert!(
-            !runs
-                .iter()
-                .any(|r| r == &["service".to_string(), "uninstall".to_string()]),
-            "the unit must not be removed when the copy fails; runs: {runs:?}"
-        );
-        assert!(
-            !runs.iter().any(|r| {
-                r.first().is_some_and(|s| s == "service")
-                    && r.get(1).is_some_and(|s| s == "install")
-            }),
-            "no reinstall may follow a failed copy; runs: {runs:?}"
-        );
-        assert!(ui.confirms().is_empty(), "no dialog");
-    }
-
-    // Design auto-replace t117 (SC8): the copy succeeds but
-    // `service install` fails ⇒ ServiceCommandFailed naming the verb.
-    #[test]
-    fn t117_auto_replace_service_install_failure_is_servicecommandfailed() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            installed_status_at(INSTALLED_SAME, "running"),
-        );
-        sys.set_run("peakbot-same", &["--version"], versioned("0.23.0"));
-        seed_builds_differ(&sys, INSTALLED_SAME);
-        sys.set_run("peakbot", &["install"], run_out(Some(0), "ok\n", ""));
-        sys.set_run(
-            "peakbot",
-            &["service", "uninstall"],
-            run_out(Some(0), "ok\n", ""),
-        );
-        sys.set_run(
-            "peakbot",
-            &["service", "install"],
-            run_out(Some(1), "", "unit failed to start\n"),
-        );
-        let ui = FakeUi::new();
-        let ctrl = started_with(sys.clone(), ui.clone(), ReplacePolicy::Auto);
-
-        match ctrl.phase() {
-            Phase::Failed(StartError::ServiceCommandFailed { command, output }) => {
-                assert!(
-                    command.contains("service install"),
-                    "command must name the failing verb; {command:?}"
-                );
-                assert!(
-                    output.contains("unit failed to start"),
-                    "output must carry the child's stderr; {output:?}"
+                    output.contains("permission denied"),
+                    "the failure output is carried; {output:?}"
                 );
             }
             other => panic!("expected ServiceCommandFailed, got {other:?}"),
         }
-        assert!(ui.confirms().is_empty(), "no dialog");
+        assert!(
+            sys.spawned_specs().is_empty(),
+            "a failed uninstall must not start a session next to the old service"
+        );
+        assert_eq!(ui.confirms().len(), 1);
+        assert_never_installs(&sys);
     }
 
-    // Design auto-replace t118 (A6): no `Exec:` line ⇒ "cannot compare"
-    // counts as NOT identical ⇒ the silent replace goes ahead.
+    // m5b: the uninstall cannot even be launched (io error) ⇒ the same
+    // failed view.
     #[test]
-    fn t118_auto_missing_exec_line_replaces_silently() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        let pre = run_out(Some(0), "Installed: true\nState:     running\n", ""); // no Exec
-        sys.set_run_seq(
-            "peakbot",
-            &["service", "status"],
-            vec![pre, installed_status_tls("running", "off")],
-        );
-        script_replace_http(&sys);
-        sys.set_default_probe(vec![Probe::Status(200)]);
+    fn m5b_uninstall_not_runnable_is_service_command_failed() {
+        let sys = migration_sys(Some(installed_status("running")), None);
         let ui = FakeUi::new();
-        let ctrl = started_with(sys.clone(), ui.clone(), ReplacePolicy::Auto);
-
+        ui.answer_confirm(true);
+        let ctrl = started(sys.clone(), ui);
         assert!(
-            sys.events()
-                .iter()
-                .all(|e| !matches!(e, Effect::SameContents { .. })),
-            "without an Exec path there is nothing to compare; events: {:?}",
-            sys.events()
-        );
-        assert!(ui.confirms().is_empty(), "no dialog");
-        assert_order_ok(&sys.run_args());
-        assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
+            matches!(
+                ctrl.phase(),
+                Phase::Failed(StartError::ServiceCommandFailed { command, .. })
+                    if command == "service uninstall"
+            ),
             "got {:?}",
             ctrl.phase()
         );
+        assert!(sys.spawned_specs().is_empty());
     }
 
-    // Design auto-replace t119 (SC9): no service installed ⇒ the
-    // session path is unchanged, and the content comparison never runs.
+    // m6: nothing to migrate ⇒ no prompt, straight to the session —
+    // `Installed: false`, a failing `service status`, a status that
+    // cannot be run at all, and unrecognised output.
     #[test]
-    fn t119_no_service_session_unchanged_and_never_compares() {
+    fn m6_not_installed_or_unavailable_no_prompt() {
+        let cases: Vec<(&str, Option<RunOutput>)> = vec![
+            (
+                "Installed: false",
+                Some(run_out(Some(0), NOT_INSTALLED, "")),
+            ),
+            (
+                "status exit 1",
+                Some(run_out(Some(1), "", "systemctl --user not available\n")),
+            ),
+            ("status not runnable", None),
+            (
+                "unrecognised output",
+                Some(run_out(Some(0), "Manager:   systemd-user\n", "")),
+            ),
+            (
+                "Installed: true but exit 1",
+                Some(run_out(Some(1), "Installed: true\n", "boom\n")),
+            ),
+        ];
+        for (label, status) in cases {
+            let sys = migration_sys(status, Some(ok_out()));
+            let ui = FakeUi::new();
+            let ctrl = started(sys.clone(), ui.clone());
+
+            assert!(
+                ui.confirms().is_empty(),
+                "{label}: no prompt; got {:?}",
+                ui.confirms()
+            );
+            assert!(
+                matches!(ctrl.phase(), Phase::Ready(_)),
+                "{label}: session Ready; got {:?}",
+                ctrl.phase()
+            );
+            assert_eq!(sys.spawned_specs().len(), 1, "{label}: one spawn");
+            assert!(
+                !sys.run_args().contains(&arg_vec(&["service", "uninstall"])),
+                "{label}: nothing to uninstall"
+            );
+            assert_never_installs(&sys);
+        }
+    }
+
+    // m6b: `service status` is still consulted on Linux/macOS (it is how
+    // the migration finds the old service) and the step is shown.
+    #[test]
+    fn m6b_not_installed_still_checks_service_status() {
+        let sys = migration_sys(Some(run_out(Some(0), NOT_INSTALLED, "")), None);
+        let ui = FakeUi::new();
+        let _ = started(sys.clone(), ui.clone());
+        assert!(
+            sys.run_args().contains(&arg_vec(&["service", "status"])),
+            "service status ran; runs: {:?}",
+            sys.run_args()
+        );
+        assert!(
+            ui.steps()
+                .contains(&Phase::Starting(StartStep::CheckingService)),
+            "the CheckingService step is shown on Linux; steps: {:?}",
+            ui.steps()
+        );
+    }
+
+    // m6c: macOS runs the same migration check as Linux.
+    #[test]
+    fn m6c_macos_installed_asks_like_linux() {
+        let sys = migration_sys(Some(installed_status("running")), Some(ok_out()));
+        let ui = FakeUi::new();
+        ui.answer_confirm(true);
+        let ctrl = started_on(sys.clone(), ui.clone(), Platform::MacOs);
+        assert_eq!(ui.confirms(), vec![remove_old_service_dialog()]);
+        assert!(
+            matches!(ctrl.phase(), Phase::Ready(_)),
+            "{:?}",
+            ctrl.phase()
+        );
+        assert_never_installs(&sys);
+    }
+
+    // m7 (adapts q1_windows_installed_identical_…): Windows NEVER runs
+    // `service status` — so it can never prompt, uninstall or show the
+    // "Looking for a background service…" step — even when a service
+    // would report as installed.
+    #[test]
+    fn m7_windows_never_runs_service_status() {
+        for state in ["running", "stopped", "unknown"] {
+            let sys = migration_sys(Some(installed_status(state)), Some(ok_out()));
+            sys.seed_file(
+                CONFIG_YAML,
+                web_yaml("127.0.0.1:7823", Some("win-token-0001")),
+            );
+            let ui = FakeUi::new();
+            ui.answer_confirm(true);
+            let ctrl = started_on(sys.clone(), ui.clone(), Platform::Windows);
+
+            assert!(
+                matches!(ctrl.phase(), Phase::Ready(t) if t.bind.port() == 7823),
+                "Windows lands Ready even with an installed service (state {state:?}); got {:?}",
+                ctrl.phase()
+            );
+            assert_eq!(sys.spawned_specs().len(), 1, "one session spawn ({state})");
+            assert_eq!(
+                ready_url(&ctrl).as_deref(),
+                Some("http://127.0.0.1:7823/?token=win-token-0001"),
+                "the target is general.web ({state})"
+            );
+            let runs = sys.run_args();
+            assert!(
+                !runs
+                    .iter()
+                    .any(|r| r.first().is_some_and(|a| a == "service")),
+                "Windows must not run any `service …` command ({state}); runs: {runs:?}"
+            );
+            assert!(
+                ui.confirms().is_empty(),
+                "Windows never prompts ({state}); got {:?}",
+                ui.confirms()
+            );
+            assert!(
+                !ui.steps().iter().any(|p| matches!(
+                    p,
+                    Phase::Starting(StartStep::CheckingService | StartStep::RemovingService)
+                )),
+                "no service steps on Windows ({state}); steps: {:?}",
+                ui.steps()
+            );
+            assert_never_installs(&sys);
+        }
+    }
+
+    // m8: across every migration outcome the desktop never installs a
+    // service or copies the binary (`install` / `service install`), and
+    // never runs anything but the bundled sidecar.
+    #[test]
+    fn m8_never_installs() {
+        // (status, answer, uninstall)
+        let scenarios: Vec<(&str, Option<RunOutput>, bool, Option<RunOutput>)> = vec![
+            (
+                "running + yes",
+                Some(installed_status("running")),
+                true,
+                Some(ok_out()),
+            ),
+            (
+                "stopped + yes",
+                Some(installed_status("stopped")),
+                true,
+                Some(ok_out()),
+            ),
+            (
+                "running + no",
+                Some(installed_status("running")),
+                false,
+                Some(ok_out()),
+            ),
+            (
+                "uninstall fails",
+                Some(installed_status("running")),
+                true,
+                Some(run_out(Some(1), "", "boom")),
+            ),
+            (
+                "not installed",
+                Some(run_out(Some(0), NOT_INSTALLED, "")),
+                false,
+                None,
+            ),
+            (
+                "status unavailable",
+                Some(run_out(Some(1), "", "x")),
+                false,
+                None,
+            ),
+        ];
+        for (label, status, answer, uninstall) in scenarios {
+            let sys = migration_sys(status, uninstall);
+            let ui = FakeUi::new();
+            ui.answer_confirm(answer);
+            let mut ctrl = started(sys.clone(), ui);
+            let _ = ctrl.handle(Action::Restart); // the retry path too
+            let runs = sys.run_args();
+            assert!(
+                !runs
+                    .iter()
+                    .any(|r| r == &arg_vec(&["install"]) || r == &arg_vec(&["service", "install"])),
+                "{label}: no install verb may ever run; runs: {runs:?}"
+            );
+            assert_never_installs(&sys);
+        }
+    }
+
+    // §C: `Action` is exactly {Start, Restart, Shutdown}. An exhaustive
+    // match is a compile-time pin: it stops compiling while the removed
+    // `ToggleBackground` / `ReinstallService` variants still exist.
+    #[test]
+    fn action_has_exactly_start_restart_shutdown() {
+        fn label(a: &Action) -> &'static str {
+            match a {
+                Action::Start => "start",
+                Action::Restart => "restart",
+                Action::Shutdown(_) => "shutdown",
+            }
+        }
+        let (tx, _rx) = mpsc::channel();
+        assert_eq!(label(&Action::Start), "start");
+        assert_eq!(label(&Action::Restart), "restart");
+        assert_eq!(label(&Action::Shutdown(tx)), "shutdown");
+    }
+
+    // §C: Restart while Starting is ignored (`Restart if !starting`).
+    // `quitting` makes the first start park in a Starting phase.
+    #[test]
+    fn restart_is_ignored_while_starting() {
+        let sys = migration_sys(Some(run_out(Some(0), NOT_INSTALLED, "")), None);
+        let ui = FakeUi::new();
+        let mut ctrl = Controller::new(
+            sys.clone(),
+            ui.clone(),
+            paths(),
+            Arc::new(AtomicBool::new(true)), // quitting: wait_ready cancels
+            Platform::Linux,
+        );
+        let _ = ctrl.handle(Action::Start);
+        assert!(
+            matches!(ctrl.phase(), Phase::Starting(_)),
+            "precondition: Cancelled leaves a Starting phase; got {:?}",
+            ctrl.phase()
+        );
+        let spawns_before = sys.spawned_specs().len();
+        let events_before = sys.events().len();
+        let phases_before = ui.phases().len();
+
+        let flow = ctrl.handle(Action::Restart);
+        assert_eq!(flow, ControlFlow::Continue(()));
+        assert_eq!(sys.spawned_specs().len(), spawns_before, "no new spawn");
+        assert_eq!(sys.events().len(), events_before, "no side effects");
+        assert_eq!(ui.phases().len(), phases_before, "no phase change");
+    }
+
+    // Shutdown with no session (e.g. after a declined migration) still
+    // acks and breaks, and touches no child.
+    #[test]
+    fn shutdown_without_session_acks_and_breaks() {
+        let sys = migration_sys(Some(installed_status("running")), Some(ok_out()));
+        let ui = FakeUi::new();
+        ui.answer_confirm(false);
+        let mut ctrl = started(sys.clone(), ui);
+        assert_eq!(ctrl.phase(), &Phase::Failed(StartError::ServiceInstalled));
+
+        let (tx, rx) = mpsc::channel();
+        assert_eq!(ctrl.handle(Action::Shutdown(tx)), ControlFlow::Break(()));
+        rx.recv().expect("the ack must be sent");
+        assert!(
+            !sys.events().iter().any(|e| matches!(
+                e,
+                Effect::ChildInterrupt { .. } | Effect::ChildKill { .. } | Effect::Signal { .. }
+            )),
+            "nothing to stop; events: {:?}",
+            sys.events()
+        );
+    }
+
+    // launch_session: a 401 even after the general.web re-read ⇒ the
+    // unit variant TokenRejected; the child is stopped, the pidfile gone.
+    #[test]
+    fn token_rejected_stops_child_and_fails_token_rejected() {
         let sys = FakeSys::new();
         sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
         sys.set_run(
@@ -3184,306 +1778,24 @@ mod tests {
             &["service", "status"],
             run_out(Some(0), NOT_INSTALLED, ""),
         );
-        sys.set_default_probe(vec![Probe::Status(200)]);
-        sys.queue_child(crate::testing::FakeChildSpec::alive());
-        sys.seed_file(
-            CONFIG_YAML,
-            web_yaml("127.0.0.1:7823", Some("seeded-token")),
-        );
+        sys.set_default_probe(vec![Probe::Status(401)]);
+        sys.queue_child(crate::testing::FakeChildSpec {
+            mode: ChildMode::ExitsOnInterrupt,
+            exit: Some(0),
+            ..Default::default()
+        });
         let ui = FakeUi::new();
-        let ctrl = started_with(sys.clone(), ui.clone(), ReplacePolicy::Auto);
+        let ctrl = started(sys.clone(), ui.clone());
 
-        assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
-            "got {:?}",
-            ctrl.phase()
-        );
+        assert_eq!(ctrl.phase(), &Phase::Failed(StartError::TokenRejected));
         assert!(
             sys.events()
                 .iter()
-                .all(|e| !matches!(e, Effect::SameContents { .. })),
-            "no content comparison without an installed exe; events: {:?}",
-            sys.events()
+                .any(|e| matches!(e, Effect::ChildInterrupt { .. })),
+            "the child that answered 401 is stopped"
         );
-        let runs = sys.run_args();
-        assert!(
-            runs.iter().all(|r| {
-                r == &["--version".to_string()]
-                    || r == &["service".to_string(), "status".to_string()]
-            }),
-            "only `--version` and `service status` may run; runs: {runs:?}"
-        );
-        assert!(ui.confirms().is_empty(), "no dialog");
-    }
-
-    // Design auto-replace t120 (dev default): policy Ask with the SAME
-    // version but a different build ⇒ the prompt stays, and "Keep"
-    // records the (0.23.0, 0.23.0) pair.
-    #[test]
-    fn t120_ask_policy_same_version_different_build_prompts() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            installed_status_at(INSTALLED_SAME, "running"),
-        );
-        sys.set_run("peakbot-same", &["--version"], versioned("0.23.0"));
-        seed_builds_differ(&sys, INSTALLED_SAME);
-        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("svc-token")));
-        sys.set_probe(
-            "http://127.0.0.1:7823/commands?token=svc-token",
-            vec![Probe::Status(200)],
-        );
-        let ui = FakeUi::new();
-        ui.answer_confirm(false); // Keep
-        let ctrl = started_with(sys.clone(), ui.clone(), ReplacePolicy::Ask);
-
-        let confirms = ui.confirms();
-        assert_eq!(
-            confirms.len(),
-            1,
-            "dev builds keep the prompt; got {confirms:?}"
-        );
-        let content = sys
-            .file(Path::new(DECLINED))
-            .expect("declined-replace written");
-        let declined = DeclinedReplace::parse(&content).expect("declined file parses");
-        let v23 = semver::Version::parse("0.23.0").unwrap();
-        assert!(
-            declined.matches(&InstalledVersion::Known(v23.clone()), &v23),
-            "the (0.23.0, 0.23.0) pair must be recorded"
-        );
-        assert!(
-            !sys.run_args().iter().any(|r| r == &["install".to_string()]),
-            "Keep must not copy a binary; runs: {:?}",
-            sys.run_args()
-        );
-        assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
-            "got {:?}",
-            ctrl.phase()
-        );
-    }
-
-    // -------------------------------------------------------------------
-    // Q1 (WINDOWS-PLAN) — the Windows session-only start.
-    //
-    // The background service is non-functional on Windows in v1, so
-    // `handle_start` on `Platform::Windows` must NOT query the service
-    // status at all — no `service status` sidecar invocation, no
-    // `same_contents`/`--version` comparison against an installed
-    // service, no AutoReplace/install/uninstall — and must ALWAYS take
-    // the session path, spawning the session sidecar exactly as when no
-    // service is installed. This holds even when the fake reports a
-    // service as installed (identical binary, an older version, running
-    // or unknown state). `Platform::Linux` behaviour is unchanged and is
-    // pinned by the existing tests (t46/t47: installed ⇒ ConnectService).
-    // -------------------------------------------------------------------
-
-    // Q1: installed service whose binary is byte-IDENTICAL to the
-    // bundled sidecar (running, and unknown state) — the session path
-    // is taken and the service is never queried.
-    #[test]
-    fn q1_windows_installed_identical_start_spawns_session_without_service_status() {
-        for state in ["running", "unknown"] {
-            let sys = FakeSys::new();
-            sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-            // The fake reports an installed service (the real-VM
-            // scenario) — on Windows it must never be queried.
-            sys.set_run(
-                "peakbot",
-                &["service", "status"],
-                installed_status_at(INSTALLED_SAME, state),
-            );
-            seed_builds_identical(&sys, INSTALLED_SAME);
-            sys.set_default_probe(vec![Probe::Status(200)]);
-            sys.queue_child(crate::testing::FakeChildSpec::alive());
-            sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("win-token")));
-            let ui = FakeUi::new();
-            let ctrl = started_on(
-                sys.clone(),
-                ui.clone(),
-                ReplacePolicy::Ask,
-                Platform::Windows,
-            );
-
-            // (1) The session path was taken, exactly like NotInstalled.
-            assert!(
-                matches!(
-                    ctrl.phase(),
-                    Phase::Ready(Mode::Session(t)) if t.bind.port() == 7823
-                ),
-                "Windows start must land Ready(Session) even with an installed service (state {state:?}); got {:?}",
-                ctrl.phase()
-            );
-            let spawns = sys.spawned_specs();
-            assert_eq!(spawns.len(), 1, "the session sidecar was spawned once");
-            assert_eq!(
-                spawns[0].args,
-                Vec::<String>::new(),
-                "the spawn is exactly the session path's (state {state:?}); got {:?}",
-                spawns[0].args
-            );
-            assert_eq!(
-                ready_url(&ctrl).as_deref(),
-                Some("http://127.0.0.1:7823/?token=win-token"),
-                "the session target is general.web (state {state:?})"
-            );
-            assert!(
-                spawns[0]
-                    .extra_env
-                    .iter()
-                    .all(|(k, _)| k != "PEAKBOT_WEB_TOKEN"),
-                "no token in the child env (state {state:?}); got {:?}",
-                spawns[0].extra_env
-            );
-
-            // (2) No service sidecar invocation at all.
-            let runs = sys.run_args();
-            assert!(
-                !runs
-                    .iter()
-                    .any(|r| r == &["service".to_string(), "status".to_string()]),
-                "Windows must not run `service status` (state {state:?}); runs: {runs:?}"
-            );
-            assert!(
-                !runs.iter().any(|r| r == &["install".to_string()]),
-                "no binary copy (state {state:?}); runs: {runs:?}"
-            );
-            assert!(
-                !runs
-                    .iter()
-                    .any(|r| r == &["service".to_string(), "uninstall".to_string()]),
-                "no service uninstall (state {state:?}); runs: {runs:?}"
-            );
-            assert!(
-                !runs.iter().any(|r| {
-                    r.first().is_some_and(|s| s == "service")
-                        && r.get(1).is_some_and(|s| s == "install")
-                }),
-                "no service install (state {state:?}); runs: {runs:?}"
-            );
-
-            // (3) No identity/version comparison against the installed exe.
-            assert!(
-                sys.events()
-                    .iter()
-                    .all(|e| !matches!(e, Effect::SameContents { .. })),
-                "no content comparison (state {state:?}); events: {:?}",
-                sys.events()
-            );
-            assert_never_ran(&sys, INSTALLED_SAME);
-
-            // (4) The phase never becomes ConnectingService; no dialog.
-            assert!(
-                !ui.steps()
-                    .iter()
-                    .any(|p| matches!(p, Phase::Starting(StartStep::ConnectingService))),
-                "the phase must never become ConnectingService (state {state:?}); steps: {:?}",
-                ui.steps()
-            );
-            assert!(
-                ui.confirms().is_empty(),
-                "no dialog (state {state:?}); got {:?}",
-                ui.confirms()
-            );
-        }
-    }
-
-    // Q1: the real-VM dead-end — an OLDER service (0.22.0) installed
-    // with the release policy (Auto). Unfixed, `plan_launch` routes to
-    // AutoReplace and silently overwrites the installed binary, then
-    // ConnectService times out after 30 s. On Windows the start must
-    // spawn the session and touch the service in no way: no auto-
-    // replace, no replace dialog.
-    #[test]
-    fn q1_windows_installed_older_start_never_auto_replaces() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0")); // bundled
-        // Installed 0.22.0, running, a DIFFERENT build.
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            installed_status_at(INSTALLED_EXE, "running"),
-        );
-        sys.set_run("peakbot-0.22.0", &["--version"], versioned("0.22.0"));
-        seed_builds_differ(&sys, INSTALLED_EXE);
-        // The replace commands are deliberately NOT scripted: if the
-        // controller tries to replace the service, it fails loudly
-        // (like t116) — the session path must not need them.
-        sys.set_default_probe(vec![Probe::Status(200)]);
-        sys.queue_child(crate::testing::FakeChildSpec::alive());
-        sys.seed_file(CONFIG_YAML, web_yaml("127.0.0.1:7823", Some("win-token")));
-        let ui = FakeUi::new();
-        let ctrl = started_on(
-            sys.clone(),
-            ui.clone(),
-            ReplacePolicy::Auto,
-            Platform::Windows,
-        );
-
-        assert!(
-            matches!(
-                ctrl.phase(),
-                Phase::Ready(Mode::Session(t)) if t.bind.port() == 7823
-            ),
-            "the session path must be taken; got {:?}",
-            ctrl.phase()
-        );
-        let spawns = sys.spawned_specs();
-        assert_eq!(spawns.len(), 1, "the session sidecar was spawned");
-        assert_eq!(
-            spawns[0].args,
-            Vec::<String>::new(),
-            "the spawn is exactly the session path's; got {:?}",
-            spawns[0].args
-        );
-
-        let runs = sys.run_args();
-        assert!(
-            !runs
-                .iter()
-                .any(|r| r == &["service".to_string(), "status".to_string()]),
-            "Windows must not run `service status`; runs: {runs:?}"
-        );
-        assert!(
-            !runs.iter().any(|r| r == &["install".to_string()]),
-            "no silent binary copy (the VM bug); runs: {runs:?}"
-        );
-        assert!(
-            !runs
-                .iter()
-                .any(|r| r == &["service".to_string(), "uninstall".to_string()]),
-            "no service uninstall; runs: {runs:?}"
-        );
-        assert!(
-            !runs.iter().any(|r| {
-                r.first().is_some_and(|s| s == "service")
-                    && r.get(1).is_some_and(|s| s == "install")
-            }),
-            "no service install; runs: {runs:?}"
-        );
-        assert!(
-            sys.events()
-                .iter()
-                .all(|e| !matches!(e, Effect::SameContents { .. })),
-            "no content comparison; events: {:?}",
-            sys.events()
-        );
-        assert_never_ran(&sys, INSTALLED_EXE);
-        assert!(
-            !ui.steps()
-                .iter()
-                .any(|p| matches!(p, Phase::Starting(StartStep::ConnectingService))),
-            "the phase must never become ConnectingService; steps: {:?}",
-            ui.steps()
-        );
-        assert!(
-            ui.confirms().is_empty(),
-            "no replace dialog; got {:?}",
-            ui.confirms()
-        );
+        assert!(!sys.has_file(Path::new(PIDFILE)), "pidfile removed");
+        assert_eq!(ui.last_tray(), "PeakBot 0.23.0 · error");
     }
 
     // -------------------------------------------------------------------
@@ -3529,7 +1841,7 @@ mod tests {
         assert_eq!(flow, ControlFlow::Continue(()), "the app never exits");
 
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
+            matches!(ctrl.phase(), Phase::Ready(_)),
             "got {:?}",
             ctrl.phase()
         );
@@ -3554,81 +1866,6 @@ mod tests {
             sys.spawned_specs()[1].args.is_empty(),
             "the relaunch passes no web flags"
         );
-        assert!(ui.confirms().is_empty(), "Restart asks nothing");
-    }
-
-    // Spec §11.6: service-mode Restart runs the reinstall path
-    // (`reconfigure_service`: uninstall + bare install, NO binary copy),
-    // then reconnects on the re-read general.web.
-    #[test]
-    fn restart_service_reinstalls() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            installed_status("running"),
-        );
-        sys.seed_file(
-            CONFIG_YAML,
-            web_yaml("127.0.0.1:7823", Some("svc-token-000001")),
-        );
-        sys.set_run(
-            "peakbot",
-            &["service", "uninstall"],
-            run_out(Some(0), "ok\n", ""),
-        );
-        sys.set_run(
-            "peakbot",
-            &["service", "install"],
-            run_out(Some(0), "ok\n", ""),
-        );
-        sys.set_default_probe(vec![Probe::Status(200)]);
-        let ui = FakeUi::new();
-        let mut ctrl = started(sys.clone(), ui.clone());
-        assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
-            "precondition; got {:?}",
-            ctrl.phase()
-        );
-        let before = sys.run_args().len();
-
-        sys.seed_file(
-            CONFIG_YAML,
-            web_yaml("127.0.0.1:7900", Some("svc-token-000001")),
-        );
-        let flow = ctrl.handle(Action::Restart);
-        assert_eq!(flow, ControlFlow::Continue(()), "the app never exits");
-
-        let runs = sys.run_args()[before..].to_vec();
-        let i_uninstall = runs
-            .iter()
-            .position(|r| r == &["service".to_string(), "uninstall".to_string()])
-            .expect("service uninstall ran");
-        let i_install = runs
-            .iter()
-            .position(|r| r == &["service".to_string(), "install".to_string()])
-            .expect("bare service install ran");
-        assert!(
-            i_uninstall < i_install,
-            "uninstall → install; runs: {runs:?}"
-        );
-        assert!(
-            !runs.iter().any(|r| r == &["install".to_string()]),
-            "Restart reinstalls the unit, it never replaces the binary; runs: {runs:?}"
-        );
-        assert_eq!(
-            ready_url(&ctrl).as_deref(),
-            Some("http://127.0.0.1:7900/?token=svc-token-000001"),
-            "reconnects on the re-read general.web; got {:?}",
-            ctrl.phase()
-        );
-        assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
-            "got {:?}",
-            ctrl.phase()
-        );
-        assert!(sys.spawned_specs().is_empty(), "no session spawn");
         assert!(ui.confirms().is_empty(), "Restart asks nothing");
     }
 
@@ -3668,20 +1905,17 @@ mod tests {
             "the Ready URL comes from the fresh read; got {:?}",
             ctrl.phase()
         );
-        assert!(matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))));
+        assert!(matches!(ctrl.phase(), Phase::Ready(_)));
         assert_eq!(sys.spawned_specs().len(), 1, "no relaunch needed");
     }
 
     // Spec §11.6: no code path reads or writes settings.json or
-    // web-token — across start, session restart, enable, service
-    // restart and disable. The token never appears in any argv/env.
+    // web-token — across start, session restart, the old-service
+    // migration (accepted) and a retry. The token never appears in any
+    // argv/env.
     #[test]
     fn no_settings_json_or_web_token_io() {
         let sys = FakeSys::new();
-        sys.seed_file(
-            CONFIG_YAML,
-            web_yaml("127.0.0.1:7823", Some("file-token-000001")),
-        );
         sys.seed_file(
             SETTINGS_FILE,
             "{\"v\":1,\"protocol\":\"https\",\"token\":true,\"remote\":true}\n",
@@ -3690,27 +1924,19 @@ mod tests {
             CONFIG_YAML,
             web_yaml("127.0.0.1:7823", Some("cfg-token-0000001")),
         );
+        sys.seed_file(WEB_TOKEN, "file-token-000001\n");
         sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
         sys.set_run_seq(
             "peakbot",
             &["service", "status"],
             vec![
-                run_out(Some(0), NOT_INSTALLED, ""), // start
-                run_out(Some(0), NOT_INSTALLED, ""), // session restart
-                installed_status("running"),         // after enable
-                installed_status("running"),         // after service restart
-                run_out(Some(0), NOT_INSTALLED, ""), // after disable
+                installed_status("running"),         // start: migration offered
+                run_out(Some(0), NOT_INSTALLED, ""), // session restart: gone now
             ],
         );
-        for args in [
-            &["install"][..],
-            &["service", "install"][..],
-            &["service", "uninstall"][..],
-        ] {
-            sys.set_run("peakbot", args, run_out(Some(0), "ok\n", ""));
-        }
+        sys.set_run("peakbot", &["service", "uninstall"], ok_out());
         sys.set_default_probe(vec![Probe::Status(200)]);
-        for _ in 0..3 {
+        for _ in 0..2 {
             sys.queue_child(crate::testing::FakeChildSpec {
                 mode: ChildMode::ExitsOnInterrupt,
                 exit: Some(0),
@@ -3718,24 +1944,17 @@ mod tests {
             });
         }
         let ui = FakeUi::new();
-        ui.answer_confirm(true); // enable
-        ui.answer_confirm(true); // disable
+        ui.answer_confirm(true); // remove the old service
         let mut ctrl = started(sys.clone(), ui.clone());
-        assert!(matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))));
-        let _ = ctrl.handle(Action::Restart);
-        assert!(matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))));
-        let _ = ctrl.handle(Action::ToggleBackground);
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))),
-            "enabled; got {:?}",
+            matches!(ctrl.phase(), Phase::Ready(_)),
+            "{:?}",
             ctrl.phase()
         );
         let _ = ctrl.handle(Action::Restart);
-        assert!(matches!(ctrl.phase(), Phase::Ready(Mode::Service(_))));
-        let _ = ctrl.handle(Action::ToggleBackground);
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
-            "disabled; got {:?}",
+            matches!(ctrl.phase(), Phase::Ready(_)),
+            "{:?}",
             ctrl.phase()
         );
         assert_eq!(
@@ -3759,6 +1978,22 @@ mod tests {
                 sys.events()
             );
         }
+        // The retired `declined-replace` memory is not read or written
+        // either (a stale file in data_dir is simply left alone).
+        let declined = "/data/declined-replace";
+        assert!(
+            !sys.read_paths().iter().any(|p| p == Path::new(declined)),
+            "declined-replace is retired; reads: {:?}",
+            sys.read_paths()
+        );
+        assert!(
+            sys.events().iter().all(|e| {
+                !matches!(e, Effect::WritePrivate { path: p } | Effect::Remove { path: p }
+                    if p == Path::new(declined))
+            }),
+            "declined-replace is retired; events: {:?}",
+            sys.events()
+        );
         for spec in sys.spawned_specs() {
             assert!(spec.args.is_empty(), "no web flags; got {:?}", spec.args);
             assert!(
@@ -3775,6 +2010,22 @@ mod tests {
                 "no token in any argv (I7); got {r:?}"
             );
         }
+    }
+
+    // A declined migration must not write the retired declined-replace
+    // memory (or anything else): the answer is re-asked on every Start.
+    #[test]
+    fn declined_migration_writes_nothing() {
+        let sys = migration_sys(Some(installed_status("running")), Some(ok_out()));
+        let ui = FakeUi::new();
+        ui.answer_confirm(false);
+        let _ = started(sys.clone(), ui);
+        assert!(
+            sys.private_written().is_empty(),
+            "a decline persists nothing; wrote {:?}",
+            sys.private_written()
+        );
+        assert!(!sys.has_file(Path::new("/data/declined-replace")));
     }
 
     // -------------------------------------------------------------------
@@ -3947,12 +2198,12 @@ Mau1Qxq3S7SfaVNWM0OeBd9HV3682/Fu/7MHE+ATQV5Ved7dQCfVoVc=
             &refs(&macos_verify_args()),
             run_out(Some(0), "", ""),
         );
-        let ctrl = started_on(sys.clone(), ui.clone(), ReplacePolicy::Ask, Platform::MacOs);
+        let ctrl = started_on(sys.clone(), ui.clone(), Platform::MacOs);
 
         assert!(
             matches!(
                 ctrl.phase(),
-                Phase::Ready(Mode::Session(t)) if t.tls
+                Phase::Ready(t) if t.tls
             ),
             "Ready(Session, tls); got {:?}",
             ctrl.phase()
@@ -3991,12 +2242,12 @@ Mau1Qxq3S7SfaVNWM0OeBd9HV3682/Fu/7MHE+ATQV5Ved7dQCfVoVc=
         );
         let add_args = macos_add_args();
         sys.set_run("security", &refs(&add_args), run_out(Some(0), "ok\n", ""));
-        let ctrl = started_on(sys.clone(), ui.clone(), ReplacePolicy::Ask, Platform::MacOs);
+        let ctrl = started_on(sys.clone(), ui.clone(), Platform::MacOs);
 
         assert!(
             matches!(
                 ctrl.phase(),
-                Phase::Ready(Mode::Session(t)) if t.tls
+                Phase::Ready(t) if t.tls
             ),
             "Ready(Session, tls); got {:?}",
             ctrl.phase()
@@ -4066,7 +2317,7 @@ Mau1Qxq3S7SfaVNWM0OeBd9HV3682/Fu/7MHE+ATQV5Ved7dQCfVoVc=
             run_out(Some(1), "", "User canceled\n"),
         );
         sys.queue_child(crate::testing::FakeChildSpec::alive()); // the retry's child
-        let mut ctrl = started_on(sys.clone(), ui.clone(), ReplacePolicy::Ask, Platform::MacOs);
+        let mut ctrl = started_on(sys.clone(), ui.clone(), Platform::MacOs);
 
         match ctrl.phase() {
             Phase::Failed(StartError::CertificateNotTrusted { detail }) => {
@@ -4097,7 +2348,7 @@ Mau1Qxq3S7SfaVNWM0OeBd9HV3682/Fu/7MHE+ATQV5Ved7dQCfVoVc=
         // the check runs again.
         let _ = ctrl.handle(Action::Start);
         assert!(
-            matches!(ctrl.phase(), Phase::Ready(Mode::Session(_))),
+            matches!(ctrl.phase(), Phase::Ready(_)),
             "the retry reaches Ready; got {:?}",
             ctrl.phase()
         );
@@ -4140,12 +2391,12 @@ Mau1Qxq3S7SfaVNWM0OeBd9HV3682/Fu/7MHE+ATQV5Ved7dQCfVoVc=
             &refs(&macos_add_args()),
             run_out(Some(0), "ok\n", ""),
         );
-        let ctrl = started_on(sys.clone(), ui.clone(), ReplacePolicy::Ask, Platform::MacOs);
+        let ctrl = started_on(sys.clone(), ui.clone(), Platform::MacOs);
 
         assert!(
             matches!(
                 ctrl.phase(),
-                Phase::Ready(Mode::Session(t)) if t.tls
+                Phase::Ready(t) if t.tls
             ),
             "a check error is not a hard failure; got {:?}",
             ctrl.phase()
@@ -4169,17 +2420,12 @@ Mau1Qxq3S7SfaVNWM0OeBd9HV3682/Fu/7MHE+ATQV5Ved7dQCfVoVc=
             &refs(&windows_check_args()),
             run_out(Some(0), &out, ""),
         );
-        let ctrl = started_on(
-            sys.clone(),
-            ui.clone(),
-            ReplacePolicy::Ask,
-            Platform::Windows,
-        );
+        let ctrl = started_on(sys.clone(), ui.clone(), Platform::Windows);
 
         assert!(
             matches!(
                 ctrl.phase(),
-                Phase::Ready(Mode::Session(t)) if t.tls
+                Phase::Ready(t) if t.tls
             ),
             "Ready(Session, tls); got {:?}",
             ctrl.phase()
@@ -4212,17 +2458,12 @@ Mau1Qxq3S7SfaVNWM0OeBd9HV3682/Fu/7MHE+ATQV5Ved7dQCfVoVc=
             &refs(&windows_add_args()),
             run_out(Some(0), "Command completed successfully.\n", ""),
         );
-        let ctrl = started_on(
-            sys.clone(),
-            ui.clone(),
-            ReplacePolicy::Ask,
-            Platform::Windows,
-        );
+        let ctrl = started_on(sys.clone(), ui.clone(), Platform::Windows);
 
         assert!(
             matches!(
                 ctrl.phase(),
-                Phase::Ready(Mode::Session(t)) if t.tls
+                Phase::Ready(t) if t.tls
             ),
             "Ready(Session, tls); got {:?}",
             ctrl.phase()
@@ -4249,12 +2490,7 @@ Mau1Qxq3S7SfaVNWM0OeBd9HV3682/Fu/7MHE+ATQV5Ved7dQCfVoVc=
             &refs(&windows_add_args()),
             run_out(Some(1), "", "The system cannot find the file specified.\n"),
         );
-        let ctrl = started_on(
-            sys.clone(),
-            ui.clone(),
-            ReplacePolicy::Ask,
-            Platform::Windows,
-        );
+        let ctrl = started_on(sys.clone(), ui.clone(), Platform::Windows);
 
         match ctrl.phase() {
             Phase::Failed(StartError::CertificateNotTrusted { detail }) => {
@@ -4272,11 +2508,11 @@ Mau1Qxq3S7SfaVNWM0OeBd9HV3682/Fu/7MHE+ATQV5Ved7dQCfVoVc=
     fn ct8_tls_false_no_trust_step_on_macos_or_windows() {
         for platform in [Platform::MacOs, Platform::Windows] {
             let (sys, ui) = ct_base(false, true);
-            let ctrl = started_on(sys.clone(), ui.clone(), ReplacePolicy::Ask, platform);
+            let ctrl = started_on(sys.clone(), ui.clone(), platform);
             assert!(
                 matches!(
                     ctrl.phase(),
-                    Phase::Ready(Mode::Session(t)) if !t.tls
+                    Phase::Ready(t) if !t.tls
                 ),
                 "Ready(Session, http) on {platform:?}; got {:?}",
                 ctrl.phase()
@@ -4290,11 +2526,11 @@ Mau1Qxq3S7SfaVNWM0OeBd9HV3682/Fu/7MHE+ATQV5Ved7dQCfVoVc=
     #[test]
     fn ct9_linux_tls_true_no_trust_step() {
         let (sys, ui) = ct_base(true, true);
-        let ctrl = started_on(sys.clone(), ui.clone(), ReplacePolicy::Ask, Platform::Linux);
+        let ctrl = started_on(sys.clone(), ui.clone(), Platform::Linux);
         assert!(
             matches!(
                 ctrl.phase(),
-                Phase::Ready(Mode::Session(t)) if t.tls
+                Phase::Ready(t) if t.tls
             ),
             "Ready(Session, https); got {:?}",
             ctrl.phase()
@@ -4307,7 +2543,7 @@ Mau1Qxq3S7SfaVNWM0OeBd9HV3682/Fu/7MHE+ATQV5Ved7dQCfVoVc=
     #[test]
     fn ct10_macos_ca_missing_fails_not_found() {
         let (sys, ui) = ct_base(true, false); // CA NOT seeded
-        let ctrl = started_on(sys.clone(), ui.clone(), ReplacePolicy::Ask, Platform::MacOs);
+        let ctrl = started_on(sys.clone(), ui.clone(), Platform::MacOs);
         match ctrl.phase() {
             Phase::Failed(StartError::CertificateNotTrusted { detail }) => {
                 assert!(
@@ -4330,7 +2566,7 @@ Mau1Qxq3S7SfaVNWM0OeBd9HV3682/Fu/7MHE+ATQV5Ved7dQCfVoVc=
     fn ct11_macos_ca_garbage_fails_without_trust_store_runs() {
         let (sys, ui) = ct_base(true, false);
         sys.seed_file(ca_cert_path(), "this is not a pem\n");
-        let ctrl = started_on(sys.clone(), ui.clone(), ReplacePolicy::Ask, Platform::MacOs);
+        let ctrl = started_on(sys.clone(), ui.clone(), Platform::MacOs);
         match ctrl.phase() {
             Phase::Failed(StartError::CertificateNotTrusted { detail }) => {
                 assert!(
@@ -4343,92 +2579,10 @@ Mau1Qxq3S7SfaVNWM0OeBd9HV3682/Fu/7MHE+ATQV5Ved7dQCfVoVc=
         assert_no_trust_store_runs(&sys);
     }
 
-    // CT12: MacOs, an installed service with TLS on (t84-style) ⇒ the
-    // trust step runs before Ready(Service, tls).
-    #[test]
-    fn ct12_macos_tls_service_trust_step_before_ready() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            installed_status_tls("running", "on"),
-        );
-        sys.set_default_probe(vec![Probe::Status(200)]);
-        sys.seed_file(CONFIG_YAML, TLS_YAML);
-        sys.seed_file(ca_cert_path(), CA_PEM);
-        sys.set_run(
-            "security",
-            &refs(&macos_verify_args()),
-            run_out(Some(1), "", ""),
-        );
-        sys.set_run(
-            "security",
-            &refs(&macos_add_args()),
-            run_out(Some(0), "ok\n", ""),
-        );
-        let ui = FakeUi::new();
-        let ctrl = started_on(sys.clone(), ui.clone(), ReplacePolicy::Ask, Platform::MacOs);
-
-        assert!(
-            matches!(
-                ctrl.phase(),
-                Phase::Ready(Mode::Service(t)) if t.tls
-            ),
-            "Ready(Service, tls); got {:?}",
-            ctrl.phase()
-        );
-        let runs = sys.run_args();
-        assert_eq!(
-            count_runs(&runs, &macos_add_args()),
-            1,
-            "the add ran exactly once; runs: {runs:?}"
-        );
-    }
-
-    // CT13: MacOs, http config but the installed unit has TLS on ⇒ the
-    // effective target is https, so the trust step runs.
-    #[test]
-    fn ct13_macos_http_config_tls_unit_still_runs_trust_step() {
-        let sys = FakeSys::new();
-        sys.set_run("peakbot", &["--version"], versioned("0.23.0"));
-        sys.set_run(
-            "peakbot",
-            &["service", "status"],
-            installed_status_tls("running", "on"),
-        );
-        sys.set_default_probe(vec![Probe::Status(200)]);
-        sys.seed_file(CONFIG_YAML, HTTP_YAML); // tls: false in config
-        sys.seed_file(ca_cert_path(), CA_PEM);
-        // Already trusted: the check just has to RUN.
-        sys.set_run(
-            "security",
-            &refs(&macos_verify_args()),
-            run_out(Some(0), "", ""),
-        );
-        let ui = FakeUi::new();
-        let ctrl = started_on(sys.clone(), ui.clone(), ReplacePolicy::Ask, Platform::MacOs);
-
-        assert!(
-            matches!(
-                ctrl.phase(),
-                Phase::Ready(Mode::Service(t)) if t.tls
-            ),
-            "the unit's TLS: line ⇒ Ready(Service, tls); got {:?}",
-            ctrl.phase()
-        );
-        let runs = sys.run_args();
-        assert!(
-            runs.iter()
-                .any(|r| r.first().is_some_and(|a| a == "verify-cert")),
-            "the trust step (verify) ran; runs: {runs:?}"
-        );
-    }
-
     /// The URL the bridge would navigate to (`None` unless Ready).
     fn ready_url(ctrl: &Controller<FakeSys, FakeUi>) -> Option<String> {
         match ctrl.phase() {
-            Phase::Ready(mode) => Some(mode.url().to_string()),
+            Phase::Ready(target) => Some(target.url().to_string()),
             _ => None,
         }
     }

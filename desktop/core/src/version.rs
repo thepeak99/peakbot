@@ -13,63 +13,6 @@ pub fn parse_version_output(stdout: &str) -> Option<Version> {
     Version::parse(rest.trim()).ok()
 }
 
-/// The version of the installed service's binary. `Unknown` = exe
-/// missing / command failed / unparseable.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InstalledVersion {
-    Known(Version),
-    Unknown,
-}
-
-/// A (installed, bundled) pair the user declined to replace. Only the
-/// exact pair suppresses the dialog again.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeclinedReplace {
-    pub installed: InstalledVersion,
-    pub bundled: Version,
-}
-
-impl DeclinedReplace {
-    /// `installed=<ver|unknown>\nbundled=<ver>\n`.
-    pub fn render(&self) -> String {
-        let installed = match &self.installed {
-            InstalledVersion::Known(v) => v.to_string(),
-            InstalledVersion::Unknown => "unknown".to_string(),
-        };
-        format!("installed={installed}\nbundled={}\n", self.bundled)
-    }
-
-    pub fn parse(s: &str) -> Option<DeclinedReplace> {
-        let mut installed: Option<InstalledVersion> = None;
-        let mut bundled: Option<Version> = None;
-        for line in s.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            if let Some(v) = line.strip_prefix("installed=") {
-                installed = Some(match v {
-                    "unknown" => InstalledVersion::Unknown,
-                    _ => InstalledVersion::Known(v.parse().ok()?),
-                });
-            } else {
-                let v = line.strip_prefix("bundled=")?;
-                let b = Version::parse(v).ok()?;
-                bundled = Some(b);
-            }
-        }
-        Some(DeclinedReplace {
-            installed: installed?,
-            bundled: bundled?,
-        })
-    }
-
-    /// Exact pair equality.
-    pub fn matches(&self, installed: &InstalledVersion, bundled: &Version) -> bool {
-        self.installed == *installed && &self.bundled == bundled
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,42 +40,5 @@ mod tests {
         for bad in ["", "peakbot", "peakbot x.y", "shifu 0.23.0", "0.23.0"] {
             assert_eq!(parse_version_output(bad), None, "{bad:?} must not parse");
         }
-    }
-
-    // §9.1 case 6.
-    #[test]
-    fn t06_declined_replace_roundtrip_and_exact_pair_match() {
-        let known = DeclinedReplace {
-            installed: InstalledVersion::Known(v("0.22.0")),
-            bundled: v("0.23.0"),
-        };
-        let rt = DeclinedReplace::parse(&known.render()).expect("render→parse roundtrip");
-        assert_eq!(rt, known);
-
-        let unknown = DeclinedReplace {
-            installed: InstalledVersion::Unknown,
-            bundled: v("0.23.0"),
-        };
-        let rt2 = DeclinedReplace::parse(&unknown.render()).expect("unknown roundtrip");
-        assert_eq!(rt2, unknown);
-
-        assert_eq!(
-            DeclinedReplace::parse("nonsense"),
-            None,
-            "garbage must not parse"
-        );
-
-        assert!(
-            known.matches(&InstalledVersion::Known(v("0.22.0")), &v("0.23.0")),
-            "exact pair must match"
-        );
-        assert!(
-            !known.matches(&InstalledVersion::Known(v("0.22.0")), &v("0.24.0")),
-            "different bundled must not match"
-        );
-        assert!(
-            !known.matches(&InstalledVersion::Unknown, &v("0.23.0")),
-            "Known vs Unknown must not match"
-        );
     }
 }

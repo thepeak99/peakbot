@@ -1,7 +1,8 @@
 # PeakBot Desktop
 
 PeakBot Desktop is a small app window around the PeakBot web UI. It ships its own
-PeakBot backend (the *sidecar*) and starts and stops it for you. Design and
+PeakBot backend (the *sidecar*) and runs it for you while the app is open. Closing the
+window keeps it in the tray; **Quit PeakBot** stops it. Design and
 contracts: [`DESIGN.md`](DESIGN.md).
 
 ## Building
@@ -46,48 +47,44 @@ downloads the MSVC SDK (cached in the build layers) and takes a while.
 - **First launch unpacks the backend.** The app extracts the bundled PeakBot
   backend to `%LOCALAPPDATA%\com.peakbot.desktop\bin\` (about 40 MB, once per
   version; older versions are removed automatically).
-- **Background mode is not available on Windows yet.** The "Keep PeakBot
-  running in background" option is therefore not shown on Windows; the app runs
-  in the foreground (window + tray) and the backend exits with it.
+- **Closing the window keeps PeakBot running.** The app runs in the tray (see
+  [Quit and the tray](#quit-and-the-tray)); the window is hidden, not closed. Choose
+  **Quit PeakBot** in the tray menu to stop it.
 
-## Settings
+## Quit and the tray
 
-Open **Settings** with any of:
+PeakBot runs in the background of the desktop app. **Closing the window hides it**;
+PeakBot (the server, and any jobs it is running) keeps running.
 
-- the tray menu item `Settings…`
-- the `PeakBot` menu → `Settings…` (macOS)
-- **Ctrl+Shift+S** (**Cmd+Shift+S** on macOS)
-- the `Settings` link on the status page
+- **Show it again:** click the tray icon, or choose **Open PeakBot**. Starting the app
+  a second time also brings the window back.
+- **Stop PeakBot:** choose **Quit PeakBot** in the tray menu (macOS: **PeakBot → Quit
+  PeakBot** or **Cmd+Q**). This stops the server and any running jobs.
+- **Windows:** left-click the tray icon to show the window; right-click for the menu.
+- **macOS:** the icon is in the menu bar. Closing the window with the red button hides it;
+  click the Dock icon to bring it back.
+- **Linux without a tray:** some desktops (e.g. GNOME without an AppIndicator extension)
+  have no tray. There, closing the window asks **Close PeakBot?** first, because closing
+  stops PeakBot. **Cancel** keeps it running.
 
-| Setting | What it does |
-|---|---|
-| Protocol | HTTP or HTTPS (PeakBot's own certificate; `--tls`). |
-| Access token | Require the access token to open PeakBot. When on, the page shows the current token; type your own, press **Generate** for a random one, or **Copy** it. Leave it empty to keep the current token (or generate one). |
-| Remote access | Listen on all network interfaces (`0.0.0.0`) so other devices can connect. Forces HTTPS and the access token. |
-| Keep PeakBot running in background | Installs/removes the background service. Applies immediately. |
+## Upgrading from the background service
 
-Saving protocol, token or remote asks for confirmation and then **restarts PeakBot**
-(or reinstalls the background service); conversations that are running at that
-moment are interrupted.
+Earlier versions could keep PeakBot running as a system service (systemd / launchd,
+"Keep PeakBot running in background"). That option has been removed. PeakBot Desktop now
+runs PeakBot itself, so an old background service would conflict with it.
 
-### Token
+When the app starts and finds the old service installed (running or stopped), it asks
+**Remove the old background service?**. Choose **Remove service** and the app removes it.
+If you choose **Not now**, the app shows *The old PeakBot background service is still
+installed* and does not start PeakBot until you press **Retry** (which asks again) or run:
 
-The access token is mandatory **only for remote access**. On this computer you can
-turn it off, but then any program or web page on it can control PeakBot (see
-#378) — leave it on unless you have a reason. The token lives in PeakBot's own
-`web-token` file (Linux `~/.config/peakbot/web-token`, macOS
-`~/Library/Application Support/com.peakbot.peakbot/web-token`, Windows
-`%APPDATA%\peakbot\peakbot\config\web-token`); the settings page
-shows the exact path and the current value. Turning the token off removes that file,
-and the terminal `peakbot` command then runs without a token too. It is not rotated
-on every launch.
+```
+peakbot service uninstall
+```
 
-**Setting your own token.** Type it into the field and press **Save**. A token may
-contain only letters, digits, `-`, `_` and `.`, and must be **16 to 256 characters**
-(this applies to loopback as well — a short token on this computer is guessable by
-any web page, #378).
+Your settings, your conversations and the `peakbot` command are kept.
 
-### HTTPS
+## HTTPS
 
 When HTTPS is on — `general.web.tls: true` in PeakBot's `config.yaml`
 (PeakBot → Settings → General) — the backend serves with a certificate signed by
@@ -108,23 +105,6 @@ To remove the CA again: macOS → Keychain Access → **login** → delete
 If `XDG_CACHE_HOME` differs between the app and the background service's
 environment, they use different CAs and the Linux app window shows the certificate
 error.
-
-### Where settings live, and how to reset
-
-Settings are saved in `settings.json` in the app's data folder:
-
-- Linux: `~/.local/share/com.peakbot.desktop/settings.json`
-- macOS: `~/Library/Application Support/com.peakbot.desktop/settings.json`
-- Windows: `%APPDATA%\com.peakbot.desktop\settings.json`
-
-**To reset to the defaults (HTTP, token on, remote off), quit the app and delete
-`settings.json`.** A missing or unreadable file always loads as the defaults.
-Whether the background service is on is never stored there; it is read from the
-service manager.
-
-## Background service updates
-
-When the app starts and a background service is installed, it checks whether the installed binary is **exactly** the build the app bundles, by comparing file contents (not just the version number). If they differ, the app replaces `~/.local/bin/peakbot` and the service automatically — no dialog — keeping the service's HTTP/HTTPS mode and access token. Two exceptions: if the installed PeakBot is *newer* than the app's, the app asks first (and remembers a "Keep" answer), and development builds (built with `make desktop-dev`) always ask, so a debug binary can never silently overwrite your installed `peakbot`. If the binary can't be written, the existing service is left running and the app shows the error.
 
 ## Bundled emoji font (Linux AppImage)
 
@@ -154,5 +134,5 @@ remains licensed under OFL-1.1; the full license text ships with the app.
   are user data — delete them only deliberately.
 - First launch on macOS (unsigned build): `xattr -dr com.apple.quarantine "/Applications/PeakBot Desktop.app"`.
 
-Before deleting the app, untick *Keep PeakBot running in background* if you don't
-want PeakBot to keep running.
+Before deleting the app, quit it from the tray (**Quit PeakBot**). If you still have an
+old background service installed, remove it first with `peakbot service uninstall`.

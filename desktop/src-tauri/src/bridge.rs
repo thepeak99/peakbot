@@ -5,15 +5,16 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use tauri::Manager;
-use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
+use tauri::menu::MenuItem;
+use tauri::{Manager, Wry};
+use tauri_plugin_dialog::{DialogExt, MessageDialogBuilder, MessageDialogButtons};
 
 use peakbot_desktop_core::controller::Ui;
 use peakbot_desktop_core::nav::{NavDecision, classify_navigation};
-use peakbot_desktop_core::phase::{Dialog, Phase, StartStep, StatusView, TrayModel, status_view};
-use peakbot_desktop_core::settings::Theme;
+use peakbot_desktop_core::phase::{Dialog, Phase, StartStep, StatusView, status_view};
+use peakbot_desktop_core::theme::Theme;
 
-use crate::tray::{self, TrayItems};
+use crate::tray;
 
 /// The embedded local page URL (DESIGN §4.8). Tauri serves embedded
 /// assets from `tauri://localhost` on Linux/macOS and
@@ -27,14 +28,6 @@ pub(crate) fn local_page_url() -> tauri::Url {
     URL.parse().expect("static local page URL parses")
 }
 
-/// The embedded settings page URL (0.24, spec §9.10): the local page
-/// origin plus `settings.html` — the `main` window navigates there.
-pub(crate) fn settings_page_url() -> tauri::Url {
-    local_page_url()
-        .join("settings.html")
-        .expect("local page origin joins with settings.html")
-}
-
 /// Shared mutable state between the controller thread, the IPC commands
 /// and the menu handlers.
 pub struct UiState {
@@ -42,15 +35,9 @@ pub struct UiState {
     pub snapshot: Mutex<StatusView>,
     /// The allowed backend origin (`None` on the local status page).
     pub nav: Arc<RwLock<Option<String>>>,
-    /// The live backend URL the phase machine last navigated to
-    /// (`None` while not Ready) — where `← Back to PeakBot` returns
-    /// (0.24, spec §9.10).
-    pub backend_url: Mutex<Option<String>>,
-    /// The last tray model the controller emitted.
-    pub tray_model: Mutex<TrayModel>,
-    /// Clones of the tray items that `TrayModel` updates (2.12's
-    /// `TrayIcon` has no `get_menu()`, so the handles are kept here).
-    pub tray_items: Mutex<Option<TrayItems>>,
+    /// A clone of the tray's status item (2.12's `TrayIcon` has no
+    /// `get_menu()`); `None` when the tray could not be created.
+    pub tray_status_item: Mutex<Option<MenuItem<Wry>>>,
     /// The web UI's last reported theme (`theme_set`); `None` until it
     /// reports one. Read back by the bundled pages via `theme_get`.
     pub theme: Mutex<Option<Theme>>,
@@ -62,14 +49,7 @@ impl UiState {
         Self {
             snapshot: Mutex::new(status_view(&starting)),
             nav: Arc::new(RwLock::new(None)),
-            backend_url: Mutex::new(None),
-            tray_model: Mutex::new(peakbot_desktop_core::phase::tray_model(
-                &starting,
-                None,
-                None,
-                peakbot_desktop_core::phase::host_platform(),
-            )),
-            tray_items: Mutex::new(None),
+            tray_status_item: Mutex::new(None),
             theme: Mutex::new(None),
         }
     }
@@ -95,9 +75,8 @@ impl TauriUi {
 }
 
 impl Ui for TauriUi {
-    fn phase_changed(&self, phase: &Phase, tray: &TrayModel) {
+    fn phase_changed(&self, phase: &Phase, tray_status: &str) {
         *self.state.snapshot.lock().expect("snapshot poisoned") = status_view(phase);
-        *self.state.tray_model.lock().expect("tray_model poisoned") = tray.clone();
         // No main-thread round-trips while quitting: during
         // `RunEvent::Exit` the main thread is blocked on the shutdown
         // ack (DESIGN §4.6), and both `navigate` (webview) and
@@ -105,32 +84,26 @@ impl Ui for TauriUi {
         // muda) would deadlock against it.
         if !self.quitting() {
             self.navigate(phase);
-            tray::apply(&self.state, tray);
+            tray::apply(&self.state, tray_status);
         }
     }
 
     fn confirm(&self, d: &Dialog) -> bool {
-        let buttons = match d.cancel.as_deref() {
-            Some(cancel) => MessageDialogButtons::OkCancelCustom(d.ok.clone(), cancel.to_string()),
-            None => MessageDialogButtons::OkCustom(d.ok.clone()),
-        };
-        self.app
-            .dialog()
-            .message(&d.body)
-            .title(&d.title)
-            .buttons(buttons)
-            .blocking_show()
+        native_dialog(&self.app, d).blocking_show()
     }
+}
 
-    fn message(&self, d: &Dialog) {
-        let _ = self
-            .app
-            .dialog()
-            .message(&d.body)
-            .title(&d.title)
-            .buttons(MessageDialogButtons::OkCustom(d.ok.clone()))
-            .blocking_show();
-    }
+/// A native dialog for `d`, not yet shown. Callers on the main thread
+/// must use the async `show`: `blocking_show` there deadlocks.
+pub(crate) fn native_dialog(app: &tauri::AppHandle, d: &Dialog) -> MessageDialogBuilder<Wry> {
+    let buttons = match d.cancel.as_deref() {
+        Some(cancel) => MessageDialogButtons::OkCancelCustom(d.ok.clone(), cancel.to_string()),
+        None => MessageDialogButtons::OkCustom(d.ok.clone()),
+    };
+    app.dialog()
+        .message(&d.body)
+        .title(&d.title)
+        .buttons(buttons)
 }
 
 impl TauriUi {
@@ -142,17 +115,14 @@ impl TauriUi {
             return;
         };
         match phase {
-            Phase::Ready(mode) => {
-                *self.state.nav.write().expect("nav poisoned") = Some(mode.origin());
-                *self.state.backend_url.lock().expect("backend_url poisoned") =
-                    Some(mode.url().to_string());
-                if let Err(e) = win.navigate(mode.url()) {
+            Phase::Ready(target) => {
+                *self.state.nav.write().expect("nav poisoned") = Some(target.url_base());
+                if let Err(e) = win.navigate(target.url()) {
                     log::warn!("navigate to backend failed: {e}");
                 }
             }
             Phase::Starting(_) | Phase::Failed(_) => {
                 *self.state.nav.write().expect("nav poisoned") = None;
-                *self.state.backend_url.lock().expect("backend_url poisoned") = None;
                 let on_local = win
                     .url()
                     .is_ok_and(|u| classify_navigation(&u, None) == NavDecision::Allow);

@@ -159,7 +159,7 @@ export interface RestartBannerProps {
 // Error-path (segment array) → screen routing (spec §9.6 "Fix" rules).
 //
 // route(path: Seg[]): RouteTarget
-export type Section = "providers" | "mcps" | "profiles" | "general" | "system" | "raw" | "desktop";
+export type Section = "providers" | "mcps" | "profiles" | "general" | "system" | "raw";
 export interface RouteTarget {
   section: Section;
   profile?: string; // ["profiles", p, …]
@@ -660,52 +660,6 @@ export interface BadgeProps {
 //                             otherwise
 // NOT built: "Check for updates" (spec: omit in v1) — no such text anywhere.
 //
-// Desktop pane (D10) — replaces the D8 "Desktop app settings ↗" link.
-// <DesktopPane/> (module ./desktopPane, file desktopPane.tsx). No props:
-// talks to the desktop app ONLY through the IPC seam in ../desktop
-// (getDesktopSettings / toggleDesktopBackground / setDesktopTheme —
-// tests stub `globalThis.__TAURI__.core.invoke`). It is a MACHINE nav
-// section, present ONLY when isDesktop() (globalThis.isTauri === true):
-// testid `nav-desktop`, label "Desktop", LAST in the MACHINE group (after
-// System); the mobile select picks it up via allItems. The old
-// `nav-desktop-link` button and the text "Desktop app settings" no
-// longer exist anywhere. The section head is
-// SECTIONS.desktop = { label: "Desktop",
-//                      desc: "Options of the PeakBot desktop app on this computer." }.
-//
-// State: `loading | ready{view} | unavailable` (unavailable is FINAL per
-// mount). On mount: `getDesktopSettings()` immediately, then every
-// 1000 ms; success → ready; ANY rejection → unavailable + polling stops
-// (the error is never parsed). The interval is cleared on unmount.
-//
-// Toggle: the checkbox calls `toggleDesktopBackground()`; a rejection →
-// unavailable. The checkbox is CONTROLLED (`checked = view.background`)
-// with NO optimistic flip — it moves only when the next poll reports the
-// new state.
-//
-// data-testids (root `desktop-pane`):
-//   `desktop-loading` — "Loading…" (while loading)
-//   ready + background_visible:
-//     `desktop-background` — checkbox "Keep PeakBot running in background",
-//       `disabled = !view.background_enabled`
-//     `desktop-background-note` — "Runs PeakBot as a background service that
-//       keeps going after you quit the app. Changing this restarts PeakBot."
-//   ready + !background_visible:
-//     `desktop-background-unsupported` — "Background mode is not available on
-//       this platform yet." (no checkbox)
-//   unavailable:
-//     `desktop-unavailable` — "Desktop options can't be loaded here — PeakBot
-//       is not on the desktop app's default address, or the desktop app is
-//       older."
-//     `desktop-open-settings-page` — button "Open desktop settings" →
-//       `window.location.href = "peakbot-desktop:settings"` (tests observe
-//       the assignment; jsdom cannot navigate to the custom scheme).
-// The pane renders NO `busy` / `cert_warning` and NO form controls: the
-// rewrite banner (a form-pane thing) is absent on the Desktop section.
-//
-// Nav buttons also get `nav-<section>` testids: nav-providers, nav-mcps,
-// nav-profiles, nav-general, nav-system, nav-raw, nav-desktop (desktop only).
-
 // ── ./raw (T31) + store additions (D9) ──────────────────────────────────
 // Store (store.ts) additions, per scope (ScopeState gains two fields):
 export interface RawError {
