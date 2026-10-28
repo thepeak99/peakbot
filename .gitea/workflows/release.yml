@@ -6,9 +6,9 @@ on:
 
 jobs:
   release:
-    name: build + publish (7 assets)
+    name: build + publish (8 assets)
     runs-on: dind
-    timeout-minutes: 180
+    timeout-minutes: 300
     # Runs on the Alpine host: it drives the HOST docker daemon (the dind
     # runner ships docker) and the pure-git checkout needs only git + sh.
     # No job-level container — bind mounts are unsafe on this runner.
@@ -31,7 +31,7 @@ jobs:
             command -v "$t" >/dev/null || { echo "missing tool on runner: $t (add it to the runner image)"; exit 1; }
           done
           [ -n "$GITEA_TOKEN" ] || { echo "RELEASE_TOKEN secret missing/empty" >&2; exit 1; }
-      - name: Release (check, build 7 assets, publish)
+      - name: Release (check, build 8 assets, publish)
         run: |
           # No `origin` remote after the pure-git checkout — the Makefile
           # derives GITEA_URL/OWNER/REPO from it, so pass them explicitly.

@@ -24,10 +24,12 @@
 #   1. build the peakbot sidecar with the EXISTING Dockerfile.windows
 #      (TARGET=x86_64-pc-windows-msvc, cargo-xwin + MSVC SDK, static CRT
 #      → unversioned artifact: output/peakbot-windows-amd64-msvc.exe)
-#   2. build the portable exe with Dockerfile.desktop-windows
-#      (cargo-xwin, no Tauri CLI; the sidecar is embedded as a zstd
-#      payload) → output/desktop/PeakBot-Desktop-<v>-windows-x86_64.exe
-#      (S-W1..S-W4 run before export)
+#   2. build BOTH Windows artifacts with Dockerfile.desktop-windows
+#      (cargo-xwin portable exe + NSIS installer via the pinned Tauri CLI;
+#      the sidecar is embedded as a zstd payload)
+#      → output/desktop/PeakBot-Desktop-<v>-windows-x86_64-portable.exe
+#      + output/desktop/PeakBot-Desktop-<v>-windows-x86_64-setup.exe
+#      (S-W1..S-W6 run before export)
 #
 # Environment:
 #   CONTAINER_BUILDER  podman (default) or docker
@@ -132,16 +134,18 @@ build_sidecar_windows() {
 build_desktop_windows() {
     [ -f output/peakbot-windows-amd64-msvc.exe ] \
         || { echo "❌ missing sidecar output/peakbot-windows-amd64-msvc.exe — build it first" >&2; exit 1; }
-    echo "🖥️  Building Windows portable exe (Dockerfile.desktop-windows)..."
+    echo "🖥️  Building Windows portable exe + NSIS installer (Dockerfile.desktop-windows)..."
     mkdir -p output/desktop
     "$CONTAINER_BUILDER" build \
         --build-arg VERSION="$VERSION" \
         --output type=local,dest=output/desktop \
         -f Dockerfile.desktop-windows \
         .
-    [ -f "output/desktop/PeakBot-Desktop-$VERSION-windows-x86_64.exe" ] \
-        || { echo "❌ expected output/desktop/PeakBot-Desktop-$VERSION-windows-x86_64.exe" >&2; exit 1; }
-    echo "✅ $(ls -lh "output/desktop/PeakBot-Desktop-$VERSION-windows-x86_64.exe")"
+    [ -f "output/desktop/PeakBot-Desktop-$VERSION-windows-x86_64-portable.exe" ] \
+        || { echo "❌ expected output/desktop/PeakBot-Desktop-$VERSION-windows-x86_64-portable.exe" >&2; exit 1; }
+    [ -f "output/desktop/PeakBot-Desktop-$VERSION-windows-x86_64-setup.exe" ] \
+        || { echo "❌ expected output/desktop/PeakBot-Desktop-$VERSION-windows-x86_64-setup.exe" >&2; exit 1; }
+    echo "✅ $(ls -lh "output/desktop/PeakBot-Desktop-$VERSION-windows-x86_64-portable.exe" "output/desktop/PeakBot-Desktop-$VERSION-windows-x86_64-setup.exe")"
 }
 
 build_linux() {
