@@ -1,0 +1,117 @@
+# PeakBot Desktop — updater artifact signer + latest.json builder
+#
+# Signs the three auto-updater artifacts (Linux AppImage, Windows NSIS
+# setup.exe, macOS universal .app.tar.gz) with the Tauri signing key
+# (`tauri signer sign --app-version`), verifies each .sig with minisign
+# against the pubkey in desktop/src-tauri/tauri.conf.json, and builds
+# latest.json via desktop/scripts/updater-manifest.sh.
+#
+# Key handling: the private key + password arrive as BuildKit secrets
+# (id=tauri_key / id=tauri_key_pw; src=<temp file> created and deleted by
+# desktop/scripts/build-desktop.sh). Inside the sign RUN the key lives only
+# in the /run/secrets mount and a same-RUN temp file (removed before the
+# layer is committed) — it never lands in an image layer or a log.
+#
+# glibc base (not alpine): the pinned @tauri-apps/cli npm package ships a
+# glibc prebuilt binary.
+#
+# Usage:
+#   sh desktop/scripts/build-desktop.sh updater
+# (or directly:)
+#   podman build -f Dockerfile.desktop-updater \
+#     --build-arg VERSION=0.24.0 \
+#     --build-arg NOTES=release-notes/0.24.0.md \
+#     --secret id=tauri_key,src=/path/updater.key \
+#     --secret id=tauri_key_pw,src=/path/updater.key.pw \
+#     --output type=local,dest=output/desktop .
+#
+# Exports four files:
+#   /PeakBot-Desktop-<VERSION>-linux-x86_64.AppImage.sig
+#   /PeakBot-Desktop-<VERSION>-windows-x86_64-setup.exe.sig
+#   /PeakBot-Desktop-<VERSION>-macos-universal.app.tar.gz.sig
+#   /latest.json
+
+FROM ubuntu:22.04 AS build
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# jq: tauri.conf.json + the manifest.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        ca-certificates \
+        jq \
+    && rm -rf /var/lib/apt/lists/*
+
+# minisign 0.11 — the same version the Tauri CLI signs with (signature
+# compatibility). Ubuntu has no minisign package, so pin the official
+# release binary (sha256 verified 2026-10-29).
+RUN curl -fsSL -o /tmp/minisign.tar.gz \
+        https://github.com/jedisct1/minisign/releases/download/0.11/minisign-0.11-linux.tar.gz \
+    && echo "f0a0954413df8531befed169e447a66da6868d79052ed7e892e50a4291af7ae0  /tmp/minisign.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/minisign.tar.gz -C /tmp \
+    && install -m 755 /tmp/minisign-linux/x86_64/minisign /usr/local/bin/minisign \
+    && rm -rf /tmp/minisign.tar.gz /tmp/minisign-linux \
+    && minisign -v
+
+# Node 22 (nodesource) — runs the pinned Tauri CLI.
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pinned Tauri CLI (same pin as the desktop builders).
+RUN npm install -g @tauri-apps/cli@2.12.3
+
+ARG VERSION
+ARG GH_MIRROR_REPO=thepeak99/peakbot
+
+# The three update artifacts (staged in output/desktop/ by the desktop
+# pipelines — names must match build-desktop.sh).
+COPY output/desktop/PeakBot-Desktop-${VERSION}-linux-x86_64.AppImage /artifacts/
+COPY output/desktop/PeakBot-Desktop-${VERSION}-windows-x86_64-setup.exe /artifacts/
+COPY output/desktop/PeakBot-Desktop-${VERSION}-macos-universal.app.tar.gz /artifacts/
+# Pubkey source, manifest builder, release notes.
+COPY desktop/src-tauri/tauri.conf.json /src/tauri.conf.json
+COPY desktop/scripts/updater-manifest.sh /src/updater-manifest.sh
+ARG NOTES=release-notes/current.md
+COPY ${NOTES} /src/notes.md
+
+RUN --mount=type=secret,id=tauri_key \
+    --mount=type=secret,id=tauri_key_pw \
+    set -eu; \
+    [ -s /run/secrets/tauri_key ] \
+        || { echo "❌ TAURI_SIGNING_PRIVATE_KEY is empty/missing — pass --secret id=tauri_key,src=<keyfile>" >&2; exit 1; }; \
+    [ -s /run/secrets/tauri_key_pw ] \
+        || { echo "❌ TAURI_SIGNING_PRIVATE_KEY_PASSWORD is empty/missing — pass --secret id=tauri_key_pw,src=<pwfile>" >&2; exit 1; }; \
+    key=$(mktemp); pw=$(mktemp); \
+    chmod 600 "$key" "$pw"; \
+    cat /run/secrets/tauri_key > "$key"; \
+    cat /run/secrets/tauri_key_pw > "$pw"; \
+    trap 'rm -f "$key" "$pw"' EXIT; \
+    pub_b64=$(jq -r '.plugins.updater.pubkey // empty' /src/tauri.conf.json); \
+    [ -n "$pub_b64" ] || { echo "❌ no plugins.updater.pubkey in tauri.conf.json" >&2; exit 1; }; \
+    # The config pubkey is the base64 of a minisign .pub file — decode it.
+    printf '%s' "$pub_b64" | base64 -d > /tmp/updater.pub; \
+    for a in "/artifacts/PeakBot-Desktop-${VERSION}-linux-x86_64.AppImage" \
+             "/artifacts/PeakBot-Desktop-${VERSION}-windows-x86_64-setup.exe" \
+             "/artifacts/PeakBot-Desktop-${VERSION}-macos-universal.app.tar.gz"; do \
+      echo "🔏 Signing $(basename "$a")..."; \
+      tauri signer sign --app-version "${VERSION}" --private-key-path "$key" --password "$(cat "$pw")" "$a"; \
+      [ -s "$a.sig" ] || { echo "❌ no signature written for $a" >&2; exit 1; }; \
+      # A tauri .sig is the base64 of a minisign signature file — decode it \
+      # before minisign -V.
+      base64 -d < "$a.sig" > /tmp/verify.msig; \
+      echo "🔍 Verifying $(basename "$a")..."; \
+      minisign -V -p /tmp/updater.pub -x /tmp/verify.msig -m "$a" \
+        || { echo "❌ minisign verification FAILED for $a (key/pubkey mismatch?)" >&2; exit 1; }; \
+    done; \
+    rm -f /tmp/verify.msig /tmp/updater.pub; \
+    echo "📄 Building latest.json..."; \
+    sh /src/updater-manifest.sh "${VERSION}" /artifacts \
+        "https://github.com/${GH_MIRROR_REPO}/releases/download/${VERSION}" /src/notes.md; \
+    mkdir -p /out; \
+    cp /artifacts/*.sig /out/; \
+    cp /artifacts/latest.json /out/
+
+# Four-file export.
+FROM scratch
+COPY --from=build /out/ /

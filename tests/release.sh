@@ -4,17 +4,29 @@
 #
 # Written BEFORE the implementation: expect RED until the developer lands
 #   - the Makefile contract: RELEASE_VERSION, release-check, explicit
-#     sequential release recipe, 8-asset draft-first release-publish with
-#     DELETE-on-failure, no-prompt release-bump with notes promotion,
-#     dumb release-tag (no PR automation), and the removal of
-#     .release-version / NOTES / ALLOW_DIRTY everywhere
-#   - .gitea/workflows/release.yml (tag-push → make release TAG=...),
-#     with desktop.yml + desktop/scripts/attach-release.sh deleted
+#     sequential release recipe, 10-asset draft-first release-publish with
+#     DELETE-on-failure and a "prerelease" flag derived from '-' in TAG,
+#     no-prompt release-bump with notes promotion, dumb release-tag (no PR
+#     automation), and the removal of .release-version / NOTES / ALLOW_DIRTY
+#   - the auto-updater pipeline: shared RELEASE_ASSETS (10 = 8 legacy +
+#     macos-universal.app.tar.gz + latest.json), release order
+#     desktop-updater → release-publish → release-publish-github
+#     (curl+jq, idempotent, polls the GitHub tag ref, draft + trap-delete,
+#     10 uploads to uploads.github.com, PATCH make_latest true/false),
+#     release-check asserting the tauri.conf.json updater endpoint contains
+#     GH_MIRROR_REPO
+#   - .gitea/workflows/release.yml (tag-push → make release TAG=...), with
+#     the GH_RELEASE_TOKEN + TAURI_SIGNING_PRIVATE_KEY(_PASSWORD) secrets
+#     mapped to env, and desktop.yml + desktop/scripts/attach-release.sh
+#     deleted
 #
 # Runs NO docker builds, NO network: make release-publish is exercised with
 # a fake `curl` on PATH (logs every invocation, returns canned JSON), and
 # release-bump/release-tag run in throwaway local clones against a local
-# bare `origin` (cargo stubbed to a no-op).
+# bare `origin` (cargo stubbed to a no-op). release-publish-github is
+# exercised the same way — the fake also speaks the GitHub API shapes
+# (tag-ref polling with a counter, releases/tags lookup per GH_REL_MODE,
+# uploads.github.com, -o/-w %{http_code} status reporting).
 #
 # Run:  sh tests/release.sh               (from the repo root, or anywhere)
 # Exit: 0 when every check passes (GREEN); 1 with a failing-check list
@@ -63,6 +75,187 @@ workdirs=""
 cleanup() { [ -n "$workdirs" ] && rm -rf $workdirs; }
 trap cleanup EXIT
 
+# ── Shared fake-curl infrastructure (T08, T26–T28, T45–T51) ───────────────
+# ONE fake `curl` on PATH serves BOTH the Gitea and the GitHub fakes. It
+# logs "METHOD URL [BODY=…] [FILE=…] [ | -H …]" per invocation to
+# $CURL_LOG and answers by URL shape:
+#   git.fake.example   — legacy Gitea canned answers (release id 42).
+#   api.github.com     — GET git/ref/tags/<v>: 404 twice, then 200 (poll
+#                        counter in $CURL_LOG.refpoll); GH_REF_ALWAYS_404=1
+#                        keeps it at 404. GET releases/tags/<v>: 404, or
+#                        200 per GH_REL_MODE=done|draft (done lists the
+#                        asset names from $CURL_LOG.doneassets, one/line).
+#                        POST releases → 201 {"id":77,"draft":true};
+#                        DELETE releases/<id> → 204; PATCH → 200.
+#   uploads.github.com — POST …/releases/<id>/assets?name=<f> → 201, or
+#                        422 when FAIL_UPLOAD=<f>.
+# GitHub answers carry their HTTP status via -w %{http_code} (body on
+# stdout or via -o), so the implementation may check status and/or body.
+# Makefile contract under test: GH_MIRROR_REPO ?= thepeak99/peakbot,
+# GH_API ?= https://api.github.com, GH_UPLOADS ?= https://uploads.github.com,
+# poll GET <GH_API>/repos/<repo>/git/ref/tags/<v> GH_TAG_WAIT_TRIES (60) ×
+# GH_TAG_WAIT_SECS (10s), auth header "Authorization: Bearer <token>",
+# token never printed.
+
+D=$(mktemp -d); workdirs="$workdirs $D"
+mkdir -p "$D/bin" "$D/out/desktop"
+
+cat > "$D/bin/curl" <<'FAKECURL'
+#!/bin/sh
+: "${CURL_LOG:?fake curl needs CURL_LOG}"
+method=GET; url=''; body=''; fdata=''; ofile=''; wfmt=''; hdrs=''
+prev=''
+for a in "$@"; do
+  case "$prev" in
+    -X|--request) method=$a; prev=''; continue ;;
+    -d|--data)    body=$a; prev=''; continue ;;
+    -F|--form)    fdata=$a; prev=''; continue ;;
+    -o)           ofile=$a; prev=''; continue ;;
+    -w)           wfmt=$a; prev=''; continue ;;
+    -H|--header)  hdrs="$hdrs | $a"; prev=''; continue ;;
+  esac
+  case "$a" in
+    -*) prev=$a ;;
+    *) prev=''; if [ -z "$url" ]; then url=$a; fi ;;
+  esac
+done
+line="$method $url"
+[ -n "$body" ]  && line="$line BODY=$body"
+[ -n "$fdata" ] && line="$line FILE=$fdata"
+[ -n "$hdrs" ]  && line="$line$hdrs"
+printf '%s\n' "$line" >> "$CURL_LOG"
+
+case "$url" in
+  *uploads.github.com*)
+    name=${url##*name=}
+    if [ -n "${FAIL_UPLOAD:-}" ] && [ "$name" = "$FAIL_UPLOAD" ]; then
+      status=422; resp="{\"message\":\"upload failed for $name\"}"
+    else
+      status=201; resp="{\"id\":1,\"name\":\"$name\"}"
+    fi
+    if [ -n "$ofile" ]; then printf '%s\n' "$resp" > "$ofile"; else printf '%s\n' "$resp"; fi
+    [ -n "$wfmt" ] && printf '%s\n' "$wfmt" | sed "s/%{http_code}/$status/g"
+    exit 0 ;;
+  *api.github.com*)
+    status=200; resp='{}'
+    case "$method" in
+      GET)
+        case "$url" in
+          *git/ref/tags/*)
+            cf="$CURL_LOG.refpoll"
+            n=$(cat "$cf" 2>/dev/null || echo 0); n=$((n+1)); printf '%s\n' "$n" > "$cf"
+            if [ "${GH_REF_ALWAYS_404:-0}" = "1" ] || [ "$n" -le 2 ]; then
+              status=404; resp='{"message":"Not Found"}'
+            else
+              status=200; resp='{"ref":"refs/tags/fake","object":{"type":"tag","sha":"fake"}}'
+            fi ;;
+          *releases/tags/*)
+            case "${GH_REL_MODE:-none}" in
+              done)
+                status=200
+                resp=$(jq -nc '{id:77, draft:false, tag_name:"", assets: [inputs]}' < "$CURL_LOG.doneassets") ;;
+              draft)
+                status=200; resp='{"id":77,"draft":true,"tag_name":"","assets":[]}' ;;
+              *)
+                status=404; resp='{"message":"Not Found"}' ;;
+            esac ;;
+          *)
+            status=404; resp='{"message":"Not Found"}' ;;
+        esac ;;
+      POST)
+        status=201; resp='{"id":77,"draft":true}' ;;
+      DELETE)
+        status=204; resp='' ;;
+      PATCH)
+        status=200; resp='{"id":77,"draft":false}' ;;
+    esac
+    if [ -n "$ofile" ]; then printf '%s\n' "$resp" > "$ofile"; else printf '%s\n' "$resp"; fi
+    [ -n "$wfmt" ] && printf '%s\n' "$wfmt" | sed "s/%{http_code}/$status/g"
+    exit 0 ;;
+  *)
+    # Gitea (git.fake.example) — legacy canned answers.
+    case "$method" in
+      POST)
+        case "$url" in
+          *releases/*/assets*)
+            name=${url##*name=}
+            if [ "$name" = "${FAIL_UPLOAD:-}" ]; then
+              printf '{"message":"upload failed for %s"}\n' "$name"
+            else
+              printf '{"name":"%s","browser_download_url":"https://fake.example/%s"}\n' "$name" "$name"
+            fi ;;
+          */releases)
+            if [ -n "${CREATE_FAIL:-}" ]; then
+              printf '{"message":"create failed"}\n'
+            else
+              printf '{"id":42}\n'
+            fi ;;
+          *) printf '{}\n' ;;
+        esac ;;
+      PATCH)  printf '{"id":42,"draft":false}\n' ;;
+      DELETE) printf '{"success":true}\n' ;;
+      *)      printf '{}\n' ;;
+    esac
+    exit 0 ;;
+esac
+FAKECURL
+chmod +x "$D/bin/curl"
+
+# ASSET10 — the 10 release asset basenames (8 legacy + the macOS updater
+# tarball + latest.json), in the spec order.
+ASSET10="peakbot-$V-linux-amd64
+peakbot-$V-windows-amd64.exe
+peakbot-$V-macos-universal2
+peakbot-$V-android-arm64
+PeakBot-Desktop-$V-linux-x86_64.AppImage
+PeakBot-Desktop-$V-macos-universal.zip
+PeakBot-Desktop-$V-macos-universal.app.tar.gz
+PeakBot-Desktop-$V-windows-x86_64-portable.exe
+PeakBot-Desktop-$V-windows-x86_64-setup.exe
+latest.json"
+
+make_assets() { # $1 = output dir: create all 10 release assets
+    mkdir -p "$1/desktop"
+    for n in peakbot-$V-linux-amd64 peakbot-$V-windows-amd64.exe \
+             peakbot-$V-macos-universal2 peakbot-$V-android-arm64; do
+        printf x > "$1/$n"
+    done
+    for n in PeakBot-Desktop-$V-linux-x86_64.AppImage \
+             PeakBot-Desktop-$V-macos-universal.zip \
+             PeakBot-Desktop-$V-macos-universal.app.tar.gz \
+             PeakBot-Desktop-$V-windows-x86_64-portable.exe \
+             PeakBot-Desktop-$V-windows-x86_64-setup.exe latest.json; do
+        printf x > "$1/desktop/$n"
+    done
+}
+
+# run_publish <logfile> [FAIL_UPLOAD] [TAG] [CWD] → sets P_RC / P_OUT
+run_publish() {
+    rp_log=$1; rp_fail=${2:-}; rp_tag=${3:-$V}; rp_cwd=${4:-$root}
+    rm -f "$rp_log"; : > "$rp_log"
+    P_OUT=$( cd "$rp_cwd" && \
+      FAIL_UPLOAD="$rp_fail" CURL_LOG="$rp_log" PATH="$D/bin:$PATH" \
+      make release-publish TAG="$rp_tag" OUTPUT_DIR="$D/out" \
+      GITEA_URL="$GU" OWNER="$GO" REPO="$GR" GITEA_TOKEN=fake-token 2>&1 )
+    P_RC=$?
+}
+
+# run_gh <cwd> <logfile> <tag> [TOKEN] → sets G_RC / G_OUT.
+# The fake's knobs (GH_FAIL_UPLOAD, GH_REF_ALWAYS_404, GH_REL_MODE,
+# GH_TAG_WAIT_TRIES) are read from the caller's environment.
+run_gh() {
+    gh_cwd=$1; gh_log=$2; gh_tag=$3; gh_tok=${4:-ghsecret-token-123}
+    rm -f "$gh_log" "$gh_log.refpoll" "$gh_log.doneassets"; : > "$gh_log"
+    G_OUT=$( cd "$gh_cwd" && \
+      CURL_LOG="$gh_log" FAIL_UPLOAD="${GH_FAIL_UPLOAD:-}" \
+      GH_REF_ALWAYS_404="${GH_REF_ALWAYS_404:-0}" \
+      GH_REL_MODE="${GH_REL_MODE:-none}" PATH="$D/bin:$PATH" \
+      make release-publish-github TAG="$gh_tag" OUTPUT_DIR="$D/out" \
+      GH_RELEASE_TOKEN="$gh_tok" GH_TAG_WAIT_SECS=0 \
+      ${GH_TAG_WAIT_TRIES:+GH_TAG_WAIT_TRIES=$GH_TAG_WAIT_TRIES} 2>&1 )
+    G_RC=$?
+}
+
 # ── A: Makefile static contract ────────────────────────────────────────────
 
 # T01: RELEASE_VERSION is defined from the root Cargo.toml [package] version
@@ -100,8 +293,31 @@ fi
 # T07: no "Release <v>" body/name fallback.
 grep_bad "T07 Makefile has no 'Release <v>' fallback" 'Release $$v' "$MK"
 
-# T08: no prerelease flag logic.
-grep_bad "T08 Makefile has no prerelease logic" 'prerelease' "$MK"
+# T08: release-publish sends "prerelease":true EXACTLY when the TAG contains
+# '-', "prerelease":false otherwise. Behavioural, via the fake curl's
+# capture of the release-create body (the prerelease TAG runs in a
+# throwaway clone so its notes file never touches the worktree).
+make_assets "$D/out"
+run_publish "$D/log-t08-stable"
+t08=1; why=""
+grep -qF '"prerelease":false' "$D/log-t08-stable" 2>/dev/null \
+    || { t08=0; why="stable create body lacks \"prerelease\":false"; }
+grep -qF '"prerelease":true' "$D/log-t08-stable" 2>/dev/null \
+    && { t08=0; why="${why}${why:+; }stable create body has \"prerelease\":true"; }
+git clone -q --depth 1 "$root" "$D/pre" 2>/dev/null || { t08=0; why="${why}${why:+; }prerelease clone failed"; }
+[ -d "$D/pre" ] && printf 'prerelease notes\n' > "$D/pre/release-notes/0.9.0-rc.1.md"
+[ -d "$D/pre" ] && run_publish "$D/log-t08-pre" "" 0.9.0-rc.1 "$D/pre"
+if [ -d "$D/pre" ]; then
+    grep -qF '"prerelease":true' "$D/log-t08-pre" 2>/dev/null \
+        || { t08=0; why="${why}${why:+; }prerelease create body lacks \"prerelease\":true"; }
+    grep -qF '"prerelease":false' "$D/log-t08-pre" 2>/dev/null \
+        && { t08=0; why="${why}${why:+; }prerelease create body has \"prerelease\":false"; }
+fi
+if [ "$t08" -eq 1 ]; then
+    ok "T08 release-publish: prerelease flag follows '-' in TAG (false stable / true rc)"
+else
+    bad "T08 release-publish: prerelease flag follows '-' in TAG (false stable / true rc) ($why)"
+fi
 
 # T09: release-tag exists and has NO PR create/merge automation.
 t09=1
@@ -126,13 +342,13 @@ else
 fi
 
 grep_ok "T12 release.yml: runs-on: dind" 'runs-on: dind' "$RY"
-# T13: the release job gets a 300-minute budget and publishes 8 assets
-# (the Windows desktop artifact split into portable exe + NSIS installer).
+# T13: the release job gets a 300-minute budget and publishes 10 assets
+# (the 8 legacy + PeakBot-Desktop-<v>-macos-universal.app.tar.gz + latest.json).
 if grep -qF 'timeout-minutes: 300' "$RY" 2>/dev/null \
-    && grep -qF '(8 assets)' "$RY" 2>/dev/null; then
-    ok "T13 release.yml: timeout-minutes: 300 + '(8 assets)'"
+    && grep -qF '(10 assets)' "$RY" 2>/dev/null; then
+    ok "T13 release.yml: timeout-minutes: 300 + '(10 assets)'"
 else
-    bad "T13 release.yml: timeout-minutes: 300 + '(8 assets)'"
+    bad "T13 release.yml: timeout-minutes: 300 + '(10 assets)'"
 fi
 
 grep_bad "T14 release.yml: no container: key" 'container:' "$RY"
@@ -203,95 +419,22 @@ else
 fi
 
 # ── D: release-publish behavior (fake curl on PATH, canned JSON) ───────────
-
-D=$(mktemp -d); workdirs="$workdirs $D"
-mkdir -p "$D/bin" "$D/out/desktop"
-
-# Fake curl: logs "METHOD URL [BODY=…] [FILE=…]" per invocation to $CURL_LOG,
-# then answers by shape. Env knobs: CREATE_FAIL (1), FAIL_UPLOAD=<asset name>.
-cat > "$D/bin/curl" <<'FAKECURL'
-#!/bin/sh
-: "${CURL_LOG:?fake curl needs CURL_LOG}"
-method=GET; url=''; body=''; fdata=''
-prev=''
-for a in "$@"; do
-  case "$prev" in
-    -X|--request) method=$a; prev=''; continue ;;
-    -d|--data)    body=$a; prev=''; continue ;;
-    -F|--form)    fdata=$a; prev=''; continue ;;
-  esac
-  case "$a" in
-    -*) prev=$a ;;
-    *) prev=''; if [ -z "$url" ]; then url=$a; fi ;;
-  esac
-done
-line="$method $url"
-[ -n "$body" ]  && line="$line BODY=$body"
-[ -n "$fdata" ] && line="$line FILE=$fdata"
-printf '%s\n' "$line" >> "$CURL_LOG"
-case "$method" in
-  POST)
-    case "$url" in
-      *releases/*/assets*)
-        name=${url##*name=}
-        if [ "$name" = "${FAIL_UPLOAD:-}" ]; then
-          printf '{"message":"upload failed for %s"}\n' "$name"
-        else
-          printf '{"name":"%s","browser_download_url":"https://fake.example/%s"}\n' "$name" "$name"
-        fi ;;
-      */releases)
-        if [ -n "${CREATE_FAIL:-}" ]; then
-          printf '{"message":"create failed"}\n'
-        else
-          printf '{"id":42}\n'
-        fi ;;
-      *) printf '{}\n' ;;
-    esac ;;
-  PATCH)  printf '{"id":42,"draft":false}\n' ;;
-  DELETE) printf '{"success":true}\n' ;;
-  *)      printf '{}\n' ;;
-esac
-exit 0
-FAKECURL
-chmod +x "$D/bin/curl"
-
-make_assets() { # $1 = output dir: create all 8 release assets
-    mkdir -p "$1/desktop"
-    printf x > "$1/peakbot-$V-linux-amd64"
-    printf x > "$1/peakbot-$V-windows-amd64.exe"
-    printf x > "$1/peakbot-$V-macos-universal2"
-    printf x > "$1/peakbot-$V-android-arm64"
-    printf x > "$1/desktop/PeakBot-Desktop-$V-linux-x86_64.AppImage"
-    printf x > "$1/desktop/PeakBot-Desktop-$V-macos-universal.zip"
-    printf x > "$1/desktop/PeakBot-Desktop-$V-windows-x86_64-portable.exe"
-    printf x > "$1/desktop/PeakBot-Desktop-$V-windows-x86_64-setup.exe"
-}
-
-# run_publish <logfile> [FAIL_UPLOAD] → sets P_RC / P_OUT
-run_publish() {
-    rm -f "$1"; : > "$1"
-    P_OUT=$( cd "$root" && \
-      if [ "$#" -ge 2 ] && [ -n "$2" ]; then FAIL_UPLOAD="$2"; fi; \
-      export FAIL_UPLOAD CURL_LOG; \
-      PATH="$D/bin:$PATH" CURL_LOG="$1" \
-      make release-publish TAG="$V" OUTPUT_DIR="$D/out" \
-      GITEA_URL="$GU" OWNER="$GO" REPO="$GR" GITEA_TOKEN=fake-token 2>&1 )
-    P_RC=$?
-}
+# (the fake curl + make_assets + run_publish live in the shared block up top)
 
 # T26: one asset missing → non-zero, message names it, ZERO HTTP requests.
+# (the NEW macOS updater tarball — proof the 10th asset is in the check loop)
 make_assets "$D/out"
-rm -f "$D/out/peakbot-$V-android-arm64"
+rm -f "$D/out/desktop/PeakBot-Desktop-$V-macos-universal.app.tar.gz"
 run_publish "$D/log-missing"
 if [ "$P_RC" -ne 0 ] && [ ! -s "$D/log-missing" ] \
-    && printf '%s' "$P_OUT" | grep -qF "peakbot-$V-android-arm64"; then
+    && printf '%s' "$P_OUT" | grep -qF "PeakBot-Desktop-$V-macos-universal.app.tar.gz"; then
     ok "T26 release-publish: missing asset → fails, names it, zero HTTP"
 else
     logstate=$([ -f "$D/log-missing" ] && wc -l < "$D/log-missing" || echo absent)
     bad "T26 release-publish: missing asset → fails, names it, zero HTTP (rc=$P_RC, log lines=$logstate)"
 fi
 
-# T27: happy path — draft create, 8 exact uploads, final PATCH, no DELETE,
+# T27: happy path — draft create, 10 exact uploads, final PATCH, no DELETE,
 # and the explicit GITEA_URL/OWNER/REPO vars are used (override origin).
 make_assets "$D/out"
 run_publish "$D/log-happy"
@@ -299,24 +442,25 @@ t27=1; why=""
 fail27() { t27=0; why="${why}${why:+; }$1"; }
 [ "$P_RC" -eq 0 ] || fail27 "rc=$P_RC: $(printf '%s' "$P_OUT" | grep '❌' | head -1)"
 lines=$(wc -l < "$D/log-happy" | tr -d ' ')
-[ "$lines" = "10" ] || fail27 "log has $lines lines, want 10 (create+8 uploads+patch)"
+[ "$lines" = "12" ] || fail27 "log has $lines lines, want 12 (create+10 uploads+patch)"
 grep -qF "POST $API/releases " "$D/log-happy" 2>/dev/null || fail27 "no create POST to $API/releases"
 grep -qF '"draft":true' "$D/log-happy" 2>/dev/null || fail27 "create body lacks draft:true"
 grep -qF "\"tag_name\":\"$V\"" "$D/log-happy" 2>/dev/null || fail27 "create body lacks tag_name=$V"
 grep -qF "\"name\":\"$V\"" "$D/log-happy" 2>/dev/null || fail27 "create body name is not exactly $V"
+grep -qF '"prerelease":false' "$D/log-happy" 2>/dev/null || fail27 "create body lacks prerelease:false (stable tag)"
 # Sentinel: a long word from the real notes file — the assertion is "notes
 # content reached the create body", independent of which version is under test.
 notes_word=$(grep -m1 -oE '[A-Za-z]{8,}' "release-notes/$V.md" 2>/dev/null)
 [ -n "$notes_word" ] || fail27 "release-notes/$V.md has no content to verify"
 grep -qF "$notes_word" "$D/log-happy" 2>/dev/null || fail27 "create body lacks release-notes/$V.md content"
-grep -qF 'prerelease' "$D/log-happy" 2>/dev/null && fail27 "prerelease flag present"
 upl=$(grep -cF 'assets?name=' "$D/log-happy" 2>/dev/null || true)
-[ "$upl" = "8" ] || fail27 "$upl asset uploads, want 8"
+[ "$upl" = "10" ] || fail27 "$upl asset uploads, want 10"
 for n in peakbot-$V-linux-amd64 peakbot-$V-windows-amd64.exe peakbot-$V-macos-universal2 \
          peakbot-$V-android-arm64 PeakBot-Desktop-$V-linux-x86_64.AppImage \
          PeakBot-Desktop-$V-macos-universal.zip \
+         PeakBot-Desktop-$V-macos-universal.app.tar.gz \
          PeakBot-Desktop-$V-windows-x86_64-portable.exe \
-         PeakBot-Desktop-$V-windows-x86_64-setup.exe; do
+         PeakBot-Desktop-$V-windows-x86_64-setup.exe latest.json; do
     c=$(grep -cF "name=$n " "$D/log-happy" 2>/dev/null || true)
     [ "$c" = "1" ] || fail27 "upload of $n: $c occurrence(s), want 1"
 done
@@ -328,7 +472,7 @@ grep -qF "PATCH $API/releases/42" "$D/log-happy" 2>/dev/null \
     || fail27 "no final PATCH /releases/42 with draft:false"
 grep -q '^DELETE' "$D/log-happy" 2>/dev/null && fail27 "DELETE present on happy path"
 if [ "$t27" -eq 1 ]; then
-    ok "T27 release-publish: happy path (draft create, 8 exact uploads, PATCH, no DELETE)"
+    ok "T27 release-publish: happy path (draft create, 10 exact uploads, PATCH, no DELETE)"
 else
     bad "T27 release-publish: happy path ($why)"
 fi
@@ -635,6 +779,239 @@ if [ "$t43" -eq 1 ]; then
     ok "T43 release.yml: GITEA_TOKEN preflight (non-empty test before make release, value never printed)"
 else
     bad "T43 release.yml: GITEA_TOKEN preflight ($why)"
+fi
+
+# ── I: auto-updater pipeline (10 assets, release-publish-github) ───────────
+
+# T44: the Makefile defines a shared RELEASE_ASSETS with EXACTLY 10 entries:
+# the 8 legacy + PeakBot-Desktop-<v>-macos-universal.app.tar.gz + latest.json.
+ra_raw=$(awk '
+    /^RELEASE_ASSETS[ \t]*[:?]?=/ { p = 1 }
+    p {
+        l = $0
+        if (l ~ /\\[ \t]*$/) { sub(/\\[ \t]*$/, "", l); buf = buf " " l; next }
+        print buf " " l; exit
+    }' "$MK" 2>/dev/null)
+ra_n=$(printf '%s' "$ra_raw" | wc -w | tr -d ' ')
+t44=1; why=""
+[ "${ra_n:-0}" = "10" ] || { t44=0; why="RELEASE_ASSETS has ${ra_n:-0} entries, want 10"; }
+for n in "PeakBot-Desktop-\$\$v-macos-universal.app.tar.gz" "latest.json"; do
+    printf '%s' "$ra_raw" | grep -qF -- "$n" \
+        || { t44=0; why="${why}${why:+; }missing $n"; }
+done
+if [ "$t44" -eq 1 ]; then
+    ok "T44 Makefile RELEASE_ASSETS: exactly 10 entries incl. the mac tarball + latest.json"
+else
+    bad "T44 Makefile RELEASE_ASSETS: exactly 10 entries incl. the mac tarball + latest.json ($why)"
+fi
+
+# T45: release-publish-github with an EMPTY GH_RELEASE_TOKEN → non-zero
+# BEFORE any HTTP request, message names GH_RELEASE_TOKEN.
+make_assets "$D/out"
+run_gh "$root" "$D/log-gh-notoken" "$V" ""
+if [ "$G_RC" -ne 0 ] && [ ! -s "$D/log-gh-notoken" ] \
+    && printf '%s' "$G_OUT" | grep -q 'GH_RELEASE_TOKEN'; then
+    ok "T45 release-publish-github: empty token → fails before any request, names it"
+else
+    bad "T45 release-publish-github: empty token → fails before any request, names it (rc=$G_RC: $(printf '%s' "$G_OUT" | head -1))"
+fi
+
+# T46: release-publish-github happy path (stable tag, DEFAULT GH_MIRROR_REPO):
+# polls the tag ref (fake: 404, 404, 200 → proceeds after exactly 3 GETs),
+# looks up releases/tags/<v>, creates a DRAFT (draft:true, tag_name,
+# prerelease:false) on api.github.com, uploads ALL 10 assets to
+# uploads.github.com (201 each), PATCHes draft:false + make_latest:"true",
+# no DELETE. Auth is "Authorization: Bearer <token>" and the token never
+# reaches stdout/stderr.
+make_assets "$D/out"
+run_gh "$root" "$D/log-gh-happy" "$V"
+L=$D/log-gh-happy
+GHAPI="https://api.github.com/repos/thepeak99/peakbot"
+GHUP="https://uploads.github.com/repos/thepeak99/peakbot"
+t46=1; why=""
+fail46() { t46=0; why="${why}${why:+; }$1"; }
+[ "$G_RC" -eq 0 ] || fail46 "rc=$G_RC: $(printf '%s' "$G_OUT" | grep '❌' | head -1)"
+refn=$(grep -cF "GET $GHAPI/git/ref/tags/$V" "$L" 2>/dev/null || true)
+[ "$refn" = "3" ] || fail46 "tag-ref polls: $refn, want 3 (404,404,200)"
+grep -qF "GET $GHAPI/releases/tags/$V" "$L" 2>/dev/null \
+    || fail46 "no GET releases/tags/$V"
+grep -qF "POST $GHAPI/releases " "$L" 2>/dev/null \
+    || fail46 "no draft-create POST to $GHAPI/releases (default GH_MIRROR_REPO)"
+grep -qF '"draft":true' "$L" 2>/dev/null || fail46 "create body lacks draft:true"
+grep -qF "\"tag_name\":\"$V\"" "$L" 2>/dev/null || fail46 "create body lacks tag_name=$V"
+grep -qF '"prerelease":false' "$L" 2>/dev/null || fail46 "create body lacks prerelease:false"
+upln=$(grep -cF "POST $GHUP/releases/77/assets?name=" "$L" 2>/dev/null || true)
+[ "$upln" = "10" ] || fail46 "$upln GitHub uploads, want 10"
+for n in $ASSET10; do
+    c=$(grep -cF "name=$n " "$L" 2>/dev/null || true)
+    [ "$c" = "1" ] || fail46 "upload of $n: $c occurrence(s), want 1"
+done
+grep -q '^DELETE' "$L" 2>/dev/null && fail46 "DELETE present on happy path"
+grep -qF "PATCH $GHAPI/releases/77" "$L" 2>/dev/null \
+    && grep -F 'PATCH ' "$L" | grep -qF '"draft":false' \
+    && grep -F 'PATCH ' "$L" | grep -qF '"make_latest":"true"' \
+    || fail46 "no final PATCH draft:false + make_latest:\"true\""
+grep -qF 'Authorization: Bearer ghsecret-token-123' "$L" 2>/dev/null \
+    || fail46 "no 'Authorization: Bearer <token>' header in the request log"
+printf '%s' "$G_OUT" | grep -qF 'ghsecret-token-123' \
+    && fail46 "token leaked into stdout/stderr"
+if [ "$t46" -eq 1 ]; then
+    ok "T46 release-publish-github: happy path (poll, draft, 10 uploads, PATCH make_latest:true, Bearer auth, no token leak)"
+else
+    bad "T46 release-publish-github: happy path ($why)"
+fi
+
+# T47: release-publish-github with a '-' TAG: create body prerelease:true and
+# final PATCH make_latest:"false" (same 10-asset path otherwise). Runs in the
+# T08 clone, which has release-notes/0.9.0-rc.1.md.
+make_assets "$D/out"
+run_gh "$D/pre" "$D/log-gh-pre" 0.9.0-rc.1
+L=$D/log-gh-pre
+t47=1; why=""
+fail47() { t47=0; why="${why}${why:+; }$1"; }
+[ "$G_RC" -eq 0 ] || fail47 "rc=$G_RC: $(printf '%s' "$G_OUT" | grep '❌' | head -1)"
+grep -qF '"prerelease":true' "$L" 2>/dev/null || fail47 "create body lacks prerelease:true"
+grep -qF '"prerelease":false' "$L" 2>/dev/null && fail47 "create body has prerelease:false"
+upln=$(grep -cF "POST $GHUP/releases/77/assets?name=" "$L" 2>/dev/null || true)
+[ "$upln" = "10" ] || fail47 "$upln GitHub uploads, want 10"
+grep -qF "PATCH $GHAPI/releases/77" "$L" 2>/dev/null \
+    && grep -F 'PATCH ' "$L" | grep -qF '"make_latest":"false"' \
+    || fail47 "no final PATCH with make_latest:\"false\""
+if [ "$t47" -eq 1 ]; then
+    ok "T47 release-publish-github: '-' tag → prerelease:true, make_latest:\"false\""
+else
+    bad "T47 release-publish-github: '-' tag → prerelease:true, make_latest:\"false\" ($why)"
+fi
+
+# T48: the tag never appears on GitHub (push-mirror lag): the fake always
+# 404s, and GH_TAG_WAIT_TRIES=2 + GH_TAG_WAIT_SECS=0 cap the wait →
+# non-zero after exactly 2 ref GETs, and NO release created.
+make_assets "$D/out"
+GH_REF_ALWAYS_404=1 GH_TAG_WAIT_TRIES=2 run_gh "$root" "$D/log-gh-404" "$V"
+L=$D/log-gh-404
+t48=1; why=""
+[ "$G_RC" -ne 0 ] || { t48=0; why="rc=0 despite the tag never appearing"; }
+refn=$(grep -cF "GET $GHAPI/git/ref/tags/$V" "$L" 2>/dev/null || true)
+[ "$refn" = "2" ] || { t48=0; why="${why}${why:+; }tag-ref polls: $refn, want 2 (GH_TAG_WAIT_TRIES=2)"; }
+cren=$(grep -cF "POST $GHAPI/releases " "$L" 2>/dev/null || true)
+[ "$cren" = "0" ] || { t48=0; why="${why}${why:+; }$cren release create(s) despite missing tag"; }
+if [ "$t48" -eq 1 ]; then
+    ok "T48 release-publish-github: tag never appears → fails after GH_TAG_WAIT_TRIES, no release created"
+else
+    bad "T48 release-publish-github: tag never appears → fails after GH_TAG_WAIT_TRIES, no release created ($why)"
+fi
+
+# T49: idempotent — a published release for the tag already exists with all
+# 10 asset names → exit 0 with NO create, NO uploads, NO PATCH.
+make_assets "$D/out"
+printf '%s\n' "$ASSET10" > "$D/log-gh-idem.doneassets"
+GH_REL_MODE=done run_gh "$root" "$D/log-gh-idem" "$V"
+L=$D/log-gh-idem
+t49=1; why=""
+[ "$G_RC" -eq 0 ] || { t49=0; why="rc=$G_RC: $(printf '%s' "$G_OUT" | grep '❌' | head -1)"; }
+grep -qF "GET $GHAPI/releases/tags/$V" "$L" 2>/dev/null \
+    || { t49=0; why="${why}${why:+; }no GET releases/tags/$V"; }
+cren=$(grep -cF "POST $GHAPI/releases " "$L" 2>/dev/null || true)
+[ "$cren" = "0" ] || { t49=0; why="${why}${why:+; }$cren release create(s), want 0"; }
+upln=$(grep -cF "POST $GHUP/" "$L" 2>/dev/null || true)
+[ "$upln" = "0" ] || { t49=0; why="${why}${why:+; }$upln upload(s), want 0"; }
+grep -q '^PATCH' "$L" 2>/dev/null && { t49=0; why="${why}${why:+; }PATCH present, want 0"; }
+if [ "$t49" -eq 1 ]; then
+    ok "T49 release-publish-github: existing complete release → exit 0, no create/uploads/PATCH (idempotent)"
+else
+    bad "T49 release-publish-github: existing complete release → exit 0, no create/uploads/PATCH ($why)"
+fi
+
+# T50: a leftover DRAFT for the tag → deleted, then recreated (draft →
+# 10 uploads → PATCH draft:false + make_latest:"true"), rc 0.
+make_assets "$D/out"
+GH_REL_MODE=draft run_gh "$root" "$D/log-gh-draft" "$V"
+L=$D/log-gh-draft
+t50=1; why=""
+fail50() { t50=0; why="${why}${why:+; }$1"; }
+[ "$G_RC" -eq 0 ] || fail50 "rc=$G_RC: $(printf '%s' "$G_OUT" | grep '❌' | head -1)"
+deln=$(grep -cF "DELETE $GHAPI/releases/77" "$L" 2>/dev/null || true)
+[ "$deln" -ge 1 ] 2>/dev/null || fail50 "no DELETE of the leftover draft"
+cren=$(grep -cF "POST $GHAPI/releases " "$L" 2>/dev/null || true)
+[ "$cren" = "1" ] || fail50 "$cren release create(s), want 1 (recreate)"
+upln=$(grep -cF "POST $GHUP/releases/77/assets?name=" "$L" 2>/dev/null || true)
+[ "$upln" = "10" ] || fail50 "$upln uploads, want 10"
+grep -qF "PATCH $GHAPI/releases/77" "$L" 2>/dev/null \
+    && grep -F 'PATCH ' "$L" | grep -qF '"draft":false' \
+    || fail50 "no final PATCH draft:false"
+if [ "$t50" -eq 1 ]; then
+    ok "T50 release-publish-github: leftover draft → deleted, recreated, published"
+else
+    bad "T50 release-publish-github: leftover draft → deleted, recreated, published ($why)"
+fi
+
+# T51: any upload failure → the draft is DELETEd and the target exits
+# non-zero with NO final PATCH.
+make_assets "$D/out"
+GH_FAIL_UPLOAD=latest.json run_gh "$root" "$D/log-gh-fail" "$V"
+L=$D/log-gh-fail
+t51=1; why=""
+fail51() { t51=0; why="${why}${why:+; }$1"; }
+[ "$G_RC" -ne 0 ] || fail51 "rc=0 despite a failed upload"
+grep -qF "name=latest.json " "$L" 2>/dev/null || fail51 "failing upload (latest.json) never attempted"
+grep -qF "DELETE $GHAPI/releases/77" "$L" 2>/dev/null || fail51 "no DELETE of the draft"
+grep -q '^PATCH' "$L" 2>/dev/null && fail51 "PATCH draft:false after failure"
+if [ "$t51" -eq 1 ]; then
+    ok "T51 release-publish-github: upload failure → draft DELETEd, non-zero, no PATCH"
+else
+    bad "T51 release-publish-github: upload failure → draft DELETEd, non-zero, no PATCH ($why)"
+fi
+
+# T52: `make -n release` shows the order: desktop-updater BEFORE
+# release-publish BEFORE release-publish-github.
+EO2=$(make -n release TAG="$V" 2>&1)
+l_up=$(printf '%s\n' "$EO2" | grep -nF 'desktop-updater' | awk -F: 'NR==1 {print $1; exit}')
+l_pub=$(printf '%s\n' "$EO2" | grep -nF 'release-publish' | awk -F: 'NR==1 {print $1; exit}')
+l_gh=$(printf '%s\n' "$EO2" | grep -nF 'release-publish-github' | awk -F: 'NR==1 {print $1; exit}')
+if [ -n "$l_up" ] && [ -n "$l_pub" ] && [ -n "$l_gh" ] \
+    && [ "$l_up" -lt "$l_pub" ] && [ "$l_pub" -lt "$l_gh" ]; then
+    ok "T52 make -n release: desktop-updater → release-publish → release-publish-github"
+else
+    bad "T52 make -n release: desktop-updater → release-publish → release-publish-github (up=${l_up:-?} pub=${l_pub:-?} gh=${l_gh:-?})"
+fi
+
+# T53: release-check fails when tauri.conf.json plugins.updater endpoints do
+# NOT contain GH_MIRROR_REPO (the updater would fetch from the wrong host).
+# Same clone-mutation pattern as T24/T25 — the worktree stays untouched.
+git clone -q --depth 1 "$root" "$FIX/repo4" 2>/dev/null \
+    || { echo "❌ fixture clone repo4 failed" >&2; exit 1; }
+sed -i 's#thepeak99/peakbot#wrongorg/wrongrepo#' "$FIX/repo4/desktop/src-tauri/tauri.conf.json"
+out=$(make -C "$FIX/repo4" release-check TAG="$V" 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qiE 'endpoint|mirror'; then
+    ok "T53 release-check: updater endpoint without GH_MIRROR_REPO → fails, names it"
+else
+    bad "T53 release-check: updater endpoint without GH_MIRROR_REPO → fails, names it (rc=$rc: $(printf '%s' "$out" | head -1))"
+fi
+
+# T54: release.yml maps the new secrets into env (GH_RELEASE_TOKEN,
+# TAURI_SIGNING_PRIVATE_KEY, TAURI_SIGNING_PRIVATE_KEY_PASSWORD), each with
+# a non-empty preflight BEFORE `make release` (the T43 pattern for
+# GITEA_TOKEN).
+t54=1; why=""
+fail54() { t54=0; why="${why}${why:+; }$1"; }
+grep -qF 'secrets.GH_RELEASE_TOKEN' "$RY" 2>/dev/null \
+    || fail54 "no secrets.GH_RELEASE_TOKEN mapping"
+grep -qF 'secrets.TAURI_SIGNING_PRIVATE_KEY }' "$RY" 2>/dev/null \
+    || fail54 "no secrets.TAURI_SIGNING_PRIVATE_KEY mapping"
+grep -qF 'secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD' "$RY" 2>/dev/null \
+    || fail54 "no secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD mapping"
+mr_line=$(grep -nF -- 'make release' "$RY" 2>/dev/null | head -n 1 | cut -d: -f1)
+for var in GH_RELEASE_TOKEN TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD; do
+    vl=$(grep -nE -- "-[nz][[:space:]]+\"\$\{?$var\}?" "$RY" 2>/dev/null | head -n 1 | cut -d: -f1)
+    [ -n "$vl" ] || { fail54 "no non-empty test on $var"; continue; }
+    if [ -n "$mr_line" ] && [ "$vl" -ge "$mr_line" ]; then
+        fail54 "$var non-empty test is not before make release"
+    fi
+done
+if [ "$t54" -eq 1 ]; then
+    ok "T54 release.yml: GH_RELEASE_TOKEN + TAURI_SIGNING* secrets → env, non-empty preflight before make release"
+else
+    bad "T54 release.yml: GH_RELEASE_TOKEN + TAURI_SIGNING* secrets → env, non-empty preflight before make release ($why)"
 fi
 
 # ── Summary ────────────────────────────────────────────────────────────────

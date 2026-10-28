@@ -109,3 +109,14 @@ jobs:
       # plus smoke-windows.sh unit-tested against fake PEs. No docker build.
       - name: Windows desktop static tests
         run: sh desktop/scripts/test-build-desktop-windows.sh
+      # Auto-updater pipeline contract tests: latest.json manifest
+      # (updater-manifest.sh) + the .app.tar.gz layout (assemble-app.sh,
+      # rcodesign stubbed by the tests themselves). Hermetic; jq + zip from
+      # apt (rust:1.95 ships neither).
+      - name: Updater + macOS tarball contract tests
+        run: |
+          set -eu
+          apt-get update
+          apt-get install -y --no-install-recommends jq zip
+          sh desktop/scripts/test-updater-manifest.sh
+          sh desktop/scripts/test-assemble-app-tarball.sh

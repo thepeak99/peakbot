@@ -17,7 +17,9 @@
 #     --build-arg VERSION=0.23.0 \
 #     --output type=local,dest=output/desktop .
 #
-# Exports a single file: /PeakBot-Desktop-<VERSION>-macos-universal.zip
+# Exports two files:
+#   /PeakBot-Desktop-<VERSION>-macos-universal.zip
+#   /PeakBot-Desktop-<VERSION>-macos-universal.app.tar.gz  (auto-updater)
 #
 # Spike-verified recipe (researcher, Tauri 2.12.4 + zigbuild):
 # - RUSTFLAGS="-C link-arg=-Wl,-headerpad,0x4000" is REQUIRED, else
