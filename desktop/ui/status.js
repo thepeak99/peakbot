@@ -9,7 +9,6 @@ const $ = (id) => document.getElementById(id);
 const LABELS = {
   retry: "Retry",
   open_logs: "Open logs",
-  reinstall_service: "Reinstall background service",
   quit: "Quit",
 };
 

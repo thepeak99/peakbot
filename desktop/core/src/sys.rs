@@ -6,7 +6,6 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::io::{Read, Write};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -106,19 +105,12 @@ pub trait Sys: Send {
     fn spawn(&self, spec: SpawnSpec) -> io::Result<Box<dyn Child>>;
     /// GET, PROBE_TIMEOUT, no redirects followed.
     fn probe(&self, url: &Url) -> Probe;
-    /// Bind of 127.0.0.1:port succeeds.
-    fn port_is_free(&self, port: u16) -> bool;
     /// `Ok(None)` if NotFound.
     fn read(&self, path: &Path) -> io::Result<Option<String>>;
-    /// Byte-for-byte equality of two files. Lengths are compared first
-    /// (different length ⇒ Ok(false) without reading). Err if either file
-    /// cannot be opened or read (NotFound included).
-    fn same_contents(&self, a: &Path, b: &Path) -> io::Result<bool>;
     /// mkdir -p, tmp+rename, 0600.
     fn write_private(&self, path: &Path, contents: &str) -> io::Result<()>;
     /// NotFound = Ok.
     fn remove(&self, path: &Path) -> io::Result<()>;
-    fn exists(&self, path: &Path) -> bool;
     /// `ps -o command= -p <pid>`; None if not alive.
     fn cmdline_of(&self, pid: u32) -> Option<String>;
     fn signal(&self, pid: u32, sig: Signal);
@@ -270,42 +262,11 @@ impl Sys for RealSys {
         }
     }
 
-    fn port_is_free(&self, port: u16) -> bool {
-        TcpListener::bind(("127.0.0.1", port)).is_ok()
-    }
-
     fn read(&self, path: &Path) -> io::Result<Option<String>> {
         match fs::read_to_string(path) {
             Ok(s) => Ok(Some(s)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
-        }
-    }
-
-    /// Design auto-replace §5.1: length first (a different length is the
-    /// common mismatch and costs no reads), then 64 KiB chunks until a
-    /// difference or both EOFs. Short reads are legal, so every chunk is
-    /// filled with `read_full`.
-    fn same_contents(&self, a: &Path, b: &Path) -> io::Result<bool> {
-        let mut fa = fs::File::open(a)?;
-        let mut fb = fs::File::open(b)?;
-        if fa.metadata()?.len() != fb.metadata()?.len() {
-            return Ok(false);
-        }
-        let mut chunk_a = [0u8; 64 * 1024];
-        let mut chunk_b = [0u8; 64 * 1024];
-        loop {
-            let n_a = read_full(&mut fa, &mut chunk_a)?;
-            let n_b = read_full(&mut fb, &mut chunk_b)?;
-            if n_a != n_b {
-                return Ok(false); // same length up front; defensive
-            }
-            if n_a == 0 {
-                return Ok(true); // both reached EOF together
-            }
-            if chunk_a[..n_a] != chunk_b[..n_b] {
-                return Ok(false);
-            }
         }
     }
 
@@ -335,10 +296,6 @@ impl Sys for RealSys {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         }
-    }
-
-    fn exists(&self, path: &Path) -> bool {
-        path.exists()
     }
 
     fn cmdline_of(&self, pid: u32) -> Option<String> {
@@ -441,19 +398,6 @@ impl Child for RealChild {
         // SIGKILL / TerminateProcess; errors ignored (already dead).
         self.0.kill().ok();
     }
-}
-
-/// Fill `buf` by repeated reads until it is full or EOF (short reads
-/// are legal) — used by `RealSys::same_contents`.
-fn read_full(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
-    let mut off = 0;
-    while off < buf.len() {
-        match r.read(&mut buf[off..])? {
-            0 => return Ok(off),
-            n => off += n,
-        }
-    }
-    Ok(off)
 }
 
 /// Read a pipe to EOF on a helper thread (so `run` never deadlocks on a

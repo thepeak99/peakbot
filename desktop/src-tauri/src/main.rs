@@ -23,17 +23,16 @@ use peakbot_desktop_core::controller::{Action, Controller, run_loop};
 use peakbot_desktop_core::fontconfig;
 use peakbot_desktop_core::paths::DesktopPaths;
 use peakbot_desktop_core::phase::host_platform;
-use peakbot_desktop_core::service::ReplacePolicy;
 
 /// Bounds `RunEvent::Exit` against a controller stuck in a modal dialog.
 const SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_secs(6);
 
-/// SIGINT handling (the DESIGN §4.6 shutdown path on `kill`/Ctrl+C).
-/// The current toolchain has no `std::os::unix::signal`, so a C handler
-/// (via `libc`) funnels each SIGINT through a self-pipe — the only
-/// async-signal-safe operation — to a dedicated reader thread.
+/// SIGINT/SIGTERM handling (the DESIGN §4.6 shutdown path on Ctrl+C,
+/// `kill`, logout). The current toolchain has no `std::os::unix::signal`,
+/// so a C handler (via `libc`) funnels each signal through a self-pipe —
+/// the only async-signal-safe operation — to a dedicated reader thread.
 #[cfg(unix)]
-mod sigint {
+mod exit_signals {
     use std::io::{ErrorKind, PipeReader, PipeWriter, pipe};
     use std::os::fd::AsRawFd;
     use std::sync::OnceLock;
@@ -43,7 +42,7 @@ mod sigint {
     static PIPES: OnceLock<(PipeReader, PipeWriter)> = OnceLock::new();
 
     /// C handler: async-signal-safe — one `write`, nothing else.
-    extern "C" fn on_sigint(_sig: libc::c_int) {
+    extern "C" fn handle_signal(_sig: libc::c_int) {
         if let Some((_, w)) = PIPES.get() {
             let one: u8 = 1;
             let _ =
@@ -51,22 +50,24 @@ mod sigint {
         }
     }
 
-    /// Install the SIGINT handler; `on_signal` runs once per SIGINT on
-    /// the reader thread.
+    /// Install the SIGINT + SIGTERM handler; `on_signal` runs once per
+    /// signal on the reader thread.
     pub fn install(on_signal: impl Fn() + Send + 'static) -> std::io::Result<()> {
         let (r, w) = pipe()?;
         PIPES.set((r, w)).expect("self-pipe stored once");
         if let Some((_, w)) = PIPES.get() {
             unsafe { libc::fcntl(w.as_raw_fd(), libc::FD_CLOEXEC) };
         }
-        unsafe {
-            libc::signal(
-                libc::SIGINT,
-                on_sigint as *const () as usize as libc::sighandler_t,
-            );
+        for sig in [libc::SIGINT, libc::SIGTERM] {
+            unsafe {
+                libc::signal(
+                    sig,
+                    handle_signal as *const () as usize as libc::sighandler_t,
+                );
+            }
         }
         std::thread::Builder::new()
-            .name("sigint".into())
+            .name("exit-signals".into())
             .spawn(move || {
                 let mut buf = [0u8; 1];
                 while let Some((r, _)) = PIPES.get() {
@@ -80,7 +81,7 @@ mod sigint {
                     }
                 }
             })
-            .expect("sigint reader thread starts");
+            .expect("exit-signals reader thread starts");
         Ok(())
     }
 }
@@ -150,8 +151,6 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::status,
             commands::act,
-            commands::settings_get,
-            commands::toggle_background,
             commands::theme_set,
             commands::theme_get
         ])
@@ -181,15 +180,7 @@ fn main() {
 
             let ui = bridge::TauriUi::new(handle.clone(), ui_state);
             let sys = peakbot_desktop_core::sys::RealSys::new();
-            // Release builds replace a stale service silently; dev/debug
-            // builds (make desktop-dev) ask — a debug sidecar must never
-            // silently overwrite the user's ~/.local/bin/peakbot.
-            let policy = if cfg!(debug_assertions) {
-                ReplacePolicy::Ask
-            } else {
-                ReplacePolicy::Auto
-            };
-            let controller = Controller::new(sys, ui, paths, quitting, policy, host_platform());
+            let controller = Controller::new(sys, ui, paths, quitting, host_platform());
             std::thread::Builder::new()
                 .name("controller".into())
                 .spawn(move || run_loop(controller, rx))
@@ -214,18 +205,18 @@ fn main() {
     #[cfg(target_os = "macos")]
     app.on_menu_event(|app, event| tray::handle_menu_event(app, event.id().as_ref()));
 
-    // SIGINT (Ctrl+C, `kill`) takes the same graceful shutdown path as a
-    // window close (DESIGN §4.6): the controller stops the session
-    // sidecar and removes the pidfile before the process exits.
+    // SIGINT/SIGTERM (Ctrl+C, `kill`, logout) take the same graceful
+    // shutdown path as Quit (DESIGN §4.6): the controller stops the
+    // session sidecar and removes the pidfile before the process exits.
     #[cfg(unix)]
     {
         let handle = app.handle().clone();
-        sigint::install(move || handle.exit(0)).expect("SIGINT handler installs");
+        exit_signals::install(move || handle.exit(0)).expect("exit signal handler installs");
     }
 
     app.run(|app, event| match event {
         tauri::RunEvent::Exit => shutdown(app),
-        // macOS only: Dock-icon click after the window closed.
+        // macOS only: Dock-icon click after the window was hidden.
         #[cfg(target_os = "macos")]
         tauri::RunEvent::Reopen { .. } => window::focus_main(app),
         _ => {}

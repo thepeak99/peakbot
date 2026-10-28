@@ -31,7 +31,6 @@ import { ProfilesPane, ProfilePage } from "./profiles";
 import { AgentPage } from "./agent";
 import { GeneralPane } from "./general";
 import { SystemPane } from "./system";
-import { DesktopPane } from "./desktopPane";
 import { RawPane } from "./raw";
 import { copyToRepoName } from "./profileOps";
 import { Crumbs } from "./widgets";
@@ -97,10 +96,6 @@ const SECTIONS: Record<Section, { label: string; desc: string }> = {
   system: {
     label: "System",
     desc: "Where PeakBot lives and runs: config and data locations, the service, the installed binary.",
-  },
-  desktop: {
-    label: "Desktop",
-    desc: "Options of the PeakBot desktop app on this computer.",
   },
   raw: {
     label: "Raw YAML",
@@ -477,7 +472,6 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
       group: "MACHINE",
       items: [
         { id: "system", label: "System" },
-        ...(desktop ? [{ id: "desktop" as const, label: "Desktop" }] : []),
       ],
     },
     { group: "ADVANCED", items: [{ id: "raw", label: "Raw YAML" }] },
@@ -707,7 +701,7 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
           </div>
 
           {/* Comment-loss banner (spec §9.0): above every FORM pane. */}
-          {st.rewriteWarning && active !== "raw" && active !== "system" && active !== "desktop" && (
+          {st.rewriteWarning && active !== "raw" && active !== "system" && (
             <div
               data-testid="rewrite-banner"
               className="mb-4 max-w-2xl rounded border border-amber-800/60 bg-amber-950/40 px-3 py-2 text-xs text-amber-300"
@@ -747,8 +741,6 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
             <GeneralPane />
           ) : active === "system" ? (
             <SystemPane />
-          ) : active === "desktop" ? (
-            <DesktopPane />
           ) : (
             <RawPane
               scope={scope}

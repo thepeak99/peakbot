@@ -29,7 +29,7 @@ make release-bump VERSION=0.3.0       # branch + bump + promote + push
 # open a PR; wait for ci.yml green; merge
 make release-tag                      # tag 0.3.0, message = release-notes/0.3.0.md
                                       # the push triggers release.yml, which builds
-                                      # and publishes all 7 assets
+                                      # and publishes all 8 assets
 ```
 
 See `agents.md` § *Release notes workflow* and *Release pipeline* for the full

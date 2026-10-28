@@ -11,7 +11,7 @@
     "withGlobalTauri": true,
     "security": {
       "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:",
-      "capabilities": ["local-pages", "desktop-pane"]
+      "capabilities": ["local-pages", "remote-theme"]
     }
   },
   "bundle": {
@@ -38,6 +38,10 @@
     },
     "macOS": {
       "minimumSystemVersion": "11.0"
+    },
+    "windows": {
+      "webviewInstallMode": { "type": "downloadBootstrapper", "silent": true },
+      "nsis": { "installMode": "currentUser" }
     }
   }
 }

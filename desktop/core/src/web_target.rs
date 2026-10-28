@@ -15,6 +15,8 @@
 
 use std::net::SocketAddr;
 
+use url::Url;
+
 use crate::token::Token;
 
 /// The lenient `general.web` view the desktop builds its backend URL
@@ -31,8 +33,8 @@ pub struct WebTarget {
 }
 
 impl WebTarget {
-    /// `"<scheme>://<host>:<port>"` — no trailing slash, no token (the
-    /// bridge adds the `?token=` query at the Mode level). Scheme is
+    /// `"<scheme>://<host>:<port>"` — no trailing slash, no token (`url`
+    /// and `probe_url` add the `?token=` query). Scheme is
     /// `https` iff `tls`; the host is `127.0.0.1` when the bind IP is
     /// loopback or unspecified (`0.0.0.0`, `::`), otherwise the bind IP
     /// (spec §8.4 "When it reads it").
@@ -53,6 +55,24 @@ impl WebTarget {
             ip.to_string()
         };
         format!("{host}:{}", self.bind.port())
+    }
+
+    /// `{url_base}/` [+ `?token=<percent-encoded>`].
+    pub fn url(&self) -> Url {
+        self.with_token(&format!("{}/", self.url_base()))
+    }
+
+    /// `{url_base}/commands` [+ `?token=…`].
+    pub fn probe_url(&self) -> Url {
+        self.with_token(&format!("{}/commands", self.url_base()))
+    }
+
+    fn with_token(&self, base: &str) -> Url {
+        let mut u = Url::parse(base).expect("url_base is always a valid URL");
+        if let Some(tok) = &self.token {
+            u.query_pairs_mut().append_pair("token", tok.as_str());
+        }
+        u
     }
 }
 
@@ -286,5 +306,109 @@ general:
     fn blank_token_is_absent() {
         let t = read_web_target(Some("general:\n  web:\n    token: \"\"\n"));
         assert_eq!(t.token, None, "blank token ⇒ None");
+    }
+
+    fn target(bind: &str, tls: bool, tok: Option<Token>) -> WebTarget {
+        WebTarget {
+            bind: bind.parse().expect("test bind parses"),
+            tls,
+            token: tok,
+        }
+    }
+
+    // §9.1 case 28, ported from the deleted `Mode` to
+    // `WebTarget::{url, probe_url}` (close-to-tray plan §C): the token must
+    // be percent-encoded in the query.
+    #[test]
+    fn t28_web_target_url_and_probe_url() {
+        let t = target(
+            "127.0.0.1:7824",
+            false,
+            Some(Token::parse("tok+en&1").expect("token with + & parses")),
+        );
+        assert_eq!(t.bind.port(), 7824);
+        assert_eq!(
+            t.url().to_string(),
+            "http://127.0.0.1:7824/?token=tok%2Ben%261",
+            "the token must be percent-encoded"
+        );
+        let probe = t.probe_url();
+        assert_eq!(probe.path(), "/commands");
+        assert_eq!(
+            probe.to_string(),
+            "http://127.0.0.1:7824/commands?token=tok%2Ben%261"
+        );
+    }
+
+    // Design #377 t73, ported to `WebTarget`: the https variants and the
+    // tokenless target.
+    #[test]
+    fn t73_web_target_https_urls_and_tokenless() {
+        let tok = Token::parse("tok+en&1").expect("token with + & parses");
+
+        let t = target("127.0.0.1:7824", true, Some(tok));
+        assert_eq!(
+            t.url().to_string(),
+            "https://127.0.0.1:7824/?token=tok%2Ben%261"
+        );
+        assert_eq!(
+            t.probe_url().to_string(),
+            "https://127.0.0.1:7824/commands?token=tok%2Ben%261"
+        );
+        assert_eq!(t.url_base(), "https://127.0.0.1:7824");
+
+        // Tokenless: no `?token=` anywhere.
+        let t = target("127.0.0.1:7824", false, None);
+        assert_eq!(t.url().to_string(), "http://127.0.0.1:7824/");
+        assert_eq!(t.probe_url().to_string(), "http://127.0.0.1:7824/commands");
+        assert_eq!(t.url_base(), "http://127.0.0.1:7824");
+
+        let t = target("127.0.0.1:7823", true, None);
+        assert_eq!(t.bind.port(), 7823);
+        assert_eq!(t.url().to_string(), "https://127.0.0.1:7823/");
+        assert_eq!(t.probe_url().to_string(), "https://127.0.0.1:7823/commands");
+    }
+
+    // §9.1 case 29, ported to `WebTarget`: the host follows
+    // `general.web.bind` — unspecified ⇒ 127.0.0.1, a concrete LAN IP ⇒ that
+    // IP.
+    #[test]
+    fn t29_web_target_url_follows_bind_host() {
+        let t = target("127.0.0.1:7823", false, None);
+        assert_eq!(t.url().to_string(), "http://127.0.0.1:7823/");
+        assert_eq!(t.url_base(), "http://127.0.0.1:7823");
+
+        let t = target("0.0.0.0:9000", false, None);
+        assert_eq!(t.url().to_string(), "http://127.0.0.1:9000/");
+        assert_eq!(t.probe_url().to_string(), "http://127.0.0.1:9000/commands");
+
+        let t = target("192.168.1.5:9000", true, None);
+        assert_eq!(
+            t.probe_url().to_string(),
+            "https://192.168.1.5:9000/commands"
+        );
+        assert_eq!(t.url_base(), "https://192.168.1.5:9000");
+
+        // A bracketed IPv6 LAN literal stays a valid URL host.
+        let t = target("[2001:db8::1]:9000", false, None);
+        assert_eq!(t.url().to_string(), "http://[2001:db8::1]:9000/");
+    }
+
+    // The `url()` the webview navigates to is `{url_base}/` + the token
+    // query, so the nav guard's allowed origin (`url_base()`) always matches.
+    #[test]
+    fn url_starts_with_url_base_and_carries_token_query() {
+        let t = target(
+            "192.168.1.5:9000",
+            true,
+            Some(Token::parse("abc123").expect("parses")),
+        );
+        let url = t.url();
+        assert!(
+            url.as_str().starts_with(&format!("{}/", t.url_base())),
+            "{url} must start with {}/",
+            t.url_base()
+        );
+        assert_eq!(url.query(), Some("token=abc123"));
     }
 }

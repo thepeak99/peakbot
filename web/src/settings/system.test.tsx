@@ -7,8 +7,9 @@
 //     /api/system/service; plus Disable (DELETE), Refresh (GET), binary
 //     install (POST /api/system/install) and error display.
 //
-// The D8 "Desktop app settings ↗" link tests lived here and are replaced
-// by the D10 Desktop PANE tests (./desktopPane.test.tsx).
+// The D8 "Desktop app settings ↗" link tests lived here; the D10 Desktop
+// PANE tests (./desktopPane.test.tsx) that replaced them are removed with the
+// Desktop pane.
 //
 // Harness: plain createRoot/act (project convention, no testing-library).
 // jsdom is enabled for `src/settings/**/*.test.tsx`; fetch is stubbed.
