@@ -69,7 +69,7 @@ Dockerfile.desktop-macos
 | `ui/` status page | Shows `StatusView` (polled), buttons → `act` | The only thing shown when the backend isn't up. Plain HTML/JS, embedded via `frontendDist`. |
 | `macos/assemble-app.sh` | Builds the `.app` layout Tauri CLI can't build on Linux | Researcher: Tauri CLI cannot bundle `.app` on Linux. |
 | Dockerfiles + `build-desktop.sh` | Reproducible builds, same path locally (podman) and in CI (docker) | Follows the existing `Dockerfile.*` + `--output type=local` pattern. |
-| Gitea workflow | `.gitea/workflows/release.yml` (tag push → `make release TAG=<v>`): builds the desktop artifacts alongside the four server assets and publishes all 7 atomically | Requirement 5. |
+| Gitea workflow | `.gitea/workflows/release.yml` (tag push → `make release TAG=<v>`): builds the desktop artifacts alongside the four server assets and publishes all 8 atomically | Requirement 5. |
 
 **Deliberately NOT added (and why):**
 - **No `tauri-plugin-shell`.** We spawn the sidecar with `std::process::Command` from Rust. `externalBin` is a *bundler* feature and works without the plugin. std gives us exact control over env, stdio, signals; the plugin would add a JS-facing capability surface we must then deny.
@@ -748,29 +748,52 @@ labels `Retry`, `Open logs`, `Quit`; click →
   `sh macos/assemble-app.sh ${VERSION} target/universal2-apple-darwin/release/peakbot-desktop src-tauri/binaries/peakbot-aarch64-apple-darwin /out`;
   `RUN sh scripts/smoke-macos.sh /out/PeakBot-Desktop-${VERSION}-macos-universal.zip ${VERSION}`; scratch export.
   (Fallback if zigbuild `universal2` fails with Tauri: the spike recipe — two single-arch builds + `rcodesign macho-universal-create`.)
-- **`Dockerfile.desktop-windows`:** `FROM ghcr.io/rust-lang/rust:1.91-bookworm` (the same
-  toolchain image as `Dockerfile.windows`); apt: `clang lld llvm file` (xwin C/link +
-  `llvm-rc` for tauri_winres + `llvm-objdump` for the S-W3 smoke check); a guard `RUN
-  command -v llvm-rc && command -v llvm-objdump && llvm-objdump --version | head -1` fails
-  fast if the toolchain regresses (Debian's `llvm-rc` has NO `--version` subcommand — it
-  exits 1 — so the guard is `command -v`, not a version probe). `rustup target add
+- **`Dockerfile.desktop-windows`:** `FROM ghcr.io/rust-lang/rust:1.91-trixie` (trixie, not bookworm:
+  its NSIS 3.11 ships `Include/Win/RestartManager.nsh`, which Tauri's `installer.nsi` includes;
+  `Dockerfile.windows` stays on bookworm — the sidecar build has no reason to change). apt:
+  `clang lld llvm file nsis 7zip` (xwin C/link + `llvm-rc` for tauri_winres + `llvm-objdump` for
+  the S-W3 smoke check; makensis; `7z` for S-W6); a guard `RUN command -v llvm-rc && command -v
+  llvm-objdump && command -v makensis && command -v 7z && llvm-objdump --version | head -1 &&
+  test -f /usr/share/nsis/Include/Win/RestartManager.nsh` fails fast if the toolchain or the
+  NSIS header regresses (Debian's `llvm-rc` has NO `--version` subcommand — it exits 1 — so the
+  guard is `command -v`, not a version probe; the `RestartManager.nsh` file test is the real
+  NSIS requirement, so there is no apt version pin on `nsis`). Node 22 (nodesource) runs the
+  pinned Tauri CLI via npx (same pin as `Dockerfile.desktop-linux`). `rustup target add
   x86_64-pc-windows-msvc`; `ENV XWIN_ACCEPT_LICENSE=1 XWIN_CACHE_DIR=/root/.cache/cargo-xwin
   CARGO_BUILD_JOBS=8`; `cargo install --locked cargo-xwin@0.23.1`; the MSVC SDK (~100 MB) is
   pre-warmed into `XWIN_CACHE_DIR` by a throwaway `cargo xwin build` in its own cached layer.
   `COPY Cargo.toml /src/Cargo.toml` + `COPY desktop/ /src/desktop`;
   `ARG SIDECAR=output/peakbot-windows-amd64-msvc.exe`;
   `COPY ${SIDECAR} …/binaries/peakbot-x86_64-pc-windows-msvc.exe`;
-  `sh scripts/check-version.sh`. The build is `cargo xwin build --release --locked -p
-  peakbot-desktop --target x86_64-pc-windows-msvc --features tauri/custom-protocol` —
-  NO Tauri CLI, no NSIS, no Node: the macOS pipeline proves tauri-build +
-  `custom-protocol` does everything the CLI did (ACL, externalBin check, icon/version
-  `.rc`, static vcruntime, embedded `ui/`). `src-tauri/build.rs` reads the SAME staged
-  file and embeds it as a zstd level-19 payload with the identity
-  `PEAKBOT_SIDECAR_ID=<version>-<sha12>` (amendment (windows-portable)). Copy
-  `target/x86_64-pc-windows-msvc/release/peakbot-desktop.exe` →
-  `/out/PeakBot-Desktop-${VERSION}-windows-x86_64.exe`;
-  `RUN sh scripts/smoke-windows.sh /out/PeakBot-Desktop-${VERSION}-windows-x86_64.exe ${VERSION}
-  src-tauri/binaries/peakbot-x86_64-pc-windows-msvc.exe`; `FROM scratch` + `COPY --from=build /out/ /`.
+  `sh scripts/check-version.sh`.
+  ONE image produces BOTH artifacts:
+  1. **Portable:** `cargo xwin build --release --locked -p peakbot-desktop --target
+     x86_64-pc-windows-msvc --features tauri/custom-protocol` — NO Tauri CLI: the macOS
+     pipeline proves tauri-build + `custom-protocol` does everything the CLI did (ACL,
+     externalBin check, icon/version `.rc`, static vcruntime, embedded `ui/`).
+     `src-tauri/build.rs` reads the SAME staged file and embeds it as a zstd level-19 payload
+     with the identity `PEAKBOT_SIDECAR_ID=<version>-<sha12>` (amendment (windows-portable)).
+  2. **NSIS installer:** in the same image, on the same warm `target/`, the pinned CLI:
+     `npx --yes @tauri-apps/cli@2.12.3 build --ci --bundles nsis --runner cargo-xwin --target
+     x86_64-pc-windows-msvc --config '{"bundle":{"externalBin":[]}}' -- --locked` (in `src-tauri`;
+     `tauri.conf.json`'s `bundle.windows` pins per-user install + WebView2 `downloadBootstrapper`).
+  **Invariants:** **I-B** — `bundle.externalBin` stays `["binaries/peakbot"]` in
+  `tauri.conf.json` (the Linux AppImage ships the sidecar through it); the installer build
+  ALONE overrides it to `[]` via `--config` (JSON merge-patch replaces arrays), so the
+  installer carries no second, unused `peakbot.exe` (tens of MB); `build.rs` embeds the staged
+  sidecar independently of `externalBin` — S-W6 proves both facts on the artifact.
+  **I-C** — ordering: the portable `cp` to `/out/…-portable.exe` runs BEFORE the CLI step,
+  because the CLI patches `target/…/peakbot-desktop.exe` in place (bundle-type marker) and
+  recompiles; the portable stays byte-identical to the plain `cargo xwin` output.
+  **I-D** — one identity: both artifacts embed the same payload id
+  `<version>-<sha12(staged sidecar)>` (S-W4 on the portable, S-W6 on the exe inside the
+  installer).
+  Copy `target/x86_64-pc-windows-msvc/release/peakbot-desktop.exe` →
+  `/out/PeakBot-Desktop-${VERSION}-windows-x86_64-portable.exe`; glob EXACTLY ONE
+  `bundle/nsis/*-setup.exe` → `/out/PeakBot-Desktop-${VERSION}-windows-x86_64-setup.exe`;
+  `RUN sh scripts/smoke-windows.sh /out/…-portable.exe /out/…-setup.exe ${VERSION}
+  src-tauri/binaries/peakbot-x86_64-pc-windows-msvc.exe` (S-W1..S-W6 on both artifacts);
+  `FROM scratch` + `COPY --from=build /out/ /` (two-file export).
 - **`macos/assemble-app.sh <version> <desktop-bin> <sidecar-bin> <outdir>`:**
   ```
   PeakBot Desktop.app/Contents/Info.plist          (Info.plist.in with @VERSION@ substituted)
@@ -786,12 +809,13 @@ labels `Retry`, `Open logs`, `Quit`; click →
   `CFBundleIconFile=icon`, `CFBundleInfoDictionaryVersion=6.0`, `LSMinimumSystemVersion=11.0`,
   `NSHighResolutionCapable=true`, `LSApplicationCategoryType=public.app-category.developer-tools`,
   `NSAppTransportSecurity → NSAllowsLocalNetworking=true` (http://127.0.0.1 in WKWebView).
-- **Artifacts:** `output/desktop/PeakBot-Desktop-<v>-linux-x86_64.AppImage`, `output/desktop/PeakBot-Desktop-<v>-macos-universal.zip`, `output/desktop/PeakBot-Desktop-<v>-windows-x86_64.exe`.
+- **Artifacts:** `output/desktop/PeakBot-Desktop-<v>-linux-x86_64.AppImage`, `output/desktop/PeakBot-Desktop-<v>-macos-universal.zip`, `output/desktop/PeakBot-Desktop-<v>-windows-x86_64-portable.exe`, `output/desktop/PeakBot-Desktop-<v>-windows-x86_64-setup.exe` (NSIS installer).
 - **`scripts/build-desktop.sh <linux|macos|windows|all>`**: reads version from root `Cargo.toml` (same awk as `release-bump`);
   `CONTAINER_BUILDER` (default podman, else docker); builds sidecar Dockerfile then desktop Dockerfile with
   `--build-arg VERSION=<v> --output type=local,dest=output/desktop`; if `PRUNE=1` runs `$CONTAINER_BUILDER builder prune -af` between builds (CI disk).
   `windows` builds the sidecar with `Dockerfile.windows --build-arg TARGET=x86_64-pc-windows-msvc`
-  (→ `output/peakbot-windows-amd64-msvc.exe`) and the portable exe with `Dockerfile.desktop-windows`;
+  (→ `output/peakbot-windows-amd64-msvc.exe`) and BOTH Windows artifacts (portable exe + NSIS
+  installer) with `Dockerfile.desktop-windows`;
   `all` = linux + macos + windows.
 - **Makefile:** `desktop-linux`, `desktop-macos`, `desktop-windows`, `desktop` (all three) → `sh desktop/scripts/build-desktop.sh …`; `desktop-dev`; `desktop-test` → `cargo test --locked --manifest-path desktop/Cargo.toml -p peakbot-desktop-core`. Add to `.PHONY` and `## help` lines.
 - **`.gitea/workflows/release.yml`:** the single release workflow (`on: push: tags: ['*']`); one job `runs-on: dind`,
@@ -800,7 +824,7 @@ labels `Retry`, `Open logs`, `Quit`; click →
   `make release TAG=$GITHUB_REF_NAME PRUNE=1 CONTAINER_BUILDER=docker GITEA_URL=… OWNER=… REPO=…`
   (secret `RELEASE_TOKEN` → env `GITEA_TOKEN`). There is no `upload-artifact` step here: desktop artifacts are
   built and published by `make release` — per platform `release-build-<p>` + `desktop-<p>`, then
-  `release-publish` (draft release, all 7 assets asserted before any upload, publish, delete-draft on failure).
+  `release-publish` (draft release, all 8 assets asserted before any upload, publish, delete-draft on failure).
 - **`ci.yml` (PR):** job `ci` also runs the release contract tests (`sh tests/release.sh`, hermetic — Makefile
   targets + `release.yml`) before the cargo gate. Job `desktop` runs the full desktop workspace
   (`--manifest-path desktop/Cargo.toml --workspace`) with fmt/clippy/test after the webkit deps
@@ -1105,20 +1129,33 @@ Order matters: T-tasks (tests) precede the C-tasks they cover (RED → GREEN).
 - S-M5 `rcodesign print-signature-info` on the `.app` and on `Contents/MacOS/peakbot` exits 0 and shows a code directory for both arm64 and x86_64 slices; `rcodesign verify` on each Mach-O exits 0.
 - S-M6 zip filename = `PeakBot-Desktop-<version>-macos-universal.zip`.
 
-`smoke-windows.sh <exe> <version> <sidecar>` (no SKIP paths — a missing tool
-fails the build):
-- S-W1 basename is exactly `PeakBot-Desktop-<version>-windows-x86_64.exe`.
-- S-W2 `file -b <exe>` matches PE32+ … x86-64 … MS Windows (both file-5.38 and
+`smoke-windows.sh <portable-exe> <setup-exe> <version> <sidecar>` (no SKIP paths — a missing
+tool fails the build; required tools `file llvm-objdump sha256sum 7z`; a missing input file
+prints `not found` and fails):
+- S-W1 BOTH basenames match the contract exactly: portable
+  `PeakBot-Desktop-<version>-windows-x86_64-portable.exe` AND setup
+  `PeakBot-Desktop-<version>-windows-x86_64-setup.exe`. Checked first, before anything that
+  needs a real PE.
+- S-W2 `file -b <portable>` matches PE32+ … x86-64 … MS Windows (both file-5.38 and
   file-5.46 word orders) **and** contains `(GUI)`; `file -b <sidecar>` matches
   PE32+ … x86-64.
-- S-W3 for each of exe and sidecar: `llvm-objdump -p` exits 0 and prints at
+- S-W3 for each of portable and sidecar: `llvm-objdump -p` exits 0 and prints at
   least one `DLL Name:` line (the check can't pass on an empty/unparsed import
   table); no line matches `DLL Name: *(vcruntime|msvcp)` (static-CRT
-  contract); exe only: no `WebView2Loader.dll`.
-- S-W4 exe size > 10 MB (the payload is present) **and**
-  `grep -aqF "<version>-$(sha256sum <sidecar> | cut -c1-12)" <exe>` — the
+  contract); portable only: no `WebView2Loader.dll`.
+- S-W4 portable size > 10 MB (the payload is present) **and**
+  `grep -aqF "<version>-$(sha256sum <sidecar> | cut -c1-12)" <portable>` — the
   embedded payload id equals the staged sidecar's hash, so the sidecar in
   S-W3 is exactly the payload's content (I1).
+- S-W5 `file -b <setup>` contains `PE32 executable` (the 32-bit NSIS stub — not PE32+)
+  **and** `Nullsoft` (file 5.46: "PE32 executable … Nullsoft Installer self-extracting
+  archive"); setup size > 10 MB (the app is embedded).
+- S-W6 `7z l -ba <setup>`: (1) lists `peakbot-desktop.exe` (suffix-anchored — tolerates a
+  7z path prefix such as `$INSTDIR\`); (2) NO entry is exactly `peakbot.exe`
+  (pattern `(^|[ /\\])peakbot\.exe$`) — proves I-B (the externalBin override kept the
+  second sidecar out of the bundle); (3) `7z e -so <setup> -r peakbot-desktop.exe |
+  grep -aqF "<version>-<sha12>"` — the embedded exe carries the same payload id as the
+  portable (I-D).
 
 ### 9.3 Manual Linux checklist (dev, before P4)
 L1 first launch with no `~/.config/peakbot` → setup wizard inside the window, no browser opens.
@@ -1169,7 +1206,7 @@ M8 (#377) Cmd+Shift+S and the PeakBot-menu `Settings…` item both open the sett
 
 ### 9.5 Manual Windows checklist (human — no Windows machine in CI)
 Use **Windows Sandbox** (Win11 Pro; clean: no VC++ redist, WebView2 present) and one real Win10 22H2 machine.
-- W1 Download and double-click `PeakBot-Desktop-<v>-windows-x86_64.exe` → SmartScreen → **More info → Run anyway**. **No console window ever appears** (startup, sidecar spawn, settings change restart, quit).
+- W1 Download and double-click `PeakBot-Desktop-<v>-windows-x86_64-portable.exe` → SmartScreen → **More info → Run anyway**. **No console window ever appears** (startup, sidecar spawn, settings change restart, quit).
 - W2 First run: `%LOCALAPPDATA%\com.peakbot.desktop\bin\<v>-<sha12>\peakbot.exe` exists, no `.tmp`; the window loads the UI; Task Manager → Details shows `peakbot-desktop.exe` and `peakbot.exe` (path in that folder, `--bind 127.0.0.1:7824`).
 - W3 In Sandbox: everything in W2 works, which proves the static CRT (no VC++ redist there).
 - W4 Launch again while it's running → the existing window is focused; there's no second process and no re-extraction.
@@ -1181,10 +1218,15 @@ Use **Windows Sandbox** (Win11 Pro; clean: no VC++ redist, WebView2 present) and
 - W10 Tray menu; Ctrl+Shift+S / tray Settings…; protocol/token change → the sidecar restarts with no console flash.
 - W11 Background toggle behaves per the Q1 decision: NOT shown on Windows in v1 (tray checkbox and settings row absent; `background_offered(Platform::Windows) == false`).
 - W12 Removal per README: delete the exe and the two data folders → nothing PeakBot is left running or scheduled.
+- W13 Installer: double-click `PeakBot-Desktop-<v>-windows-x86_64-setup.exe` → SmartScreen shows "Windows protected your PC" (unsigned build) → **More info → Run anyway** works.
+- W14 Installs **without a UAC prompt**, per-user, under `%LOCALAPPDATA%\PeakBot Desktop`; the Start-menu "PeakBot Desktop" shortcut is present.
+- W15 The installed app launches from the Start menu: the window loads the UI, Task Manager shows `peakbot-desktop.exe` and `peakbot.exe --bind 127.0.0.1:7824` (the sidecar starts); on a system without WebView2 the installer downloaded the bootstrapper first (needs internet — offline users take the portable exe).
+- W16 Uninstall via Settings → Apps → PeakBot Desktop removes the program files (and the Start-menu shortcut).
+- W17 Run the installer over a running instance → it prompts to close the app (RestartManager) → it closes and the install completes.
 
 ## 10. AMENDMENT (windows-portable) — single self-extracting exe (2026-10-17)
 Condensed from the locked plan (full document: `desktop/WINDOWS-PLAN.md`, kept on disk, not committed).
-**One file:** `PeakBot-Desktop-<v>-windows-x86_64.exe` — the normal Tauri desktop exe, cross-built on Linux
+**One file:** `PeakBot-Desktop-<v>-windows-x86_64-portable.exe` (renamed from `-windows-x86_64.exe`) — the normal Tauri desktop exe, cross-built on Linux
 with `cargo xwin` (no Tauri CLI; the macOS pipeline precedent), carrying the `peakbot.exe` sidecar as a
 zstd-compressed byte blob. On startup, only on Windows, the app writes it once to
 `%LOCALAPPDATA%\com.peakbot.desktop\bin\<version>-<sha12>\peakbot.exe` and points `DesktopPaths.sidecar`

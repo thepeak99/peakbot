@@ -87,15 +87,16 @@ jobs:
       - name: Install rustfmt + clippy
         run: rustup component add rustfmt clippy
       # Tauri 2 Linux prerequisites (same set as Dockerfile.desktop-linux).
-      # file + llvm: the Windows portable-exe static tests unit-test
+      # file + llvm: the Windows desktop static tests unit-test
       # smoke-windows.sh against fake PEs (it needs file + llvm-objdump).
+      # 7zip: S-W6 inspects the NSIS installer archive (it needs 7z).
       - name: Install webkit/Tauri system deps
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
             pkg-config libwebkit2gtk-4.1-dev libxdo-dev \
             libssl-dev libayatana-appindicator3-dev librsvg2-dev \
-            file llvm
+            file llvm 7zip
       - name: Desktop fmt + clippy + test
         run: |
           # tauri-build fails if bundle.externalBin is missing; a placeholder suffices for check builds.
@@ -103,8 +104,8 @@ jobs:
           cargo fmt --manifest-path desktop/Cargo.toml --all -- --check
           cargo clippy --locked --manifest-path desktop/Cargo.toml --workspace --all-targets -- -D warnings
           cargo test --locked --manifest-path desktop/Cargo.toml --workspace
-      # Static tests for the Windows portable-exe pipeline (T01–T39): shell
+      # Static tests for the Windows desktop pipeline (T01–T48): shell
       # contract checks on build-desktop.sh / the Dockerfiles / the Makefile,
       # plus smoke-windows.sh unit-tested against fake PEs. No docker build.
-      - name: Windows portable-exe static tests
+      - name: Windows desktop static tests
         run: sh desktop/scripts/test-build-desktop-windows.sh

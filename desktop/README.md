@@ -14,7 +14,7 @@ Desktop artifacts are cross-built on Linux in containers (podman by default;
 |---|---|
 | `make desktop-linux` | `PeakBot-Desktop-<v>-linux-x86_64.AppImage` |
 | `make desktop-macos` | `PeakBot-Desktop-<v>-macos-universal.zip` |
-| `make desktop-windows` | `PeakBot-Desktop-<v>-windows-x86_64.exe` |
+| `make desktop-windows` | `PeakBot-Desktop-<v>-windows-x86_64-portable.exe` + `PeakBot-Desktop-<v>-windows-x86_64-setup.exe` (NSIS installer) |
 | `make desktop` | all three |
 
 `make desktop-windows` cross-compiles with `cargo-xwin` (MSVC target, static CRT,
@@ -24,14 +24,26 @@ downloads the MSVC SDK (cached in the build layers) and takes a while.
 
 ## Windows
 
-- **One file, no install.** `PeakBot-Desktop-<v>-windows-x86_64.exe` runs from
-  anywhere — double-click it (from Downloads, a USB stick, a read-only folder).
-  No installer, no admin rights.
-- **Unsigned build → SmartScreen warning.** The exe is not code-signed, so
+- **Two downloads.**
+  - **Installer (recommended): `PeakBot-Desktop-<v>-windows-x86_64-setup.exe`.**
+    Per-user install, no admin rights, Start-menu entry. Uninstall from
+    Settings → Apps.
+  - **Portable: `PeakBot-Desktop-<v>-windows-x86_64-portable.exe`.** No install,
+    no admin rights; double-click it from anywhere (Downloads, a USB stick).
+    Works offline.
+- **Unsigned builds → SmartScreen warning.** Neither file is code-signed, so
   Windows shows "Windows protected your PC". Click **More info → Run anyway**.
+  If **Smart App Control** is On, unsigned apps are blocked with no per-app
+  bypass; the only option is turning Smart App Control off (Windows Security →
+  App & browser control), which cannot be turned back on without resetting Windows.
 - **WebView2 required.** The app window uses Microsoft Edge WebView2, which is
-  preinstalled on Windows 11 and on almost every Windows 10. On the rare machine
-  without it, the app shows a dialog with the download link.
+  preinstalled on Windows 11 and on almost every Windows 10. If it is missing,
+  the installer downloads it (needs internet); the portable exe shows a dialog
+  with the download link instead.
+- **Shared data.** Installed and portable builds both use
+  `%LOCALAPPDATA%\com.peakbot.desktop` (extracted backend + settings). Run one at
+  a time. The uninstaller's optional "delete application data" checkbox also wipes
+  the portable's data; the backend is re-extracted on next launch, but settings are lost.
 - **First launch unpacks the backend.** The app extracts the bundled PeakBot
   backend to `%LOCALAPPDATA%\com.peakbot.desktop\bin\` (about 40 MB, once per
   version; older versions are removed automatically).
@@ -114,10 +126,11 @@ remains licensed under OFL-1.1; the full license text ships with the app.
 - macOS: `~/.local/bin/peakbot service uninstall` (or `launchctl bootout gui/$(id -u)/com.peakbot.agent; rm ~/Library/LaunchAgents/com.peakbot.agent.plist`);
   optionally `rm ~/.local/bin/peakbot` and
   `rm -r ~/Library/Application\ Support/com.peakbot.desktop ~/Library/Logs/com.peakbot.desktop`.
-- Windows: quit the app, then delete the `PeakBot-Desktop-<v>-windows-x86_64.exe`
+- Windows, installer: uninstall from Settings → Apps (quit the app first).
+- Windows, portable: quit the app, then delete the `PeakBot-Desktop-<v>-windows-x86_64-portable.exe`
   file; optionally delete `%LOCALAPPDATA%\com.peakbot.desktop` (the unpacked
   backend + settings) and `%APPDATA%\com.peakbot.desktop` (settings). There is
-  no installer and no background task to remove. Settings in `%APPDATA%\peakbot`
+  no background task to remove. Settings in `%APPDATA%\peakbot`
   are user data — delete them only deliberately.
 - First launch on macOS (unsigned build): `xattr -dr com.apple.quarantine "/Applications/PeakBot Desktop.app"`.
 

@@ -13,6 +13,7 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ### Features
 
+- Desktop (Windows): new NSIS installer (`PeakBot-Desktop-<v>-windows-x86_64-setup.exe`, per-user, no admin rights, downloads WebView2 if missing). The standalone exe is now named `PeakBot-Desktop-<v>-windows-x86_64-portable.exe`. Both are unsigned — SmartScreen: **More info → Run anyway**.
 - PeakBot Desktop: closing the window now keeps PeakBot running in the tray (menu bar on macOS); choose **Quit PeakBot** to stop it. The "Keep PeakBot running in background" option and the desktop settings page are gone; if an old background service is installed, the app offers to remove it on start (settings and the `peakbot` command are kept). Linux desktops without a tray ask before closing, since closing stops PeakBot.
 - Desktop: the bundled status page follows the app's light/dark theme.
 - Prompts: the closing prayer now follows the complete answer in the same message, the final `memory.md` update happens before the final reply, and the answer is never left only in the model's thinking. The `agent-dev-team` example lets the orchestrator manage `memory.md` itself.
