@@ -273,19 +273,21 @@ release:
 	$(MAKE) release-publish TAG=$(TAG)
 	$(MAKE) release-publish-github TAG=$(TAG)
 
-## release-bump: Bump to VERSION (X.Y.Z, required) on a fresh release/<v>
-##               branch cut from origin/master — bump both Cargo.tomls (+
-##               lock updates), promote release-notes/current.md to
-##               release-notes/<v>.md, commit, push. Open a PR; after the
-##               merge, run release-tag.
+## release-bump: Bump to VERSION (X.Y.Z or X.Y.Z-<prerelease>, required) on a
+##               fresh release/<v> branch cut from origin/master — bump both
+##               Cargo.tomls (+ lock updates), copy
+##               release-notes/current.md to release-notes/<v>.md, commit,
+##               push. Stable: current.md is reset to a fresh draft;
+##               prerelease (RC): current.md keeps accumulating. Open a PR;
+##               after the merge, run release-tag.
 release-bump:
 	@set -eu; \
 	if [ -z "$(VERSION)" ]; then \
 	  echo "❌ VERSION is required: make release-bump VERSION=X.Y.Z"; exit 1; \
 	fi; \
 	v="$(VERSION)"; \
-	if ! echo "$$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$$'; then \
-	  echo "❌ Invalid version: '$$v' (expected X.Y.Z)"; exit 1; \
+	if ! echo "$$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$$'; then \
+	  echo "❌ Invalid version: '$$v' (expected X.Y.Z or X.Y.Z-<prerelease>)"; exit 1; \
 	fi; \
 	if git rev-parse "refs/tags/$$v" >/dev/null 2>&1; then \
 	  echo "❌ Tag '$$v' already exists"; exit 1; \
@@ -304,15 +306,26 @@ release-bump:
 	echo "🔒 Updating Cargo.lock..."; \
 	cargo update -p peakbot --precise "$$v" >/dev/null 2>&1 || cargo update -p peakbot >/dev/null; \
 	cargo update --workspace --manifest-path desktop/Cargo.toml >/dev/null 2>&1; \
-	echo "📄 Promoting release notes: release-notes/$$v.md ← release-notes/current.md"; \
 	if [ ! -f release-notes/current.md ]; then \
 	  echo "❌ release-notes/current.md not found"; exit 1; \
 	fi; \
-	awk '/^## /{f=1} f' release-notes/current.md > release-notes/$$v.md; \
-	awk '/^## /{exit} {print}' release-notes/current.md > release-notes/current.md.tmp; \
-	printf '## Changes\n' >> release-notes/current.md.tmp; \
-	mv release-notes/current.md.tmp release-notes/current.md; \
-	git add Cargo.toml Cargo.lock desktop/Cargo.toml desktop/Cargo.lock release-notes/$$v.md release-notes/current.md; \
+	case "$$v" in \
+	*-*) \
+	  # Prerelease (RC): snapshot the notes; the draft keeps accumulating for stable. \
+	  echo "📄 Snapshotting release notes (prerelease): release-notes/$$v.md ← release-notes/current.md"; \
+	  awk '/^## /{f=1} f' release-notes/current.md > release-notes/$$v.md; \
+	  git add Cargo.toml Cargo.lock desktop/Cargo.toml desktop/Cargo.lock release-notes/$$v.md; \
+	  ;; \
+	*) \
+	  # Stable: promote — the draft becomes the versioned file, a fresh draft starts. \
+	  echo "📄 Promoting release notes: release-notes/$$v.md ← release-notes/current.md"; \
+	  awk '/^## /{f=1} f' release-notes/current.md > release-notes/$$v.md; \
+	  awk '/^## /{exit} {print}' release-notes/current.md > release-notes/current.md.tmp; \
+	  printf '## Changes\n' >> release-notes/current.md.tmp; \
+	  mv release-notes/current.md.tmp release-notes/current.md; \
+	  git add Cargo.toml Cargo.lock desktop/Cargo.toml desktop/Cargo.lock release-notes/$$v.md release-notes/current.md; \
+	  ;; \
+	esac; \
 	git commit -m "chore: release $$v" -m "Co-authored by PeakBot!"; \
 	echo "📤 Pushing release/$$v to origin..."; \
 	git push -u origin HEAD; \
