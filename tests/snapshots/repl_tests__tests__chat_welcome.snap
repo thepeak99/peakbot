@@ -1,9 +1,10 @@
 ---
 source: tests/repl_tests.rs
-expression: "lines.join(\"\\n\")"
+assertion_line: 185
+expression: "redact_version(&lines.join(\"\\n\"))"
 ---
 ┌ Chat Messages ──────────────────────────────────────────┐▲
-│✨  PeakBot vX.Y.Z                                       │█
+│✨  PeakBot vX.Y.Z                                        │█
 │Start a conversation or use /help for commands.          │█
 │                                                         │█
 │                                                         │█
