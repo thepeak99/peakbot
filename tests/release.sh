@@ -231,6 +231,32 @@ make_assets() { # $1 = output dir, $2 = version (default: $V): create all 10 rel
     done
 }
 
+# ST — controlled STABLE tag for the stable-side fixture runs (T08's
+# stable half, T27, T46). The worktree version is deliberately irrelevant:
+# on a release branch $V is itself a prerelease, so the stable-side
+# contract (prerelease:false, make_latest:"true") must be exercised with a
+# tag that has no '-'.
+ST=0.8.0
+ASSET10_ST="peakbot-$ST-linux-amd64
+peakbot-$ST-windows-amd64.exe
+peakbot-$ST-macos-universal2
+peakbot-$ST-android-arm64
+PeakBot-Desktop-$ST-linux-x86_64.AppImage
+PeakBot-Desktop-$ST-macos-universal.zip
+PeakBot-Desktop-$ST-macos-universal.app.tar.gz
+PeakBot-Desktop-$ST-windows-x86_64-portable.exe
+PeakBot-Desktop-$ST-windows-x86_64-setup.exe
+latest.json"
+
+# stable_fixture <clone-dir> — throwaway clone of $root with the $ST notes
+# file + $ST asset set (stable twin of the $D/pre 0.9.0-rc.1 fixture used
+# by T08/T47).
+stable_fixture() {
+    git clone -q --depth 1 "$root" "$1" 2>/dev/null || return 1
+    printf 'stable sentinel notes\n' > "$1/release-notes/$ST.md"
+    make_assets "$D/out" "$ST"
+}
+
 # run_publish <logfile> [FAIL_UPLOAD] [TAG] [CWD] → sets P_RC / P_OUT
 run_publish() {
     rp_log=$1; rp_fail=${2:-}; rp_tag=${3:-$V}; rp_cwd=${4:-$root}
@@ -301,15 +327,19 @@ grep_bad "T07 Makefile has no 'Release <v>' fallback" 'Release $$v' "$MK"
 
 # T08: release-publish sends "prerelease":true EXACTLY when the TAG contains
 # '-', "prerelease":false otherwise. Behavioural, via the fake curl's
-# capture of the release-create body (the prerelease TAG runs in a
-# throwaway clone so its notes file never touches the worktree).
-make_assets "$D/out"
-run_publish "$D/log-t08-stable"
+# capture of the release-create body. Both polarities run in throwaway
+# clones with controlled tags (stable $ST / rc 0.9.0-rc.1) so their notes
+# files never touch the worktree — and the worktree version is irrelevant
+# (on a release branch $V is itself a prerelease).
 t08=1; why=""
-grep -qF '"prerelease":false' "$D/log-t08-stable" 2>/dev/null \
-    || { t08=0; why="stable create body lacks \"prerelease\":false"; }
-grep -qF '"prerelease":true' "$D/log-t08-stable" 2>/dev/null \
-    && { t08=0; why="${why}${why:+; }stable create body has \"prerelease\":true"; }
+stable_fixture "$D/stb" || { t08=0; why="stable fixture clone failed"; }
+[ -d "$D/stb" ] && run_publish "$D/log-t08-stable" "" "$ST" "$D/stb"
+if [ -d "$D/stb" ]; then
+    grep -qF '"prerelease":false' "$D/log-t08-stable" 2>/dev/null \
+        || { t08=0; why="stable create body lacks \"prerelease\":false"; }
+    grep -qF '"prerelease":true' "$D/log-t08-stable" 2>/dev/null \
+        && { t08=0; why="${why}${why:+; }stable create body has \"prerelease\":true"; }
+fi
 git clone -q --depth 1 "$root" "$D/pre" 2>/dev/null || { t08=0; why="${why}${why:+; }prerelease clone failed"; }
 [ -d "$D/pre" ] && printf 'prerelease notes\n' > "$D/pre/release-notes/0.9.0-rc.1.md"
 # The rc run looks for TAG-named assets (release-publish derives names from
@@ -445,8 +475,9 @@ fi
 
 # T27: happy path — draft create, 10 exact uploads, final PATCH, no DELETE,
 # and the explicit GITEA_URL/OWNER/REPO vars are used (override origin).
-make_assets "$D/out"
-run_publish "$D/log-happy"
+# The controlled stable tag $ST in the T08 fixture clone (the worktree
+# version may be a prerelease).
+run_publish "$D/log-happy" "" "$ST" "$D/stb"
 t27=1; why=""
 fail27() { t27=0; why="${why}${why:+; }$1"; }
 [ "$P_RC" -eq 0 ] || fail27 "rc=$P_RC: $(printf '%s' "$P_OUT" | grep '❌' | head -1)"
@@ -454,28 +485,23 @@ lines=$(wc -l < "$D/log-happy" | tr -d ' ')
 [ "$lines" = "12" ] || fail27 "log has $lines lines, want 12 (create+10 uploads+patch)"
 grep -qF "POST $API/releases " "$D/log-happy" 2>/dev/null || fail27 "no create POST to $API/releases"
 grep -qF '"draft":true' "$D/log-happy" 2>/dev/null || fail27 "create body lacks draft:true"
-grep -qF "\"tag_name\":\"$V\"" "$D/log-happy" 2>/dev/null || fail27 "create body lacks tag_name=$V"
-grep -qF "\"name\":\"$V\"" "$D/log-happy" 2>/dev/null || fail27 "create body name is not exactly $V"
+grep -qF "\"tag_name\":\"$ST\"" "$D/log-happy" 2>/dev/null || fail27 "create body lacks tag_name=$ST"
+grep -qF "\"name\":\"$ST\"" "$D/log-happy" 2>/dev/null || fail27 "create body name is not exactly $ST"
 grep -qF '"prerelease":false' "$D/log-happy" 2>/dev/null || fail27 "create body lacks prerelease:false (stable tag)"
-# Sentinel: a long word from the real notes file — the assertion is "notes
-# content reached the create body", independent of which version is under test.
-notes_word=$(grep -m1 -oE '[A-Za-z]{8,}' "release-notes/$V.md" 2>/dev/null)
-[ -n "$notes_word" ] || fail27 "release-notes/$V.md has no content to verify"
-grep -qF "$notes_word" "$D/log-happy" 2>/dev/null || fail27 "create body lacks release-notes/$V.md content"
+# Sentinel: a long word from the fixture notes file — the assertion is
+# "notes content reached the create body".
+notes_word=$(grep -m1 -oE '[A-Za-z]{8,}' "$D/stb/release-notes/$ST.md" 2>/dev/null)
+[ -n "$notes_word" ] || fail27 "fixture release-notes/$ST.md has no content to verify"
+grep -qF "$notes_word" "$D/log-happy" 2>/dev/null || fail27 "create body lacks release-notes/$ST.md content"
 upl=$(grep -cF 'assets?name=' "$D/log-happy" 2>/dev/null || true)
 [ "$upl" = "10" ] || fail27 "$upl asset uploads, want 10"
-for n in peakbot-$V-linux-amd64 peakbot-$V-windows-amd64.exe peakbot-$V-macos-universal2 \
-         peakbot-$V-android-arm64 PeakBot-Desktop-$V-linux-x86_64.AppImage \
-         PeakBot-Desktop-$V-macos-universal.zip \
-         PeakBot-Desktop-$V-macos-universal.app.tar.gz \
-         PeakBot-Desktop-$V-windows-x86_64-portable.exe \
-         PeakBot-Desktop-$V-windows-x86_64-setup.exe latest.json; do
+for n in $ASSET10_ST; do
     c=$(grep -cF "name=$n " "$D/log-happy" 2>/dev/null || true)
     [ "$c" = "1" ] || fail27 "upload of $n: $c occurrence(s), want 1"
 done
 # The old bare Windows desktop name must never be uploaded.
-bare=$(grep -cF "name=PeakBot-Desktop-$V-windows-x86_64.exe " "$D/log-happy" 2>/dev/null || true)
-[ "$bare" = "0" ] || fail27 "bare PeakBot-Desktop-$V-windows-x86_64.exe uploaded $bare times, want 0"
+bare=$(grep -cF "name=PeakBot-Desktop-$ST-windows-x86_64.exe " "$D/log-happy" 2>/dev/null || true)
+[ "$bare" = "0" ] || fail27 "bare PeakBot-Desktop-$ST-windows-x86_64.exe uploaded $bare times, want 0"
 grep -qF "PATCH $API/releases/42" "$D/log-happy" 2>/dev/null \
     && grep -F 'PATCH ' "$D/log-happy" | grep -qF '"draft":false' \
     || fail27 "no final PATCH /releases/42 with draft:false"
@@ -831,27 +857,27 @@ fi
 # prerelease:false) on api.github.com, uploads ALL 10 assets to
 # uploads.github.com (201 each), PATCHes draft:false + make_latest:"true",
 # no DELETE. Auth is "Authorization: Bearer <token>" and the token never
-# reaches stdout/stderr.
-make_assets "$D/out"
-run_gh "$root" "$D/log-gh-happy" "$V"
+# reaches stdout/stderr. The controlled stable tag $ST runs in the T08
+# fixture clone (the worktree version may be a prerelease).
+run_gh "$D/stb" "$D/log-gh-happy" "$ST"
 L=$D/log-gh-happy
 GHAPI="https://api.github.com/repos/thepeak99/peakbot"
 GHUP="https://uploads.github.com/repos/thepeak99/peakbot"
 t46=1; why=""
 fail46() { t46=0; why="${why}${why:+; }$1"; }
 [ "$G_RC" -eq 0 ] || fail46 "rc=$G_RC: $(printf '%s' "$G_OUT" | grep '❌' | head -1)"
-refn=$(grep -cF "GET $GHAPI/git/ref/tags/$V" "$L" 2>/dev/null || true)
+refn=$(grep -cF "GET $GHAPI/git/ref/tags/$ST" "$L" 2>/dev/null || true)
 [ "$refn" = "3" ] || fail46 "tag-ref polls: $refn, want 3 (404,404,200)"
-grep -qF "GET $GHAPI/releases/tags/$V" "$L" 2>/dev/null \
-    || fail46 "no GET releases/tags/$V"
+grep -qF "GET $GHAPI/releases/tags/$ST" "$L" 2>/dev/null \
+    || fail46 "no GET releases/tags/$ST"
 grep -qF "POST $GHAPI/releases " "$L" 2>/dev/null \
     || fail46 "no draft-create POST to $GHAPI/releases (default GH_MIRROR_REPO)"
 grep -qF '"draft":true' "$L" 2>/dev/null || fail46 "create body lacks draft:true"
-grep -qF "\"tag_name\":\"$V\"" "$L" 2>/dev/null || fail46 "create body lacks tag_name=$V"
+grep -qF "\"tag_name\":\"$ST\"" "$L" 2>/dev/null || fail46 "create body lacks tag_name=$ST"
 grep -qF '"prerelease":false' "$L" 2>/dev/null || fail46 "create body lacks prerelease:false"
 upln=$(grep -cF "POST $GHUP/releases/77/assets?name=" "$L" 2>/dev/null || true)
 [ "$upln" = "10" ] || fail46 "$upln GitHub uploads, want 10"
-for n in $ASSET10; do
+for n in $ASSET10_ST; do
     c=$(grep -cF "name=$n " "$L" 2>/dev/null || true)
     [ "$c" = "1" ] || fail46 "upload of $n: $c occurrence(s), want 1"
 done
