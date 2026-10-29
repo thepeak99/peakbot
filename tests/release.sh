@@ -75,17 +75,18 @@ workdirs=""
 cleanup() { [ -n "$workdirs" ] && rm -rf $workdirs; }
 trap cleanup EXIT
 
-# ── Shared fake-curl infrastructure (T08, T26–T28, T45–T51) ───────────────
+# ── Shared fake-curl infrastructure (T08, T26–T28, T45–T51, T58) ───────────
 # ONE fake `curl` on PATH serves BOTH the Gitea and the GitHub fakes. It
-# logs "METHOD URL [BODY=…] [FILE=…] [ | -H …]" per invocation to
+# logs "METHOD URL [BODY=…] [FILE=…] [DATA=…] [ | -H …]" per invocation to
 # $CURL_LOG and answers by URL shape:
 #   git.fake.example   — legacy Gitea canned answers (release id 42).
 #   api.github.com     — GET git/ref/tags/<v>: 404 twice, then 200 (poll
 #                        counter in $CURL_LOG.refpoll); GH_REF_ALWAYS_404=1
 #                        keeps it at 404. GET releases/tags/<v>: 404, or
 #                        200 per GH_REL_MODE=done|draft (done builds
-#                        assets: [{name:…}] from the JSON-string lines in
-#                        $CURL_LOG.doneassets — real GitHub's shape).
+#                        assets from the JSON-object lines in
+#                        $CURL_LOG.doneassets — {"name":…,"size":…} per
+#                        line, the shape real GitHub returns in .assets[]).
 #                        POST releases → 201 {"id":77,"draft":true};
 #                        DELETE releases/<id> → 204; PATCH → 200.
 #   uploads.github.com — POST …/releases/<id>/assets?name=<f> → 201, or
@@ -96,7 +97,9 @@ trap cleanup EXIT
 # GH_API ?= https://api.github.com, GH_UPLOADS ?= https://uploads.github.com,
 # poll GET <GH_API>/repos/<repo>/git/ref/tags/<v> GH_TAG_WAIT_TRIES (60) ×
 # GH_TAG_WAIT_SECS (10s), auth header "Authorization: Bearer <token>",
-# token never printed.
+# token never printed. GitHub asset uploads must be RAW bodies
+# (--data-binary @<file>, logged as DATA=…); Gitea asset uploads stay
+# multipart (-F attachment=@<file>, logged as FILE=…).
 
 D=$(mktemp -d); workdirs="$workdirs $D"
 mkdir -p "$D/bin" "$D/out/desktop"
@@ -104,16 +107,17 @@ mkdir -p "$D/bin" "$D/out/desktop"
 cat > "$D/bin/curl" <<'FAKECURL'
 #!/bin/sh
 : "${CURL_LOG:?fake curl needs CURL_LOG}"
-method=GET; url=''; body=''; fdata=''; ofile=''; wfmt=''; hdrs=''
+method=GET; url=''; body=''; fdata=''; data=''; ofile=''; wfmt=''; hdrs=''
 prev=''
 for a in "$@"; do
   case "$prev" in
-    -X|--request) method=$a; prev=''; continue ;;
-    -d|--data)    body=$a; prev=''; continue ;;
-    -F|--form)    fdata=$a; prev=''; continue ;;
-    -o)           ofile=$a; prev=''; continue ;;
-    -w)           wfmt=$a; prev=''; continue ;;
-    -H|--header)  hdrs="$hdrs | $a"; prev=''; continue ;;
+    -X|--request)    method=$a; prev=''; continue ;;
+    -d|--data)       body=$a; prev=''; continue ;;
+    -F|--form)       fdata=$a; prev=''; continue ;;
+    --data-binary)   data=$a; prev=''; continue ;;
+    -o)              ofile=$a; prev=''; continue ;;
+    -w)              wfmt=$a; prev=''; continue ;;
+    -H|--header)     hdrs="$hdrs | $a"; prev=''; continue ;;
   esac
   case "$a" in
     -*) prev=$a ;;
@@ -123,6 +127,7 @@ done
 line="$method $url"
 [ -n "$body" ]  && line="$line BODY=$body"
 [ -n "$fdata" ] && line="$line FILE=$fdata"
+[ -n "$data" ]  && line="$line DATA=$data"
 [ -n "$hdrs" ]  && line="$line$hdrs"
 printf '%s\n' "$line" >> "$CURL_LOG"
 
@@ -154,7 +159,7 @@ case "$url" in
             case "${GH_REL_MODE:-none}" in
               done)
                 status=200
-                resp=$(jq -nc '{id:77, draft:false, tag_name:"", assets: [inputs | {name: .}]}' < "$CURL_LOG.doneassets") ;;
+                resp=$(jq -nc '{id:77, draft:false, tag_name:"", assets: [inputs]}' < "$CURL_LOG.doneassets") ;;
               draft)
                 status=200; resp='{"id":77,"draft":true,"tag_name":"","assets":[]}' ;;
               *)
@@ -498,6 +503,13 @@ upl=$(grep -cF 'assets?name=' "$D/log-happy" 2>/dev/null || true)
 for n in $ASSET10_ST; do
     c=$(grep -cF "name=$n " "$D/log-happy" 2>/dev/null || true)
     [ "$c" = "1" ] || fail27 "upload of $n: $c occurrence(s), want 1"
+done
+# Gitea's attachment API is multipart BY DESIGN — the uploads must stay
+# -F attachment=@<file> (it is the GitHub mirror that takes raw bodies).
+for n in $ASSET10_ST; do
+    case $n in peakbot-*) p="$D/out/$n" ;; *) p="$D/out/desktop/$n" ;; esac
+    grep -F "name=$n " "$D/log-happy" 2>/dev/null | grep -qF "FILE=attachment=@$p" \
+        || fail27 "Gitea upload of $n is not multipart (-F attachment=@$p)"
 done
 # The old bare Windows desktop name must never be uploaded.
 bare=$(grep -cF "name=PeakBot-Desktop-$ST-windows-x86_64.exe " "$D/log-happy" 2>/dev/null || true)
@@ -881,6 +893,15 @@ for n in $ASSET10_ST; do
     c=$(grep -cF "name=$n " "$L" 2>/dev/null || true)
     [ "$c" = "1" ] || fail46 "upload of $n: $c occurrence(s), want 1"
 done
+# GitHub's asset endpoint takes the RAW file body — every upload must be
+# --data-binary @<file>; multipart (-F/--form) must never appear.
+ghmp=$(grep -F "POST $GHUP/" "$L" 2>/dev/null | grep -cF 'FILE=' || true)
+[ "$ghmp" = "0" ] || fail46 "$ghmp GitHub upload(s) use multipart -F"
+for n in $ASSET10_ST; do
+    case $n in peakbot-*) p="$D/out/$n" ;; *) p="$D/out/desktop/$n" ;; esac
+    grep -F "name=$n " "$L" 2>/dev/null | grep -qF "DATA=@$p" \
+        || fail46 "GitHub upload of $n is not raw (--data-binary @$p)"
+done
 grep -q '^DELETE' "$L" 2>/dev/null && fail46 "DELETE present on happy path"
 grep -qF "PATCH $GHAPI/releases/77" "$L" 2>/dev/null \
     && grep -F 'PATCH ' "$L" | grep -qF '"draft":false' \
@@ -911,6 +932,10 @@ grep -qF '"prerelease":true' "$L" 2>/dev/null || fail47 "create body lacks prere
 grep -qF '"prerelease":false' "$L" 2>/dev/null && fail47 "create body has prerelease:false"
 upln=$(grep -cF "POST $GHUP/releases/77/assets?name=" "$L" 2>/dev/null || true)
 [ "$upln" = "10" ] || fail47 "$upln GitHub uploads, want 10"
+ghmp=$(grep -F "POST $GHUP/" "$L" 2>/dev/null | grep -cF 'FILE=' || true)
+[ "$ghmp" = "0" ] || fail47 "$ghmp GitHub upload(s) use multipart -F"
+rawn=$(grep -F "POST $GHUP/" "$L" 2>/dev/null | grep -cF 'DATA=@' || true)
+[ "$rawn" = "10" ] || fail47 "$rawn raw GitHub uploads (--data-binary), want 10"
 grep -qF "PATCH $GHAPI/releases/77" "$L" 2>/dev/null \
     && grep -F 'PATCH ' "$L" | grep -qF '"make_latest":"false"' \
     || fail47 "no final PATCH with make_latest:\"false\""
@@ -939,11 +964,12 @@ else
 fi
 
 # T49: idempotent — a published release for the tag already exists with all
-# 10 asset names → exit 0 with NO create, NO uploads, NO PATCH.
-# doneassets holds one JSON STRING per line (jq -R .): the fake maps them to
-# {name:…} objects — the shape real GitHub returns in .assets[].
+# 10 asset names AND sizes → exit 0 with NO create, NO uploads, NO PATCH.
+# doneassets holds one JSON object per line {"name":…,"size":…} (the shape
+# real GitHub returns in .assets[]); the sizes match the 1-byte fixture
+# files, so the size check passes.
 make_assets "$D/out"
-printf '%s\n' "$ASSET10" | jq -R . > "$D/log-gh-idem.doneassets"
+printf '%s\n' "$ASSET10" | jq -Rc '{name:., size:1}' > "$D/log-gh-idem.doneassets"
 GH_REL_MODE=done run_gh "$root" "$D/log-gh-idem" "$V"
 L=$D/log-gh-idem
 t49=1; why=""
@@ -1171,6 +1197,33 @@ if [ "$t57" -eq 1 ]; then
     ok "T57 release-bump: '1.2' and '1.2.3_x' still rejected"
 else
     bad "T57 release-bump: '1.2' and '1.2.3_x' still rejected ($why)"
+fi
+
+# T58: a published release with all 10 asset NAMES but a WRONG size for one
+# asset (the multipart-wrapped rc.2 bug shape: same name, bigger bytes) →
+# non-zero, NO uploads, NO create, NO PATCH, message names the asset and
+# the size problem.
+make_assets "$D/out"
+printf '%s\n' "$ASSET10" \
+    | jq -Rc 'if . == "latest.json" then {name:., size:999} else {name:., size:1} end' \
+    > "$D/log-gh-size.doneassets"
+GH_REL_MODE=done run_gh "$root" "$D/log-gh-size" "$V"
+L=$D/log-gh-size
+t58=1; why=""
+[ "$G_RC" -ne 0 ] || { t58=0; why="rc=0 despite a size mismatch"; }
+upln=$(grep -cF "POST $GHUP/" "$L" 2>/dev/null || true)
+[ "$upln" = "0" ] || { t58=0; why="${why}${why:+; }$upln upload(s), want 0"; }
+cren=$(grep -cF "POST $GHAPI/releases " "$L" 2>/dev/null || true)
+[ "$cren" = "0" ] || { t58=0; why="${why}${why:+; }$cren release create(s), want 0"; }
+grep -q '^PATCH' "$L" 2>/dev/null && { t58=0; why="${why}${why:+; }PATCH present, want 0"; }
+printf '%s' "$G_OUT" | grep -qF 'latest.json' \
+    || { t58=0; why="${why}${why:+; }message does not name latest.json"; }
+printf '%s' "$G_OUT" | grep -qi 'size' \
+    || { t58=0; why="${why}${why:+; }message does not mention size"; }
+if [ "$t58" -eq 1 ]; then
+    ok "T58 release-publish-github: published release with a size mismatch → fails, names the asset, no uploads"
+else
+    bad "T58 release-publish-github: published release with a size mismatch → fails, names the asset, no uploads ($why)"
 fi
 
 # ── Summary ────────────────────────────────────────────────────────────────
