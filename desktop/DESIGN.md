@@ -77,7 +77,7 @@ Dockerfile.desktop-macos
 - **No HTTP version endpoint / no backend API change for versions.** `<exe> --version` already exists.
 - **(amended §12: the remote origin gets exactly one command on loopback :7823 — `theme_set`.) No other IPC for the remote origin, no other `remote` capability, no `@tauri-apps/api` npm package, no frontend build.**
 - **No `PR_SET_PDEATHSIG`.** Linux-only, tied to the *spawning thread's* lifetime (subtle), and a second orphan mechanism. The pidfile reaper (§4.6) is portable and sufficient.
-- **No auto-updater, no code signing/notarization, no Windows build** (decision 4). Design stays portable: Windows differences are isolated in `RealSys` (`interrupt` = kill) and `paths::sidecar_file_name`.
+- **(amended — auto-update, §14) No Apple notarization / Authenticode code signing, no Windows build** (decision 4). Design stays portable: Windows differences are isolated in `RealSys` (`interrupt` = kill) and `paths::sidecar_file_name`.
 - **No "Restart backend" / "Open in browser" tray items.** Not requested (YAGNI).
 - **No custom app menu on Linux.** Tray only (see risk R6). macOS keeps Tauri's default menu (needed for ⌘C/⌘V/⌘Q) plus our "PeakBot" submenu.
 - **No process-group for the sidecar.** Not setting it means Ctrl+C on a terminal-launched desktop app also SIGINTs the sidecar (graceful), instead of orphaning it.
@@ -1452,3 +1452,80 @@ Windows thumbprint match, tls off, Linux no-op, missing/garbage CA, service mode
 
 **Supersedes.** T-B4 (macOS deferred; the cert note) — done. Closes the Keychain line of
 #377b's "Out of scope". The Linux webview trust of #377b (I9) is unchanged.
+
+## 14. AUTO-UPDATE (2026-10-29)
+
+**Reason.** Released builds should update themselves (v1's "no auto-updater"
+decision, §2, is superseded).
+
+**Source.** The public GitHub mirror —
+`https://github.com/thepeak99/peakbot/releases/latest/download/latest.json`
+(`plugins.updater.endpoints` in `tauri.conf.json`, minisign `pubkey` in the
+same file). No token in the app; the Gitea push-mirror syncs refs only, the
+pipeline publishes the release (agents.md, "Release pipeline").
+
+**Supported bundles.** Linux AppImage, the Windows NSIS-installed `setup.exe`,
+macOS `.app`. The Windows **portable** exe and **dev** builds are excluded —
+left to itself the plugin would happily install a second copy where the
+running exe can't be replaced (spike S2), so the glue gates up front:
+`updater::detect_bundle()` maps `platform::bundle_type()` (macOS: the exe
+path — under `*.app/Contents/MacOS`, not under `/AppTranslocation/`) to
+`core::update::Bundle`, and `supported(bundle, debug)` is false for
+`None`/debug. Excluded builds get no check, no banner, no tray item.
+
+**State machine (`core::update`, pure).** `step(state, event) ->
+(state, effect)` table: `Idle → Checking → Available → Downloading →
+Installing → Gone`; `Failed(version)` is retryable; single-flight (one check,
+one install at a time); `Checking.known` keeps a known update visible across
+a failed re-check. `due(last, now)` = 24 h, and a backwards clock is DUE — a
+skewed clock must never block checks forever. Checks run at startup and
+daily; failures are silent. 49 unit tests in `update.rs`; the IPC surface is
+pinned in `core/tests/ipc_surface.rs`.
+
+**Threading.** All blocking updater work (network, download, install,
+dialogs) runs on one dedicated **updater thread** (`run_loop` over
+`UpdateSys`). `restart()` is **never** called on the main thread — a
+main-thread restart skips `RunEvent::Exit`, so the single-instance lock would
+stay held (spike S2). On Windows our `on_before_exit` REPLACES the plugin's
+default hook, so it must call `shutdown()` (sidecar stop) +
+`cleanup_before_exit()` itself.
+
+**UI surfaces.**
+- **Web banner** (`web/src/components/UpdateBanner.tsx`): a slim bar under the
+  TopBar, desktop-only (zero calls in a browser); fetches `update_status` on
+  mount and every 30 s (the first rejection stops polling), shows
+  "Update available — v{version}" + **Restart to update** (click →
+  `update_install` → "Restarting…"), "Installing update…" / "Update to
+  v{version} failed" + Retry; dismissible until the version changes (not
+  persisted). Granted by the `remote-web` capability
+  (`remote-theme.json` → `remote-web.json`: now `theme_set` +
+  `update_status` + `update_install` — supersedes §12's single-command
+  remote surface).
+- **Tray / macOS menu item `update`** (updatable builds only): state-driven
+  label from `core::update::menu_label` (`Check for updates…` /
+  `Checking for updates…` / `Update available — v{v}` /
+  `Downloading v{v}…` / `Installing v{v}…` / `Update to v{v} failed —
+  retry`), kept in sync across all stored menu copies; click sends
+  `Event::Click` to the updater thread.
+
+**Signing (post-build, `make desktop-updater`).** `createUpdaterArtifacts`
+stays OFF. `Dockerfile.desktop-updater` (pinned `@tauri-apps/cli@2.12.3`,
+minisign 0.11): `tauri signer sign --app-version <v>` on the AppImage,
+`setup.exe` and `.app.tar.gz`; every `.sig` is verified with `minisign -V`
+against the pubkey in `tauri.conf.json` (missing/empty sig = build failure);
+then `desktop/scripts/updater-manifest.sh` writes `latest.json` (platforms
+`linux-x86_64`, `windows-x86_64`, `darwin-x86_64` + `darwin-aarch64` —
+identical universal tarball + signature for the darwin pair; base URL = the
+mirror's `releases/download/<v>`). The private key enters only as a BuildKit
+secret from `TAURI_SIGNING_PRIVATE_KEY(_PASSWORD)` — never a layer, never a
+log.
+
+**Known limitations.**
+- The AppImage must run from a **writable** location to update in place, and
+  the running file keeps its **old version** in the filename after an update.
+- macOS **App Translocation** (`/AppTranslocation/`) is unsupported — the
+  translocated bundle is read-only, so the app is simply not updatable there.
+- Windows artifacts are unsigned (no Authenticode) — **SmartScreen** may warn
+  on the first install/update (More info → Run anyway).
+- 0.24.x and earlier have no updater — they must be updated to this version
+  **manually once**.
