@@ -546,10 +546,27 @@ release-publish-github:
 	      printf '%s' "$$resp" | jq -e --arg n "$$n" '[.assets[] | if type=="object" then .name else . end] | index($$n)' >/dev/null \
 	        || missing="$$missing $$n"; \
 	    done; \
-	    if [ -z "$$missing" ]; then \
-	      echo "✅ $$v already published on $(GH_MIRROR_REPO) with all 10 assets — nothing to do"; exit 0; \
+	    if [ -n "$$missing" ]; then \
+	      echo "❌ Published release for $$v is missing assets:$$missing — refusing to modify a published release (resolve manually)"; exit 1; \
 	    fi; \
-	    echo "❌ Published release for $$v is missing assets:$$missing — refusing to modify a published release (resolve manually)"; exit 1; \
+	    # Names alone are not enough — a same-named asset with different bytes \
+	    # (e.g. a multipart-wrapped upload) would pass. Compare sizes too; on \
+	    # a mismatch fail loudly, never auto-delete a published release. \
+	    badsize=""; \
+	    for n in $(RELEASE_ASSETS); do \
+	      case $$n in \
+	        peakbot-*) f="$(OUTPUT_DIR)/$$n" ;; \
+	        *) f="$(OUTPUT_DIR)/desktop/$$n" ;; \
+	      esac; \
+	      want=$$(wc -c < "$$f" | tr -d '[:space:]'); \
+	      have=$$(printf '%s' "$$resp" | jq -r --arg n "$$n" '.assets[] | select(.name == $$n) | .size' | head -n 1); \
+	      [ "$$have" = "$$want" ] || badsize="$$badsize $$n"; \
+	    done; \
+	    if [ -n "$$badsize" ]; then \
+	      nbad=$$(printf '%s\n' $$badsize | wc -l | tr -d '[:space:]'); \
+	      echo "❌ Published release for $$v has $nbad assets whose size differs from local:$$badsize — fix manually (a published release is never auto-deleted)"; exit 1; \
+	    fi; \
+	    echo "✅ $$v already published on $(GH_MIRROR_REPO) with all 10 assets (names + sizes match) — nothing to do"; exit 0; \
 	  fi; \
 	fi; \
 	echo "🚀 Creating draft GitHub release $$v (prerelease=$$prerelease) at $$api/releases ..."; \
@@ -571,8 +588,11 @@ release-publish-github:
 	    *) f="$(OUTPUT_DIR)/desktop/$$n" ;; \
 	  esac; \
 	  echo "⬆️  Uploading $$n ..."; \
+	  # uploads.github.com takes the raw file body — a multipart (-F) upload \
+	  # wraps it in a form envelope and corrupts every asset. \
 	  code=$$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H "$$auth" \
-	    -F "file=@$$f" "$$uploads/releases/$$rid/assets?name=$$n"); \
+	    -H "Content-Type: application/octet-stream" \
+	    --data-binary @"$$f" "$$uploads/releases/$$rid/assets?name=$$n"); \
 	  if [ "$$code" != "201" ]; then \
 	    echo "❌ GitHub upload failed for $$n (HTTP $$code)"; exit 1; \
 	  fi; \
