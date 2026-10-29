@@ -3162,7 +3162,7 @@ dependencies = [
 
 [[package]]
 name = "peakbot"
-version = "0.25.0-rc.3"
+version = "0.25.0"
 dependencies = [
  "anyhow",
  "async-trait",
