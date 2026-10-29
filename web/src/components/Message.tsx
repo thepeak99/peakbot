@@ -124,7 +124,8 @@ function sameThinking(a: string[] | undefined, b: string[] | undefined): boolean
 
 // Only /images/, http(s)://, and data: become <img>: a bare local path the
 // backend left unresolved would hit the SPA catch-all route and render broken.
-function isRenderableImageSrc(src: string | undefined): boolean {
+// Type guard: after this check `src` is a usable string.
+function isRenderableImageSrc(src: string | undefined): src is string {
   return (
     src !== undefined &&
     (src.startsWith("/images/") ||
@@ -139,6 +140,7 @@ function isRenderableImageSrc(src: string | undefined): boolean {
 function CachedImage({ src, alt }: ComponentProps<"img"> & { node?: unknown }) {
   const [error, setError] = useState(false);
   const [lastSrc, setLastSrc] = useState(src);
+  const [open, setOpen] = useState(false);
   if (src !== lastSrc) {
     // Reset during render (not in an effect) so a new src never shows the
     // stale fallback for a frame.
@@ -153,15 +155,23 @@ function CachedImage({ src, alt }: ComponentProps<"img"> & { node?: unknown }) {
     );
   }
   return (
-    <a href={src} target="_blank" rel="noreferrer">
+    <>
       <img
         src={src}
         alt={alt ?? ""}
         loading="lazy"
+        onClick={() => setOpen(true)}
         onError={() => setError(true)}
-        className="max-h-96 rounded border border-zinc-800/60"
+        className="max-h-96 cursor-zoom-in rounded border border-zinc-800/60"
       />
-    </a>
+      {open && (
+        <Lightbox
+          images={[{ id: src, name: alt || "image", url: src }]}
+          start={0}
+          onClose={() => setOpen(false)}
+        />
+      )}
+    </>
   );
 }
 
