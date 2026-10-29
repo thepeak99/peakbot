@@ -3,7 +3,7 @@ members = ["core", "src-tauri"]
 resolver = "3"
 
 [workspace.package]
-version = "0.25.0-rc.2"          # == root Cargo.toml version (release-bump + check-version.sh)
+version = "0.25.0-rc.3"          # == root Cargo.toml version (release-bump + check-version.sh)
 edition = "2024"
 
 [profile.test]
