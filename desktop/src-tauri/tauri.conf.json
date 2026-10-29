@@ -46,7 +46,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDYzRkFFNkVFMDA2RkY2RTUKUldUbDltOEE3dWI2WTBHZjhtcnU1UjFXWFdRbzlPc0M1ZFBwUjdIR2U0MEZJcFVrbmZNSmtwTGwK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDM5MDcyQTE5Njg3RDQyNjUKUldSbFFuMW9HU29IT1RreFd5SEZvM1FNM2JtVXZDOGk3dUZ4WXhxS01SRTRidUxGcFdnSGZieUcK",
       "endpoints": ["https://github.com/thepeak99/peakbot/releases/latest/download/latest.json"],
       "windows": { "installMode": "passive" }
     }
