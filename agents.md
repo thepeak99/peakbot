@@ -275,13 +275,15 @@ server-side by the same `Config::parse` as boot; the save bar says which keys
 apply "on next /new" vs "restart required" (the server computes the boot-only
 list — the client keeps none). The gear is hidden when the active profile's
 `ui.tabs` filters out the `settings` tab, and the whole settings API is refused
-under a `--profile` pin. In the desktop app the machine group gains a
-"Desktop" pane (`settings/desktopPane.tsx`) — the desktop's own option (keep
-running in background), read and toggled through three scoped Tauri commands
-(`settings_get`, `toggle_background`, `theme_set`; only on the desktop's
-loopback `:7823` backend, otherwise the pane offers a button to the bundled
-settings page). The web theme is reported to the desktop so its bundled pages
-follow it. The web-server settings live in Settings → General.
+under a `--profile` pin. In the desktop app the web UI additionally gets
+**exactly three loopback-only IPC commands** (`theme_set`, `update_status`,
+`update_install`) granted to the `:7823` backend by the `remote-web` capability
+(`desktop/src-tauri/capabilities/remote-web.json`) — `theme_set` reports the web
+theme so the desktop's bundled pages follow it, and `update_status` /
+`update_install` drive the in-app **Update available** banner (slim bar under
+the top bar; polls `update_status` every 30 s; click = download, install,
+restart; dismissible until the version changes) — nothing else reaches the web
+origin. The web-server settings live in Settings → General.
 
 **First run**: with no global config (or a failed migration) the chat is
 replaced by a guided setup — Welcome → Provider → Agent → Web → Review →
@@ -460,9 +462,17 @@ Fully CI-driven: `release-bump` branch → PR green → merged → `make release
 make release TAG=0.3.0 PRUNE=1 CONTAINER_BUILDER=docker GITEA_URL=… OWNER=ai-bots REPO=peakbot
 ```
 
-`make release` = `release-check` (TAG == Cargo version == desktop version, `release-notes/<TAG>.md` exists) → per platform: `release-build-<p>` → `desktop-<p>` → prune, for linux, macos, windows → `release-build-android` → `release-publish`. Sequential by design — never run with `-j`.
+`make release` = `release-check` (TAG == Cargo version == desktop version, `release-notes/<TAG>.md` exists, `tauri.conf.json` updater endpoints point at the GitHub mirror) → per platform: `release-build-<p>` → `desktop-<p>` → prune, for linux, macos, windows → `release-build-android` → `desktop-updater` → `release-publish` → `release-publish-github`. Sequential by design — never run with `-j`.
 
-`release-publish` asserts all 8 assets exist **before** any API call — server: `peakbot-<v>-{linux-amd64, windows-amd64.exe, macos-universal2, android-arm64}`; desktop: `PeakBot-Desktop-<v>-{linux-x86_64.AppImage, macos-universal.zip, windows-x86_64-portable.exe, windows-x86_64-setup.exe}` — then creates a DRAFT release, uploads all 8, and publishes; any failure deletes the draft, so a release is complete or absent, never partial.
+Ten release assets: server `peakbot-<v>-{linux-amd64, windows-amd64.exe, macos-universal2, android-arm64}`; desktop `PeakBot-Desktop-<v>-{linux-x86_64.AppImage, macos-universal.zip, macos-universal.app.tar.gz, windows-x86_64-portable.exe, windows-x86_64-setup.exe}`; plus `latest.json` (the updater manifest).
+
+`desktop-updater` (after the builds) signs the three updater artifacts (AppImage, `setup.exe`, `.app.tar.gz`) with `tauri signer sign --app-version <v>`, verifies each `.sig` with minisign against the pubkey in `tauri.conf.json`, and builds `latest.json` via `desktop/scripts/updater-manifest.sh` (platforms `linux-x86_64`, `windows-x86_64`, `darwin-x86_64` + `darwin-aarch64` — one universal tarball for both). The signing key never enters a layer or log: it crosses the build boundary as a BuildKit secret from the Gitea secrets `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
+
+`release-publish` (Gitea) asserts all 10 assets exist **before** any API call, then creates a DRAFT release, uploads all 10, and publishes; tags with a `-` (RCs) are marked **prerelease**; any failure deletes the draft, so a release is complete or absent, never partial.
+
+`release-publish-github` then publishes the same 10 assets to the public mirror `thepeak99/peakbot` — the auto-updater's download host — with `GH_RELEASE_TOKEN` (Gitea secret): it waits for the tag to arrive via the push-mirror, is idempotent (an existing complete release is a no-op), uploads into a DRAFT, and publishes with `make_latest` **true for stable tags only** — RCs are prerelease and never `latest`.
+
+**Recovery (Gitea published, GitHub failed):** re-run `make release-publish-github TAG=<v>` with the assets still in `output/` (idempotent), or use the human's local, uncommitted `scripts/sync-github-mirror.sh` (`DRY_RUN=1` first, then a real run). Afterwards verify `GET https://api.github.com/repos/thepeak99/peakbot/releases/latest`.
 
 Release body + tag message = `release-notes/<v>.md` (read via `jq --rawfile` — any Markdown is safe). No `NOTES=` override, no fallback. Local re-run of the CI job: `make release TAG=X.Y.Z GITEA_TOKEN=…` (if the tag already went out, delete it locally + from origin first). Host needs: git, cargo, podman/docker, curl, jq, awk.
 
@@ -615,7 +625,7 @@ Where it lives: `src/pipeline/{delegate_tool,handoff}.rs`, `build_sub_agent` in 
 
 Two workflows on runner `shinpachi` (label `dind`):
 
-- **`ci.yml`** — `rust:1.95` container. Job `ci` = release contract tests (`sh tests/release.sh`, hermetic — Makefile targets + `release.yml`) → Node 22 frontend gate (`web/`: `npm ci` + lint/typecheck/test/build) → `cargo fmt --all -- --check` → `cargo clippy --all-targets --locked -- -D warnings` → `cargo test --workspace --locked`. Job `desktop` = the full desktop workspace (`--manifest-path desktop/Cargo.toml --workspace`) with the same fmt/clippy/test trio — after apt-installing the Tauri webkit deps (same set as `Dockerfile.desktop-linux`) and `touch`ing a placeholder sidecar binary (tauri-build requires `bundle.externalBin` to exist) — plus the Windows portable-exe static tests (`desktop/scripts/test-build-desktop-windows.sh`). No node/web build there: `desktop/ui` is committed static files.
+- **`ci.yml`** — `rust:1.95` container. Job `ci` = release contract tests (`sh tests/release.sh`, hermetic — Makefile targets + `release.yml`) → Node 22 frontend gate (`web/`: `npm ci` + lint/typecheck/test/build) → `cargo fmt --all -- --check` → `cargo clippy --all-targets --locked -- -D warnings` → `cargo test --workspace --locked`. Job `desktop` = the full desktop workspace (`--manifest-path desktop/Cargo.toml --workspace`) with the same fmt/clippy/test trio — after apt-installing the Tauri webkit deps (same set as `Dockerfile.desktop-linux`) and `touch`ing a placeholder sidecar binary (tauri-build requires `bundle.externalBin` to exist) — plus the Windows portable-exe static tests (`desktop/scripts/test-build-desktop-windows.sh`) and the auto-updater + macOS tarball contract tests (`desktop/scripts/test-updater-manifest.sh`, `desktop/scripts/test-assemble-app-tarball.sh`, after apt-installing `jq` + `zip`). No node/web build there: `desktop/ui` is committed static files.
 - **`release.yml`** — on tag push (`push: tags: ['*']`), on the `dind` runner (Alpine host driving the host docker daemon, no job container, `timeout-minutes: 180`, secret `RELEASE_TOKEN` → env `GITEA_TOKEN`): pure-git checkout, tool check, then `make release TAG=$GITHUB_REF_NAME PRUNE=1 CONTAINER_BUILDER=docker GITEA_URL=… OWNER=… REPO=…`.
 
 (Reproduce `ci` locally with exactly those commands; autofix with `cargo fmt --all` + `cargo clippy --fix --allow-dirty [--tests]`.)

@@ -42,10 +42,17 @@ fn main() {
 
     // Command ACL: every command gets generated `allow-`/`deny-`
     // permissions. `local-pages` grants the bundled pages their set;
-    // `remote-theme` grants the remote web UI (loopback :7823 only)
-    // exactly `theme_set`.
+    // `remote-web` grants the remote web UI (loopback :7823 only)
+    // exactly theme_set + the two update commands.
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
-        tauri_build::AppManifest::new().commands(&["status", "act", "theme_set", "theme_get"]),
+        tauri_build::AppManifest::new().commands(&[
+            "act",
+            "status",
+            "theme_get",
+            "theme_set",
+            "update_install",
+            "update_status",
+        ]),
     ))
     .expect("tauri-build failed");
 }

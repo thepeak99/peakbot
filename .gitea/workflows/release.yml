@@ -6,7 +6,7 @@ on:
 
 jobs:
   release:
-    name: build + publish (8 assets)
+    name: build + publish (10 assets)
     runs-on: dind
     timeout-minutes: 300
     # Runs on the Alpine host: it drives the HOST docker daemon (the dind
@@ -16,6 +16,9 @@ jobs:
       GITHUB_TOKEN: ${{ github.token }}
       # Gitea forbids secret names starting with GITEA_, hence the mapping.
       GITEA_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+      GH_RELEASE_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
     steps:
       - name: Checkout (no-node, pure git)
@@ -25,14 +28,18 @@ jobs:
             "https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git" \
             "$GITHUB_SHA"
           git checkout --detach FETCH_HEAD
-      - name: Check required tools and release token (no installs — add missing tools to the runner image)
+      - name: Check required tools and release secrets (no installs — add missing tools to the runner image)
         run: |
           for t in make curl jq docker git awk; do
             command -v "$t" >/dev/null || { echo "missing tool on runner: $t (add it to the runner image)"; exit 1; }
           done
           [ -n "$GITEA_TOKEN" ] || { echo "RELEASE_TOKEN secret missing/empty" >&2; exit 1; }
-      - name: Release (check, build 8 assets, publish)
+          [ -n "$GH_RELEASE_TOKEN" ] || { echo "GH_RELEASE_TOKEN secret missing/empty" >&2; exit 1; }
+          [ -n "$TAURI_SIGNING_PRIVATE_KEY" ] || { echo "TAURI_SIGNING_PRIVATE_KEY secret missing/empty" >&2; exit 1; }
+          [ -n "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" ] || { echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD secret missing/empty" >&2; exit 1; }
+      - name: Release (check, build 10 assets, sign updater, publish)
         run: |
           # No `origin` remote after the pure-git checkout — the Makefile
           # derives GITEA_URL/OWNER/REPO from it, so pass them explicitly.
+          # GH_RELEASE_TOKEN + TAURI_SIGNING_* ride along via the job env.
           make release TAG="$GITHUB_REF_NAME" PRUNE=1 CONTAINER_BUILDER=docker GITEA_URL="$GITHUB_SERVER_URL" OWNER="${GITHUB_REPOSITORY%/*}" REPO="${GITHUB_REPOSITORY#*/}"

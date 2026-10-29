@@ -21,7 +21,13 @@ tauri-plugin-window-state = "2.5.0"
 tauri-plugin-opener = "2.7.2"
 tauri-plugin-dialog = "2.8.3"
 tauri-plugin-log = "2.10.1"
+# Updater (spike S2): rustls TLS (no aws-lc/cmake in the graph) +
+# system proxies; `zip` dropped — we ship a raw AppImage, a raw
+# setup.exe and a .app.tar.gz (tar/flate2 are unconditional on macOS).
+tauri-plugin-updater = { version = "2.14.1", default-features = false, features = ["rustls-tls", "system-proxy"] }
 serde = { version = "1", features = ["derive"] }
+# generate_context! embeds the (plugin) config and names serde_json.
+serde_json = "1"
 log = "0.4"
 
 [target.'cfg(unix)'.dependencies]

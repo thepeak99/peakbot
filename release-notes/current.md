@@ -13,6 +13,7 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ### Features
 
+- Desktop auto-update: PeakBot Desktop now checks for updates at startup and daily (from the GitHub releases) and shows an in-app "Update available" banner plus a tray item — click to download, install and restart. This is the first auto-updating version: if you're on 0.24.x, install it manually once from the release page. The Windows portable exe doesn't auto-update (use the `setup.exe` installer), and an AppImage must be in a writable location to update in place.
 - Desktop (Windows): new NSIS installer (`PeakBot-Desktop-<v>-windows-x86_64-setup.exe`, per-user, no admin rights, downloads WebView2 if missing). The standalone exe is now named `PeakBot-Desktop-<v>-windows-x86_64-portable.exe`. Both are unsigned — SmartScreen: **More info → Run anyway**.
 - PeakBot Desktop: closing the window now keeps PeakBot running in the tray (menu bar on macOS); choose **Quit PeakBot** to stop it. The "Keep PeakBot running in background" option and the desktop settings page are gone; if an old background service is installed, the app offers to remove it on start (settings and the `peakbot` command are kept). Linux desktops without a tray ask before closing, since closing stops PeakBot.
 - Desktop: the bundled status page follows the app's light/dark theme.

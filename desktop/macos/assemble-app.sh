@@ -2,9 +2,9 @@
 #
 # assemble-app.sh <version> <desktop-bin> <sidecar-bin> <outdir>
 #
-# Hand-assemble the PeakBot Desktop .app bundle and export it as a zip
-# (desktop/DESIGN.md §5.7). The Tauri CLI cannot bundle a .app on Linux,
-# so the layout is built by hand:
+# Hand-assemble the PeakBot Desktop .app bundle and export it as BOTH a zip
+# and a .app.tar.gz (desktop/DESIGN.md §5.7). The Tauri CLI cannot bundle a
+# .app on Linux, so the layout is built by hand:
 #
 #   PeakBot Desktop.app/Contents/Info.plist
 #   PeakBot Desktop.app/Contents/MacOS/peakbot-desktop   (755)
@@ -13,7 +13,12 @@
 #
 # then ad-hoc signed with rcodesign (no cert args — it signs every nested
 # Mach-O in both slices and writes Contents/_CodeSignature/CodeResources),
-# then zipped.
+# then zipped AND tarred.
+#
+# The tarball is the auto-updater's update artifact: tauri-plugin-updater
+# extracts it with the FIRST path component stripped, so the bundle dir
+# itself must be the tar root — `tar -czf ... "PeakBot Desktop.app"`,
+# never `./` (spike S2).
 #
 # The zip entry list must stay EXACTLY the ten entries checked by
 # scripts/smoke-macos.sh S-M1 (§9.2) — don't add files to the bundle
@@ -64,4 +69,10 @@ rcodesign sign "$APP"
 rm -f "$OUTDIR/PeakBot-Desktop-$VERSION-macos-universal.zip"
 ( cd "$workdir" && zip -qry "$OUTDIR/PeakBot-Desktop-$VERSION-macos-universal.zip" "PeakBot Desktop.app" )
 
+# Updater tarball: the bundle dir as single tar root (no ./ prefix) — the
+# updater strips the first path component when extracting (spike S2).
+rm -f "$OUTDIR/PeakBot-Desktop-$VERSION-macos-universal.app.tar.gz"
+( cd "$workdir" && tar -czf "$OUTDIR/PeakBot-Desktop-$VERSION-macos-universal.app.tar.gz" "PeakBot Desktop.app" )
+
 echo "✅ $OUTDIR/PeakBot-Desktop-$VERSION-macos-universal.zip"
+echo "✅ $OUTDIR/PeakBot-Desktop-$VERSION-macos-universal.app.tar.gz"

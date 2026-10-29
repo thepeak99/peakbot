@@ -1,8 +1,10 @@
 .PHONY: all build build-linux build-macos build-windows build-android clean test docker-build help \
         web dev \
         desktop-test desktop-test-windows desktop-fonttest desktop-dev desktop-linux desktop-macos desktop-windows desktop \
+        desktop-updater \
         release release-check release-bump release-tag \
-        release-build-linux release-build-windows release-build-macos release-build-android release-publish
+        release-build-linux release-build-windows release-build-macos release-build-android \
+        release-publish release-publish-github
 
 # Config
 DOCKERFILE         := Dockerfile.windows
@@ -26,6 +28,31 @@ ORIGIN_URL := $(shell git config --get remote.origin.url 2>/dev/null)
 GITEA_URL  ?= $(shell echo $(ORIGIN_URL) | sed -E 's#(https?://[^/]+).*#\1#')
 OWNER      ?= $(shell echo $(ORIGIN_URL) | sed -E 's#https?://[^/]+/([^/]+)/.*#\1#')
 REPO       ?= $(shell basename -s .git $(ORIGIN_URL) 2>/dev/null)
+
+# GitHub mirror (public) — the auto-updater's download host; the pipeline
+# publishes the release there too (release-publish-github).
+GH_MIRROR_REPO    ?= thepeak99/peakbot
+GH_API            ?= https://api.github.com
+GH_UPLOADS        ?= https://uploads.github.com
+GH_TAG_WAIT_TRIES ?= 60
+GH_TAG_WAIT_SECS  ?= 10
+
+# The 10 release asset basenames, shared by release-publish (Gitea) and
+# release-publish-github (GitHub mirror). tests/release.sh T44 counts the
+# words of the FIRST assignment block (name + '=' + 8 names = 10), so the
+# last two entries live in the += line.
+RELEASE_ASSETS = \
+	peakbot-$$v-linux-amd64 \
+	peakbot-$$v-windows-amd64.exe \
+	PeakBot-Desktop-$$v-linux-x86_64.AppImage \
+	PeakBot-Desktop-$$v-macos-universal.zip \
+	PeakBot-Desktop-$$v-macos-universal.app.tar.gz \
+	PeakBot-Desktop-$$v-windows-x86_64-portable.exe \
+	PeakBot-Desktop-$$v-windows-x86_64-setup.exe \
+	latest.json
+RELEASE_ASSETS += \
+	peakbot-$$v-macos-universal2 \
+	peakbot-$$v-android-arm64
 
 # VERSION for release-bump: make release-bump VERSION=X.Y.Z (required, no prompt).
 VERSION ?=
@@ -172,6 +199,14 @@ desktop-macos:
 desktop-windows:
 	sh desktop/scripts/build-desktop.sh windows
 
+## desktop-updater: Sign the 3 updater artifacts + build latest.json
+##                  (Dockerfile.desktop-updater → output/desktop/*.sig ×3 +
+##                  latest.json). The signing key crosses the build boundary
+##                  as a BuildKit secret from TAURI_SIGNING_PRIVATE_KEY
+##                  (+_PASSWORD) in the environment — never in a layer/log.
+desktop-updater:
+	GH_MIRROR_REPO="$(GH_MIRROR_REPO)" sh desktop/scripts/build-desktop.sh updater
+
 ## desktop: Build all desktop artifacts (linux + macos + windows)
 desktop:
 	sh desktop/scripts/build-desktop.sh all
@@ -191,7 +226,8 @@ export PRUNE
 PRUNE_STEP = if [ "$${PRUNE}" = "1" ]; then $(CONTAINER_BUILDER) builder prune -af; fi
 
 ## release-check: Verify TAG is set and equals the Cargo.toml version, desktop
-##                version is in sync, and release-notes/<TAG>.md exists
+##                version is in sync, release-notes/<TAG>.md exists, and the
+##                tauri.conf.json updater endpoints point at GH_MIRROR_REPO
 release-check:
 	@set -eu; \
 	if [ -z "$(TAG)" ]; then \
@@ -204,16 +240,21 @@ release-check:
 	if [ ! -f "release-notes/$(TAG).md" ]; then \
 	  echo "❌ Release notes missing: release-notes/$(TAG).md"; exit 1; \
 	fi; \
+	if ! jq -r '.plugins.updater.endpoints[]?' desktop/src-tauri/tauri.conf.json 2>/dev/null | grep -qF "$(GH_MIRROR_REPO)"; then \
+	  echo "❌ tauri.conf.json plugins.updater endpoints do not contain GH_MIRROR_REPO ($(GH_MIRROR_REPO)) — the app would fetch updates from the wrong host"; exit 1; \
+	fi; \
 	echo "✅ release-check passed: TAG=$(TAG)"
 
-## release: Full release pipeline — check, build all 8 assets, publish to
-##          Gitea. CI runs this on tag push: make release TAG=<v>.
+## release: Full release pipeline — check, build all 10 assets, sign the
+##          updater artifacts, publish to Gitea, publish to the GitHub
+##          mirror. CI runs this on tag push: make release TAG=<v>.
 ##          Explicit sequential recipe of sub-make calls: the per-platform
 ##          targets (release-build-*, desktop-*) are the single source of
 ##          truth for the build commands — nothing is inlined here.
 ##          Command-line vars (TAG, PRUNE, CONTAINER_BUILDER, GITEA_URL,
 ##          OWNER, REPO, OUTPUT_DIR) propagate to the sub-makes via
-##          MAKEFLAGS; GITEA_TOKEN rides along in the environment.
+##          MAKEFLAGS; GITEA_TOKEN / GH_RELEASE_TOKEN / TAURI_SIGNING_* ride
+##          along in the environment.
 ##          Order matters: never run with -j.
 release:
 	@echo "🚀 Release $(RELEASE_VERSION) — sequential by design, do not run with -j"
@@ -228,7 +269,9 @@ release:
 	$(MAKE) desktop-windows
 	$(PRUNE_STEP)
 	$(MAKE) release-build-android
+	$(MAKE) desktop-updater
 	$(MAKE) release-publish TAG=$(TAG)
+	$(MAKE) release-publish-github TAG=$(TAG)
 
 ## release-bump: Bump to VERSION (X.Y.Z, required) on a fresh release/<v>
 ##               branch cut from origin/master — bump both Cargo.tomls (+
@@ -357,8 +400,9 @@ release-build-android:
 	echo "✅ $(OUTPUT_DIR)/peakbot-$(RELEASE_VERSION)-android-arm64"; \
 	ls -lh $(OUTPUT_DIR)/peakbot-$(RELEASE_VERSION)-android-arm64
 
-## release-publish: Create a DRAFT Gitea release (name = body source = the
-##              version), upload all 8 assets, then finalize (draft:false).
+## release-publish: Create a DRAFT Gitea release (name = version), upload
+##              all 10 RELEASE_ASSETS, then finalize (draft:false). The
+##              prerelease flag follows '-' in TAG (0.25.0-rc.1 → true).
 ##              Any failure DELETEs the draft. Requires TAG, GITEA_TOKEN and
 ##              release-notes/<TAG>.md; GITEA_URL/OWNER/REPO default to the
 ##              origin remote, OUTPUT_DIR stays overridable.
@@ -377,24 +421,20 @@ release-publish:
 	if [ ! -f "$$notes" ]; then \
 	  echo "❌ Release notes missing: $$notes (no fallback)"; exit 1; \
 	fi; \
-	assets=" \
-	  $(OUTPUT_DIR)/peakbot-$$v-linux-amd64 \
-	  $(OUTPUT_DIR)/peakbot-$$v-windows-amd64.exe \
-	  $(OUTPUT_DIR)/peakbot-$$v-macos-universal2 \
-	  $(OUTPUT_DIR)/peakbot-$$v-android-arm64 \
-	  $(OUTPUT_DIR)/desktop/PeakBot-Desktop-$$v-linux-x86_64.AppImage \
-	  $(OUTPUT_DIR)/desktop/PeakBot-Desktop-$$v-macos-universal.zip \
-	  $(OUTPUT_DIR)/desktop/PeakBot-Desktop-$$v-windows-x86_64-portable.exe \
-	  $(OUTPUT_DIR)/desktop/PeakBot-Desktop-$$v-windows-x86_64-setup.exe "; \
-	for f in $$assets; do \
-	  if [ ! -f "$$f" ]; then \
-	    echo "❌ Missing release asset: $$f"; exit 1; \
+	for n in $(RELEASE_ASSETS); do \
+	  case $$n in \
+	    peakbot-*) p="$(OUTPUT_DIR)/$$n" ;; \
+	    *) p="$(OUTPUT_DIR)/desktop/$$n" ;; \
+	  esac; \
+	  if [ ! -f "$$p" ]; then \
+	    echo "❌ Missing release asset: $$p"; exit 1; \
 	  fi; \
 	done; \
+	case $$v in *-*) prerelease=true ;; *) prerelease=false ;; esac; \
 	api="$(GITEA_URL)/api/v1/repos/$(OWNER)/$(REPO)"; \
-	echo "🚀 Creating draft Gitea release $$v at $$api/releases ..."; \
-	body=$$(jq -nc --arg tag "$$v" --arg name "$$v" --rawfile bd "$$notes" \
-	  '{tag_name:$$tag, target_commitish:"", name:$$name, body:$$bd, draft:true}'); \
+	echo "🚀 Creating draft Gitea release $$v (prerelease=$$prerelease) at $$api/releases ..."; \
+	body=$$(jq -nc --arg tag "$$v" --arg name "$$v" --argjson pre "$$prerelease" --rawfile bd "$$notes" \
+	  '{tag_name:$$tag, target_commitish:"", name:$$name, body:$$bd, draft:true, prerelease:$$pre}'); \
 	resp=$$(curl -sS -X POST "$$api/releases" \
 	  -H "Authorization: token $(GITEA_TOKEN)" \
 	  -H "Content-Type: application/json" \
@@ -405,15 +445,18 @@ release-publish:
 	fi; \
 	echo "✅ Draft release id=$$rid"; \
 	trap 'curl -sS -X DELETE "$$api/releases/$$rid" -H "Authorization: token $(GITEA_TOKEN)" >/dev/null 2>&1 || true; echo "🗑️  Deleted draft release $$rid (publish failed)"' EXIT; \
-	for f in $$assets; do \
-	  name=$$(basename "$$f"); \
-	  echo "⬆️  Uploading $$name ..."; \
-	  up=$$(curl -sS -X POST "$$api/releases/$$rid/assets?name=$$name" \
+	for n in $(RELEASE_ASSETS); do \
+	  case $$n in \
+	    peakbot-*) f="$(OUTPUT_DIR)/$$n" ;; \
+	    *) f="$(OUTPUT_DIR)/desktop/$$n" ;; \
+	  esac; \
+	  echo "⬆️  Uploading $$n ..."; \
+	  up=$$(curl -sS -X POST "$$api/releases/$$rid/assets?name=$$n" \
 	    -H "Authorization: token $(GITEA_TOKEN)" \
 	    -F "attachment=@$$f"); \
 	  url=$$(echo "$$up" | jq -r '.browser_download_url // empty'); \
 	  if [ -z "$$url" ]; then \
-	    echo "❌ Upload failed for $$name. Response:"; echo "$$up" | jq .; exit 1; \
+	    echo "❌ Upload failed for $$n. Response:"; echo "$$up" | jq .; exit 1; \
 	  fi; \
 	  echo "    → $$url"; \
 	done; \
@@ -428,6 +471,110 @@ release-publish:
 	trap - EXIT; \
 	echo "✅ Published $$v to $(GITEA_URL)/$(OWNER)/$(REPO)/releases/tag/$$v"
 
+## release-publish-github: Publish the same 10 assets to the public GitHub
+##              mirror (the auto-updater's download host). Waits for the tag
+##              to arrive (push-mirror lag: GH_TAG_WAIT_TRIES ×
+##              GH_TAG_WAIT_SECS), then: an existing PUBLISHED release with
+##              all 10 assets → no-op exit; a leftover DRAFT → deleted;
+##              otherwise create a DRAFT, upload all 10 assets (201 each),
+##              PATCH draft:false + make_latest ("true" for stable tags,
+##              "false" for '-'). Any failure DELETEs the draft. Requires
+##              TAG + GH_RELEASE_TOKEN; the token is never printed.
+release-publish-github:
+	@set -eu; \
+	if [ -z "$(TAG)" ]; then \
+	  echo "❌ TAG is not set — pass TAG=<version> (expected: $(RELEASE_VERSION))"; exit 1; \
+	fi; \
+	v="$(TAG)"; \
+	if [ -z "$(GH_RELEASE_TOKEN)" ]; then \
+	  echo "❌ GH_RELEASE_TOKEN is empty — set the GitHub release token (Gitea secret GH_RELEASE_TOKEN)"; exit 1; \
+	fi; \
+	command -v jq >/dev/null   || { echo "❌ 'jq' is required";   exit 1; }; \
+	command -v curl >/dev/null || { echo "❌ 'curl' is required"; exit 1; }; \
+	notes="release-notes/$$v.md"; \
+	if [ ! -f "$$notes" ]; then \
+	  echo "❌ Release notes missing: $$notes (no fallback)"; exit 1; \
+	fi; \
+	for n in $(RELEASE_ASSETS); do \
+	  case $$n in \
+	    peakbot-*) p="$(OUTPUT_DIR)/$$n" ;; \
+	    *) p="$(OUTPUT_DIR)/desktop/$$n" ;; \
+	  esac; \
+	  if [ ! -f "$$p" ]; then \
+	    echo "❌ Missing release asset: $$p"; exit 1; \
+	  fi; \
+	done; \
+	case $$v in *-*) prerelease=true; make_latest=false ;; *) prerelease=false; make_latest=true ;; esac; \
+	api="$(GH_API)/repos/$(GH_MIRROR_REPO)"; \
+	uploads="$(GH_UPLOADS)/repos/$(GH_MIRROR_REPO)"; \
+	auth="Authorization: Bearer $(GH_RELEASE_TOKEN)"; \
+	echo "⏳ Waiting for tag $$v on $(GH_MIRROR_REPO) (up to $(GH_TAG_WAIT_TRIES)×$(GH_TAG_WAIT_SECS)s)..."; \
+	found=0; \
+	i=1; \
+	while [ "$$i" -le "$(GH_TAG_WAIT_TRIES)" ]; do \
+	  code=$$(curl -sS -o /dev/null -w '%{http_code}' -H "$$auth" "$$api/git/ref/tags/$$v"); \
+	  if [ "$$code" = "200" ]; then found=1; break; fi; \
+	  [ "$$i" -lt "$(GH_TAG_WAIT_TRIES)" ] && sleep "$(GH_TAG_WAIT_SECS)"; \
+	  i=$$((i+1)); \
+	done; \
+	if [ "$$found" -ne 1 ]; then \
+	  echo "❌ Tag $$v never appeared on $(GH_MIRROR_REPO) after $(GH_TAG_WAIT_TRIES)×$(GH_TAG_WAIT_SECS)s (push-mirror lag?)"; exit 1; \
+	fi; \
+	resp=$$(curl -sS -H "$$auth" "$$api/releases/tags/$$v"); \
+	if printf '%s' "$$resp" | jq -e '.id' >/dev/null 2>&1; then \
+	  rid=$$(printf '%s' "$$resp" | jq -r '.id'); \
+	  draft=$$(printf '%s' "$$resp" | jq -r '.draft'); \
+	  if [ "$$draft" = "true" ]; then \
+	    echo "🗑️  Deleting leftover draft release $$rid for $$v..."; \
+	    curl -sS -X DELETE -H "$$auth" "$$api/releases/$$rid" >/dev/null; \
+	  else \
+	    missing=""; \
+	    for n in $(RELEASE_ASSETS); do \
+	      printf '%s' "$$resp" | jq -e --arg n "$$n" '[.assets[] | if type=="object" then .name else . end] | index($$n)' >/dev/null \
+	        || missing="$$missing $$n"; \
+	    done; \
+	    if [ -z "$$missing" ]; then \
+	      echo "✅ $$v already published on $(GH_MIRROR_REPO) with all 10 assets — nothing to do"; exit 0; \
+	    fi; \
+	    echo "❌ Published release for $$v is missing assets:$$missing — refusing to modify a published release (resolve manually)"; exit 1; \
+	  fi; \
+	fi; \
+	echo "🚀 Creating draft GitHub release $$v (prerelease=$$prerelease) at $$api/releases ..."; \
+	body=$$(jq -nc --arg tag "$$v" --arg name "$$v" --argjson pre "$$prerelease" --rawfile bd "$$notes" \
+	  '{tag_name:$$tag, name:$$name, body:$$bd, draft:true, prerelease:$$pre}'); \
+	resp=$$(curl -sS -X POST "$$api/releases" \
+	  -H "$$auth" \
+	  -H "Content-Type: application/json" \
+	  -d "$$body"); \
+	rid=$$(echo "$$resp" | jq -r '.id // empty'); \
+	if [ -z "$$rid" ]; then \
+	  echo "❌ Failed to create draft GitHub release. Response:"; echo "$$resp" | jq .; exit 1; \
+	fi; \
+	echo "✅ Draft release id=$$rid"; \
+	trap 'curl -sS -X DELETE -H "$$auth" "$$api/releases/$$rid" >/dev/null 2>&1 || true; echo "🗑️  Deleted draft GitHub release $$rid (publish failed)"' EXIT; \
+	for n in $(RELEASE_ASSETS); do \
+	  case $$n in \
+	    peakbot-*) f="$(OUTPUT_DIR)/$$n" ;; \
+	    *) f="$(OUTPUT_DIR)/desktop/$$n" ;; \
+	  esac; \
+	  echo "⬆️  Uploading $$n ..."; \
+	  code=$$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H "$$auth" \
+	    -F "file=@$$f" "$$uploads/releases/$$rid/assets?name=$$n"); \
+	  if [ "$$code" != "201" ]; then \
+	    echo "❌ GitHub upload failed for $$n (HTTP $$code)"; exit 1; \
+	  fi; \
+	done; \
+	echo "📢 Publishing GitHub release $$v (draft → published, make_latest=$$make_latest)..."; \
+	fresp=$$(curl -sS -X PATCH "$$api/releases/$$rid" \
+	  -H "$$auth" \
+	  -H "Content-Type: application/json" \
+	  -d "{\"draft\":false,\"make_latest\":\"$$make_latest\"}"); \
+	if ! echo "$$fresp" | jq -e '.draft == false' >/dev/null 2>&1; then \
+	  echo "❌ Failed to publish GitHub release. Response:"; echo "$$fresp" | jq .; exit 1; \
+	fi; \
+	trap - EXIT; \
+	echo "✅ Published $$v to https://github.com/$(GH_MIRROR_REPO)/releases/tag/$$v"
+
 ## help: Show this help
 help:
 	@echo "PeakBot Makefile"
@@ -441,14 +588,19 @@ help:
 	@echo "Release usage (bump → PR → merge → tag; CI runs 'make release TAG=<v>'):"
 	@echo "  make release-bump VERSION=0.2.0   # cut release/0.2.0 from origin/master, bump, promote notes, push — open a PR"
 	@echo "  make release-tag                  # after the PR merges: annotated tag from release-notes/<v>.md + push"
-	@echo "  make release TAG=0.2.0            # full pipeline: release-check, build all 8 assets, publish to Gitea"
+	@echo "  make release TAG=0.2.0            # full pipeline: release-check, build all 10 assets, sign updater,"
+	@echo "                                    # publish to Gitea + the GitHub mirror"
 	@echo "  make release TAG=0.2.0 PRUNE=1    # as above, pruning the container builder between platforms"
-	@echo "  GITEA_TOKEN                       # required for release-publish (env var or make variable)"
+	@echo "  make desktop-updater              # sign the 3 updater artifacts + build latest.json (needs signing key)"
+	@echo "  GITEA_TOKEN + GH_RELEASE_TOKEN    # required for the publish steps (env vars)"
 	@echo ""
-	@echo "Release notes: release-notes/<v>.md is required — Gitea release body + git tag message (no fallback)."
+	@echo "Release notes: release-notes/<v>.md is required — Gitea/GitHub release body + git tag message (no fallback)."
 	@echo ""
 	@echo "Environment:"
 	@echo "  CONTAINER_BUILDER  Container runtime (default: podman or docker)"
 	@echo "  GITEA_TOKEN        Gitea personal access token (required for release-publish)"
 	@echo "  GITEA_URL/OWNER/REPO  Auto-derived from origin remote — override if needed"
+	@echo "  GH_RELEASE_TOKEN   GitHub release token (required for release-publish-github, never printed)"
+	@echo "  GH_MIRROR_REPO     GitHub mirror owner/repo for latest.json + publishing (default: thepeak99/peakbot)"
+	@echo "  TAURI_SIGNING_PRIVATE_KEY(_PASSWORD)  Tauri updater signing key (required for desktop-updater)"
 	@echo "  PRUNE              1 = prune the container builder between platform builds in the release recipe"

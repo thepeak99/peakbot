@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
-  "identifier": "remote-theme",
-  "description": "The PeakBot web UI on the default loopback backend: report the theme so the native window chrome follows it. Nothing else, ever.",
+  "identifier": "remote-web",
+  "description": "The PeakBot web UI on the default loopback backend: report the theme, read the update state, and start an update. Nothing else, ever.",
   "local": false,
   "windows": ["main"],
   "remote": {
@@ -12,5 +12,5 @@
       "https://localhost:7823/*"
     ]
   },
-  "permissions": ["allow-theme-set"]
+  "permissions": ["allow-theme-set", "allow-update-status", "allow-update-install"]
 }

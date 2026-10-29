@@ -10,6 +10,7 @@ mod sidecar_payload;
 #[cfg(target_os = "linux")]
 mod tls_trust;
 mod tray;
+mod updater;
 mod window;
 
 use std::sync::Arc;
@@ -127,6 +128,13 @@ fn main() {
         }
     }
 
+    // macOS: the app menu is built at `builder.menu()` time — before
+    // `setup` — so `UiState` must exist here (its `update` item is
+    // stored for the updater thread).
+    let ui_state = Arc::new(bridge::UiState::new());
+    // A clone for the macOS menu closure: `setup` moves the original.
+    #[cfg(target_os = "macos")]
+    let menu_ui_state = ui_state.clone();
     let builder = tauri::Builder::default()
         // FIRST: a second launch focuses the existing window.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -148,11 +156,16 @@ fn main() {
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // Requires `plugins.updater.pubkey` in tauri.conf.json (plan
+        // "Glue"); the endpoints + pubkey stay in the config.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             commands::status,
             commands::act,
             commands::theme_set,
-            commands::theme_get
+            commands::theme_get,
+            commands::update_status,
+            commands::update_install
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -163,13 +176,15 @@ fn main() {
             );
 
             let paths = build_paths(&handle)?;
-            let ui_state = Arc::new(bridge::UiState::new());
 
             app.manage(ui_state.clone());
             app.manage(paths.clone());
 
             window::create_main(&handle, ui_state.nav.clone())?;
             tray::create(&handle, &ui_state)?;
+            // The updater thread (plan "Glue"): a no-op with a log line
+            // when this build is not updatable (portable/dev).
+            updater::spawn(&handle);
 
             // Controller thread (DESIGN §4.1): one owner of the session
             // child + phase; all long work is serialized there.
@@ -194,7 +209,7 @@ fn main() {
     // the tab bar closes a conversation tab (issue #373). Never on Linux:
     // `Builder::menu` would add a GTK menubar there.
     #[cfg(target_os = "macos")]
-    let builder = builder.menu(menu::app_menu);
+    let builder = builder.menu(move |app| menu::app_menu(app, &menu_ui_state));
 
     let app = builder
         .build(tauri::generate_context!())
@@ -225,9 +240,14 @@ fn main() {
 
 /// `RunEvent::Exit` (DESIGN §4.6): set `quitting`, send `Shutdown(ack)`,
 /// wait at most 6 s for the ack, then let the process exit.
-fn shutdown(app: &tauri::AppHandle) {
-    if let Some(quitting) = app.try_state::<Arc<AtomicBool>>() {
-        quitting.store(true, Ordering::SeqCst);
+/// Idempotent: the updater's restart path (and Windows' `on_before_exit`
+/// hook) reaches the same exit with the flag already set.
+pub(crate) fn shutdown(app: &tauri::AppHandle) {
+    let Some(quitting) = app.try_state::<Arc<AtomicBool>>() else {
+        return;
+    };
+    if quitting.swap(true, Ordering::SeqCst) {
+        return;
     }
     let Some(tx) = app.try_state::<commands::ActionTx>() else {
         return;
