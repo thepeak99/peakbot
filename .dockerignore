@@ -12,6 +12,10 @@
 #   Dockerfile.desktop-windows → desktop/ (minus heavy intermediates) and
 #                              output/peakbot-windows-amd64-msvc.exe (sidecar,
 #                              staged by desktop/scripts/build-desktop.sh)
+#   Dockerfile.desktop-updater → output/desktop/ (the 3 updater artifacts),
+#                              desktop/src-tauri/tauri.conf.json,
+#                              desktop/scripts/updater-manifest.sh,
+#                              release-notes/<v>.md
 
 # VCS
 .git
@@ -21,11 +25,13 @@ target/
 desktop/target/
 
 # Release artifacts: keep ONLY the unversioned sidecars that the desktop
-# Dockerfiles COPY in (everything else is previous output)
+# Dockerfiles COPY in (everything else is previous output) plus the
+# versioned updater artifacts Dockerfile.desktop-updater signs
 output/*
 !output/peakbot-linux-amd64
 !output/peakbot-macos-universal2
 !output/peakbot-windows-amd64-msvc.exe
+!output/desktop/
 *.tar
 
 # Desktop build intermediates (regenerated in-container; the local debug
@@ -50,3 +56,7 @@ docs/
 examples/
 release-notes/
 *.md
+# Release notes are release input, not doc noise — re-include them
+# (negations only work after the exclusions above)
+!release-notes/
+!release-notes/*.md

@@ -1059,6 +1059,120 @@ else
     bad "T54 release.yml: GH_RELEASE_TOKEN + TAURI_SIGNING* secrets → env, non-empty preflight before make release ($why)"
 fi
 
+# ── J: .dockerignore — the updater signing build context ───────────────────
+
+# T55: every path Dockerfile.desktop-updater COPYs must survive
+# .dockerignore. 0.25.0-rc.1 died in the desktop-updater step with
+# "release-notes/0.25.0-rc.1.md: not found" — the root .dockerignore
+# excluded output/* (only the 3 unversioned sidecars re-included),
+# release-notes/ and *.md, so the 3 updater artifacts + the notes file
+# never reached the build context. Simulated with git check-ignore (same
+# pattern semantics as docker/podman): parse the COPY sources, substitute
+# the ARGs (VERSION / NOTES), and require each path NOT to be ignored —
+# while stale output/ and root *.md stay excluded.
+T55V=0.25.0-rc.1
+T55D=$(mktemp -d); workdirs="$workdirs $T55D"
+git init -q "$T55D"
+cp .dockerignore "$T55D/.gitignore"
+t55_srcs=$(grep -E '^[[:space:]]*COPY' Dockerfile.desktop-updater \
+    | grep -vF -- '--from=' | awk '
+        { for (i = 1; i <= NF; i++)
+            if ($i != "COPY" && $i !~ /^--/) { print $i; break } }')
+t55_paths=$(printf '%s\n' "$t55_srcs" \
+    | sed -e "s/\${VERSION}/$T55V/g" -e "s/\${NOTES}/release-notes\/$T55V.md/g")
+t55_expected="output/desktop/PeakBot-Desktop-$T55V-linux-x86_64.AppImage
+output/desktop/PeakBot-Desktop-$T55V-windows-x86_64-setup.exe
+output/desktop/PeakBot-Desktop-$T55V-macos-universal.app.tar.gz
+desktop/src-tauri/tauri.conf.json
+desktop/scripts/updater-manifest.sh
+release-notes/$T55V.md"
+t55=1; why=""
+fail55() { t55=0; why="${why}${why:+; }$1"; }
+[ -n "$t55_srcs" ] || fail55 "no COPY sources parsed from Dockerfile.desktop-updater"
+[ "$t55_paths" = "$t55_expected" ] \
+    || fail55 "parsed COPY sources differ from the 6 expected (Dockerfile changed?)"
+for p in $t55_expected; do
+    if git -C "$T55D" check-ignore --no-index --quiet -- "$p" 2>/dev/null; then
+        fail55 "$p is excluded by .dockerignore"
+    fi
+done
+if ! git -C "$T55D" check-ignore --no-index --quiet -- output/stale-peakbot 2>/dev/null; then
+    fail55 "output/stale-peakbot NOT excluded (output/* broken?)"
+fi
+if ! git -C "$T55D" check-ignore --no-index --quiet -- README.md 2>/dev/null; then
+    fail55 "README.md NOT excluded (*.md broken?)"
+fi
+if [ "$t55" -eq 1 ]; then
+    ok "T55 .dockerignore: all Dockerfile.desktop-updater COPY sources reach the build context"
+else
+    bad "T55 .dockerignore: updater build context ($why)"
+fi
+
+# T56: release-bump with a PRERELEASE VERSION (9.9.10-rc.1) — branch
+# release/<v>, both Cargo.tomls bumped, release-notes/<v>.md created from
+# current.md's first `## ` section, and current.md left UNTOUCHED (notes
+# keep accumulating for the stable release). T38-style fixture.
+fresh_work
+printf -- '- T56 sentinel draft entry.\n' >> "$F/work/release-notes/current.md"
+git -C "$F/work" commit -qam "test: seed notes draft"
+git -C "$F/work" push -q origin master
+fresh_work
+cp "$F/work/release-notes/current.md" "$F/t56_current_before"
+awk '/^## /{f=1} f' "$F/work/release-notes/current.md" > "$F/t56_expected_notes"
+run_bump "9.9.10-rc.1"
+t56=1; why=""
+fail56() { t56=0; why="${why}${why:+; }$1"; }
+[ "$B_RC" -eq 0 ] || fail56 "rc=$B_RC: $(printf '%s' "$B_OUT" | grep '❌' | head -1)"
+branch=$(git -C "$F/work" rev-parse --abbrev-ref HEAD 2>/dev/null)
+[ "$branch" = "release/9.9.10-rc.1" ] || fail56 "on branch '$branch', want release/9.9.10-rc.1"
+rv=$(awk '/^\[package\]/{p=1} p && /^version[[:space:]]*=/{gsub(/[" ]/,"",$3); print $3; exit}' "$F/work/Cargo.toml")
+[ "$rv" = "9.9.10-rc.1" ] || fail56 "Cargo.toml version $rv"
+dv=$(awk '/^\[workspace\.package\]/{p=1} p && /^version[[:space:]]*=/{gsub(/[" ]/,"",$3); print $3; exit}' "$F/work/desktop/Cargo.toml")
+[ "$dv" = "9.9.10-rc.1" ] || fail56 "desktop/Cargo.toml version $dv"
+committed=$(git -C "$F/work" show --name-only --format= HEAD 2>/dev/null)
+for f in Cargo.toml desktop/Cargo.toml release-notes/9.9.10-rc.1.md; do
+    printf '%s\n' "$committed" | grep -qx "$f" || fail56 "HEAD commit does not touch $f"
+done
+printf '%s\n' "$committed" | grep -qx 'release-notes/current.md' \
+    && fail56 "HEAD commit touches release-notes/current.md (RC must leave it untouched)"
+cmp -s "$F/t56_expected_notes" "$F/work/release-notes/9.9.10-rc.1.md" 2>/dev/null \
+    || fail56 "release-notes/9.9.10-rc.1.md is not current.md from first '## '"
+cmp -s "$F/t56_current_before" "$F/work/release-notes/current.md" 2>/dev/null \
+    || fail56 "release-notes/current.md was modified (RC must keep accumulating)"
+[ -n "$(git -C "$F/work" ls-remote origin refs/heads/release/9.9.10-rc.1 2>/dev/null)" ] \
+    || fail56 "release/9.9.10-rc.1 not pushed to origin"
+if [ "$t56" -eq 1 ]; then
+    ok "T56 release-bump: prerelease (RC) keeps current.md, creates the notes copy"
+else
+    bad "T56 release-bump: prerelease (RC) keeps current.md, creates the notes copy ($why)"
+fi
+# Restore the shared fixture origin (tests stay independent).
+git -C "$F/origin.git" update-ref refs/heads/master "$(git -C "$root" rev-parse HEAD)"
+
+# T57: release-bump still rejects non-semver VERSIONs: '1.2' (too short)
+# and '1.2.3_x' (underscore is not a semver identifier char).
+fresh_work
+run_bump "1.2"
+t57=1; why=""
+fail57() { t57=0; why="${why}${why:+; }$1"; }
+if [ "$B_RC" -ne 0 ] && printf '%s' "$B_OUT" | grep -qi 'invalid'; then
+    :
+else
+    fail57 "VERSION=1.2 not rejected (rc=$B_RC: $(printf '%s' "$B_OUT" | head -1))"
+fi
+fresh_work
+run_bump "1.2.3_x"
+if [ "$B_RC" -ne 0 ] && printf '%s' "$B_OUT" | grep -qi 'invalid'; then
+    :
+else
+    fail57 "VERSION=1.2.3_x not rejected (rc=$B_RC: $(printf '%s' "$B_OUT" | head -1))"
+fi
+if [ "$t57" -eq 1 ]; then
+    ok "T57 release-bump: '1.2' and '1.2.3_x' still rejected"
+else
+    bad "T57 release-bump: '1.2' and '1.2.3_x' still rejected ($why)"
+fi
+
 # ── Summary ────────────────────────────────────────────────────────────────
 
 echo ""
