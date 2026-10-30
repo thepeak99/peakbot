@@ -1,6 +1,7 @@
 // Composer chip for one pending attachment: a 64×64 thumbnail for images the
 // browser can render, otherwise an icon chip (tinted glyph + ext + name + size).
 
+import { useState } from "react";
 import type { Pending } from "../useAttachments";
 import {
   GROUP_STYLE,
@@ -10,6 +11,7 @@ import {
   isThumbnailable,
   middleTruncate,
 } from "../fileTypes";
+import { Lightbox } from "./Lightbox";
 
 const NO_VISION = "Model can't view images — sent as file";
 const TOO_BIG_FOR_MODEL =
@@ -80,6 +82,7 @@ export function AttachmentChip({
   const mime = chip.state === "done" ? chip.attachment.mime : chip.file.type;
   const warn = visionWarning(chip, supportsVision);
   const errored = chip.state === "error";
+  const [open, setOpen] = useState(false);
   // Done chips fall back to the served file if no local preview survived.
   const src =
     chip.preview ??
@@ -89,21 +92,35 @@ export function AttachmentChip({
 
   if (isThumbnailable(mime) && src && !errored) {
     return (
-      <div className="relative h-16 w-16 overflow-hidden rounded-md border border-zinc-700">
-        <img src={src} alt={name} className="h-full w-full object-cover" />
-        <div className="absolute right-0.5 top-0.5">
-          <RemoveButton name={name} onClick={onRemove} />
+      <>
+        <div className="relative h-16 w-16 overflow-hidden rounded-md border border-zinc-700">
+          <img
+            src={src}
+            alt={name}
+            onClick={() => setOpen(true)}
+            className="h-full w-full cursor-zoom-in object-cover"
+          />
+          <div className="absolute right-0.5 top-0.5">
+            <RemoveButton name={name} onClick={onRemove} />
+          </div>
+          {warn && (
+            <span
+              title={warn}
+              className="absolute bottom-1 left-0.5 rounded bg-zinc-950/80 px-0.5 text-[11px] leading-none text-amber-400"
+            >
+              ⚠
+            </span>
+          )}
+          {chip.state === "uploading" && <ProgressBar fraction={chip.progress} />}
         </div>
-        {warn && (
-          <span
-            title={warn}
-            className="absolute bottom-1 left-0.5 rounded bg-zinc-950/80 px-0.5 text-[11px] leading-none text-amber-400"
-          >
-            ⚠
-          </span>
+        {open && (
+          <Lightbox
+            images={[{ id: src, name, url: src }]}
+            start={0}
+            onClose={() => setOpen(false)}
+          />
         )}
-        {chip.state === "uploading" && <ProgressBar fraction={chip.progress} />}
-      </div>
+      </>
     );
   }
 

@@ -3,14 +3,15 @@
 
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
-import type { AttachmentView } from "../types";
 
+// Callers pass either full AttachmentViews or bare {id,name,url} (markdown
+// images) — the viewer only reads these three fields.
 export function Lightbox({
   images,
   start,
   onClose,
 }: {
-  images: AttachmentView[];
+  images: { id: string; name: string; url: string }[];
   start: number;
   onClose: () => void;
 }) {

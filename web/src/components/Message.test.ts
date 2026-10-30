@@ -186,7 +186,11 @@ describe("markdown image rendering (CachedImage)", () => {
     }
   });
 
-  it("wraps the <img> in an anchor to the same src and sets loading=lazy", async () => {
+  it("renders the <img> without an anchor wrapper and with cursor-zoom-in", async () => {
+    // RED (image-lightbox): CachedImage currently wraps the <img> in
+    // <a href={src} target="_blank" rel="noreferrer">. New contract: the
+    // anchor is gone and the <img> itself signals "click to zoom" — the
+    // lightbox opens on click (see the cases below).
     const { el, unmount } = await renderMessage({
       ...full(),
       content: "![x](/images/abc.png)",
@@ -195,9 +199,139 @@ describe("markdown image rendering (CachedImage)", () => {
       const img = el.querySelector("img");
       expect(img).not.toBeNull();
       expect(img!.getAttribute("loading")).toBe("lazy");
-      const anchor = img!.closest("a");
-      expect(anchor).not.toBeNull();
-      expect(anchor!.getAttribute("href")).toBe("/images/abc.png");
+      expect(img!.closest("a"), "markdown images are no longer anchor-wrapped").toBeNull();
+      expect(img!.getAttribute("class")).toContain("cursor-zoom-in");
+    } finally {
+      await unmount();
+    }
+  });
+
+  it("opens the Lightbox when a markdown image is clicked", async () => {
+    const { el, unmount } = await renderMessage({
+      ...full(),
+      content: "![x](/images/abc.png)",
+    });
+    try {
+      const img = el.querySelector("img");
+      expect(img).not.toBeNull();
+      expect(document.querySelector('[role="dialog"]')).toBeNull();
+      await act(async () => {
+        img!.click();
+      });
+      const dialog = document.querySelector('[role="dialog"][aria-modal="true"]');
+      expect(dialog, "clicking a markdown image opens a modal dialog").not.toBeNull();
+      expect(dialog!.parentElement, "the Lightbox portals into document.body").toBe(
+        document.body,
+      );
+      // The src now appears twice: inline in the message + full size in the
+      // lightbox — the lightbox must show the same src that was clicked.
+      expect(document.querySelectorAll('img[src="/images/abc.png"]')).toHaveLength(2);
+    } finally {
+      await unmount();
+    }
+  });
+
+  it("closes the Lightbox with the ✕ close button when a markdown image is open", async () => {
+    const { el, unmount } = await renderMessage({
+      ...full(),
+      content: "![x](/images/abc.png)",
+    });
+    try {
+      const img = el.querySelector("img");
+      expect(img).not.toBeNull();
+      await act(async () => {
+        img!.click();
+      });
+      expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+      const close = document.querySelector<HTMLButtonElement>(
+        '[role="dialog"] button[aria-label="Close"]',
+      );
+      expect(close, "the lightbox exposes an aria-label=Close button").not.toBeNull();
+      await act(async () => {
+        close!.click();
+      });
+      expect(
+        document.querySelector('[role="dialog"]'),
+        "the ✕ button closes the lightbox",
+      ).toBeNull();
+    } finally {
+      await unmount();
+    }
+  });
+
+  it("closes the Lightbox on Escape when a markdown image is open", async () => {
+    const { el, unmount } = await renderMessage({
+      ...full(),
+      content: "![x](/images/abc.png)",
+    });
+    try {
+      const img = el.querySelector("img");
+      expect(img).not.toBeNull();
+      await act(async () => {
+        img!.click();
+      });
+      expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+      // Dispatch on document: a window-level listener still receives it via
+      // bubbling, so either wiring is covered.
+      await act(async () => {
+        document.dispatchEvent(
+          new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+        );
+      });
+      expect(
+        document.querySelector('[role="dialog"]'),
+        "Escape should close the lightbox",
+      ).toBeNull();
+    } finally {
+      await unmount();
+    }
+  });
+
+  it("does not open a Lightbox when the muted fallback stub is clicked (unrenderable src)", async () => {
+    // The 🖼 fallback (non-renderable src) is unchanged and must NOT be
+    // clickable into a lightbox.
+    const { el, unmount } = await renderMessage({
+      ...full(),
+      content: "![chart](out/chart.png)",
+    });
+    try {
+      const span = el.querySelector<HTMLElement>("span[title='out/chart.png']");
+      expect(span).not.toBeNull();
+      expect(span!.textContent).toContain("🖼 chart");
+      await act(async () => {
+        span!.click();
+      });
+      expect(
+        document.querySelector('[role="dialog"]'),
+        "the fallback stub must not open a lightbox",
+      ).toBeNull();
+    } finally {
+      await unmount();
+    }
+  });
+
+  it("does not open a Lightbox when the muted fallback stub is clicked (load failed)", async () => {
+    // Same contract for the onError fallback: once the image degrades to the
+    // 🖼 stub, clicking it does nothing.
+    const { el, unmount } = await renderMessage({
+      ...full(),
+      content: "![chart](/images/deadbeef.png)",
+    });
+    try {
+      const img = el.querySelector("img");
+      expect(img).not.toBeNull();
+      await act(async () => {
+        img!.dispatchEvent(new Event("error"));
+      });
+      const span = el.querySelector<HTMLElement>("span[title='/images/deadbeef.png']");
+      expect(span).not.toBeNull();
+      await act(async () => {
+        span!.click();
+      });
+      expect(
+        document.querySelector('[role="dialog"]'),
+        "the fallback stub must not open a lightbox",
+      ).toBeNull();
     } finally {
       await unmount();
     }
