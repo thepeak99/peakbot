@@ -151,15 +151,25 @@ html.light .markdown-body a {
 .ctab-scroll.fade-l { -webkit-mask-image: linear-gradient(to left, #000 calc(100% - 28px), transparent); mask-image: linear-gradient(to left, #000 calc(100% - 28px), transparent); }
 .ctab-scroll.fade-l.fade-r { -webkit-mask-image: linear-gradient(to right, transparent, #000 28px, #000 calc(100% - 28px), transparent); mask-image: linear-gradient(to right, transparent, #000 28px, #000 calc(100% - 28px), transparent); }
 
-.ctab { position: relative; display: flex; align-items: center; gap: 6px;
-        flex: 0 1 200px; min-width: 120px; max-width: 200px; height: 31px;
-        padding: 0 28px 0 10px; font-size: 12px; line-height: 1; cursor: pointer; user-select: none;
+/* Browser-style shrinking tabs (fix/tab-shrink). .ctab starts at 200px and
+   shrinks evenly (flex: 0 1 200px) down to the 36px floor, then the strip
+   scrolls. container-type: inline-size lets the @container rules below
+   react to each tab's OWN width — progressive degradation, pure CSS.
+   The ✕ is absolutely positioned inside the reserved 18px right padding,
+   so a 36px tab still fits icon + ✕ without the flex row overflowing. */
+.ctab { position: relative; display: flex; align-items: center; gap: 4px;
+        container-type: inline-size; width: 200px; flex: 0 1 200px;
+        min-width: 36px; max-width: 200px; height: 31px;
+        padding: 0 18px 0 5px; font-size: 12px; line-height: 1; cursor: pointer; user-select: none;
         color: var(--color-zinc-500); border: 1px solid transparent; border-bottom: 0;
         border-radius: 6px 6px 0 0; }
 .ctab:hover { background: color-mix(in oklab, var(--color-zinc-900) 70%, transparent); color: var(--color-zinc-300); }
 .ctab.active { background: var(--color-zinc-900); color: var(--color-zinc-100);
                border-color: var(--color-zinc-800); margin-bottom: -1px; height: 32px;
                box-shadow: inset 0 2px 0 var(--color-emerald-500, #10b981); }
+.ctab .icon { width: 12px; height: 12px; flex: none; border-radius: 9999px;
+              background: var(--color-zinc-600, #52525b); }
+.ctab.active .icon { background: var(--color-zinc-400, #a1a1aa); }
 .ctab .title { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ctab .title.untitled { font-style: italic; }
 /* status slot: only rendered when there is something to say */
@@ -168,7 +178,7 @@ html.light .markdown-body a {
               animation: ctspin 0.9s linear infinite; }
 .ctab .unread { width: 6px; height: 6px; flex: none; border-radius: 9999px; background: var(--color-sky-400, #38bdf8); margin: 0 2px; }
 @keyframes ctspin { to { transform: rotate(360deg); } }
-.ctab .x { position: absolute; right: 5px; top: 50%; transform: translateY(-50%);
+.ctab .x { position: absolute; right: 2px; top: 50%; transform: translateY(-50%);
            width: 18px; height: 18px; border-radius: 4px; display: none; align-items: center; justify-content: center;
            font-size: 14px; color: var(--color-zinc-500); background: transparent; border: 0; cursor: pointer; }
 .ctab:hover .x, .ctab.active .x { display: flex; }
@@ -178,12 +188,26 @@ html.light .markdown-body a {
 /* hover on a tab shows × AND a tint so the hover is obvious in a still */
 .ctab:hover .title { -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 6px), transparent); }
 
+/* Progressive degradation keyed to the tab's own width. Container content
+   box = outer − 25px (1px borders × 2 + 5px + 18px padding), so:
+     outer ≤ 79px → content ≤ 54px → title hidden (icon only)
+     outer ≤ 47px → content ≤ 22px → inactive tabs lose the ✕ (the ACTIVE
+     tab always keeps it — every ✕-hiding selector carries :not(.active)).
+   These blocks sit AFTER `.ctab:hover .x` so that on a specificity tie the
+   narrow-width rule wins. The .icon is never hidden at any width. */
+@container (max-width: 54px) {
+  .ctab .title { display: none; }
+}
+@container (max-width: 22px) {
+  .ctab:not(.active) .x { display: none; }
+}
+
 .ctab-btn { align-self: center; flex: none; width: 26px; height: 26px; display: flex; align-items: center; justify-content: center;
             border-radius: 6px; border: 1px solid transparent; background: transparent; color: var(--color-zinc-400);
             font-size: 15px; cursor: pointer; }
 .ctab-btn:hover { background: var(--color-zinc-800); color: var(--color-zinc-200); }
 .ctab-btn.plus { margin-left: 2px; }
-.ctab-btn.arrow { width: 22px; font-size: 13px; }
+.ctab-btn.arrow { width: 22px; font-size: 13px; line-height: 1; user-select: none; }
+.ctab-btn.arrow:hover:not(:disabled) { background: var(--color-zinc-800); color: var(--color-zinc-200); }
+.ctab-btn[disabled] { opacity: .35; cursor: default; }
 .ctab-btn[hidden] { display: none; }
-.ctab-spacer { flex: 1 1 0; min-width: 0; }
-.ctab-count { align-self: center; font: 500 10px/1 ui-monospace, monospace; color: var(--color-zinc-500); padding: 0 4px; }
