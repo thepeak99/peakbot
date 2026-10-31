@@ -86,6 +86,9 @@ use uuid::Uuid;
 mod conversations;
 mod images;
 pub mod registry;
+// T5 lands the client ahead of its callers (relay T6, list T7, proxy T8).
+#[allow(dead_code)]
+mod remote;
 pub mod settings;
 pub mod system;
 #[cfg(test)]

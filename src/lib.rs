@@ -913,7 +913,7 @@ fn load_fresh_config(
 }
 
 /// `<first error> (+N more)` — one chat line for a whole error list.
-fn config_errors_summary(errors: &crate::config::ConfigErrors) -> String {
+pub(crate) fn config_errors_summary(errors: &crate::config::ConfigErrors) -> String {
     let Some(first) = errors.0.first() else {
         return "invalid config".to_string();
     };
