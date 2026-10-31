@@ -127,7 +127,9 @@ impl Ui for StdioUi {
         });
 
         // `ready` must precede `models_available`.
-        let _ = out_tx.send(OutboundMessage::Ready);
+        let _ = out_tx.send(OutboundMessage::Ready {
+            v: crate::ui::wire::PROTOCOL_VERSION,
+        });
         if !self.models.is_empty() {
             let _ = out_tx.send(OutboundMessage::ModelsAvailable {
                 active: self.active_alias.clone(),

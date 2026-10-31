@@ -45,6 +45,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// Wire protocol version, sent in `ready`. Bump it on any incompatible wire change.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 /// Inbound message types from the client.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -54,6 +57,15 @@ pub(crate) enum InboundMessage {
     /// mints a fresh session and reports the real id via `Attached`).
     Attach {
         convo: Option<String>,
+        /// Bind a fresh conversation to this profile (ignored once it has turns).
+        #[serde(default)]
+        profile: Option<String>,
+        /// With `profile`: the agent to start on; absent = the profile's first.
+        #[serde(default)]
+        agent: Option<String>,
+        /// Set only by a relay; forbids chaining remote profiles.
+        #[serde(default)]
+        relayed: bool,
     },
     /// `text` may be a slash command (`/new`, `/load <id>`, …) — peakbot
     /// classifies it internally.
@@ -110,6 +122,10 @@ pub(crate) enum InboundMessage {
     /// End an active session for *everyone* attached to it (dropdown "kill").
     KillSession {
         convo: String,
+        /// Routing hint for a relay; the local path ignores it.
+        #[serde(default)]
+        #[allow(dead_code)] // first reader is the T6 relay's kill routing
+        profile: Option<String>,
     },
     Shutdown,
 }
@@ -250,7 +266,11 @@ pub(crate) struct ConversationSummaryWire {
 pub(crate) enum OutboundMessage {
     /// Handshake, sent once before any user input so the client can render
     /// the welcome banner.
-    Ready,
+    /// `v` is [`PROTOCOL_VERSION`]; a build that predates it omits `v` (reads as 0).
+    Ready {
+        #[serde(default)]
+        v: u32,
+    },
     /// Reply to the first `Attach`: the real conversation id this socket is
     /// bound to. The client writes it into the URL (`?convo=…`) so a refresh
     /// or bookmark re-attaches to the same live session.
@@ -312,9 +332,21 @@ pub(crate) fn build_conversations_snapshot(
     active_ids: &std::collections::HashSet<uuid::Uuid>,
     running_ids: &std::collections::HashSet<uuid::Uuid>,
 ) -> Vec<ConversationSummaryWire> {
-    sm.list_conversations()
-        .unwrap_or_default()
-        .into_iter()
+    summaries_to_wire(
+        sm.list_conversations().unwrap_or_default(),
+        active_ids,
+        running_ids,
+    )
+}
+
+/// Storage rows → wire rows with the registry's active/running flags. Split
+/// out so the HTTP list can run without a session's `StateManager`.
+pub(crate) fn summaries_to_wire(
+    rows: Vec<crate::storage::ConversationSummary>,
+    active_ids: &std::collections::HashSet<uuid::Uuid>,
+    running_ids: &std::collections::HashSet<uuid::Uuid>,
+) -> Vec<ConversationSummaryWire> {
+    rows.into_iter()
         .map(|s| ConversationSummaryWire {
             active: active_ids.contains(&s.id),
             running: running_ids.contains(&s.id),
@@ -482,18 +514,21 @@ mod tests {
     fn attach_parses_with_and_without_convo() {
         let with: InboundMessage =
             serde_json::from_str(r#"{"type":"attach","convo":"abc-123"}"#).unwrap();
-        assert!(matches!(with, InboundMessage::Attach { convo: Some(c) } if c == "abc-123"));
+        assert!(matches!(with, InboundMessage::Attach { convo: Some(c), .. } if c == "abc-123"));
 
         let without: InboundMessage =
             serde_json::from_str(r#"{"type":"attach","convo":null}"#).unwrap();
-        assert!(matches!(without, InboundMessage::Attach { convo: None }));
+        assert!(matches!(
+            without,
+            InboundMessage::Attach { convo: None, .. }
+        ));
     }
 
     #[test]
     fn kill_session_parses() {
         let m: InboundMessage =
             serde_json::from_str(r#"{"type":"kill_session","convo":"xyz"}"#).unwrap();
-        assert!(matches!(m, InboundMessage::KillSession { convo } if convo == "xyz"));
+        assert!(matches!(m, InboundMessage::KillSession { convo, .. } if convo == "xyz"));
     }
 
     // ── T7 — send_message attachments (file-uploads design §5.3) ───────────
@@ -1178,5 +1213,140 @@ mod tests {
             None,
             "a profile-less conversation must carry None, not a guess"
         );
+    }
+
+    // ── remote profiles T4: wire deltas (design §6.1, §9 T4) ────────────
+    //
+    // All additive and serde-lenient: old payloads (no `profile` / `agent` /
+    // `relayed` / `v`) keep parsing with their legacy reading.
+    // `PROTOCOL_VERSION` is the single source of truth — one const here,
+    // exact match on the relay (locked decision Q-A, 2026-10-31).
+
+    /// Locked decision: `PROTOCOL_VERSION` is defined once in
+    // `src/ui/wire.rs` and is 1 (bumped on ANY incompatible wire change).
+    #[test]
+    fn protocol_version_is_one() {
+        assert_eq!(PROTOCOL_VERSION, 1, "the locked protocol version is 1");
+    }
+
+    #[test]
+    fn attach_parses_with_profile_agent_and_relayed() {
+        let m: InboundMessage = serde_json::from_str(
+            r#"{"type":"attach","convo":null,"profile":"home-dev","agent":"team","relayed":true}"#,
+        )
+        .expect("the extended attach frame must parse");
+        match m {
+            InboundMessage::Attach {
+                convo,
+                profile,
+                agent,
+                relayed,
+            } => {
+                assert!(convo.is_none(), "a fresh attach carries convo:null");
+                assert_eq!(profile.as_deref(), Some("home-dev"));
+                assert_eq!(agent.as_deref(), Some("team"));
+                assert!(relayed, "the relayed marker must parse");
+            }
+            other => panic!("expected Attach, got {other:?}"),
+        }
+    }
+
+    /// Old SPA payloads (pre-remote-profiles) omit all three new fields —
+    /// they must still parse with the legacy reading: no profile, no agent,
+    /// not relayed.
+    #[test]
+    fn attach_old_payload_without_new_fields_still_parses() {
+        let m: InboundMessage = serde_json::from_str(r#"{"type":"attach","convo":null}"#)
+            .expect("an old attach frame must keep parsing");
+        match m {
+            InboundMessage::Attach {
+                profile,
+                agent,
+                relayed,
+                ..
+            } => {
+                assert!(profile.is_none(), "absent profile reads as None");
+                assert!(agent.is_none(), "absent agent reads as None");
+                assert!(
+                    !relayed,
+                    "absent relayed reads as false (a browser is never a relay)"
+                );
+            }
+            other => panic!("expected Attach, got {other:?}"),
+        }
+    }
+
+    /// `relayed` is a `#[serde(default)]` bool: explicit `false` must be
+    /// indistinguishable from absent — a normal attach.
+    #[test]
+    fn attach_relayed_false_explicit_is_a_normal_attach() {
+        let m: InboundMessage =
+            serde_json::from_str(r#"{"type":"attach","convo":null,"relayed":false}"#)
+                .expect("an explicit relayed:false must parse");
+        assert!(
+            matches!(m, InboundMessage::Attach { relayed: false, .. }),
+            "explicit false must read as a normal attach"
+        );
+    }
+
+    #[test]
+    fn kill_session_parses_with_optional_profile() {
+        let m: InboundMessage =
+            serde_json::from_str(r#"{"type":"kill_session","convo":"abc","profile":"home-dev"}"#)
+                .expect("the extended kill_session frame must parse");
+        match m {
+            InboundMessage::KillSession { convo, profile } => {
+                assert_eq!(convo, "abc");
+                assert_eq!(profile.as_deref(), Some("home-dev"));
+            }
+            other => panic!("expected KillSession, got {other:?}"),
+        }
+
+        // Old frame: no profile key (the local path ignores it anyway).
+        let old: InboundMessage = serde_json::from_str(r#"{"type":"kill_session","convo":"abc"}"#)
+            .expect("an old kill_session frame must keep parsing");
+        assert!(
+            matches!(old, InboundMessage::KillSession { profile: None, .. }),
+            "absent profile reads as None"
+        );
+    }
+
+    /// JSON shape lock: `{"type":"ready","v":1}` — the relay's exact-match
+    /// check (T13) compares `v` against `PROTOCOL_VERSION`.
+    #[test]
+    fn ready_serializes_with_protocol_version() {
+        let json = serde_json::to_string(&OutboundMessage::Ready {
+            v: PROTOCOL_VERSION,
+        })
+        .expect("ready serialises");
+        assert_eq!(
+            json, r#"{"type":"ready","v":1}"#,
+            "the ready frame must be exactly {{\"type\":\"ready\",\"v\":1}}"
+        );
+    }
+
+    /// A `ready` from an older build (no `v`) deserialises to `v: 0` —
+    /// the exact-match rule then refuses it as E-VERSION. (The relay-side
+    /// refusal is T6; this locks the deserialise half here.)
+    #[test]
+    fn ready_without_v_deserialises_to_zero() {
+        let m: OutboundMessage =
+            serde_json::from_str(r#"{"type":"ready"}"#).expect("an old ready frame must parse");
+        match m {
+            OutboundMessage::Ready { v } => {
+                assert_eq!(v, 0, "a missing v must read as 0, never 1")
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ready_round_trips_the_version() {
+        let m: OutboundMessage =
+            serde_json::from_str(r#"{"type":"ready","v":7}"#).expect("ready with v parses");
+        match m {
+            OutboundMessage::Ready { v } => assert_eq!(v, 7, "v must round-trip"),
+            other => panic!("expected Ready, got {other:?}"),
+        }
     }
 }

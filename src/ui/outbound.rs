@@ -252,12 +252,12 @@ mod tests {
         let (tx, mut rx) = outbound_channel();
         tx.publish_state(Arc::new(AppState::new()))
             .expect("publish before any send");
-        tx.send(OutboundMessage::Ready)
+        tx.send(OutboundMessage::Ready { v: 0 })
             .expect("send before any send");
 
         let first = futures::executor::block_on(rx.next());
         assert!(
-            matches!(first, Some(OutboundMessage::Ready)),
+            matches!(first, Some(OutboundMessage::Ready { .. })),
             "first frame must be Ready (biased), got {first:?}"
         );
         let second = futures::executor::block_on(rx.next());
@@ -296,7 +296,7 @@ mod tests {
         let (tx, rx) = outbound_channel();
         drop(rx);
 
-        let ordered = tx.send(OutboundMessage::Ready);
+        let ordered = tx.send(OutboundMessage::Ready { v: 0 });
         assert!(
             matches!(ordered, Err(Disconnected)),
             "send must report Disconnected when rx was dropped, got {ordered:?}"

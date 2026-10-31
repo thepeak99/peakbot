@@ -91,6 +91,20 @@ pub fn ca_cert_pem(tls_dir: &Path) -> Result<String> {
     Ok(load_or_create_ca(tls_dir)?.cert_pem)
 }
 
+/// `sha256:<hex>` of the CA certificate's DER — what a remote-profile `ca`
+/// pin compares against (shown in the banner so it can be copied).
+pub fn ca_fingerprint(tls_dir: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let pem = ca_cert_pem(tls_dir)?;
+    let der = CertificateDer::from_pem_slice(pem.as_bytes())
+        .context("CA certificate PEM did not parse")?;
+    let hex: String = Sha256::digest(der.as_ref())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    Ok(format!("sha256:{hex}"))
+}
+
 /// A rustls server config presenting a freshly-minted leaf (signed by the CA)
 /// for `sans`. Building it proves the leaf and its key are valid and matched.
 pub fn server_config(tls_dir: &Path, sans: &[String]) -> Result<ServerConfig> {
@@ -280,6 +294,29 @@ mod tests {
             not_after,
             now + time::Duration::days(365),
             "not_after = now + 365 days"
+        );
+    }
+
+    // The pin a remote profile's `ca` compares against: sha256 over the CA
+    // DER, lowercase hex, stable across calls (the CA is persisted).
+    #[test]
+    fn ca_fingerprint_is_sha256_of_the_ca_der() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let fp = ca_fingerprint(dir.path()).unwrap();
+
+        let pem = ca_cert_pem(dir.path()).unwrap();
+        let der = CertificateDer::from_pem_slice(pem.as_bytes()).unwrap();
+        let want: String = Sha256::digest(der.as_ref())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(fp, format!("sha256:{want}"));
+        assert_eq!(fp.len(), "sha256:".len() + 64);
+        assert_eq!(
+            fp,
+            ca_fingerprint(dir.path()).unwrap(),
+            "stable across calls"
         );
     }
 

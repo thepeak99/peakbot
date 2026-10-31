@@ -83,10 +83,13 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
 
+mod conversations;
 mod images;
 pub mod registry;
 pub mod settings;
 pub mod system;
+#[cfg(test)]
+mod t4_tests;
 pub mod tls;
 pub mod uploads;
 
@@ -328,6 +331,13 @@ impl Ui for WebUi {
         // `require_token` as `/ws`, `/commands` and `/images/{id}`.
         app = app.merge(uploads::router(self.ws_state.uploads.clone()));
 
+        // Conversation list/kill for relaying servers (remote-profiles §6.2).
+        // Before the token layer, so token-gated. Skipped in needs_setup mode
+        // (no registry): the settings `/api/*` catch-all answers 404 there.
+        if self.deps.is_some() {
+            app = app.merge(conversations::router(self.ws_state.clone()));
+        }
+
         // Gate every route behind the shared secret when one is configured.
         // Open by default (loopback); `main` guarantees a token exists before
         // a non-loopback bind ever reaches here.
@@ -417,6 +427,7 @@ impl WebUi {
             "   iOS: after installing, enable it under Settings → General → About → Certificate Trust Settings."
         );
         eprintln!("   CA stored at {}", tls_dir.display());
+        eprintln!("🔑 CA fingerprint: {}", tls::ca_fingerprint(&tls_dir)?);
         self.maybe_open_browser(&url);
 
         let handle = axum_server::Handle::new();
@@ -689,12 +700,21 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
     // non-attach first frame attaches fresh and is then processed normally so
     // nothing is silently dropped. A socket that closes before any frame just
     // unwinds (writer drops on scope exit).
-    let (want, leftover) = match read_first_frame(&mut ws_stream).await {
+    let (want, profile, agent, relayed, leftover) = match read_first_frame(&mut ws_stream).await {
         Some(text) => match serde_json::from_str::<InboundMessage>(&text) {
-            Ok(InboundMessage::Attach { convo }) => {
-                (convo.and_then(|s| Uuid::parse_str(&s).ok()), None)
-            }
-            _ => (None, Some(text)),
+            Ok(InboundMessage::Attach {
+                convo,
+                profile,
+                agent,
+                relayed,
+            }) => (
+                convo.and_then(|s| Uuid::parse_str(&s).ok()),
+                profile,
+                agent,
+                relayed,
+                None,
+            ),
+            _ => (None, None, None, false, Some(text)),
         },
         None => return,
     };
@@ -706,6 +726,25 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
         .registry
         .clone()
         .expect("ws_handler is mounted only with deps; the needs_setup guard replaces it");
+
+    // E-CHAIN (design §5.9): a relay may not reach through a remote profile.
+    // Checked before `attach` so a refused chain never mints a session.
+    if relayed
+        && let Some(p) = profile.as_deref()
+        && registry.boot_catalog().remote(p).is_some()
+    {
+        refuse(
+            out_tx,
+            writer_task,
+            format!(
+                "profile '{p}' on this server is itself a remote profile — \
+                 chaining remote profiles isn't supported"
+            ),
+        )
+        .await;
+        return;
+    }
+
     let registered = match registry.attach(want) {
         Ok(r) => r,
         Err(e) => {
@@ -726,12 +765,30 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
         .live_convo()
         .unwrap_or(registered.session.conversation_id);
 
+    // Attach-time profile selection ("ensure"). Refused before any handshake
+    // frame so the client sees only the error; detach so the minted session
+    // can idle out instead of pinning `attached`.
+    if let Some(p) = profile.as_deref()
+        && let Err(message) = ensure_selection(
+            &registered.session,
+            registry.profile_pin(),
+            p,
+            agent.as_deref(),
+        )
+    {
+        registry.detach(session_key);
+        refuse(out_tx, writer_task, message).await;
+        return;
+    }
+
     // Report the real id (may differ from `want` on a resume→fresh fallback),
     // then the usual handshake: `attached` → `ready` → `models_available`.
     let _ = out_tx.send(OutboundMessage::Attached {
         convo: convo_id.to_string(),
     });
-    let _ = out_tx.send(OutboundMessage::Ready);
+    let _ = out_tx.send(OutboundMessage::Ready {
+        v: crate::ui::wire::PROTOCOL_VERSION,
+    });
     if !state.models.is_empty() {
         let _ = out_tx.send(OutboundMessage::ModelsAvailable {
             active: state.active_alias.to_string(),
@@ -809,6 +866,67 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
     registry.detach(session_key);
 }
 
+/// Send one `error` frame, then close: dropping the last sender lets the
+/// writer drain the frame and close the sink.
+async fn refuse(out_tx: OutboundTx, writer_task: tokio::task::JoinHandle<()>, message: String) {
+    let _ = out_tx.send(OutboundMessage::Error { message });
+    drop(out_tx);
+    let _ = writer_task.await;
+}
+
+/// Attach-time "ensure" (design §5.1): bind a conversation with no turns to
+/// `(profile, agent)`. A conversation with turns keeps its persisted selection
+/// (silently — no 🔒 line). A profile-only attach on the current profile keeps
+/// the chosen agent, so a reconnect never resets a chip choice. The `Err`
+/// strings are the locked E-UNKNOWN-PROFILE / E-PINNED texts; the lock, pin and
+/// remote refusals are still enforced by `resolve_selection_choice` when the
+/// `Select` runs.
+fn ensure_selection(
+    session: &crate::session::Session,
+    pin: Option<&str>,
+    profile: &str,
+    agent: Option<&str>,
+) -> Result<(), String> {
+    let sm = &session.state_manager;
+    if sm.conversation_has_turns() {
+        return Ok(());
+    }
+    let state = sm.get_state();
+    // The session's own (fresh, cwd-aware) catalogue; remote entries are
+    // filtered out of it, so a remote name reads as unknown here.
+    let Some(info) = state.catalog.iter().find(|p| p.name == profile) else {
+        return Err(format!("Unknown profile '{profile}'."));
+    };
+    if let Some(pin) = pin
+        && pin != profile
+    {
+        return Err(format!(
+            "This server is pinned to profile '{pin}' (--profile)."
+        ));
+    }
+    let cur = &state.selection;
+    let agent = match agent {
+        Some(a) => a,
+        None if cur.profile == profile => cur.agent.as_str(),
+        None => info.agents.first().map_or("", |a| a.name.as_str()),
+    };
+    if !info.agents.iter().any(|a| a.name == agent) {
+        return Err(format!("Unknown agent '{agent}' in profile '{profile}'."));
+    }
+    if cur.profile == profile && cur.agent == agent {
+        return Ok(());
+    }
+    let _ = session.action_sender.send(UiAction::Select {
+        selection: crate::config::resolve::Selection {
+            profile: profile.to_string(),
+            agent: agent.to_string(),
+            subagent_models: Default::default(),
+        },
+        model: None,
+    });
+    Ok(())
+}
+
 /// Await the first text frame of a connection, skipping non-text control
 /// frames. Returns `None` if the socket closes first.
 async fn read_first_frame(
@@ -879,7 +997,7 @@ fn dispatch_inbound(
             let dirs = build_recent_dirs(state_manager);
             out_tx.send(OutboundMessage::RecentDirs { dirs }).is_ok()
         }
-        Ok(InboundMessage::KillSession { convo }) => {
+        Ok(InboundMessage::KillSession { convo, .. }) => {
             let Ok(id) = Uuid::parse_str(&convo) else {
                 return true;
             };
@@ -1873,7 +1991,7 @@ mod tests {
             tx.publish_state(Arc::new(state))
                 .expect("publish must succeed before producer is dropped");
         }
-        tx.send(OutboundMessage::Ready)
+        tx.send(OutboundMessage::Ready { v: 0 })
             .expect("ordered send must succeed");
         tx.send(OutboundMessage::ModelsAvailable {
             active: "sonnet".to_string(),
@@ -1915,7 +2033,7 @@ mod tests {
                 .expect("every recorded frame must deserialise as OutboundMessage")
             {
                 OutboundMessage::Attached { .. } => ordered_kinds.push("attached"),
-                OutboundMessage::Ready => ordered_kinds.push("ready"),
+                OutboundMessage::Ready { .. } => ordered_kinds.push("ready"),
                 OutboundMessage::ModelsAvailable { .. } => ordered_kinds.push("models_available"),
                 OutboundMessage::State { state } => {
                     state_message_lens.push(state.chat.messages.len());
@@ -2245,7 +2363,7 @@ mod tests {
             convo: "c-1".to_string(),
         })
         .unwrap();
-        tx.send(OutboundMessage::Ready).unwrap();
+        tx.send(OutboundMessage::Ready { v: 0 }).unwrap();
         tx.send(OutboundMessage::ModelsAvailable {
             active: "sonnet".to_string(),
             models: vec![ModelInfo {
@@ -2282,7 +2400,7 @@ mod tests {
                 serde_json::from_str::<OutboundMessage>(s)
                     .map(|m| match m {
                         OutboundMessage::Attached { .. } => "attached",
-                        OutboundMessage::Ready => "ready",
+                        OutboundMessage::Ready { .. } => "ready",
                         OutboundMessage::ModelsAvailable { .. } => "models_available",
                         other => panic!("unexpected variant: {other:?}"),
                     })

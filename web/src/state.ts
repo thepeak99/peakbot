@@ -324,7 +324,7 @@ export interface SlashCommand {
 }
 
 export type OutboundMessage =
-  | { type: "ready" }
+  | { type: "ready"; v?: number }
   | { type: "attached"; convo: string }
   | { type: "models_available"; active: string; models: ModelInfo[] }
   | { type: "state"; state: AppState }
@@ -342,7 +342,14 @@ export type OutboundMessage =
   | { type: "error"; message: string };
 
 export type InboundMessage =
-  | { type: "attach"; convo: string | null }
+  | {
+      type: "attach";
+      convo: string | null;
+      profile?: string;
+      agent?: string;
+      /** Set only by a server-side relay; the SPA never sends it. */
+      relayed?: boolean;
+    }
   | { type: "send_message"; text: string; attachments?: string[] }
   | { type: "stop" }
   /** Request the running (pausable) sub-agent pause at its next checkpoint.
@@ -368,7 +375,7 @@ export type InboundMessage =
   | { type: "list_dir"; path: string }
   | { type: "request_recent_dirs" }
   | { type: "request_conversations" }
-  | { type: "kill_session"; convo: string }
+  | { type: "kill_session"; convo: string; profile?: string }
   | { type: "shutdown" };
 
 /** Build a `select` inbound frame — the single selection frame (0.24

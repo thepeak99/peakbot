@@ -15,3 +15,6 @@ This file is the working draft for the next release. When a version is tagged, t
   - Remote profiles are allowed only in the global config.
   - They are validated at load, and the token is never logged.
   - They are listed by `/profile` but can't be opened yet; opening from the web UI lands in a later release.
+- **Server side of remote profiles.** The web socket's `attach` frame now accepts `profile` and `agent` and starts a new conversation on that pair (an unknown profile, an unknown agent or a `--profile` pin conflict is refused with an error). A conversation that already has turns keeps its saved selection. The `ready` frame carries a protocol version (`v`).
+- New token-gated `GET /api/conversations` and `POST /api/conversations/{id}/kill` return this server's own conversation list.
+- The HTTPS startup banner prints the CA fingerprint (`sha256:…`), the value a remote profile's `ca` pins.

@@ -159,6 +159,9 @@ tokio-util = { version = "0.7" }
 # notBefore/notAfter. Already in the lock via rcgen — this only adds a
 # dev-only dependency edge, no new crate.
 x509-parser = "0.18"
+# Remote-profiles T4 E2E: a real WebSocket client to drive `/ws` in
+# `src/ui/web/t4_tests.rs`. Same 0.29 axum already pulls — no new crate.
+tokio-tungstenite = "0.29"
 
 # No debuginfo for test builds: cold codegen of the large lib test binary
 # OOMs at debuginfo=2 (host and CI). Mirrors CI's CARGO_PROFILE_TEST_DEBUG=0.
