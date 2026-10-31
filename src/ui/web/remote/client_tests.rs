@@ -448,7 +448,7 @@ async fn pinned_ca_mismatch_is_etls_pin_with_both_fingerprints_and_sends_nothing
     assert_eq!(
         err.to_string(),
         format!(
-            "Remote profile '{PROFILE}': the server's CA is {}, but the config pins {}.\
+            "Remote profile '{PROFILE}': the server's CA is {}, but the config pins {}. \
              Refusing to connect. If the server's CA was rotated, update `ca` in Settings → Profiles.",
             server_ca.fingerprint, other_ca.fingerprint
         ),

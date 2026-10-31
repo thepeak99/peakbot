@@ -124,7 +124,6 @@ pub(crate) enum InboundMessage {
         convo: String,
         /// Routing hint for a relay; the local path ignores it.
         #[serde(default)]
-        #[allow(dead_code)] // first reader is the T6 relay's kill routing
         profile: Option<String>,
     },
     Shutdown,

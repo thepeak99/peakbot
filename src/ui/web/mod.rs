@@ -86,8 +86,6 @@ use uuid::Uuid;
 mod conversations;
 mod images;
 pub mod registry;
-// T5 lands the client ahead of its callers (relay T6, list T7, proxy T8).
-#[allow(dead_code)]
 mod remote;
 pub mod settings;
 pub mod system;
@@ -703,20 +701,14 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
     // non-attach first frame attaches fresh and is then processed normally so
     // nothing is silently dropped. A socket that closes before any frame just
     // unwinds (writer drops on scope exit).
-    let (want, profile, agent, relayed, leftover) = match read_first_frame(&mut ws_stream).await {
+    let (convo, profile, agent, relayed, leftover) = match read_first_frame(&mut ws_stream).await {
         Some(text) => match serde_json::from_str::<InboundMessage>(&text) {
             Ok(InboundMessage::Attach {
                 convo,
                 profile,
                 agent,
                 relayed,
-            }) => (
-                convo.and_then(|s| Uuid::parse_str(&s).ok()),
-                profile,
-                agent,
-                relayed,
-                None,
-            ),
+            }) => (convo, profile, agent, relayed, None),
             _ => (None, None, None, false, Some(text)),
         },
         None => return,
@@ -748,6 +740,27 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
         return;
     }
 
+    // Remote(L) (design §5.1): relay and RETURN — no path from here reaches
+    // `registry.attach`, so a failed remote never falls back to a local session.
+    if let Some(remote) = profile
+        .as_deref()
+        .and_then(|p| registry.boot_catalog().remote(p))
+    {
+        if let Some(pin) = registry.profile_pin() {
+            refuse(out_tx, writer_task, pinned_message(pin)).await;
+            return;
+        }
+        let view = remote::relay::LocalView {
+            name: remote.name.clone(),
+            target_profile: remote.target.profile.clone(),
+            target_agent: remote.target.agent.clone(),
+            catalog: registry.boot_catalog().infos(),
+        };
+        remote::relay::run(ws_stream, out_tx, writer_task, registry, view, convo, agent).await;
+        return;
+    }
+
+    let want = convo.and_then(|s| Uuid::parse_str(&s).ok());
     let registered = match registry.attach(want) {
         Ok(r) => r,
         Err(e) => {
@@ -903,9 +916,7 @@ fn ensure_selection(
     if let Some(pin) = pin
         && pin != profile
     {
-        return Err(format!(
-            "This server is pinned to profile '{pin}' (--profile)."
-        ));
+        return Err(pinned_message(pin));
     }
     let cur = &state.selection;
     let agent = match agent {
@@ -928,6 +939,11 @@ fn ensure_selection(
         model: None,
     });
     Ok(())
+}
+
+/// E-PINNED (design §5.12).
+fn pinned_message(pin: &str) -> String {
+    format!("This server is pinned to profile '{pin}' (--profile).")
 }
 
 /// Await the first text frame of a connection, skipping non-text control

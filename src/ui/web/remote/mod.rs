@@ -34,8 +34,16 @@ use crate::config::remote::{CaFingerprint, Endpoint, RemoteProfile, Trust};
 use crate::config::resolve::{Config, LoadError, ParseCtx, RepoMode};
 use crate::ui::wire::ConversationSummaryWire;
 
+pub(super) mod relay;
+
 #[cfg(test)]
 mod client_tests;
+
+#[cfg(test)]
+mod relay_tests;
+
+#[cfg(test)]
+mod test_support;
 
 pub type WsStream = tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -110,11 +118,9 @@ impl fmt::Display for RemoteError {
                     "Remote profile '{profile}' at {host} didn't answer in time."
                 )
             }
-            // No space after "pins {want}." — matches the locked test string
-            // (client_tests.rs); the design doc has one. See the T5 report.
             Self::TlsPin { profile, want, got } => write!(
                 f,
-                "Remote profile '{profile}': the server's CA is {got}, but the config pins {want}.\
+                "Remote profile '{profile}': the server's CA is {got}, but the config pins {want}. \
                  Refusing to connect. If the server's CA was rotated, update `ca` in Settings → Profiles."
             ),
             Self::TlsName { profile, host } => write!(
@@ -482,6 +488,7 @@ impl Client {
     }
 
     /// `GET /api/conversations` — the remote's local rows (T4 shape).
+    #[allow(dead_code)] // first non-test caller is T7's merged list
     pub async fn list(&self) -> Result<Vec<ConversationSummaryWire>, RemoteError> {
         #[derive(Deserialize)]
         struct Items {
@@ -499,6 +506,7 @@ impl Client {
 
     /// `POST /api/conversations/{id}/kill`; `Some(msg)` is the remote's
     /// refusal (`error`, §6.2), `None` a clean kill.
+    #[allow(dead_code)] // first non-test caller is T7's kill routing
     pub async fn kill(&self, id: &Uuid) -> Result<Option<String>, RemoteError> {
         #[derive(Deserialize)]
         struct KillReply {
