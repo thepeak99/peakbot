@@ -212,6 +212,24 @@ impl SessionRegistry {
             .map(|r| r.session.state_manager.session_cwd())
     }
 
+    /// Saved conversations straight from shared storage — no session needed
+    /// (the HTTP list must not mint one). Empty when persistence is off.
+    pub fn list_conversations(&self) -> Vec<crate::storage::ConversationSummary> {
+        let storage = self.inner.deps.storage.as_ref();
+        storage.and_then(|s| s.list().ok()).unwrap_or_default()
+    }
+
+    /// The boot catalogue. Remote entries are global-only, so it is
+    /// authoritative for "is this a remote profile" before any session exists.
+    pub fn boot_catalog(&self) -> &crate::config::resolve::Catalog {
+        &self.inner.deps.config.catalog
+    }
+
+    /// The boot `--profile` pin, if any.
+    pub fn profile_pin(&self) -> Option<&str> {
+        self.inner.deps.profile_pin.as_deref()
+    }
+
     /// Attach a socket to a session. `want` is the `?convo=` id from the URL:
     /// - a live session is currently on that conversation → share it;
     /// - persisted but inactive → resume it (new session loads the id);

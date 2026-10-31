@@ -3210,6 +3210,7 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "tokio",
+ "tokio-tungstenite 0.29.0",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
