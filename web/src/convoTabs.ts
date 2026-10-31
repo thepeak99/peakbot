@@ -10,7 +10,7 @@
 //      is the only place they are minted (they key the per-tab composers)
 // An invalid index returns the state unchanged (same reference).
 
-import type { ConversationSummary } from "./state";
+import type { ConversationSummary, TabColor, WireProfileInfo } from "./state";
 
 export type TabId = string;
 
@@ -20,6 +20,10 @@ export interface ConvoTab {
   readonly convo: string | null;
   /** Last known title; "" = untitled. */
   readonly title: string;
+  /** The profile this conversation runs under; `null` = unbound/legacy.
+   * Active tab: from `state.selection.profile`; other tabs: from the
+   * conversation-list rows (design §6.4). */
+  readonly profile: string | null;
 }
 
 export interface TabsState {
@@ -39,10 +43,11 @@ export const NEW_TAB_LABEL = "New conversation";
 
 let nextTabId = 0;
 
-/** The only id mint site (I5). */
-export function freshTab(convo: string | null = null, title = ""): ConvoTab {
+/** The only id mint site (I5). A fresh tab is local until the server binds
+ * a profile to it. */
+export function freshTab(convo: string | null = null, title = "", profile: string | null = null): ConvoTab {
   nextTabId += 1;
-  return { id: `t${nextTabId}`, convo, title };
+  return { id: `t${nextTabId}`, convo, title, profile };
 }
 
 const validIndex = (s: TabsState, i: number): boolean =>
@@ -139,6 +144,35 @@ export function retitle(s: TabsState, convo: string, title: string): TabsState {
   };
 }
 
+/** The active tab's profile follows the socket's selection (design §6.4);
+ * `null` = no selection yet. */
+export function activeProfile(s: TabsState, profile: string | null): TabsState {
+  const cur = activeTab(s);
+  if (cur.profile === profile) return s;
+  return withActive(s, { ...cur, profile });
+}
+
+/** Fold each list row's profile into its tab. A row only fills a tab whose
+ * profile is still null — the selection owns the active tab (via
+ * `activeProfile`), and a row never overrides or clears a known profile. */
+export function applyListProfiles(s: TabsState, list: readonly ConversationSummary[]): TabsState {
+  const byId = new Map<string, string>();
+  for (const c of list) if (c.profile !== null && c.profile !== undefined) byId.set(c.id, c.profile);
+  let next = s;
+  for (let i = 0; i < s.tabs.length; i++) {
+    const t = next.tabs[i];
+    if (t.convo === null || t.profile !== null) continue;
+    const profile = byId.get(t.convo);
+    if (profile !== undefined) {
+      next = {
+        tabs: next.tabs.map((x, j) => (j === i ? { ...x, profile } : x)),
+        active: next.active,
+      };
+    }
+  }
+  return next;
+}
+
 /** Fold a polled conversations list into the background status of inactive
  * tabs. Unread = a turn finished (running → idle) while the tab was inactive. */
 export function applyList(
@@ -202,12 +236,17 @@ export interface TabView {
   active: boolean;
   running: boolean;
   unread: boolean;
+  /** The tab's profile accent, resolved from the catalogue (design T2).
+   * `undefined` for a null, unknown or colourless profile — the SPA never
+   * derives a colour itself (RP8). */
+  color?: TabColor;
 }
 
 export function tabViews(
   s: TabsState,
   status: StatusMap,
   activeRunning: boolean,
+  catalog?: readonly WireProfileInfo[],
 ): TabView[] {
   return s.tabs.map((t, i) => {
     const active = i === s.active;
@@ -221,6 +260,7 @@ export function tabViews(
       active,
       running: active ? activeRunning : (st?.running ?? false),
       unread: active ? false : (st?.unread ?? false),
+      color: t.profile !== null ? catalog?.find((c) => c.name === t.profile)?.color : undefined,
     };
   });
 }

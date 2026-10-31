@@ -180,6 +180,7 @@ export function adaptCatalog(s: AppState): CatalogProfile[] {
         inherited: sa.inherited,
       })),
     })),
+    color: p.color,
   }));
 }
 

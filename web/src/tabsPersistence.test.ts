@@ -36,17 +36,20 @@ import {
   parseStored,
   saveTabs,
 } from "./tabsPersistence";
-import type { TabsState } from "./convoTabs";
+import { freshTab, type TabsState } from "./convoTabs";
 
-/** A parsed tab: `{convo, title}` plus the runtime id minted at parse time. */
-const parsed = (convo: string | null, title: string) => ({
+/** A parsed tab: `{convo, title, profile}` plus the runtime id minted at
+ * parse time. */
+const parsed = (convo: string | null, title: string, profile: string | null = null) => ({
   id: expect.any(String),
   convo,
   title,
+  profile,
 });
-/** The `{convo, title}` projection of parsed tabs (drops the minted id). */
+/** The `{convo, title, profile}` projection of parsed tabs (drops the
+ * minted id). */
 const stripIds = (s: TabsState | null) =>
-  s?.tabs.map((t) => ({ convo: t.convo, title: t.title }));
+  s?.tabs.map((t) => ({ convo: t.convo, title: t.title, profile: t.profile }));
 
 // ─── fake Storage (node env: no DOM) ─────────────────────────────────────
 
@@ -99,8 +102,11 @@ const asStorage = (s: FakeStorage | ThrowingStorage): Storage => s as unknown as
 
 // ─── fixtures ────────────────────────────────────────────────────────────
 
-const state = (tabs: { convo: string | null; title: string }[], active = 0): TabsState =>
-  ({ tabs: tabs.map((t, i) => ({ id: `rt-${i}`, ...t })), active }) as TabsState;
+const state = (
+  tabs: { convo: string | null; title: string; profile?: string | null }[],
+  active = 0,
+): TabsState =>
+  ({ tabs: tabs.map((t, i) => ({ id: `rt-${i}`, profile: null, ...t })), active }) as TabsState;
 
 // ─── constants ───────────────────────────────────────────────────────────
 
@@ -352,7 +358,7 @@ describe("loadTabs", () => {
 // ─── saveTabs ────────────────────────────────────────────────────────────
 
 describe("saveTabs", () => {
-  it("writes {v:1, tabs:[{convo,title}], active} under TABS_STORAGE_KEY", () => {
+  it("writes {v:1, tabs:[{convo,title,profile}], active} under TABS_STORAGE_KEY", () => {
     const storage = new FakeStorage();
     saveTabs(asStorage(storage), state([{ convo: "a", title: "A" }, { convo: null, title: "" }], 1));
 
@@ -362,8 +368,8 @@ describe("saveTabs", () => {
     expect(parsed).toEqual({
       v: 1,
       tabs: [
-        { convo: "a", title: "A" },
-        { convo: null, title: "" },
+        { convo: "a", title: "A", profile: null },
+        { convo: null, title: "", profile: null },
       ],
       active: 1,
     });
@@ -389,14 +395,14 @@ describe("saveTabs", () => {
 // ─── tab ids (I5): runtime-only, never persisted ─────────────────────────
 
 describe("saveTabs — ids are not persisted", () => {
-  it("writes exactly {convo, title} per tab: no `id` key anywhere", () => {
+  it("writes exactly {convo, title, profile} per tab: no `id` key anywhere", () => {
     const storage = new FakeStorage();
     saveTabs(asStorage(storage), state([{ convo: "a", title: "A" }, { convo: null, title: "" }], 0));
     const written = JSON.parse(storage.getItem(TABS_STORAGE_KEY)!) as {
       tabs: Record<string, unknown>[];
     };
     for (const t of written.tabs) {
-      expect(Object.keys(t).sort()).toEqual(["convo", "title"]);
+      expect(Object.keys(t).sort()).toEqual(["convo", "profile", "title"]);
     }
     expect(storage.getItem(TABS_STORAGE_KEY)).not.toContain("rt-0");
   });
@@ -448,7 +454,7 @@ describe("parseStored — ids are minted fresh", () => {
 
   it("does not let a non-string stored id break the entry", () => {
     const s = parseStored(raw([{ id: 42, convo: "a", title: "A" }]));
-    expect(stripIds(s)).toEqual([{ convo: "a", title: "A" }]);
+    expect(stripIds(s)).toEqual([{ convo: "a", title: "A", profile: null }]);
     expect(typeof s!.tabs[0].id).toBe("string");
   });
 
@@ -481,5 +487,86 @@ describe("saveTabs → loadTabs round trip", () => {
     const back = loadTabs(asStorage(storage));
     expect(stripIds(back)).toEqual(stripIds(s));
     expect(back!.active).toBe(2);
+  });
+});
+
+// ─── profile (remote-profiles design T2) ─────────────────────────────────
+//
+// `ConvoTab` gains `profile: string | null` (null = a local conversation,
+// the legacy-compatible reading) and `tabsPersistence` stores
+// `{convo, title, profile}` per tab. RED before implementation: the current
+// save/parse ignores `profile`, so these fail on the stored shape.
+
+const stateWithProfiles = (
+  tabs: { convo: string | null; title: string; profile: string | null }[],
+  active = 0,
+): TabsState => ({ tabs: tabs.map((t, i) => ({ id: `rt-${i}`, ...t })), active }) as TabsState;
+
+describe("tabsPersistence — profile (remote-profiles T2)", () => {
+  it("saveTabs writes {convo, title, profile} per tab — profile round-trips", () => {
+    const storage = new FakeStorage();
+    saveTabs(
+      asStorage(storage),
+      stateWithProfiles(
+        [
+          { convo: "a", title: "A", profile: "home-dev" },
+          { convo: null, title: "", profile: null },
+        ],
+        1,
+      ),
+    );
+
+    const written = JSON.parse(storage.getItem(TABS_STORAGE_KEY)!) as {
+      tabs: Record<string, unknown>[];
+    };
+    for (const t of written.tabs) {
+      expect(Object.keys(t).sort()).toEqual(["convo", "profile", "title"]);
+    }
+    expect(written.tabs[0].profile).toBe("home-dev");
+    expect(written.tabs[1].profile).toBe(null);
+
+    // …and comes back intact through parseStored.
+    const back = parseStored(storage.getItem(TABS_STORAGE_KEY));
+    expect(back?.tabs[0].profile).toBe("home-dev");
+    expect(back?.tabs[1].profile).toBe(null);
+  });
+
+  it("parseStored reads a missing profile as null (the legacy local reading)", () => {
+    // A payload written before the feature: no `profile` key anywhere.
+    const s = parseStored(
+      JSON.stringify({
+        v: 1,
+        tabs: [
+          { convo: "a", title: "A" },
+          { convo: null, title: "" },
+        ],
+        active: 0,
+      }),
+    );
+    expect(s).not.toBeNull();
+    expect(s!.tabs[0].profile).toBeNull();
+    expect(s!.tabs[1].profile).toBeNull();
+  });
+
+  it("parseStored reads a non-string profile as null (graceful, not fatal)", () => {
+    const s = parseStored(
+      JSON.stringify({
+        v: 1,
+        tabs: [
+          { convo: "a", title: "A", profile: 42 },
+          { convo: "b", title: "B", profile: { nested: true } },
+        ],
+        active: 0,
+      }),
+    );
+    expect(s, "a bad profile value must not drop the tab").not.toBeNull();
+    expect(s!.tabs).toHaveLength(2);
+    expect(s!.tabs[0].profile).toBeNull();
+    expect(s!.tabs[1].profile).toBeNull();
+  });
+
+  it("freshTab starts with profile null (a new tab is local until bound)", () => {
+    const t = freshTab("abc", "Title");
+    expect(t.profile).toBeNull();
   });
 });

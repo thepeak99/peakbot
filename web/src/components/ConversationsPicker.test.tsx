@@ -27,6 +27,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { ConversationsPicker } from "./ConversationsPicker";
 import type { ConversationSummary } from "../state";
+import type { CatalogProfile } from "../types";
 
 // React 19's `flushSync` checks `IS_REACT_ACT_ENVIRONMENT`; set once so the
 // console stays clean, matching CwdPicker.test.tsx's setup.
@@ -48,6 +49,7 @@ interface ConversationsPickerPropsWithError {
   onKill: (id: string) => void;
   dropUp?: boolean;
   error: string | null;
+  catalog?: CatalogProfile[];
 }
 
 const KILL_ERROR = "Can't kill a running conversation — press Stop first.";
@@ -356,5 +358,44 @@ describe("ConversationsPicker — desktop vs browser (issue #373)", () => {
 
     expect(confirmSpy).not.toHaveBeenCalled();
     expect(onLoad).toHaveBeenCalledWith("b2");
+  });
+});
+
+// ─── per-profile row colour dot (remote-profiles design T2) ──────────────
+//
+// A row whose `profile` matches a coloured catalogue entry shows a dot in
+// the profile's colour (`var(--profile-<c>)`); a profile-less or unknown
+// row shows none. The catalogue is the only colour source (RP8).
+
+describe("ConversationsPicker — per-profile row colour dot (remote-profiles T2)", () => {
+  const CATALOG: CatalogProfile[] = [
+    { name: "dev", origin: "global", overridesGlobal: false, agents: [], color: "teal" },
+    { name: "ops", origin: "global", overridesGlobal: false, agents: [], color: "pink" },
+  ];
+  const convoWith = (id: string, profile: string | null): ConversationSummary => ({
+    ...convo(id),
+    profile,
+  });
+  const rows = [convoWith("a1", "dev"), convoWith("b2", "ops")];
+
+  it("shows a dot in the catalogue colour for each coloured row", async () => {
+    const el = await render({ ...baseProps, error: null, catalog: CATALOG, conversations: rows });
+    await openPicker(el);
+    // A fresh array reference clears the loading state (the list "landed").
+    await render({ ...baseProps, error: null, catalog: CATALOG, conversations: [...rows] });
+
+    const dots = el.querySelectorAll<HTMLElement>('[data-testid="picker-row-color"]');
+    expect(dots, "one dot per coloured row").toHaveLength(2);
+    expect(dots[0].getAttribute("style")).toContain("var(--profile-teal)");
+    expect(dots[1].getAttribute("style")).toContain("var(--profile-pink)");
+  });
+
+  it("shows no dot for profile-less or unknown-profile rows", async () => {
+    const rows2 = [convoWith("a1", null), convoWith("b2", "ghost")];
+    const el = await render({ ...baseProps, error: null, catalog: CATALOG, conversations: rows2 });
+    await openPicker(el);
+    await render({ ...baseProps, error: null, catalog: CATALOG, conversations: [...rows2] });
+
+    expect(el.querySelectorAll('[data-testid="picker-row-color"]')).toHaveLength(0);
   });
 });

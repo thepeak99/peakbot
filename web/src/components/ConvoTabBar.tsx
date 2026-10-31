@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import type { TabView } from "../convoTabs";
 
 // Desktop-only strip of open conversations (issue #373). Purely
@@ -247,6 +247,19 @@ export function ConvoTabBar({
     }, 90);
   };
 
+  // Per-tab inline style: the profile accent (design T2) plus the
+  // close-freeze width pin. An undefined accent sets no `--ctab-accent` at
+  // all, so the CSS top edge simply doesn't render for colour-less tabs.
+  const tabStyle = (t: TabView): CSSProperties | undefined => {
+    const style: CSSProperties & Record<string, string> = {};
+    if (t.color) style["--ctab-accent"] = `var(--profile-${t.color})`;
+    if (frozen) {
+      const pin = pinsRef.current.get(t.key);
+      if (pin !== undefined) style.flex = `0 0 ${pin}px`;
+    }
+    return Object.keys(style).length > 0 ? style : undefined;
+  };
+
   return (
     <nav
       ref={navRef}
@@ -287,11 +300,7 @@ export function ConvoTabBar({
             aria-selected={t.active}
             title={t.tooltip}
             className={`ctab${t.active ? " active" : ""}`}
-            style={
-              frozen && pinsRef.current.has(t.key)
-                ? { flex: `0 0 ${pinsRef.current.get(t.key)}px` }
-                : undefined
-            }
+            style={tabStyle(t)}
             onClick={() => onActivate(i)}
             onKeyDown={(e) => {
               if (e.target !== e.currentTarget) return;

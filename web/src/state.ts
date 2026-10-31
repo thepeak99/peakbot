@@ -240,13 +240,28 @@ export interface WireAgentInfo {
   subagents: WireSubagentInfo[];
 }
 
+/** The 8-slot per-profile accent palette (src/config/file.rs `TabColor`,
+ * design §4.2). The order is the server's `derived` contract. */
+export type TabColor =
+  | "red"
+  | "orange"
+  | "yellow"
+  | "green"
+  | "teal"
+  | "blue"
+  | "purple"
+  | "pink";
+
 /** A profile in the catalog (src/config/resolve.rs `ProfileInfo`) — the §8.7
  * wire projection of a config profile, carried on `AppState.catalog`. */
 export interface WireProfileInfo {
   name: string;
-  origin: "repo" | "global";
+  origin: "repo" | "global" | "remote";
   overrides_global: boolean;
   agents: WireAgentInfo[];
+  /** Resolved accent (RP8: always set server-side, `ui.color` else
+   * derived from the name). Optional so old wire snapshots parse. */
+  color?: TabColor;
 }
 
 /** The (profile, agent) a conversation is bound to (src/config/resolve.rs
@@ -277,6 +292,9 @@ export interface ConversationSummary {
   active: boolean;
   /** An agent turn is in flight in the live session (absent on older servers). */
   running?: boolean;
+  /** The config profile this conversation is bound to (design T1, §6.1).
+   * `null`/absent = a legacy profile-less conversation. */
+  profile?: string | null;
 }
 
 // One entry in a `dir_listing` reply (src/ui/wire.rs DirEntryWire).

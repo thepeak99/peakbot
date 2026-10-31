@@ -1202,3 +1202,40 @@ describe("composer settings hint (T32)", () => {
     expect(has("composer-settings-hint")).toBe(false);
   });
 });
+
+// ─── chip colour dot (remote-profiles design T2) ─────────────────────────
+
+describe("chip colour dot (remote-profiles T2)", () => {
+  const COLORED_CATALOG: CatalogProfile[] = [
+    {
+      name: "peakbot-dev",
+      origin: "repo",
+      overridesGlobal: false,
+      agents: [{ name: "team", model: "sonnet", subagents: [] }],
+      color: "teal",
+    },
+    {
+      name: "writer",
+      origin: "global",
+      overridesGlobal: false,
+      agents: [{ name: "draft", model: "haiku", subagents: [] }],
+    },
+  ];
+
+  it("shows a dot in the profile colour for a coloured selected profile", () => {
+    mountChip({
+      catalog: COLORED_CATALOG,
+      selection: { profile: "peakbot-dev", agent: "team", subagentModels: {} },
+    });
+    const dot = q("selection-chip-color");
+    expect(dot.getAttribute("style")).toContain("var(--profile-teal)");
+  });
+
+  it("shows no dot when the selected profile carries no colour", () => {
+    mountChip({
+      catalog: COLORED_CATALOG,
+      selection: { profile: "writer", agent: "draft", subagentModels: {} },
+    });
+    expect(has("selection-chip-color")).toBe(false);
+  });
+});

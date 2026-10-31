@@ -223,6 +223,14 @@ export function SelectionChip({
           className="max-w-[9rem] truncate xl:max-w-[16rem]"
           title={`${selection.profile} › ${selection.agent} › ${chipModel}`}
         >
+          {selectedProfile?.color && (
+            <span
+              data-testid="selection-chip-color"
+              aria-hidden
+              className="inline-block h-2 w-2 shrink-0 rounded-full align-middle"
+              style={{ backgroundColor: `var(--profile-${selectedProfile.color})` }}
+            />
+          )}
           {selection.profile} <span className="text-zinc-600">›</span> {selection.agent}{" "}
           <span className="text-zinc-600">›</span>{" "}
           <span

@@ -235,6 +235,11 @@ pub(crate) struct ConversationSummaryWire {
     /// serialised (never omitted) so clients can rely on a bool; drives the
     /// spinner on background desktop tabs. Runtime-only, never persisted.
     running: bool,
+    /// The config profile this conversation is bound to (design T1, §6.1).
+    /// `#[serde(default)]`: absent on old servers and on legacy
+    /// profile-less conversations ⇒ `None`.
+    #[serde(default)]
+    profile: Option<String>,
 }
 
 /// Outbound message envelopes to the client. Owning (no lifetime) so any
@@ -318,6 +323,7 @@ pub(crate) fn build_conversations_snapshot(
             updated_at: s.updated_at.to_rfc3339(),
             message_count: s.message_count,
             model: s.model,
+            profile: s.profile.clone(),
         })
         .collect()
 }
@@ -568,6 +574,7 @@ mod tests {
             active: true,
             // issue #373: the background-tab spinner flag (additive).
             running: false,
+            profile: None,
         };
         let json = serde_json::to_string(&wire).unwrap();
         assert!(json.contains(r#""active":true"#), "json = {json}");
@@ -591,6 +598,7 @@ mod tests {
             model: "m".into(),
             active: true,
             running: true,
+            profile: None,
         };
         let json = serde_json::to_string(&wire).unwrap();
         assert!(json.contains(r#""running":true"#), "json = {json}");
@@ -1072,6 +1080,103 @@ mod tests {
             )
             .is_err(),
             "the removed select_profile frame must no longer parse"
+        );
+    }
+
+    // ── tab colour / remote profiles (design T1, §6.1) ──────────────────
+    //
+    // `ConversationSummaryWire` gains `#[serde(default)] profile:
+    // Option<String>` — the profile the conversation is bound to. Absent on
+    // old servers and for legacy profile-less conversations ⇒ None.
+    // Compile-RED until the field lands.
+
+    fn summary_with_profile(profile: Option<&str>) -> ConversationSummaryWire {
+        ConversationSummaryWire {
+            id: "i".into(),
+            name: "n".into(),
+            updated_at: "t".into(),
+            message_count: 0,
+            model: "m".into(),
+            active: false,
+            running: false,
+            profile: profile.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn conversation_summary_wire_round_trips_profile() {
+        let wire = summary_with_profile(Some("home-dev"));
+        let json = serde_json::to_string(&wire).expect("summary serialises");
+        assert!(
+            json.contains(r#""profile":"home-dev""#),
+            "the row must carry its profile: {json}"
+        );
+        let back: ConversationSummaryWire =
+            serde_json::from_str(&json).expect("summary deserialises");
+        assert_eq!(back.profile.as_deref(), Some("home-dev"));
+    }
+
+    /// An old payload (no `profile` key at all) still deserialises — the
+    /// field is `#[serde(default)]`, absent ⇒ None (legacy reading).
+    #[test]
+    fn conversation_summary_wire_without_profile_deserialises_lenient() {
+        let old = r#"{"id":"i","name":"n","updated_at":"t","message_count":0,"model":"m","active":false,"running":false}"#;
+        let wire: ConversationSummaryWire =
+            serde_json::from_str(old).expect("an old summary without `profile` must parse");
+        assert_eq!(wire.profile, None, "absent profile reads as None");
+    }
+
+    /// The SPA mirror is `string | null`: an explicit JSON null also reads
+    /// as None.
+    #[test]
+    fn conversation_summary_wire_profile_null_reads_as_none() {
+        let json = r#"{"id":"i","name":"n","updated_at":"t","message_count":0,"model":"m","active":false,"running":false,"profile":null}"#;
+        let wire: ConversationSummaryWire =
+            serde_json::from_str(json).expect("a null profile must parse");
+        assert_eq!(wire.profile, None);
+    }
+
+    /// `request_conversations` rows carry `profile` from
+    /// `Conversation.profile` (a conversation without one stays None).
+    #[test]
+    fn conversations_snapshot_carries_profile() {
+        let tmp = TempDir::new().unwrap();
+        let (sm, store) = sm_and_store(tmp.path().join("storage"), tmp.path().join("session"));
+
+        let now = Utc::now();
+        let mut profiled = Conversation::new(
+            "profiled".to_string(),
+            "test-prov".to_string(),
+            "test-model".to_string(),
+            String::new(),
+        );
+        profiled.updated_at = now;
+        profiled.profile = Some("home-dev".to_string());
+        store.save(&profiled).unwrap();
+        save_conv(&store, "", now - chrono::Duration::seconds(60));
+
+        let empty: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
+        let items = build_conversations_snapshot(&sm, &empty, &empty);
+        assert_eq!(items.len(), 2);
+        let by_id = |id: &str| {
+            items
+                .iter()
+                .find(|i| i.id == id)
+                .unwrap_or_else(|| panic!("missing {id}"))
+        };
+        assert_eq!(
+            by_id(&profiled.id.to_string()).profile.as_deref(),
+            Some("home-dev"),
+            "a bound conversation must carry its profile on the row"
+        );
+        assert_eq!(
+            items
+                .iter()
+                .find(|i| i.id != profiled.id.to_string())
+                .unwrap()
+                .profile,
+            None,
+            "a profile-less conversation must carry None, not a guess"
         );
     }
 }

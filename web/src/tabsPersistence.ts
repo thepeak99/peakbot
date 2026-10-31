@@ -28,14 +28,17 @@ export function parseStored(raw: string | null): TabsState | null {
   for (const e of o.tabs as unknown[]) {
     if (tabs.length >= MAX_TABS) break;
     if (typeof e !== "object" || e === null) continue;
-    const { convo, title } = e as Record<string, unknown>;
+    const { convo, title, profile } = e as Record<string, unknown>;
     if (typeof title !== "string") continue;
     if (convo !== null && typeof convo !== "string") continue;
+    // A missing or non-string profile reads as null (the legacy local
+    // reading) — a bad value must never drop the tab.
+    const p = typeof profile === "string" ? profile : null;
     if (convo !== null) {
       if (seen.has(convo)) continue;
       seen.add(convo);
     }
-    tabs.push(freshTab(convo, title.slice(0, MAX_TITLE)));
+    tabs.push(freshTab(convo, title.slice(0, MAX_TITLE), p));
   }
   if (tabs.length === 0) return null;
 
@@ -63,7 +66,7 @@ export function saveTabs(storage: Storage, s: TabsState): void {
       TABS_STORAGE_KEY,
       JSON.stringify({
         v: 1,
-        tabs: s.tabs.map(({ convo, title }) => ({ convo, title })),
+        tabs: s.tabs.map(({ convo, title, profile }) => ({ convo, title, profile })),
         active: s.active,
       }),
     );

@@ -503,6 +503,12 @@ pub struct ConversationSummary {
     /// fail to parse — `read_index` folds that into `None` and `list()`
     /// rebuilds. The absent default is the migration.
     pub cwd: String,
+    /// The config profile this conversation is bound to; `None` for legacy
+    /// profile-less conversations. `#[serde(default)]` because pre-feature
+    /// index entries lack it (the INDEX_VERSION bump forces a one-time
+    /// rebuild anyway).
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 impl From<&Conversation> for ConversationSummary {
@@ -518,6 +524,7 @@ impl From<&Conversation> for ConversationSummary {
             provider_name: conv.provider_name.clone(),
             model: conv.model.clone(),
             cwd: conv.cwd.clone(),
+            profile: conv.profile.clone(),
         }
     }
 }

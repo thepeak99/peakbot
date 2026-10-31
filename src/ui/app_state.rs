@@ -1751,6 +1751,7 @@ pub struct WelcomeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::file::TabColor;
     use crate::config::resolve::{AgentInfo, SubagentInfo};
 
     // ── Phase 1: sub-agent lane plumbing ────────────────────────────────
@@ -1914,6 +1915,7 @@ mod tests {
             name: "dev".to_string(),
             origin: "repo".to_string(),
             overrides_global: true,
+            color: TabColor::derived("dev"),
             agents: vec![AgentInfo {
                 name: "team".to_string(),
                 model: "sonnet".to_string(),

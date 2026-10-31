@@ -3972,6 +3972,7 @@ mod tests {
     /// per-request size, and no lane's tokens are a single request's count.
     #[test]
     fn fresh_session_lane_rows_are_cumulative_and_carry_the_model() {
+        use crate::config::file::TabColor;
         use crate::config::resolve::{AgentInfo, ProfileInfo, Selection, SubagentInfo};
         use crate::ui::app_state::MessageSource;
         let sm = StateManager::new();
@@ -3982,6 +3983,7 @@ mod tests {
             name: "dev".to_string(),
             origin: "global".to_string(),
             overrides_global: false,
+            color: TabColor::derived("dev"),
             agents: vec![AgentInfo {
                 name: "team".to_string(),
                 model: "opus-5".to_string(),
@@ -9909,6 +9911,7 @@ mod tests {
     /// caller orders it) and is visible via `get_state()` immediately.
     #[test]
     fn set_catalog_writes_app_state() {
+        use crate::config::file::TabColor;
         use crate::config::resolve::ProfileInfo;
 
         let sm = StateManager::new();
@@ -9917,12 +9920,14 @@ mod tests {
                 name: "dev".to_string(),
                 origin: "repo".to_string(),
                 overrides_global: true,
+                color: TabColor::derived("dev"),
                 agents: Vec::new(),
             },
             ProfileInfo {
                 name: "default".to_string(),
                 origin: "global".to_string(),
                 overrides_global: false,
+                color: TabColor::derived("default"),
                 agents: Vec::new(),
             },
         ]);

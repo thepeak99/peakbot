@@ -21,6 +21,31 @@ html.light {
   --color-zinc-50: oklch(14.1% 0.005 285.823); /* was 950 */
 }
 
+/* Per-profile accent palette (remote-profiles T2). The server resolves each
+   profile's colour (RP8); these vars only paint it. Dark is the default:
+   bright -400 tones read on the zinc-950/900 tab bar; light uses -600 tones
+   for the near-white remapped ramp. Flat rules — no nesting. */
+:root {
+  --profile-red: #f87171;
+  --profile-orange: #fb923c;
+  --profile-yellow: #facc15;
+  --profile-green: #4ade80;
+  --profile-teal: #2dd4bf;
+  --profile-blue: #60a5fa;
+  --profile-purple: #a78bfa;
+  --profile-pink: #f472b6;
+}
+html.light {
+  --profile-red: #dc2626;
+  --profile-orange: #ea580c;
+  --profile-yellow: #ca8a04;
+  --profile-green: #16a34a;
+  --profile-teal: #0d9488;
+  --profile-blue: #2563eb;
+  --profile-purple: #7c3aed;
+  --profile-pink: #db2777;
+}
+
 /* Fenced code blocks stay dark-on-dark in both themes (paired with the
    github-dark highlight theme) — a light-mode dark code block reads as
    intentional. Only the inline-code chip needs a light tweak so it isn't
@@ -167,6 +192,13 @@ html.light .markdown-body a {
 .ctab.active { background: var(--color-zinc-900); color: var(--color-zinc-100);
                border-color: var(--color-zinc-800); margin-bottom: -1px; height: 32px;
                box-shadow: inset 0 2px 0 var(--color-emerald-500, #10b981); }
+/* Per-profile accent (remote-profiles T2): `--ctab-accent` is set inline per
+   tab (ConvoTabBar) from the server-resolved colour. With no accent the var
+   is undefined and the declaration drops, so colour-less tabs stay plain.
+   The .active override sits after .ctab.active to beat its border-color. */
+.ctab { border-top: 2px solid var(--ctab-accent); }
+.ctab.active { border-top-color: var(--ctab-accent); }
+.ctab:not(.active) { border-top-color: color-mix(in oklab, var(--ctab-accent) 60%, transparent); }
 .ctab .icon { width: 12px; height: 12px; flex: none; border-radius: 9999px;
               background: var(--color-zinc-600, #52525b); }
 .ctab.active .icon { background: var(--color-zinc-400, #a1a1aa); }

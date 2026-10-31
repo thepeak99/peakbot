@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { ConversationSummary } from "../state";
+import type { CatalogProfile } from "../types";
 import { isDesktop } from "../desktop";
 
 // Conversations picker in the top bar. Opening it requests a fresh list
@@ -58,6 +59,9 @@ export function ConversationsPicker({
   // the mobile bottom bar, where a downward menu would clip off-screen.
   dropUp = false,
   error,
+  // The catalogue, for the per-profile row colour dot (design T2). Absent =
+  // no dots (old server / colourless rows).
+  catalog,
 }: {
   conversations: ConversationSummary[];
   hasTranscript: boolean;
@@ -67,6 +71,7 @@ export function ConversationsPicker({
   dropUp?: boolean;
   // Kill-refusal message from the last list reply; null when none.
   error: string | null;
+  catalog?: CatalogProfile[];
 }) {
   const desktop = isDesktop();
   const [open, setOpen] = useState(false);
@@ -250,7 +255,13 @@ export function ConversationsPicker({
               No conversations match "{searchQuery}".
             </div>
           ) : (
-            filtered.map(({ conversation: c, originalIndex }, fi) => (
+            filtered.map(({ conversation: c, originalIndex }, fi) => {
+              // The row's profile accent, resolved from the catalogue (design
+              // T2); a row without a known profile shows no dot.
+              const rowColor = c.profile
+                ? catalog?.find((p) => p.name === c.profile)?.color
+                : undefined;
+              return (
               <div
                 key={c.id}
                 className={`group flex items-center gap-1 px-1 ${
@@ -270,6 +281,14 @@ export function ConversationsPicker({
                   </span>
                   <span className="flex min-w-0 flex-col">
                     <span className="flex items-center gap-1.5">
+                      {rowColor && (
+                        <span
+                          data-testid="picker-row-color"
+                          aria-hidden
+                          className="inline-block h-2 w-2 shrink-0 rounded-full"
+                          style={{ backgroundColor: `var(--profile-${rowColor})` }}
+                        />
+                      )}
                       {c.active && (
                         <span
                           className="inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-400"
@@ -302,7 +321,8 @@ export function ConversationsPicker({
                   </button>
                 )}
               </div>
-            ))
+              );
+            })
           )}
           {error && !loading && (
             <div

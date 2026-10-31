@@ -16,7 +16,7 @@ use serde_yaml::Value;
 
 use super::errors::{ConfigError, ConfigErrors, ConfigFileKind, PathSeg, dotted};
 use super::file::{
-    AgentDef, ConfigFile, Env, General, ProfileDef, RepoFile, SubagentDef, VectorDbConfig,
+    AgentDef, ConfigFile, Env, General, ProfileDef, RepoFile, SubagentDef, TabColor, VectorDbConfig,
 };
 use super::migrate::is_legacy;
 use super::model_registry::canonical_alias;
@@ -164,6 +164,8 @@ pub struct ResolvedProfile {
     pub vector: Option<VectorSpec>,
     /// Already filtered from `TAB_NAMES`, in canonical order.
     pub tabs: Vec<&'static str>,
+    /// `ui.color`, else derived from the name (RP8: always set).
+    pub color: TabColor,
     pub agents: Vec<ResolvedAgent>,
 }
 
@@ -183,6 +185,8 @@ pub struct ProfileInfo {
     /// A repo profile shadowing a same-named global one.
     pub overrides_global: bool,
     pub agents: Vec<AgentInfo>,
+    /// Always set (RP8): `ui.color`, else derived from the name.
+    pub color: TabColor,
 }
 
 /// The wire projection of an agent (§8.7).
@@ -906,6 +910,7 @@ impl Resolver<'_> {
                 .into_iter()
                 .filter(|tab| def.ui.tabs.allows(tab))
                 .collect(),
+            color: def.ui.color.unwrap_or_else(|| TabColor::derived(name)),
             agents: agents.into_iter().collect::<Option<_>>()?,
         })
     }
@@ -1205,6 +1210,7 @@ fn profile_info(p: &ResolvedProfile) -> ProfileInfo {
             }
         ),
         agents: p.agents.iter().map(agent_info).collect(),
+        color: p.color,
     }
 }
 
@@ -2020,5 +2026,173 @@ profiles:
             !team.same_pair(&solo),
             "a different agent is a different pair"
         );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tab colour (remote-profiles design T1, §4.2/§4.3/RP8): `ProfileUi.color`,
+// the resolved `ProfileInfo.color` (ui.color, else `TabColor::derived(name)`),
+// and the field-path error shape for an unknown colour name.
+// Written BEFORE the fields exist — compile-RED until T1 lands.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tab_color_resolve_tests {
+    use super::*;
+    use crate::config::file::TabColor;
+
+    /// `dev` has a CONFIGURED colour that differs from its derived one
+    /// (derived("dev") = Teal, so Pink proves the config wins); `work` and
+    /// `home` have none, so they fall back to the name-derived colours
+    /// (Red and Purple per the golden table in `file.rs`).
+    const GLOBAL_YAML: &str = r#"
+providers:
+  - name: patchnotes
+    type: openai
+    base_url: https://ai.patchnotes.com/v1
+    api_key: pn-test
+    models:
+      - { name: anthropic/claude-sonnet-4.5, alias: sonnet, max_tokens: 8192 }
+profiles:
+  dev:
+    ui: { color: pink }
+    agents:
+      team: { model: sonnet }
+  work:
+    agents:
+      solo: { model: sonnet }
+  home:
+    agents:
+      solo: { model: sonnet }
+"#;
+
+    /// One repo profile with a configured colour, one without.
+    const REPO_YAML: &str = r#"
+profiles:
+  site:
+    ui: { color: blue }
+    agents:
+      solo: { model: sonnet }
+  ops:
+    agents:
+      solo: { model: sonnet }
+"#;
+
+    fn ctx() -> ParseCtx<'static> {
+        ParseCtx { known_skills: &[] }
+    }
+
+    fn parse(global: &str, repo: Option<&str>) -> Result<Config, ConfigErrors> {
+        Config::parse(
+            Source {
+                path: Path::new("/global/config.yaml"),
+                text: global,
+            },
+            repo.map(|text| Source {
+                path: Path::new("/repo/.peakbot/config.yaml"),
+                text,
+            }),
+            &ctx(),
+        )
+    }
+
+    fn info(cfg: &Config, name: &str) -> ProfileInfo {
+        cfg.catalog
+            .infos()
+            .into_iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("catalog must contain '{name}'"))
+    }
+
+    #[test]
+    fn ui_color_parses_and_wins_over_the_derived_one() {
+        let cfg = parse(GLOBAL_YAML, None).expect("`ui.color: pink` must parse");
+        // derived("dev") is Teal — Pink can only come from the config.
+        assert_eq!(info(&cfg, "dev").color, TabColor::Pink);
+    }
+
+    #[test]
+    fn ui_color_absent_is_derived_deterministically_from_the_name() {
+        let cfg = parse(GLOBAL_YAML, None).expect("fixture must parse");
+        assert_eq!(info(&cfg, "work").color, TabColor::derived("work"));
+        assert_eq!(info(&cfg, "home").color, TabColor::derived("home"));
+        assert_eq!(info(&cfg, "work").color, TabColor::Red);
+        assert_eq!(info(&cfg, "home").color, TabColor::Purple);
+
+        // Same file, second parse: the derived colours are stable.
+        let again = parse(GLOBAL_YAML, None).expect("fixture must parse again");
+        assert_eq!(info(&cfg, "work").color, info(&again, "work").color);
+        assert_eq!(info(&cfg, "home").color, info(&again, "home").color);
+
+        // Different names are expected to land on different colours.
+        assert_ne!(info(&cfg, "work").color, info(&cfg, "home").color);
+    }
+
+    #[test]
+    fn unknown_colour_name_is_a_field_path_keyed_parse_error() {
+        let bad = GLOBAL_YAML.replace("color: pink", "color: magenta");
+        let err = parse(&bad, None).expect_err("an unknown colour name must not parse");
+        let errors = err.0;
+        assert_eq!(
+            errors.len(),
+            1,
+            "one error for the one bad colour: {errors:?}"
+        );
+        let e = &errors[0];
+        assert_eq!(e.file, ConfigFileKind::Global);
+        assert_eq!(
+            e.path,
+            vec![
+                PathSeg::Key("profiles".into()),
+                PathSeg::Key("dev".into()),
+                PathSeg::Key("ui".into()),
+                PathSeg::Key("color".into()),
+            ],
+            "the error points at profiles.dev.ui.color"
+        );
+        assert!(
+            e.message.contains("magenta"),
+            "the message must name the bad value: {}",
+            e.message
+        );
+    }
+
+    /// RP8: `ProfileInfo.color` is always set — the SPA never derives a
+    /// colour, so every catalogue entry carries a resolved one.
+    #[test]
+    fn every_profile_info_carries_a_resolved_colour() {
+        let cfg = parse(GLOBAL_YAML, None).expect("fixture must parse");
+        for p in cfg.catalog.infos() {
+            let json = serde_json::to_value(&p).expect("ProfileInfo serialises");
+            assert!(
+                json["color"].is_string() && !json["color"].as_str().unwrap().is_empty(),
+                "catalogue entry '{}' must carry a colour: {json}",
+                p.name
+            );
+        }
+    }
+
+    /// The catalogue projection is the wire shape the SPA reads
+    /// (`AppState.catalog`): `name` plus the lowercase `color`, round-trip.
+    #[test]
+    fn profile_info_serialises_name_and_colour_and_round_trips() {
+        let cfg = parse(GLOBAL_YAML, None).expect("fixture must parse");
+        let p = info(&cfg, "dev");
+        let json = serde_json::to_string(&p).expect("ProfileInfo serialises");
+        assert!(json.contains(r#""name":"dev""#), "json = {json}");
+        assert!(json.contains(r#""color":"pink""#), "json = {json}");
+
+        let back: ProfileInfo = serde_json::from_str(&json).expect("ProfileInfo deserialises");
+        assert_eq!(back, p, "the wire projection round-trips");
+        assert_eq!(back.color, TabColor::Pink);
+    }
+
+    /// Repo profiles are local profiles: `ui.color` resolves exactly like
+    /// the global ones (configured wins, absent derives from the name).
+    #[test]
+    fn repo_profile_colour_resolves_like_global() {
+        let cfg = parse(GLOBAL_YAML, Some(REPO_YAML)).expect("fixture must parse");
+        assert_eq!(info(&cfg, "site").color, TabColor::Blue);
+        assert_eq!(info(&cfg, "ops").color, TabColor::derived("ops"));
+        assert_eq!(info(&cfg, "ops").color, TabColor::Green);
     }
 }
