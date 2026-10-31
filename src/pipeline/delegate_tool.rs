@@ -589,6 +589,7 @@ mod tests {
             memory: crate::config::MemoryConfig::default(),
             vector: None,
             tabs: Vec::new(),
+            color: crate::config::file::TabColor::derived("dev"),
             agents: vec![ResolvedAgent {
                 main: member("main"),
                 prompt: None,
@@ -1412,6 +1413,7 @@ profiles:
             memory: crate::config::MemoryConfig::default(),
             vector: None,
             tabs: Vec::new(),
+            color: crate::config::file::TabColor::derived("dev"),
             agents: vec![ResolvedAgent {
                 main: member("main"),
                 prompt: None,

@@ -23,13 +23,15 @@
 // Runs under `node` (pure logic, no DOM).
 
 import { describe, expect, it } from "vitest";
-import type { ConversationSummary } from "./state";
+import type { ConversationSummary, WireProfileInfo } from "./state";
 import type { ConvoTab, StatusMap, TabsState } from "./convoTabs";
 import {
   NEW_TAB_LABEL,
   activate,
+  activeProfile,
   activeTab,
   applyList,
+  applyListProfiles,
   bound,
   closeTab,
   cycle,
@@ -47,10 +49,16 @@ import {
 // ─── fixtures ────────────────────────────────────────────────────────────
 
 /** Literal-id fixture: the id defaults to `id-<convo>` (unique per convo). */
-const tab = (convo: string | null, title = "", id = `id-${convo}`): ConvoTab => ({
+const tab = (
+  convo: string | null,
+  title = "",
+  id = `id-${convo}`,
+  profile: string | null = null,
+): ConvoTab => ({
   id,
   convo,
   title,
+  profile,
 });
 const state = (tabs: ConvoTab[], active = 0): TabsState => ({ tabs, active });
 
@@ -91,7 +99,7 @@ describe("initialTabs", () => {
   it("gives one tab for the URL convo when nothing is stored", () => {
     const s = initialTabs(null, "abc-123");
     expect(s).toEqual({
-      tabs: [{ id: expect.any(String), convo: "abc-123", title: "" }],
+      tabs: [{ id: expect.any(String), convo: "abc-123", title: "", profile: null }],
       active: 0,
     });
   });
@@ -99,7 +107,7 @@ describe("initialTabs", () => {
   it("gives one fresh null-convo tab when nothing is stored and no URL convo", () => {
     const s = initialTabs(null, null);
     expect(s).toEqual({
-      tabs: [{ id: expect.any(String), convo: null, title: "" }],
+      tabs: [{ id: expect.any(String), convo: null, title: "", profile: null }],
       active: 0,
     });
   });
@@ -123,7 +131,7 @@ describe("initialTabs", () => {
     const s = initialTabs(stored, "d");
     expect(s.tabs).toHaveLength(3);
     expect(s.active).toBe(2);
-    expect(s.tabs[2]).toEqual({ id: expect.any(String), convo: "d", title: "" });
+    expect(s.tabs[2]).toEqual({ id: expect.any(String), convo: "d", title: "", profile: null });
     // Earlier tabs keep their identity (I4).
     expect(s.tabs[0]).toBe(A);
     expect(s.tabs[1]).toBe(B);
@@ -150,7 +158,7 @@ describe("newTab", () => {
   it("appends a null-convo untitled tab and activates it", () => {
     const s = newTab(state([A, B], 0));
     expect(s.tabs).toHaveLength(3);
-    expect(s.tabs[2]).toEqual({ id: expect.any(String), convo: null, title: "" });
+    expect(s.tabs[2]).toEqual({ id: expect.any(String), convo: null, title: "", profile: null });
     expect(s.active).toBe(2);
   });
 
@@ -213,7 +221,7 @@ describe("closeTab", () => {
 
   it("gives a fresh empty tab when the last tab is closed (I1)", () => {
     const s = closeTab(state([A], 0), 0);
-    expect(s.tabs).toEqual([{ id: expect.any(String), convo: null, title: "" }]);
+    expect(s.tabs).toEqual([{ id: expect.any(String), convo: null, title: "", profile: null }]);
     expect(s.active).toBe(0);
   });
 
@@ -296,12 +304,13 @@ describe("openConvo", () => {
       id: expect.any(String),
       convo: "d",
       title: "Fresh convo",
+      profile: null,
     });
   });
 
   it("stores an empty title when none is given", () => {
     const s = openConvo(state([A], 0), "d");
-    expect(s.tabs[1]).toEqual({ id: expect.any(String), convo: "d", title: "" });
+    expect(s.tabs[1]).toEqual({ id: expect.any(String), convo: "d", title: "", profile: null });
   });
 });
 
@@ -332,7 +341,7 @@ describe("bound", () => {
   it("binds the active tab and resets its title when no other tab holds the convo", () => {
     const next = bound(state([A, C], 0), "d");
     // Binding keeps the active tab's identity (I5): only convo/title change.
-    expect(next.tabs[0]).toEqual({ id: "id-A", convo: "d", title: "" });
+    expect(next.tabs[0]).toEqual({ id: "id-A", convo: "d", title: "", profile: null });
     expect(next.tabs).toHaveLength(2);
   });
 
@@ -686,7 +695,7 @@ describe("tab ids — bound (I5)", () => {
   it("null → uuid keeps the ACTIVE tab's id (the composer must not remount)", () => {
     const pending = tab(null, "", "id-pending");
     const next = bound(state([A, pending], 1), "uuid-1");
-    expect(next.tabs[1]).toEqual({ id: "id-pending", convo: "uuid-1", title: "" });
+    expect(next.tabs[1]).toEqual({ id: "id-pending", convo: "uuid-1", title: "", profile: null });
     expect(next.active).toBe(1);
   });
 
@@ -700,7 +709,7 @@ describe("tab ids — bound (I5)", () => {
     // Active A (index 0) binds to "b", which tab B (index 1) already shows.
     const next = bound(state([A, B], 0), "b");
     expect(next.tabs).toHaveLength(1);
-    expect(next.tabs[0]).toEqual({ id: "id-B", convo: "b", title: "Refactor parser" });
+    expect(next.tabs[0]).toEqual({ id: "id-B", convo: "b", title: "Refactor parser", profile: null });
     expect(next.active).toBe(0);
   });
 
@@ -787,5 +796,127 @@ describe("tab ids — invariant I5 over a deterministic op sequence", () => {
       expect(s.active).toBeGreaterThanOrEqual(0);
       expect(s.active).toBeLessThan(s.tabs.length);
     }
+  });
+});
+
+// ─── TabView colour (remote-profiles design T2) ──────────────────────────
+//
+// `ConvoTab` gains `profile: string | null` and `tabViews` gains a fourth
+// argument — the catalogue (`WireProfileInfo[]`) — from which it resolves
+// each tab's `color`. The SPA never derives a colour itself (RP8): the
+// server sends the resolved one on every catalogue entry. RED before
+// implementation: the current `tabViews` ignores the catalogue, so
+// `view.color` is undefined.
+
+const catalogWith = (entries: WireProfileInfo[]): WireProfileInfo[] => entries;
+
+const tabWithProfile = (
+  convo: string | null,
+  title: string,
+  profile: string | null,
+  id: string,
+): ConvoTab => ({ id, convo, title, profile }) as ConvoTab;
+
+describe("tabViews — per-profile colour (remote-profiles T2)", () => {
+  const dev = tabWithProfile("a", "Fix login bug", "dev", "id-A");
+  const ghost = tabWithProfile("b", "Mystery", "ghost", "id-B");
+  const local = tabWithProfile(null, "", null, "id-FRESH");
+  const s = state([dev, ghost, local], 0);
+  const emptyStatus: StatusMap = {};
+
+  it("sets the tab colour from the catalogue for a known profile", () => {
+    const views = tabViews(
+      s,
+      emptyStatus,
+      false,
+      catalogWith([{ name: "dev", origin: "global", overrides_global: false, agents: [], color: "teal" }]),
+    );
+    expect(views[0].color).toBe("teal");
+  });
+
+  it("has no colour for a profile the catalogue does not know", () => {
+    const views = tabViews(
+      s,
+      emptyStatus,
+      false,
+      catalogWith([{ name: "dev", origin: "global", overrides_global: false, agents: [], color: "teal" }]),
+    );
+    expect(views[1].color).toBeUndefined();
+  });
+
+  it("has no colour for a profile-less (null) tab — the legacy local reading", () => {
+    const views = tabViews(
+      s,
+      emptyStatus,
+      false,
+      catalogWith([{ name: "dev", origin: "global", overrides_global: false, agents: [], color: "teal" }]),
+    );
+    expect(views[2].color).toBeUndefined();
+  });
+
+  it("falls back gracefully when a catalogue entry carries no colour (old server)", () => {
+    const views = tabViews(
+      s,
+      emptyStatus,
+      false,
+      catalogWith([{ name: "dev", origin: "global", overrides_global: false, agents: [] }]),
+    );
+    expect(views[0].color).toBeUndefined();
+  });
+});
+
+// ─── tab profile (remote-profiles design T2, §6.4) ───────────────────────
+//
+// The active tab's profile follows the socket's selection; the other tabs'
+// profiles come from the conversation-list rows. `tabViews` then resolves
+// the accent from the catalogue (the SPA never derives a colour — RP8).
+
+describe("activeProfile — the active tab follows the selection (design T2)", () => {
+  it("sets the active tab's profile and keeps the others untouched", () => {
+    const s = state([A, B], 0);
+    const next = activeProfile(s, "dev");
+    expect(next.tabs[0].profile).toBe("dev");
+    expect(next.tabs[1]).toBe(B); // I4: identity for untouched tabs
+    expect(next.active).toBe(0);
+  });
+
+  it("returns the same reference when the profile is unchanged", () => {
+    const s = state([tab("a", "A", "id-A", "dev"), B], 0);
+    expect(activeProfile(s, "dev")).toBe(s);
+  });
+
+  it("nulls the profile when the selection is absent (fresh conversation)", () => {
+    const s = state([tab("a", "A", "id-A", "dev"), B], 0);
+    expect(activeProfile(s, null).tabs[0].profile).toBeNull();
+  });
+});
+
+describe("applyListProfiles — list rows feed the inactive tabs (design T2)", () => {
+  const row = (id: string, profile?: string | null): ConversationSummary =>
+    convo({ id, profile });
+
+  it("sets each inactive tab's profile from its list row", () => {
+    const s = state([A, B], 0);
+    const next = applyListProfiles(s, [row("a", "dev"), row("b", "ops")]);
+    expect(next.tabs[0].profile).toBe("dev"); // active tab: row ignored, then
+    expect(next.tabs[1].profile).toBe("ops");
+  });
+
+  it("leaves the active tab's profile to the selection", () => {
+    const s = state([tab("a", "A", "id-A", "dev"), B], 0);
+    const next = applyListProfiles(s, [row("a", "ops")]);
+    expect(next.tabs[0].profile).toBe("dev"); // selection wins, not the row
+    expect(next.tabs[1].profile).toBeNull();
+  });
+
+  it("never clears a known profile from a row without one (legacy reading)", () => {
+    const s = state([A, tab("b", "B", "id-B", "ops")], 0);
+    const next = applyListProfiles(s, [row("b", null)]);
+    expect(next.tabs[1].profile).toBe("ops");
+  });
+
+  it("returns the same reference when nothing changes", () => {
+    const s = state([A, B], 0);
+    expect(applyListProfiles(s, [row("a"), row("b")])).toBe(s);
   });
 });

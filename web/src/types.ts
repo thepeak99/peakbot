@@ -2,7 +2,7 @@
 // display contract (kept from the Phase-0 mock). `adapt.ts` maps the wire
 // `AppState` (state.ts) into these; components never see raw wire types.
 
-import type { WireAttachment } from "./state";
+import type { TabColor, WireAttachment } from "./state";
 
 export type MessageRole =
   | "user"
@@ -154,7 +154,7 @@ export interface Welcome {
 // Catalog view (0.24 cutover): the profiles/agents/sub-agents this install
 // declares, mapped from the wire `WireProfileInfo` (state.ts). The Agents
 // panel renders the bound agent's roster from this.
-export type CatalogOrigin = "repo" | "global";
+export type CatalogOrigin = "repo" | "global" | "remote";
 
 export interface CatalogSubagent {
   name: string;
@@ -175,6 +175,9 @@ export interface CatalogProfile {
   /** A repo profile shadowing a same-named global one. */
   overridesGlobal: boolean;
   agents: CatalogAgent[];
+  /** Resolved accent (RP8: always set server-side). Optional so old wire
+   * snapshots parse; absent = no dot. */
+  color?: TabColor;
 }
 
 /** The (profile, agent) this conversation is bound to, normalised by the

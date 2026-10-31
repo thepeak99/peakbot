@@ -201,3 +201,73 @@ describe("index.css — .ctab .icon", () => {
     expect(decl(body, "flex")).toBe("none");
   });
 });
+
+// ─── per-profile tab colour (remote-profiles design T2) ──────────────────
+//
+// The tab accent is a 2px top edge painted from `--ctab-accent` (set
+// inline per tab by ConvoTabBar), at 60% strength when the tab is
+// inactive. Each palette colour has a theme variable `--profile-<c>`
+// defined in BOTH themes (dark is the default; light = `html.light`).
+// RED before implementation: none of these declarations exist yet.
+
+const PALETTE = ["red", "orange", "yellow", "green", "teal", "blue", "purple", "pink"];
+
+/** Every rule (top-level or nested) as `{selector, body}`, comments out. */
+const allRules = (): { selector: string; body: string }[] => {
+  const out: { selector: string; body: string }[] = [];
+  const re = /(?:^|\})\s*([^@{}]+)\{([^{}]*)\}/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(stripped))) {
+    out.push({ selector: m[1].trim(), body: m[2] });
+  }
+  return out;
+};
+
+describe("index.css — per-profile tab colour (remote-profiles T2)", () => {
+  it("paints a 2px top accent on .ctab from --ctab-accent", () => {
+    const accent = allRules().find(
+      (r) =>
+        /^\.ctab(\.active)?$/.test(r.selector) &&
+        r.body.includes("var(--ctab-accent)") &&
+        /2px/.test(r.body),
+    );
+    expect(
+      accent,
+      "a .ctab (or .ctab.active) rule must paint a 2px accent from var(--ctab-accent)",
+    ).toBeDefined();
+  });
+
+  it("renders the accent at 60% on inactive tabs", () => {
+    const inactive = allRules().find(
+      (r) =>
+        /\.ctab/.test(r.selector) &&
+        /:not\(\.active\)/.test(r.selector) &&
+        r.body.includes("--ctab-accent"),
+    );
+    expect(
+      inactive,
+      "an inactive .ctab rule (:not(.active)) must reference --ctab-accent",
+    ).toBeDefined();
+    expect(inactive!.body, "the inactive accent must be at 60%").toMatch(/60%|0\.6/);
+  });
+
+  it("defines --profile-<c> for all 8 colours in the dark theme", () => {
+    const dark = [ruleBody(":root"), ruleBody("html")].find(
+      (b) => b !== null && PALETTE.every((c) => b.includes(`--profile-${c}:`)),
+    );
+    expect(
+      dark,
+      "the dark theme (:root or html) must define all 8 --profile-<c> variables",
+    ).toBeDefined();
+  });
+
+  it("defines --profile-<c> for all 8 colours in the light theme", () => {
+    const light = [ruleBody("html.light"), ruleBody(":root.light")].find(
+      (b) => b !== null && PALETTE.every((c) => b.includes(`--profile-${c}:`)),
+    );
+    expect(
+      light,
+      "the light theme (html.light) must define all 8 --profile-<c> variables",
+    ).toBeDefined();
+  });
+});

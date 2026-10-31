@@ -117,6 +117,7 @@ export function TopBar({
           onOpen={() => send({ type: "request_conversations" })}
           onLoad={onLoadConversation}
           onKill={(id) => send({ type: "kill_session", convo: id })}
+          catalog={catalog}
         />
 
         {cwd && (

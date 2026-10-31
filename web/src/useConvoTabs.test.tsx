@@ -101,6 +101,7 @@ const tab = (convo: string | null, title = ""): ConvoTab => ({
   id: `id-${convo ?? "new"}`,
   convo,
   title,
+  profile: null,
 });
 const state = (tabs: ConvoTab[], active = 0): TabsState => ({ tabs, active }) as TabsState;
 
@@ -263,8 +264,8 @@ describe("useConvoTabs — mount", () => {
     expect(JSON.parse(raw!)).toEqual({
       v: 1,
       tabs: [
-        { convo: "a", title: "A" },
-        { convo: "b", title: "B" },
+        { convo: "a", title: "A", profile: null },
+        { convo: "b", title: "B", profile: null },
       ],
       active: 1,
     });
@@ -645,7 +646,7 @@ describe("bootDesktopTabs", () => {
   it("starts one tab for the URL convo when nothing is stored", () => {
     window.history.replaceState(null, "", "/?convo=abc");
     expect(bootDesktopTabs()).toEqual({
-      tabs: [{ id: expect.any(String), convo: "abc", title: "" }],
+      tabs: [{ id: expect.any(String), convo: "abc", title: "", profile: null }],
       active: 0,
     });
     expect(new URLSearchParams(window.location.search).get("convo")).toBe("abc");
@@ -704,7 +705,7 @@ describe("bootDesktopTabs", () => {
     const s = bootDesktopTabs();
     expect(s.tabs).toHaveLength(2);
     expect(s.active).toBe(1);
-    expect(s.tabs[1]).toEqual({ id: expect.any(String), convo: "c", title: "" });
+    expect(s.tabs[1]).toEqual({ id: expect.any(String), convo: "c", title: "", profile: null });
   });
 
   it("leaves no ?convo param when the active stored tab has no convo", () => {
@@ -744,7 +745,7 @@ describe("bootDesktopTabs", () => {
     // Appended and activated (design §4: URL wins), URL kept as-is.
     expect(s.tabs).toHaveLength(3);
     expect(s.active).toBe(2);
-    expect(s.tabs[2]).toEqual({ id: expect.any(String), convo: "fromurl", title: "" });
+    expect(s.tabs[2]).toEqual({ id: expect.any(String), convo: "fromurl", title: "", profile: null });
     expect(new URLSearchParams(window.location.search).get("convo")).toBe("fromurl");
   });
 });
@@ -851,10 +852,10 @@ describe("useConvoTabs — state mirror and id stability", () => {
     expect(api).toBeNull();
   });
 
-  it("persists {convo,title} only: no `id` key in storage", async () => {
+  it("persists {convo,title,profile} only: no `id` key in storage", async () => {
     const agent = makeAgent({ convo: "a" });
     await renderHook(agent, state([tab("a", "A"), tab("b", "B")], 0));
     const raw = JSON.parse(localStorage.getItem("peakbot.desktop.tabs")!);
-    for (const t of raw.tabs) expect(Object.keys(t).sort()).toEqual(["convo", "title"]);
+    for (const t of raw.tabs) expect(Object.keys(t).sort()).toEqual(["convo", "profile", "title"]);
   });
 });

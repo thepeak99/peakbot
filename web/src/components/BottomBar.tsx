@@ -79,6 +79,7 @@ export function BottomBar({
         onLoad={onLoadConversation}
         onKill={(id) => send({ type: "kill_session", convo: id })}
         dropUp
+        catalog={catalog}
       />
 
       {cwd && (

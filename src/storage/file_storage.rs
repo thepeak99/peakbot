@@ -22,7 +22,8 @@ const INDEX_FILE: &str = "index.json";
 /// Index schema version. Old indexes lack the field, so they fail to
 /// parse in `read_index` and fold into a rebuild — the one-time heal for
 /// indexes that were fingerprint-blessed while missing conversations.
-const INDEX_VERSION: u32 = 1;
+/// v2: entries gained `ConversationSummary.profile`.
+const INDEX_VERSION: u32 = 2;
 
 /// On-disk shape of `index.json`. Fingerprint and entries live in ONE
 /// document so a crash mid-write can never pair a fresh fingerprint with a
@@ -374,15 +375,18 @@ impl ConversationStorage for FileStorage {
             return Ok(Vec::new());
         }
 
-        // Serve from the index; rebuild only when it is missing, corrupt, or
-        // the directory's file set no longer matches the recorded
-        // fingerprint (files copied in/out). Content-only changes never
-        // reach this check: they arrive via save/delete, which update the
-        // index and fingerprint under the same lock.
+        // Serve from the index; rebuild only when it is missing, corrupt,
+        // older than INDEX_VERSION, or the directory's file set no longer
+        // matches the recorded fingerprint (files copied in/out).
+        // Content-only changes never reach this check: they arrive via
+        // save/delete, which update the index and fingerprint under the
+        // same lock.
         let _guard = self.index_lock.lock().unwrap();
         let fingerprint = self.dir_fingerprint();
         let index = match self.read_index() {
-            Some(index) if index.fingerprint == fingerprint => index.entries,
+            Some(index) if index.version == INDEX_VERSION && index.fingerprint == fingerprint => {
+                index.entries
+            }
             _ => self.rebuild_index()?,
         };
 
@@ -839,5 +843,69 @@ mod tests {
                 c.id
             );
         }
+    }
+
+    /// A pre-profile install carries a v1 index: fingerprint-blessed, yet
+    /// its entries predate `ConversationSummary.profile`. The index VERSION
+    /// bumps with the field (design T1), so a matching-fingerprint v1 index
+    /// must be discarded and rebuilt from the files — ONCE: the rebuild
+    /// persists the current version, and the next `list` serves from it.
+    #[test]
+    fn list_rebuilds_index_from_old_version_once() {
+        let dir = TempDir::new().unwrap();
+        let store = FileStorage::new(dir.path().to_path_buf()).unwrap();
+
+        let preexisting: Vec<Conversation> = (0..3).map(|i| conv(&format!("pre {i}"))).collect();
+        for c in &preexisting {
+            write_preexisting_file(dir.path(), c);
+        }
+
+        let fresh = conv("fresh");
+        store.save(&fresh).unwrap();
+
+        // Hand-write a v1 index (older INDEX_VERSION, entries without the
+        // `profile` field) that is fingerprint-blessed but carries only the
+        // seeded entry — exactly what an un-upgraded install leaves on disk.
+        let old_version = 1;
+        let poisoned = serde_json::json!({
+            "version": old_version,
+            "fingerprint": store.dir_fingerprint(),
+            "entries": {
+                fresh.id.to_string(): serde_json::to_value(ConversationSummary::from(&fresh)).unwrap(),
+            },
+        });
+        assert_ne!(
+            old_version, INDEX_VERSION,
+            "the test needs a genuinely OLD index version — bump the fixture if INDEX_VERSION moves past 1 again"
+        );
+        fs::write(store.index_path(), poisoned.to_string()).unwrap();
+
+        let ids: Vec<Uuid> = store.list().unwrap().iter().map(|s| s.id).collect();
+        assert_eq!(
+            ids.len(),
+            4,
+            "a v1 blessed index must be discarded and rebuilt — got {ids:?}"
+        );
+        for c in &preexisting {
+            assert!(
+                ids.contains(&c.id),
+                "pre-existing conversation {} must be visible",
+                c.id
+            );
+        }
+
+        // Rebuilt once: the on-disk index now carries the current version,
+        // so the second list serves from it (no further rescan).
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(store.index_path()).unwrap()).unwrap();
+        assert_eq!(
+            on_disk["version"], INDEX_VERSION,
+            "the rebuild must persist the current index version"
+        );
+        assert_eq!(
+            store.list().unwrap().len(),
+            4,
+            "the fresh index serves the second list"
+        );
     }
 }

@@ -1314,3 +1314,39 @@ describe("ConvoTabBar — wheel scrolls the strip sideways", () => {
     expect(ev.defaultPrevented).toBe(false);
   });
 });
+
+// ─── per-profile tab colour (remote-profiles design T2) ──────────────────
+//
+// A tab whose profile resolves to a colour gets the inline style
+// `--ctab-accent: var(--profile-<color>)`; the CSS paints the 2px top
+// accent from that variable (60% when the tab is inactive). A tab without
+// a colour sets NO `--ctab-accent` at all — the accent simply doesn't
+// render. RED before implementation: the component doesn't set the
+// variable yet, so `getPropertyValue` returns "".
+
+type TabViewWithColor = TabView & { color?: string };
+
+describe("ConvoTabBar — per-profile tab colour (remote-profiles T2)", () => {
+  it("sets --ctab-accent to var(--profile-<color>) for a coloured tab", async () => {
+    const el = await mount({
+      tabs: [
+        view({ key: "a", label: "Dev", active: true, color: "teal" } as TabViewWithColor),
+        view({ key: "b", label: "Home", color: "purple" } as TabViewWithColor),
+      ],
+      ...noop,
+    });
+    const [a, b] = tabsOf(el);
+    expect(a.style.getPropertyValue("--ctab-accent")).toBe("var(--profile-teal)");
+    expect(b.style.getPropertyValue("--ctab-accent")).toBe("var(--profile-purple)");
+  });
+
+  it("sets no --ctab-accent for a tab without a colour (graceful fallback)", async () => {
+    const el = await mount({
+      tabs: [view({ key: "a", label: "Local", active: true }), view({ key: "b", label: "New" })],
+      ...noop,
+    });
+    for (const t of tabsOf(el)) {
+      expect(t.style.getPropertyValue("--ctab-accent")).toBe("");
+    }
+  });
+});

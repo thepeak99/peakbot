@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::named::Named;
 use super::{
@@ -265,6 +265,48 @@ impl ConversationConfig {
 pub struct ProfileUi {
     #[serde(default)]
     pub tabs: NameFilter,
+    /// Accent for this profile's tabs; absent = derived from the name.
+    #[serde(default)]
+    pub color: Option<TabColor>,
+}
+
+/// The eight-slot per-profile accent palette (remote-profiles design §4.2).
+/// The variant order IS the `derived` contract, and the lowercase serde
+/// names are the config/wire contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TabColor {
+    Red,
+    Orange,
+    Yellow,
+    Green,
+    Teal,
+    Blue,
+    Purple,
+    Pink,
+}
+
+impl TabColor {
+    /// `FNV-1a-32(name) % 8` over the palette order — a stable per-name
+    /// colour, so the SPA never derives one (RP8).
+    pub fn derived(name: &str) -> TabColor {
+        const PALETTE: [TabColor; 8] = [
+            TabColor::Red,
+            TabColor::Orange,
+            TabColor::Yellow,
+            TabColor::Green,
+            TabColor::Teal,
+            TabColor::Blue,
+            TabColor::Purple,
+            TabColor::Pink,
+        ];
+        let mut hash: u32 = 2_166_136_261;
+        for b in name.as_bytes() {
+            hash ^= u32::from(*b);
+            hash = hash.wrapping_mul(16_777_619);
+        }
+        PALETTE[(hash % 8) as usize]
+    }
 }
 
 fn default_bind() -> SocketAddr {
@@ -299,5 +341,88 @@ fn default_context() -> ContextConfig {
         keep_recent: 5,
         enabled: true,
         compaction_model: None,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tab colour (remote-profiles design T1, §4.2): `TabColor` + `derived()`.
+// Written BEFORE the type exists — compile-RED until T1 lands.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tab_color_tests {
+    use super::TabColor;
+
+    /// The golden table is a stability contract (design §9, T1): these six
+    /// names map to these colours on every machine, in every release.
+    /// Each entry is `FNV-1a-32(name) % 8` over the enum order
+    /// [Red, Orange, Yellow, Green, Teal, Blue, Purple, Pink].
+    const GOLDEN: &[(&str, TabColor)] = &[
+        ("dev", TabColor::Teal),
+        ("work", TabColor::Red),
+        ("home", TabColor::Purple),
+        ("personal", TabColor::Blue),
+        ("ops", TabColor::Green),
+        ("design", TabColor::Pink),
+    ];
+
+    #[test]
+    fn derived_golden_table_is_the_stability_contract() {
+        for (name, expected) in GOLDEN {
+            assert_eq!(TabColor::derived(name), *expected, "derived({name})");
+        }
+    }
+
+    #[test]
+    fn derived_is_deterministic_and_name_sensitive() {
+        // Same name → same colour, every time (no clock, no random).
+        assert_eq!(TabColor::derived("dev"), TabColor::derived("dev"));
+        // The six golden names land on six DISTINCT colours: renaming a
+        // profile is expected to change its colour (a collision is
+        // overridable via `ui.color` — that is the point of eight slots).
+        let mut seen: Vec<TabColor> = Vec::new();
+        for (name, _) in GOLDEN {
+            let color = TabColor::derived(name);
+            assert!(
+                !seen.contains(&color),
+                "golden names must not collide: {name}"
+            );
+            seen.push(color);
+        }
+    }
+
+    #[test]
+    fn serde_is_lowercase_and_round_trips_all_eight() {
+        let all = [
+            TabColor::Red,
+            TabColor::Orange,
+            TabColor::Yellow,
+            TabColor::Green,
+            TabColor::Teal,
+            TabColor::Blue,
+            TabColor::Purple,
+            TabColor::Pink,
+        ];
+        let names = [
+            "red", "orange", "yellow", "green", "teal", "blue", "purple", "pink",
+        ];
+        for (color, name) in all.iter().zip(names) {
+            let json = serde_json::to_string(color).expect("TabColor serialises");
+            assert_eq!(json, format!("\"{name}\""), "the wire name is lowercase");
+            assert_eq!(
+                &serde_json::from_str::<TabColor>(&json).expect("round-trip"),
+                color
+            );
+        }
+    }
+
+    #[test]
+    fn serde_rejects_unknown_and_miscased_colour_names() {
+        assert!(
+            serde_json::from_str::<TabColor>("\"magenta\"").is_err(),
+            "no such colour in the eight-slot palette"
+        );
+        // Case is part of the wire contract.
+        assert!(serde_json::from_str::<TabColor>("\"Teal\"").is_err());
+        assert!(serde_json::from_str::<TabColor>("\"teal \"").is_err());
     }
 }

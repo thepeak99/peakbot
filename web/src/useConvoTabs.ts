@@ -10,8 +10,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   activate,
+  activeProfile,
   activeTab,
   applyList,
+  applyListProfiles,
   bound,
   closeTab,
   cycle,
@@ -135,6 +137,14 @@ export function useConvoTabs(
     apply(retitle(tabsRef.current, convo, activeTitle));
   }, [convo, activeTitle, apply]);
 
+  // The active tab's profile follows the socket's selection (design T2,
+  // §6.4). Absent selection (fresh conversation / old server) = null.
+  const selProfile = agent.state?.selection?.profile || null;
+  useEffect(() => {
+    if (!tabsRef.current) return;
+    apply(activeProfile(tabsRef.current, selProfile));
+  }, [selProfile, apply]);
+
   // Fold each conversations list into the background status + inactive titles.
   const { conversations } = agent;
   useEffect(() => {
@@ -142,7 +152,7 @@ export function useConvoTabs(
     if (!s) return;
     setStatus((st) => applyList(st, conversations, s));
     const activeConvo = activeTab(s).convo;
-    let next = s;
+    let next = applyListProfiles(s, conversations);
     for (const c of conversations) {
       if (c.message_count > 0 && c.id !== activeConvo) {
         next = retitle(next, c.id, c.name);
@@ -196,8 +206,8 @@ export function useConvoTabs(
   }, [enabled, dispatch]);
 
   const views = useMemo(
-    () => (tabs ? tabViews(tabs, status, activeRunning) : []),
-    [tabs, status, activeRunning],
+    () => (tabs ? tabViews(tabs, status, activeRunning, agent.state?.catalog) : []),
+    [tabs, status, activeRunning, agent.state?.catalog],
   );
 
   const api = useMemo<ConvoTabsApi | null>(
