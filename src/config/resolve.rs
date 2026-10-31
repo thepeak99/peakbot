@@ -16,11 +16,13 @@ use serde_yaml::Value;
 
 use super::errors::{ConfigError, ConfigErrors, ConfigFileKind, PathSeg, dotted};
 use super::file::{
-    AgentDef, ConfigFile, Env, General, ProfileDef, RepoFile, SubagentDef, TabColor, VectorDbConfig,
+    AgentDef, ConfigFile, Env, General, ProfileDef, ProfileEntry, RepoFile, SubagentDef, TabColor,
+    VectorDbConfig,
 };
 use super::migrate::is_legacy;
 use super::model_registry::canonical_alias;
 use super::named::{NamedFailure, named_failure};
+use super::remote::{self, RemoteProfile};
 use super::{
     BUILTIN_TOOL_NAMES, EmbeddingsConfig, FetchUrlConfig, McpServerConfig, MemoryConfig,
     ModelRegistry, NameFilter, ProviderEntry, RegistryError, ResolvedModel, TAB_NAMES,
@@ -83,30 +85,61 @@ pub struct Config {
     pub warnings: Vec<String>,
 }
 
-/// The selectable profiles. I1: non-empty, repo-origin profiles first, so
-/// "default" is always `[0]`. I7: a repo profile never coexists with a
-/// same-named global one.
+/// One catalogue entry: a local profile (bindable to a session) or a
+/// remote profile (relayed, never bound locally) — design §4.2.
+#[derive(Debug)]
+pub enum CatalogEntry {
+    Local(Arc<ResolvedProfile>),
+    Remote(Arc<RemoteProfile>),
+}
+
+/// The selectable profiles. ONE ordered list (I1): repo entries first, then
+/// global in file order, local and remote mixed. CE1: at least one Local.
 #[derive(Debug)]
 pub struct Catalog {
-    profiles: Vec<Arc<ResolvedProfile>>,
+    entries: Vec<CatalogEntry>,
 }
 
 impl Catalog {
-    /// The first agent of the first profile.
+    /// The entries in catalog order (repo first, then global file order).
+    pub fn entries(&self) -> impl Iterator<Item = &CatalogEntry> {
+        self.entries.iter()
+    }
+
+    /// The first agent of the first LOCAL profile — a remote entry listed
+    /// first never becomes the default (CE1 guarantees a local exists).
     pub fn default_bound(&self) -> Bound {
-        Bound::new(Arc::clone(&self.profiles[0]), 0)
+        let profile = self
+            .entries
+            .iter()
+            .find_map(local_entry)
+            .expect("CE1: at least one local profile");
+        Bound::new(Arc::clone(profile), 0)
     }
 
+    /// LOCAL only: remotes have no local agents and are never a `Bound`.
     pub fn profile(&self, name: &str) -> Option<&Arc<ResolvedProfile>> {
-        self.profiles.iter().find(|p| p.name == name)
+        self.iter().find(|p| p.name == name)
     }
 
+    /// The remote entry with this name, if any.
+    pub fn remote(&self, name: &str) -> Option<&Arc<RemoteProfile>> {
+        self.entries
+            .iter()
+            .find(|e| matches!(e, CatalogEntry::Remote(r) if r.name == name))
+            .and_then(|e| match e {
+                CatalogEntry::Remote(r) => Some(r),
+                _ => None,
+            })
+    }
+
+    /// LOCAL only, in catalog order.
     pub fn iter(&self) -> impl Iterator<Item = &Arc<ResolvedProfile>> {
-        self.profiles.iter()
+        self.entries.iter().filter_map(local_entry)
     }
 
     /// `(profile, agent)` → a Bound with NO overrides; `None` if either name
-    /// is unknown — never a silent default (§5.3).
+    /// is unknown — never a silent default (§5.3). LOCAL only.
     pub fn resolve(&self, profile: &str, agent: &str) -> Option<Bound> {
         let profile = self.profile(profile)?;
         let agent_index = profile.agents.iter().position(|a| a.main.name == agent)?;
@@ -114,21 +147,22 @@ impl Catalog {
     }
 
     /// The session's starting `Bound`: the pinned profile's first agent
-    /// when pinned, else the default (first profile, first agent). A pin
-    /// names only GLOBAL profiles — repo files are ignored under a pin,
-    /// so a repo-origin profile is unknown and not listed (§4.3 PIN).
+    /// when pinned, else the default (first LOCAL profile, first agent). A
+    /// pin names only GLOBAL local profiles — repo files are ignored under
+    /// a pin (§4.3 PIN), and a remote profile can't be pinned at all.
     pub fn start_bound(&self, pin: Option<&str>) -> Result<Bound, String> {
         let Some(pin) = pin else {
             return Ok(self.default_bound());
         };
+        if self.remote(pin).is_some() {
+            return Err(format!("--profile can't pin a remote profile ('{pin}')"));
+        }
         let profile = self
-            .profiles
             .iter()
             .find(|p| p.name == pin && matches!(p.origin, Origin::Global))
             .cloned();
         let Some(profile) = profile else {
             let configured: Vec<&str> = self
-                .profiles
                 .iter()
                 .filter(|p| matches!(p.origin, Origin::Global))
                 .map(|p| p.name.as_str())
@@ -142,9 +176,31 @@ impl Catalog {
     }
 
     /// The wire projection for Settings and AppState (§8.7), in catalog
-    /// order (repo first). `inherited` is derived, not stored (Z4).
+    /// order (repo first). `inherited` is derived, not stored (Z4). Remote
+    /// entries carry `origin: "remote"`, `agents: []` (the relay fills them
+    /// for the active remote tab, §6.3) and a resolved colour — and never
+    /// the token, URL or fingerprint.
     pub fn infos(&self) -> Vec<ProfileInfo> {
-        self.profiles.iter().map(|p| profile_info(p)).collect()
+        self.entries
+            .iter()
+            .map(|e| match e {
+                CatalogEntry::Local(p) => profile_info(p),
+                CatalogEntry::Remote(r) => ProfileInfo {
+                    name: r.name.clone(),
+                    origin: "remote".to_string(),
+                    overrides_global: false,
+                    agents: Vec::new(),
+                    color: r.color,
+                },
+            })
+            .collect()
+    }
+}
+
+fn local_entry(e: &CatalogEntry) -> Option<&Arc<ResolvedProfile>> {
+    match e {
+        CatalogEntry::Local(p) => Some(p),
+        CatalogEntry::Remote(_) => None,
     }
 }
 
@@ -461,7 +517,9 @@ impl Config {
         if file.profiles.is_empty() {
             global_sink.push(vec![key("profiles")], E2_MESSAGE);
         }
-        let mut resolved = Vec::new();
+        let mut entries: Vec<CatalogEntry> = Vec::new();
+        // (name, origin, target profile) of the parsed remotes, for RP4.
+        let mut remotes: Vec<(String, String, String)> = Vec::new();
         if let (Some(repo_file), Some(src)) = (&repo_file, &repo) {
             // `<root>/.peakbot/config.yaml` → `<root>`.
             let root = src
@@ -469,23 +527,109 @@ impl Config {
                 .parent()
                 .and_then(Path::parent)
                 .unwrap_or(Path::new(""));
-            for (name, def) in repo_file.profiles.iter() {
-                let origin = Origin::Repo {
-                    overrides_global: file.profiles.get(name).is_some(),
-                };
-                resolved.push(resolver.profile(&mut repo_sink, name, def, origin, Some(root)));
+            for (name, entry) in repo_file.profiles.iter() {
+                match entry {
+                    // RP7: a `remote` block is a global-file-only kind.
+                    ProfileEntry::Remote(_) => {
+                        repo_sink.push(
+                            vec![key("profiles"), key(name)],
+                            "remote profiles are only allowed in the global config.yaml",
+                        );
+                    }
+                    // A repo profile can't replace a global remote definition.
+                    ProfileEntry::Local(def)
+                        if file
+                            .profiles
+                            .get(name)
+                            .is_some_and(|g| matches!(g, ProfileEntry::Remote(_))) =>
+                    {
+                        repo_sink.push(
+                            vec![key("profiles"), key(name)],
+                            format!("'{name}' would replace the remote profile '{name}' — rename one of them"),
+                        );
+                    }
+                    ProfileEntry::Local(def) => {
+                        let origin = Origin::Repo {
+                            overrides_global: file.profiles.get(name).is_some(),
+                        };
+                        if let Some(profile) =
+                            resolver.profile(&mut repo_sink, name, def, origin, Some(root))
+                        {
+                            entries.push(CatalogEntry::Local(Arc::new(profile)));
+                        }
+                    }
+                }
             }
         }
-        for (name, def) in file.profiles.iter() {
+        for (name, entry) in file.profiles.iter() {
             let shadowed = repo_file
                 .as_ref()
                 .is_some_and(|r| r.profiles.get(name).is_some());
-            if !shadowed {
-                resolved.push(resolver.profile(&mut global_sink, name, def, Origin::Global, None));
+            if shadowed {
+                continue;
+            }
+            match entry {
+                ProfileEntry::Local(def) => {
+                    if let Some(profile) =
+                        resolver.profile(&mut global_sink, name, def, Origin::Global, None)
+                    {
+                        entries.push(CatalogEntry::Local(Arc::new(profile)));
+                    }
+                }
+                ProfileEntry::Remote(rdef) => {
+                    match remote::parse_remote(name, &rdef.remote, rdef.ui.color) {
+                        Ok(remote_profile) => {
+                            remotes.push((
+                                name.clone(),
+                                remote_profile.endpoint.origin_without_slash(),
+                                remote_profile.target.profile.clone(),
+                            ));
+                            entries.push(CatalogEntry::Remote(Arc::new(remote_profile)));
+                        }
+                        // §4.4: one error per field, keyed at the block.
+                        Err(field_errors) => {
+                            for e in field_errors {
+                                global_sink.push(
+                                    vec![key("profiles"), key(name), key("remote"), key(e.field)],
+                                    e.message,
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
-        let profiles: Vec<ResolvedProfile> = resolved.into_iter().flatten().collect();
-        check_shared_vector_dbs(&profiles, &mut global_sink, &mut repo_sink);
+        // RP4: (origin, target profile) is unique across remote profiles.
+        for (i, later) in remotes.iter().enumerate() {
+            for earlier in &remotes[..i] {
+                if later.1 == earlier.1 && later.2 == earlier.2 {
+                    global_sink.push(
+                        vec![key("profiles"), key(&later.0)],
+                        format!(
+                            "'{}' and '{}' both point at profile '{}' on {}",
+                            later.0, earlier.0, later.2, later.1
+                        ),
+                    );
+                }
+            }
+        }
+        // CE1 (desktop MVP): the catalog needs a local profile to bind a
+        // session — judged on the FILE, so a failing local profile reports
+        // its own errors only, not a second "no local" on top.
+        if !file.profiles.is_empty()
+            && !file
+                .profiles
+                .iter()
+                .any(|(_, e)| matches!(e, ProfileEntry::Local(_)))
+        {
+            global_sink.push(vec![key("profiles")], CE1_MESSAGE);
+        }
+        let locals: Vec<&ResolvedProfile> = entries
+            .iter()
+            .filter_map(local_entry)
+            .map(|p| p.as_ref())
+            .collect();
+        check_shared_vector_dbs(&locals, &mut global_sink, &mut repo_sink);
         resolver.general(&mut global_sink, &file.general);
 
         let errors: Vec<ConfigError> = global_sink
@@ -502,9 +646,7 @@ impl Config {
             registry: Arc::new(registry.expect("registry built when no errors")),
             mcps: file.mcps,
             general: file.general,
-            catalog: Catalog {
-                profiles: profiles.into_iter().map(Arc::new).collect(),
-            },
+            catalog: Catalog { entries },
             warnings,
         })
     }
@@ -553,6 +695,8 @@ impl Config {
 }
 
 const E2_MESSAGE: &str = "declare at least one profile — the first one is the default";
+/// CE1 (desktop MVP): a profiles map with no LOCAL profile at all.
+const CE1_MESSAGE: &str = "declare at least one local profile (one with agents)";
 
 /// RP1 for every non-`profiles` key (collected), else the typed parse.
 fn parse_repo(
@@ -771,7 +915,7 @@ fn check_mcps(servers: &[McpServerConfig], sink: &mut Sink) {
 
 /// V2: one DB file needs one embedding model. Reported on the later profile,
 /// in the file that declares it.
-fn check_shared_vector_dbs(profiles: &[ResolvedProfile], global: &mut Sink, repo: &mut Sink) {
+fn check_shared_vector_dbs(profiles: &[&ResolvedProfile], global: &mut Sink, repo: &mut Sink) {
     for (i, profile) in profiles.iter().enumerate() {
         let Some(spec) = &profile.vector else {
             continue;
@@ -2194,5 +2338,826 @@ profiles:
         assert_eq!(info(&cfg, "site").color, TabColor::Blue);
         assert_eq!(info(&cfg, "ops").color, TabColor::derived("ops"));
         assert_eq!(info(&cfg, "ops").color, TabColor::Green);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// T3 RED tests (remote-profiles design, task 3): the `remote` profile kind.
+// Written BEFORE the types exist, against the locked spec: §4.1 (the YAML
+// that must parse), §4.2 (the resolved `RemoteProfile`/`Endpoint`/`Trust`/
+// `CaFingerprint`/`RemoteToken`/`RemoteTarget` and the `CatalogEntry`
+// catalogue), §4.4 (every parse error — one shape, keyed by field path),
+// RP1–RP8 and CE1. They must fail to compile until `config::remote` and
+// the `CatalogEntry` catalogue land.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod t3_remote_profile_tests {
+    use std::path::Path;
+
+    use crate::config::remote::{Endpoint, Trust};
+
+    use super::*;
+
+    /// The fixture CA pin — 64 lowercase hex, the only shape besides
+    /// `system` that `ca` accepts (RP2).
+    const CA_PIN: &str = "sha256:3f9a0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab";
+
+    /// A fully valid `remote:` block (the lines under the profile name).
+    const VALID_BLOCK: &str = "    remote:\n      url: https://10.2.0.48:7823\n      token: pito\n      ca: sha256:3f9a0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab\n      profile: dev";
+
+    /// The §4.1 example, verbatim (plus the provider the parse needs): a
+    /// local `dev` with a configured colour, then one remote profile per
+    /// trust/plaintext case.
+    const GLOBAL_YAML: &str = r#"
+providers:
+  - name: patchnotes
+    type: openai
+    base_url: https://ai.patchnotes.com/v1
+    api_key: pn-test
+    models:
+      - { name: anthropic/claude-sonnet-4.5, alias: sonnet, max_tokens: 8192 }
+profiles:
+  dev:                                   # local profile — unchanged, may gain ui.color
+    ui: { color: teal }
+    agents:
+      team: { model: sonnet }
+  home-dev:                              # REMOTE profile: `remote` (+ optional ui.color) and nothing else
+    remote:
+      url: https://10.2.0.48:7823
+      token: pito
+      ca: sha256:3f9a0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab
+      profile: dev
+    ui: { color: purple }
+  vps-web:
+    remote:
+      url: https://bot.example.ts.net
+      token: 9c1e
+      ca: system
+      profile: web
+  sandbox:
+    remote: { url: http://127.0.0.1:7824, token: s3cret, profile: dev }
+"#;
+
+    fn ctx() -> ParseCtx<'static> {
+        ParseCtx { known_skills: &[] }
+    }
+
+    fn parse(global: &str, repo: Option<&str>) -> Result<Config, ConfigErrors> {
+        Config::parse(
+            Source {
+                path: Path::new("/global/config.yaml"),
+                text: global,
+            },
+            repo.map(|text| Source {
+                path: Path::new("/repo/.peakbot/config.yaml"),
+                text,
+            }),
+            &ctx(),
+        )
+    }
+
+    /// One global config: the remote entry spelled by `entry_body` (the
+    /// indented lines under the profile name) plus a minimal local profile,
+    /// so CE1 has a local to stand on.
+    fn with_remote_entry(entry_name: &str, entry_body: &str) -> String {
+        format!(
+            "providers:\n  - name: patchnotes\n    type: openai\n    base_url: https://ai.patchnotes.com/v1\n    api_key: pn-test\n    models:\n      - {{ name: anthropic/claude-sonnet-4.5, alias: sonnet, max_tokens: 8192 }}\nprofiles:\n  {entry_name}:\n{entry_body}  local:\n    agents:\n      a:\n        model: sonnet\n"
+        )
+    }
+
+    /// `VALID_BLOCK` with one `field:` line's value replaced.
+    fn block_with(field: &str, value: &str) -> String {
+        let prefix = format!("      {field}:");
+        let mut out = String::new();
+        for line in VALID_BLOCK.lines() {
+            if line.starts_with(&prefix) {
+                out.push_str(&format!("{prefix} {value}\n"));
+            } else {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// `VALID_BLOCK` with one line dropped.
+    fn block_without(field: &str) -> String {
+        let prefix = format!("      {field}:");
+        VALID_BLOCK
+            .lines()
+            .filter(|line| !line.starts_with(&prefix))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    }
+
+    /// A plain-http block: `ca` is FORBIDDEN on http (row 7), so it has none.
+    fn http_block(url: &str) -> String {
+        format!("    remote:\n      url: {url}\n      token: pito\n      profile: dev\n")
+    }
+
+    /// `VALID_BLOCK` with one line appended.
+    fn block_plus(extra_line: &str) -> String {
+        format!("{VALID_BLOCK}\n{extra_line}\n")
+    }
+
+    /// A global config with two remote entries (in order) plus a local one.
+    fn two_remote_entries(first: &str, second: &str) -> String {
+        format!(
+            "providers:\n  - name: patchnotes\n    type: openai\n    base_url: https://ai.patchnotes.com/v1\n    api_key: pn-test\n    models:\n      - {{ name: anthropic/claude-sonnet-4.5, alias: sonnet, max_tokens: 8192 }}\nprofiles:\n  home-dev:\n{first}\n  home-dev-2:\n{second}\n  local:\n    agents:\n      a:\n        model: sonnet\n"
+        )
+    }
+
+    fn entry_path(name: &str) -> Vec<PathSeg> {
+        vec![key("profiles"), key(name)]
+    }
+
+    fn remote_block_path(name: &str) -> Vec<PathSeg> {
+        vec![key("profiles"), key(name), key("remote")]
+    }
+
+    fn remote_path(name: &str, field: &str) -> Vec<PathSeg> {
+        vec![key("profiles"), key(name), key("remote"), key(field)]
+    }
+
+    /// Exactly one error, at `path`; returns it for the message assert.
+    fn one_err<'a>(err: &'a ConfigErrors, path: &[PathSeg], label: &str) -> &'a ConfigError {
+        assert_eq!(err.0.len(), 1, "exactly one error for {label}: {err:?}");
+        let e = &err.0[0];
+        assert_eq!(&e.path, path, "error path for {label}: {e:?}");
+        e
+    }
+
+    /// §4.4 row 1's message, with the offending key.
+    fn excl_msg(key: &str) -> String {
+        format!(
+            "a remote profile has only `remote` and `ui.color` — `{key}` belongs to the profile on the remote server"
+        )
+    }
+
+    /// §4.1 verbatim → §4.2 types: the three remote profiles resolve to the
+    /// doc's `RemoteProfile` (parsed endpoint, trust, target, colour) and
+    /// the local profile is untouched.
+    #[test]
+    fn section_4_1_yaml_resolves_to_the_doc_types() {
+        let cfg = parse(GLOBAL_YAML, None).expect("the §4.1 example must parse");
+
+        let home = cfg.catalog.remote("home-dev").expect("home-dev is remote");
+        assert_eq!(home.name, "home-dev");
+        match &home.endpoint {
+            Endpoint::Tls { origin, trust } => {
+                assert_eq!(origin.as_str(), "https://10.2.0.48:7823/");
+                assert!(
+                    matches!(trust, Trust::PinnedCa(f) if f.to_string() == CA_PIN),
+                    "the pin is the 64-hex fingerprint: {trust:?}"
+                );
+            }
+            other => panic!("home-dev is https — expected Tls, got {other:?}"),
+        }
+        assert_eq!(home.target.profile, "dev");
+        assert_eq!(home.target.agent, None, "no agent pin in the fixture");
+        assert_eq!(home.color, TabColor::Purple, "the configured colour wins");
+
+        let vps = cfg.catalog.remote("vps-web").expect("vps-web is remote");
+        match &vps.endpoint {
+            Endpoint::Tls { origin, trust } => {
+                assert_eq!(origin.as_str(), "https://bot.example.ts.net/");
+                assert!(
+                    matches!(trust, Trust::System),
+                    "ca: system = explicit system trust"
+                );
+            }
+            other => panic!("vps-web is https — expected Tls, got {other:?}"),
+        }
+        assert_eq!(vps.target.profile, "web");
+        assert_eq!(
+            vps.color,
+            TabColor::derived("vps-web"),
+            "no ui.color → derived from the name"
+        );
+
+        let sandbox = cfg.catalog.remote("sandbox").expect("sandbox is remote");
+        match &sandbox.endpoint {
+            Endpoint::LoopbackPlain { origin } => {
+                assert_eq!(origin.as_str(), "http://127.0.0.1:7824/");
+            }
+            other => panic!("sandbox is loopback http — expected LoopbackPlain, got {other:?}"),
+        }
+        assert_eq!(sandbox.target.profile, "dev");
+        assert_eq!(sandbox.color, TabColor::derived("sandbox"));
+
+        // The local profile is unchanged: still local, still teal, one agent.
+        let dev = cfg
+            .catalog
+            .profile("dev")
+            .expect("dev stays in the catalog");
+        assert_eq!(dev.color, TabColor::Teal);
+        assert_eq!(dev.agents.len(), 1);
+        assert!(
+            cfg.catalog.remote("dev").is_none(),
+            "dev is not a remote profile"
+        );
+    }
+
+    /// `remote.agent` is the OPTIONAL agent pin: absent = `None`, present =
+    /// carried into the target.
+    #[test]
+    fn remote_agent_pin_lands_in_the_target() {
+        let yaml = with_remote_entry("home-dev", &block_plus("      agent: team"));
+        let cfg = parse(&yaml, None).expect("an agent pin must parse");
+        let home = cfg.catalog.remote("home-dev").expect("home-dev");
+        assert_eq!(home.target.profile, "dev");
+        assert_eq!(home.target.agent.as_deref(), Some("team"));
+    }
+
+    /// §7: the remote token is redacted — `RemoteToken`'s Debug AND Display
+    /// are the literal `RemoteToken(***)`, and a `RemoteProfile`'s Debug
+    /// carries no trace of the value.
+    #[test]
+    fn remote_token_debug_and_display_redact() {
+        let cfg = parse(GLOBAL_YAML, None).expect("fixture must parse");
+        let home = cfg.catalog.remote("home-dev").expect("home-dev");
+        assert_eq!(home.token.to_string(), "RemoteToken(***)");
+        assert_eq!(format!("{:?}", home.token), "RemoteToken(***)");
+        let debug = format!("{home:?}");
+        assert!(!debug.contains("pito"), "the token must not print: {debug}");
+
+        let debug = format!("{:?}", cfg.catalog.remote("sandbox").expect("sandbox"));
+        assert!(
+            !debug.contains("s3cret"),
+            "the token must not print: {debug}"
+        );
+    }
+
+    /// §4.4 row 1: `remote` plus ANY local field is a parse error keyed at
+    /// the profile, naming the offending key. `ui.color` is the only allowed
+    /// `ui` key (it is in GLOBAL_YAML).
+    #[test]
+    fn remote_plus_a_local_field_is_mutually_exclusive() {
+        let cases: &[(&str, &str)] = &[
+            ("agents", "    agents:\n      a:\n        model: sonnet\n"),
+            ("tools", "    tools: { disabled: [bash] }\n"),
+            ("mcps", "    mcps: { only: [playwright] }\n"),
+            ("fetch_url", "    fetch_url: { allow_post: true }\n"),
+            ("env", "    env: { FOO: bar }\n"),
+            ("memory", "    memory: { enabled: false }\n"),
+            (
+                "vector_db",
+                "    vector_db:\n      db_path: /tmp/db\n      embeddings:\n        base_url: https://e.example/v1\n        model: m\n        dimensions: 8\n",
+            ),
+            ("ui.tabs", "    ui:\n      tabs: { disabled: [bash] }\n"),
+        ];
+        for (key, body) in cases {
+            let yaml = with_remote_entry("home-dev", &block_plus(body));
+            let err =
+                parse(&yaml, None).expect_err(&format!("`{key}` next to `remote` must not parse"));
+            let e = one_err(
+                &err,
+                &entry_path("home-dev"),
+                &format!("mutual exclusion {key}"),
+            );
+            assert_eq!(e.file, ConfigFileKind::Global);
+            assert_eq!(
+                e.message,
+                excl_msg(key),
+                "the message must name the offending key"
+            );
+        }
+    }
+
+    /// `deny_unknown_fields` at the entry: a key that is neither `remote`,
+    /// `ui` nor a known LOCAL field is serde's unknown-field error, keyed at
+    /// the entry (§4.4 row 1 is for the known local keys only).
+    #[test]
+    fn remote_entry_unknown_key_is_a_serde_unknown_field_error() {
+        let yaml = with_remote_entry("home-dev", &block_plus("    bogus: 1"));
+        let err = parse(&yaml, None).expect_err("an unknown entry key must not parse");
+        let e = one_err(&err, &entry_path("home-dev"), "unknown entry key");
+        assert!(
+            e.message.starts_with("unknown field `bogus`"),
+            "the serde deny_unknown_fields wording: {}",
+            e.message
+        );
+    }
+
+    /// `RemoteUi` is `deny_unknown_fields`: `ui.color` is the only `ui` key
+    /// a remote profile has (`ui.tabs` is the exclusion row, anything else
+    /// is unknown).
+    #[test]
+    fn remote_ui_unknown_key_is_a_serde_unknown_field_error() {
+        let yaml = with_remote_entry("home-dev", &block_plus("    ui: { bogus: 1 }"));
+        let err = parse(&yaml, None).expect_err("an unknown remote ui key must not parse");
+        let e = one_err(
+            &err,
+            &[key("profiles"), key("home-dev"), key("ui")],
+            "unknown remote ui key",
+        );
+        assert!(
+            e.message.starts_with("unknown field `bogus`"),
+            "the serde deny_unknown_fields wording: {}",
+            e.message
+        );
+    }
+
+    /// An unknown `ui.color` name on a remote profile is the same
+    /// field-path-keyed parse error as on a local one.
+    #[test]
+    fn remote_ui_unknown_colour_is_a_field_path_keyed_error() {
+        let yaml = with_remote_entry("home-dev", &block_plus("    ui: { color: magenta }"));
+        let err = parse(&yaml, None).expect_err("an unknown colour must not parse");
+        let e = one_err(
+            &err,
+            &[key("profiles"), key("home-dev"), key("ui"), key("color")],
+            "unknown remote colour",
+        );
+        assert!(
+            e.message.contains("magenta"),
+            "names the bad value: {}",
+            e.message
+        );
+    }
+
+    /// §7: no secret reaches a Debug print or an error. The file-layer
+    /// `RemoteDef`, the whole `Config`, every parse error and the wire
+    /// projection (`infos()` → AppState.catalog → the SPA) carry neither the
+    /// token nor the URL.
+    #[test]
+    fn token_never_reaches_debug_errors_or_the_wire_projection() {
+        use crate::config::file::ConfigFile;
+
+        let file: ConfigFile = serde_yaml::from_str(GLOBAL_YAML).expect("file layer parses");
+        let debug = format!("{file:?}");
+        for secret in ["pito", "s3cret", "9c1e"] {
+            assert!(
+                !debug.contains(secret),
+                "file-layer Debug leaks {secret}: {debug}"
+            );
+        }
+
+        let cfg = parse(GLOBAL_YAML, None).expect("fixture must parse");
+        let debug = format!("{cfg:?}");
+        for secret in ["pito", "s3cret", "9c1e"] {
+            assert!(
+                !debug.contains(secret),
+                "Config Debug leaks {secret}: {debug}"
+            );
+        }
+
+        let wire = serde_json::to_string(&cfg.catalog.infos()).expect("infos serialise");
+        for secret in [
+            "pito",
+            "s3cret",
+            "9c1e",
+            "10.2.0.48",
+            "bot.example.ts.net",
+            "3f9a0123",
+        ] {
+            assert!(
+                !wire.contains(secret),
+                "the wire projection leaks {secret}: {wire}"
+            );
+        }
+
+        // A URL with the token in its userinfo must not be echoed back.
+        let yaml = with_remote_entry(
+            "home-dev",
+            &block_with("url", "https://hunter2@10.2.0.48:7823"),
+        );
+        let err = parse(&yaml, None).expect_err("userinfo must not parse");
+        let rendered = format!("{err:?}");
+        assert!(
+            !rendered.contains("hunter2"),
+            "the error echoes the userinfo: {rendered}"
+        );
+
+        // A bad token must not be echoed back.
+        let yaml = with_remote_entry("home-dev", &block_with("token", "top;secret"));
+        let err = parse(&yaml, None).expect_err("a cookie-unsafe token must not parse");
+        let rendered = format!("{err:?}");
+        assert!(
+            !rendered.contains("top;secret"),
+            "the error echoes the token: {rendered}"
+        );
+    }
+
+    /// Remote entries are reload-safe (next attach): editing a remote
+    /// profile's token / url / pin is NOT a boot-only change.
+    #[test]
+    fn editing_a_remote_profile_is_not_a_boot_only_change() {
+        let before = parse(GLOBAL_YAML, None).expect("fixture must parse");
+        let edited = GLOBAL_YAML
+            .replace("token: pito", "token: rotated")
+            .replace("https://10.2.0.48:7823", "https://10.2.0.49:7823");
+        let after = parse(&edited, None).expect("the edited fixture must parse");
+        assert!(
+            boot_only_diff(&before, &after).is_empty(),
+            "remote edits apply on the next attach, not on restart"
+        );
+    }
+
+    /// `deny_unknown_fields` on the `remote:` block: unknown keys inside it
+    /// are serde unknown-field errors keyed at the block that holds them.
+    #[test]
+    fn remote_block_unknown_field_is_a_serde_error() {
+        let yaml = with_remote_entry("home-dev", &block_plus("      bogus: 1"));
+        let err = parse(&yaml, None).expect_err("an unknown remote key must not parse");
+        let e = one_err(&err, &remote_block_path("home-dev"), "unknown remote key");
+        assert!(
+            e.message.starts_with("unknown field `bogus`"),
+            "the serde deny_unknown_fields wording: {}",
+            e.message
+        );
+    }
+
+    /// §4.4 row 2: not a URL, or a scheme outside {https, http}.
+    #[test]
+    fn remote_url_bad_scheme_is_rejected() {
+        for (label, url) in [
+            ("not a URL", "notaurl"),
+            ("ftp scheme", "ftp://example.com"),
+        ] {
+            let yaml = with_remote_entry("home-dev", &block_with("url", url));
+            let err = parse(&yaml, None).expect_err(label);
+            let e = one_err(&err, &remote_path("home-dev", "url"), label);
+            assert_eq!(
+                e.message,
+                "must be an https:// URL, e.g. https://10.0.0.5:7823"
+            );
+        }
+    }
+
+    /// §4.4 row 3 + RP3: `http` on a non-loopback host is refused; loopback
+    /// (127.0.0.0/8, `::1`, `localhost`) is the only plaintext.
+    #[test]
+    fn remote_url_http_non_loopback_is_rejected() {
+        for url in [
+            "http://10.0.0.5:7824",
+            "http://example.com",
+            // Look-alikes: a prefix/suffix of a loopback name is NOT loopback.
+            "http://127.0.0.1.example.com",
+            "http://localhost.example.com",
+            "http://0.0.0.0:7824",
+        ] {
+            let yaml = with_remote_entry("home-dev", &http_block(url));
+            let err = parse(&yaml, None).expect_err("http off loopback must not parse");
+            let e = one_err(&err, &remote_path("home-dev", "url"), url);
+            assert_eq!(
+                e.message,
+                "remote profiles connect over HTTPS — http is allowed only for 127.0.0.1 / localhost"
+            );
+        }
+    }
+
+    /// RP3: the loopback hosts (127.0.0.0/8, `::1`, `localhost`) are the ONLY
+    /// plaintext, and resolve to `Endpoint::LoopbackPlain`.
+    #[test]
+    fn remote_url_http_loopback_hosts_resolve_to_loopback_plain() {
+        for url in [
+            "http://127.0.0.1:7824",
+            "http://127.5.6.7:7824",
+            "http://localhost:7824",
+            "http://[::1]:7824",
+        ] {
+            let yaml = with_remote_entry("home-dev", &http_block(url));
+            let cfg = parse(&yaml, None).unwrap_or_else(|e| panic!("{url} must parse: {e:?}"));
+            let home = cfg.catalog.remote("home-dev").expect("home-dev");
+            assert!(
+                matches!(home.endpoint, Endpoint::LoopbackPlain { .. }),
+                "{url} → LoopbackPlain, got {:?}",
+                home.endpoint
+            );
+        }
+    }
+
+    /// Row 4 allows the bare `/` path: a trailing slash is the same
+    /// `scheme://host[:port]`, not a path.
+    #[test]
+    fn remote_url_trailing_slash_is_accepted() {
+        let yaml = with_remote_entry("home-dev", &block_with("url", "https://10.2.0.48:7823/"));
+        let cfg = parse(&yaml, None).expect("a bare `/` path is not a path");
+        let home = cfg.catalog.remote("home-dev").expect("home-dev");
+        match &home.endpoint {
+            Endpoint::Tls { origin, .. } => assert_eq!(origin.as_str(), "https://10.2.0.48:7823/"),
+            other => panic!("expected Tls, got {other:?}"),
+        }
+    }
+
+    /// §4.4 row 4: `scheme://host[:port]` only — a path, query, fragment or
+    /// userinfo is refused.
+    #[test]
+    fn remote_url_with_path_query_fragment_userinfo_is_rejected() {
+        let cases = [
+            ("a path", "https://10.2.0.48:7823/base"),
+            ("a query", "https://10.2.0.48:7823?token=pito"),
+            ("a fragment", "https://10.2.0.48:7823#ws"),
+            ("userinfo", "https://pito@10.2.0.48:7823"),
+        ];
+        for (label, url) in cases {
+            let yaml = with_remote_entry("home-dev", &block_with("url", url));
+            let err = parse(&yaml, None).expect_err(label);
+            let e = one_err(&err, &remote_path("home-dev", "url"), label);
+            assert_eq!(
+                e.message,
+                "only scheme://host[:port] — put the token in `token`"
+            );
+        }
+    }
+
+    /// §4.4 row 5: an empty token, or one with whitespace / `;` / `,` / `"`
+    /// / control chars (cookie-unsafe), is refused.
+    #[test]
+    fn remote_token_rejects_empty_and_unsafe_chars() {
+        let bad: &[(&str, &str)] = &[
+            ("empty", "\"\""),
+            ("whitespace", "a b"),
+            ("semicolon", "a;b"),
+            ("comma", "a,b"),
+            ("double quote", "\"a\\\"b\""),
+            ("control char", "\"a\\u0001b\""),
+        ];
+        for (label, value) in bad {
+            let yaml = with_remote_entry("home-dev", &block_with("token", value));
+            let err = parse(&yaml, None).expect_err(&format!("token {label} must not parse"));
+            let e = one_err(&err, &remote_path("home-dev", "token"), label);
+            assert_eq!(
+                e.message,
+                "the remote's web token (as printed by its `?token=…` link)"
+            );
+        }
+    }
+
+    /// §4.4 row 6 + RP2: `ca` is REQUIRED on https — no pin and no `system`
+    /// is a parse error (there is no "https with default trust" state).
+    #[test]
+    fn remote_https_missing_ca_is_rejected() {
+        let yaml = with_remote_entry("home-dev", &block_without("ca"));
+        let err = parse(&yaml, None).expect_err("https without a ca must not parse");
+        let e = one_err(&err, &remote_path("home-dev", "ca"), "missing ca");
+        assert_eq!(
+            e.message,
+            "pin the server's CA (`ca: sha256:…` from its pairing link) or use `ca: system` for a publicly trusted certificate"
+        );
+    }
+
+    /// §4.4 row 7: `ca` is FORBIDDEN on loopback http.
+    #[test]
+    fn remote_ca_on_loopback_http_is_rejected() {
+        // Both `ca` shapes are refused on loopback http: a pin and `system`.
+        for ca in [CA_PIN, "system"] {
+            let yaml = with_remote_entry(
+                "home-dev",
+                &format!(
+                    "    remote:\n      url: http://127.0.0.1:7824\n      token: pito\n      ca: {ca}\n      profile: dev\n"
+                ),
+            );
+            let err = parse(&yaml, None).expect_err("ca on loopback http must not parse");
+            let e = one_err(&err, &remote_path("home-dev", "ca"), "ca on http");
+            assert_eq!(e.message, "`ca` applies to https only");
+        }
+    }
+
+    /// §4.4 row 8: `ca` is `system` or `sha256:<64 lowercase hex>` — nothing
+    /// else (short, long, non-hex, upper-case, prefix-less).
+    #[test]
+    fn remote_ca_must_be_system_or_64_lower_hex() {
+        let bad: Vec<String> = vec![
+            "sha256:zz".into(),
+            "\"sha256:\"".into(),
+            "xyz".into(),
+            format!("sha256:{}", "a".repeat(63)),
+            format!("sha256:{}", "a".repeat(65)),
+            format!("sha256:{}", "A".repeat(64)),
+        ];
+        for value in &bad {
+            let yaml = with_remote_entry("home-dev", &block_with("ca", value));
+            let err = parse(&yaml, None).expect_err(&format!("bad ca must not parse: {value}"));
+            let e = one_err(&err, &remote_path("home-dev", "ca"), "bad ca");
+            assert_eq!(e.message, "expected `system` or `sha256:<64 hex chars>`");
+        }
+    }
+
+    /// §4.4 row 9: `remote.profile` / `remote.agent` obey the profile name
+    /// rule — the existing N1 message, re-pathed into the `remote` block.
+    #[test]
+    fn remote_profile_and_agent_obey_the_name_rule() {
+        let yaml = with_remote_entry("home-dev", &block_with("profile", "\"\""));
+        let err = parse(&yaml, None).expect_err("an empty target profile must not parse");
+        let e = one_err(
+            &err,
+            &remote_path("home-dev", "profile"),
+            "empty remote.profile",
+        );
+        assert_eq!(
+            e.message,
+            "name '' must be 1–64 characters of letters, digits, space, '_', '.', '-' with no leading/trailing space"
+        );
+
+        let long = "a".repeat(65);
+        let yaml = with_remote_entry("home-dev", &block_plus(&format!("      agent: {long}")));
+        let err = parse(&yaml, None).expect_err("a 65-char agent pin must not parse");
+        let e = one_err(&err, &remote_path("home-dev", "agent"), "long remote.agent");
+        assert_eq!(
+            e.message,
+            format!(
+                "name '{long}' must be 1–64 characters of letters, digits, space, '_', '.', '-' with no leading/trailing space"
+            )
+        );
+    }
+
+    /// `remote.profile` is REQUIRED (Q1): absent = serde missing-field at
+    /// the `remote` block.
+    #[test]
+    fn remote_missing_profile_is_a_missing_field() {
+        let yaml = with_remote_entry("home-dev", &block_without("profile"));
+        let err = parse(&yaml, None).expect_err("remote.profile is required");
+        let e = one_err(
+            &err,
+            &remote_block_path("home-dev"),
+            "missing remote.profile",
+        );
+        assert_eq!(e.message, "missing field `profile`");
+    }
+
+    /// RP4 / §4.4 row 10: two remote profiles with the same (origin,
+    /// profile) are a parse error on the LATER one, naming both profiles,
+    /// the target and the origin.
+    #[test]
+    fn duplicate_remote_target_is_an_r4_error() {
+        let yaml = two_remote_entries(VALID_BLOCK, VALID_BLOCK);
+        let err = parse(&yaml, None).expect_err("a duplicated (origin, profile) must not parse");
+        let e = one_err(&err, &entry_path("home-dev-2"), "RP4 duplicate");
+        assert_eq!(
+            e.message,
+            "'home-dev-2' and 'home-dev' both point at profile 'dev' on https://10.2.0.48:7823"
+        );
+
+        // Same origin, different target profiles: fine.
+        let ok = two_remote_entries(VALID_BLOCK, &block_with("profile", "web"));
+        parse(&ok, None).expect("different target profiles on one origin are fine");
+
+        // Same target profile, different origins: fine.
+        let ok = two_remote_entries(VALID_BLOCK, &block_with("url", "https://10.2.0.49:7823"));
+        parse(&ok, None).expect("the same target profile on different origins is fine");
+    }
+
+    /// §4.4 row 11 + RP7: a `remote` block in the REPO file is a parse
+    /// error — remote profiles exist only in the global file.
+    #[test]
+    fn repo_remote_profile_is_rejected() {
+        // A name the global file does not use, so row 12 cannot also fire.
+        let repo = "profiles:\n  repo-remote:\n    remote:\n      url: https://10.2.0.99:7823\n      token: pito\n      ca: sha256:3f9a0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab\n      profile: dev\n";
+        let err = parse(GLOBAL_YAML, Some(repo)).expect_err("a repo remote profile must not parse");
+        let e = one_err(&err, &entry_path("repo-remote"), "repo remote profile");
+        assert_eq!(e.file, ConfigFileKind::Repo);
+        assert_eq!(
+            e.message,
+            "remote profiles are only allowed in the global config.yaml"
+        );
+    }
+
+    /// §4.4 row 12: a repo profile with the same name as a GLOBAL REMOTE
+    /// profile is a parse error — it would replace the remote definition.
+    #[test]
+    fn repo_profile_shadowing_a_global_remote_is_rejected() {
+        let repo = "profiles:\n  home-dev:\n    agents:\n      a:\n        model: sonnet\n";
+        let err =
+            parse(GLOBAL_YAML, Some(repo)).expect_err("shadowing a remote profile must not parse");
+        let e = one_err(&err, &entry_path("home-dev"), "repo shadows a remote");
+        assert_eq!(e.file, ConfigFileKind::Repo);
+        assert_eq!(
+            e.message,
+            "'home-dev' would replace the remote profile 'home-dev' — rename one of them"
+        );
+    }
+
+    /// §4.4 row 13: `--profile` cannot pin a remote profile.
+    #[test]
+    fn start_bound_refuses_to_pin_a_remote_profile() {
+        let cfg = parse(GLOBAL_YAML, None).expect("fixture must parse");
+        let msg = cfg
+            .catalog
+            .start_bound(Some("home-dev"))
+            .expect_err("a remote profile cannot be pinned");
+        assert_eq!(msg, "--profile can't pin a remote profile ('home-dev')");
+    }
+
+    /// §4.4 row 14 + CE1 (desktop MVP): a profiles map with NO local
+    /// profile (only remote entries) is a parse error at `profiles`.
+    #[test]
+    fn all_remote_profiles_are_a_no_local_profile_error() {
+        let yaml = "providers:\n  - name: patchnotes\n    type: openai\n    base_url: https://ai.patchnotes.com/v1\n    api_key: pn-test\n    models:\n      - { name: anthropic/claude-sonnet-4.5, alias: sonnet, max_tokens: 8192 }\nprofiles:\n  home-dev:\n    remote:\n      url: https://10.2.0.48:7823\n      token: pito\n      ca: sha256:3f9a0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab\n      profile: dev\n";
+        let err = parse(yaml, None).expect_err("a local-less profile set must not parse");
+        let e = one_err(&err, &[key("profiles")], "no local profile");
+        assert_eq!(
+            e.message,
+            "declare at least one local profile (one with agents)"
+        );
+    }
+
+    /// "First = default" with a remote entry in the mix: `default_bound` /
+    /// `start_bound` iterate the LOCAL entries only — a remote first in file
+    /// order never becomes a session bound.
+    #[test]
+    fn default_bound_and_start_bound_skip_remote_entries() {
+        // `home-dev` is FIRST in the file; the local `dev` follows.
+        let yaml = "providers:\n  - name: patchnotes\n    type: openai\n    base_url: https://ai.patchnotes.com/v1\n    api_key: pn-test\n    models:\n      - { name: anthropic/claude-sonnet-4.5, alias: sonnet, max_tokens: 8192 }\nprofiles:\n  home-dev:\n    remote:\n      url: https://10.2.0.48:7823\n      token: pito\n      ca: sha256:3f9a0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab\n      profile: dev\n  dev:\n    agents:\n      team:\n        model: sonnet\n      solo:\n        model: sonnet\n";
+        let cfg = parse(yaml, None).expect("a remote-first file must parse");
+        let bound = cfg.catalog.default_bound();
+        assert_eq!(
+            bound.selection(),
+            Selection {
+                profile: "dev".into(),
+                agent: "team".into(),
+                ..Default::default()
+            }
+        );
+        let bound = cfg
+            .catalog
+            .start_bound(None)
+            .expect("no pin binds the first LOCAL profile");
+        assert_eq!(bound.selection().profile, "dev");
+        // A local pin still works, and binds that profile's first agent.
+        let bound = cfg
+            .catalog
+            .start_bound(Some("dev"))
+            .expect("a local pin binds");
+        assert_eq!(bound.selection().profile, "dev");
+        assert_eq!(bound.selection().agent, "team");
+    }
+
+    /// `Catalog::resolve` is local-only: a remote name never resolves to a
+    /// `Bound` (it has no local agents).
+    #[test]
+    fn resolve_ignores_remote_entries() {
+        let cfg = parse(GLOBAL_YAML, None).expect("fixture must parse");
+        assert!(
+            cfg.catalog.resolve("home-dev", "dev").is_none(),
+            "a remote profile has no local agents"
+        );
+        assert!(cfg.catalog.resolve("home-dev", "team").is_none());
+        assert!(
+            cfg.catalog.resolve("dev", "team").is_some(),
+            "local lookups are unchanged"
+        );
+    }
+
+    /// §4.2: `infos()` lists remote entries with `origin: "remote"`,
+    /// `agents: []` (the relay fills them for the active remote tab, §6.3)
+    /// and a resolved colour; local entries keep their origin and agents.
+    #[test]
+    fn infos_list_remote_entries_with_origin_and_empty_agents() {
+        let cfg = parse(GLOBAL_YAML, None).expect("fixture must parse");
+        let infos = cfg.catalog.infos();
+
+        let home = infos
+            .iter()
+            .find(|p| p.name == "home-dev")
+            .expect("home-dev in infos");
+        assert_eq!(home.origin, "remote");
+        assert!(
+            home.agents.is_empty(),
+            "remote entries carry no agents: {home:?}"
+        );
+        assert_eq!(home.color, TabColor::Purple);
+
+        let sandbox = infos
+            .iter()
+            .find(|p| p.name == "sandbox")
+            .expect("sandbox in infos");
+        assert_eq!(sandbox.origin, "remote");
+        assert!(sandbox.agents.is_empty());
+        assert_eq!(sandbox.color, TabColor::derived("sandbox"));
+
+        let dev = infos
+            .iter()
+            .find(|p| p.name == "dev")
+            .expect("dev in infos");
+        assert_eq!(dev.origin, "global");
+        assert_eq!(dev.agents.len(), 1);
+        assert_eq!(dev.agents[0].name, "team");
+    }
+
+    /// §4.2: the catalog keeps ONE ordered list of `CatalogEntry` — repo
+    /// first, then global in file order, LOCAL and REMOTE entries mixed.
+    #[test]
+    fn catalog_entries_keep_repo_first_then_global_file_order() {
+        let repo = "profiles:\n  repo-a:\n    agents:\n      a:\n        model: sonnet\n";
+        let cfg = parse(GLOBAL_YAML, Some(repo)).expect("fixture must parse");
+        let entries: Vec<&CatalogEntry> = cfg.catalog.entries().collect();
+        assert_eq!(entries.len(), 5, "one repo + four global entries");
+        let names: Vec<String> = entries
+            .iter()
+            .map(|e| match e {
+                CatalogEntry::Local(p) => p.name.clone(),
+                CatalogEntry::Remote(r) => r.name.clone(),
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["repo-a", "dev", "home-dev", "vps-web", "sandbox"],
+            "repo first, then the global file order"
+        );
+        assert!(matches!(&entries[1], CatalogEntry::Local(_)));
+        assert!(matches!(&entries[2], CatalogEntry::Remote(_)));
     }
 }

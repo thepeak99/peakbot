@@ -3214,6 +3214,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-width",
+ "url",
  "uuid",
  "webpki-roots 1.0.6",
  "x509-parser",

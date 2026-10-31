@@ -19,8 +19,8 @@
 use std::net::SocketAddr;
 
 use peakbot::config::file::{
-    AgentDef, ConfigFile, ConversationConfig, General, ProfileDef, RepoFile, SearchConfig,
-    SubagentDef, VectorDbConfig, WebConfig,
+    AgentDef, ConfigFile, ConversationConfig, General, ProfileDef, ProfileEntry, RepoFile,
+    SearchConfig, SubagentDef, VectorDbConfig, WebConfig,
 };
 use peakbot::config::{
     ContextConfig, FetchUrlConfig, HttpConfig, McpAuth, McpTransportType, MemoryConfig, NameFilter,
@@ -36,6 +36,11 @@ fn fixture(name: &str) -> String {
 
 fn parse_global(yaml: &str) -> Result<ConfigFile, serde_yaml::Error> {
     serde_yaml::from_str(yaml)
+}
+
+/// The fixtures here are all local profiles; unwrap the entry kind.
+fn local(entry: &ProfileEntry) -> &ProfileDef {
+    entry.as_local().expect("fixture profile is local")
 }
 
 /// Minimal valid global config; `extra` is appended at the top level.
@@ -105,7 +110,7 @@ fn global_example_fixture_deserializes_and_keeps_order() {
     // researcher, senior, tester.
     let profile_names: Vec<&str> = cfg.profiles.iter().map(|(k, _)| k.as_str()).collect();
     assert_eq!(profile_names, ["dev", "research"]);
-    let dev = cfg.profiles.get("dev").expect("profile dev");
+    let dev = local(cfg.profiles.get("dev").expect("profile dev"));
     let agent_names: Vec<&str> = dev.agents.iter().map(|(k, _)| k.as_str()).collect();
     assert_eq!(agent_names, ["team", "solo"]);
     let team = dev.agents.get("team").expect("agent team");
@@ -117,7 +122,7 @@ fn global_example_fixture_deserializes_and_keeps_order() {
 fn global_example_agent_and_subagent_fields() {
     let cfg: ConfigFile = parse_global(&fixture("global_example.yaml")).expect("fixture parses");
 
-    let dev = cfg.profiles.get("dev").expect("profile dev");
+    let dev = local(cfg.profiles.get("dev").expect("profile dev"));
     let team = dev.agents.get("team").expect("agent team");
     assert_eq!(team.model.as_deref(), Some("sonnet"));
     assert!(
@@ -159,10 +164,7 @@ fn global_example_agent_and_subagent_fields() {
         "absent subagents map stays empty"
     );
 
-    let scholar = cfg
-        .profiles
-        .get("research")
-        .expect("profile research")
+    let scholar = local(cfg.profiles.get("research").expect("profile research"))
         .agents
         .get("scholar")
         .expect("agent scholar");
@@ -181,7 +183,7 @@ fn global_example_agent_and_subagent_fields() {
 fn global_example_profile_fields() {
     let cfg: ConfigFile = parse_global(&fixture("global_example.yaml")).expect("fixture parses");
 
-    let dev = cfg.profiles.get("dev").expect("profile dev");
+    let dev = local(cfg.profiles.get("dev").expect("profile dev"));
     assert_eq!(
         dev.tools,
         filter(true, &["powershell", "powershell_bg"], &[])
@@ -202,7 +204,7 @@ fn global_example_profile_fields() {
     );
     assert_eq!(dev.ui.tabs, filter(true, &["bash"], &[]));
 
-    let research = cfg.profiles.get("research").expect("profile research");
+    let research = local(cfg.profiles.get("research").expect("profile research"));
     assert_eq!(
         research.tools,
         filter(
@@ -317,10 +319,11 @@ fn repo_example_fixture_deserializes_and_keeps_order() {
     let profile_names: Vec<&str> = repo.profiles.iter().map(|(k, _)| k.as_str()).collect();
     assert_eq!(profile_names, ["peakbot-dev", "dev"]);
 
-    let pbd = repo
-        .profiles
-        .get("peakbot-dev")
-        .expect("profile peakbot-dev");
+    let pbd = local(
+        repo.profiles
+            .get("peakbot-dev")
+            .expect("profile peakbot-dev"),
+    );
     let agent_names: Vec<&str> = pbd.agents.iter().map(|(k, _)| k.as_str()).collect();
     assert_eq!(agent_names, ["team", "quick"]);
     let team = pbd.agents.get("team").expect("agent team");
@@ -343,10 +346,11 @@ fn repo_example_fixture_deserializes_and_keeps_order() {
     let quick = pbd.agents.get("quick").expect("agent quick");
     assert_eq!(quick.model.as_deref(), Some("qwen"));
 
-    let dev = repo
-        .profiles
-        .get("dev")
-        .expect("profile dev (replaces global)");
+    let dev = local(
+        repo.profiles
+            .get("dev")
+            .expect("profile dev (replaces global)"),
+    );
     assert_eq!(dev.mcps, filter(true, &[], &["playwright", "linear"]));
     let agent_names: Vec<&str> = dev.agents.iter().map(|(k, _)| k.as_str()).collect();
     assert_eq!(agent_names, ["solo"]);

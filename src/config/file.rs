@@ -6,6 +6,7 @@
 //! by `Config::parse` (A4). Consumed by `Config::parse` in the config cutover.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -31,16 +32,17 @@ pub struct ConfigFile {
     #[serde(default)]
     pub mcps: Vec<McpServerConfig>,
     /// REQUIRED ordered map; E2 is checked in `Config::parse`. First = default.
-    pub profiles: Named<ProfileDef>,
+    pub profiles: Named<ProfileEntry>,
     #[serde(default)]
     pub general: General,
 }
 
 /// The per-repo `.peakbot/config.yaml`: `profiles:` and nothing else (RP1).
+/// A `remote` entry here is a parse error (RP7, checked in `Config::parse`).
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RepoFile {
-    pub profiles: Named<ProfileDef>,
+    pub profiles: Named<ProfileEntry>,
 }
 
 /// One profile: the self-contained capability set of a `(profile, agent)`
@@ -68,6 +70,202 @@ pub struct ProfileDef {
     pub ui: ProfileUi,
     /// REQUIRED ordered map; E3 is checked in `Config::parse`. First = default.
     pub agents: Named<AgentDef>,
+}
+
+/// One entry of the `profiles:` map: a local profile (agents, tools, …) or
+/// a remote profile (`remote:` block) — design §4.2. Hand-written, NOT
+/// `untagged` (its errors are useless): the kind is discriminated by the
+/// PRESENCE of the `remote` key, and every field is deserialised through
+/// the incoming `MapAccess` so `serde_path_to_error` keeps full path
+/// fidelity (`profiles.<n>.remote.*`, `…ui.color`, …).
+#[derive(Debug, Clone, PartialEq)]
+// Parse-time type, a handful per config: boxing would only complicate the shape the design fixes.
+#[allow(clippy::large_enum_variant)]
+pub enum ProfileEntry {
+    Local(ProfileDef),
+    Remote(RemoteProfileDef),
+}
+
+impl ProfileEntry {
+    /// The local definition, `None` for a remote entry.
+    pub fn as_local(&self) -> Option<&ProfileDef> {
+        match self {
+            ProfileEntry::Local(def) => Some(def),
+            ProfileEntry::Remote(_) => None,
+        }
+    }
+}
+
+/// The `remote:` (+ optional `ui.color`) entry shape: nothing else is
+/// expressible on a remote profile (RP1).
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteProfileDef {
+    pub remote: RemoteDef,
+    #[serde(default)]
+    pub ui: RemoteUi,
+}
+
+/// The `remote:` block, raw strings: the §4.4 rules (URL shape, cookie-safe
+/// token, CA pin, name rule) are applied in `Config::parse` via
+/// `remote::parse_remote` (A4).
+#[derive(Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteDef {
+    pub url: String,
+    pub token: String,
+    #[serde(default)]
+    pub ca: Option<String>,
+    pub profile: String,
+    #[serde(default)]
+    pub agent: Option<String>,
+}
+
+// Hand-rolled Debug (design §7): the token must not reach a
+// `format!("{file:?}")` of the file layer.
+impl fmt::Debug for RemoteDef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RemoteDef")
+            .field("url", &self.url)
+            .field("token", &"***")
+            .field("ca", &self.ca)
+            .field("profile", &self.profile)
+            .field("agent", &self.agent)
+            .finish()
+    }
+}
+
+/// The only `ui` key a remote profile has: `ui.tabs` is the §4.4 row-1
+/// exclusion, anything else is unknown.
+#[derive(Debug, Deserialize, Clone, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteUi {
+    #[serde(default)]
+    pub color: Option<TabColor>,
+}
+
+/// `ui:` as BOTH kinds share it: `tabs` is local-only (row 1 checks it),
+/// `color` is shared. Read into this union because the kind is only known
+/// after the whole entry has been seen.
+#[derive(Deserialize, Clone, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+struct UiShape {
+    #[serde(default)]
+    tabs: Option<NameFilter>,
+    #[serde(default)]
+    color: Option<TabColor>,
+}
+
+/// §4.4 row 1: `remote` plus a local-only key, naming the key.
+fn remote_local_field_message(key: &str) -> String {
+    format!(
+        "a remote profile has only `remote` and `ui.color` — `{key}` belongs to the profile on the remote server"
+    )
+}
+
+impl<'de> Deserialize<'de> for ProfileEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct EntryVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for EntryVisitor {
+            type Value = ProfileEntry;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a profile entry (local fields, or a `remote` block)")
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut access: M,
+            ) -> Result<ProfileEntry, M::Error> {
+                let mut remote: Option<RemoteDef> = None;
+                let mut ui: Option<UiShape> = None;
+                let mut tools: Option<NameFilter> = None;
+                let mut mcps: Option<NameFilter> = None;
+                let mut fetch_url: Option<FetchUrlConfig> = None;
+                let mut env: Option<Env> = None;
+                let mut memory: Option<MemoryConfig> = None;
+                let mut vector_db: Option<VectorDbConfig> = None;
+                let mut agents: Option<Named<AgentDef>> = None;
+                while let Some(key) = access.next_key::<String>()? {
+                    match key.as_str() {
+                        "remote" => remote = Some(access.next_value()?),
+                        "ui" => ui = Some(access.next_value()?),
+                        "tools" => tools = Some(access.next_value()?),
+                        "mcps" => mcps = Some(access.next_value()?),
+                        "fetch_url" => fetch_url = Some(access.next_value()?),
+                        "env" => env = Some(access.next_value()?),
+                        "memory" => memory = Some(access.next_value()?),
+                        "vector_db" => vector_db = Some(access.next_value()?),
+                        "agents" => agents = Some(access.next_value()?),
+                        // deny_unknown_fields, at the entry (P1-style path).
+                        _ => {
+                            return Err(serde::de::Error::unknown_field(
+                                &key,
+                                &[
+                                    "remote",
+                                    "ui",
+                                    "tools",
+                                    "mcps",
+                                    "fetch_url",
+                                    "env",
+                                    "memory",
+                                    "vector_db",
+                                    "agents",
+                                ],
+                            ));
+                        }
+                    }
+                }
+
+                match &remote {
+                    // Row 1: a remote profile has only `remote` and `ui.color`.
+                    // Fixed key order keeps the named key deterministic.
+                    Some(remote) => {
+                        let offending = [
+                            (agents.is_some(), "agents"),
+                            (tools.is_some(), "tools"),
+                            (mcps.is_some(), "mcps"),
+                            (fetch_url.is_some(), "fetch_url"),
+                            (env.is_some(), "env"),
+                            (memory.is_some(), "memory"),
+                            (vector_db.is_some(), "vector_db"),
+                            (ui.as_ref().is_some_and(|u| u.tabs.is_some()), "ui.tabs"),
+                        ]
+                        .into_iter()
+                        .find(|(present, _)| *present)
+                        .map(|(_, key)| key);
+                        if let Some(key) = offending {
+                            return Err(serde::de::Error::custom(remote_local_field_message(key)));
+                        }
+                        Ok(ProfileEntry::Remote(RemoteProfileDef {
+                            remote: remote.clone(),
+                            ui: RemoteUi {
+                                color: ui.as_ref().and_then(|u| u.color),
+                            },
+                        }))
+                    }
+                    None => Ok(ProfileEntry::Local(ProfileDef {
+                        tools: tools.unwrap_or_default(),
+                        mcps: mcps.unwrap_or_default(),
+                        fetch_url: fetch_url.unwrap_or_default(),
+                        env: env.unwrap_or_default(),
+                        memory: memory.unwrap_or_default(),
+                        vector_db,
+                        ui: ProfileUi {
+                            tabs: ui.as_ref().and_then(|u| u.tabs.clone()).unwrap_or_default(),
+                            color: ui.as_ref().and_then(|u| u.color),
+                        },
+                        // Same serde wording as the derived `ProfileDef`.
+                        agents: agents
+                            .ok_or_else(|| serde::de::Error::custom("missing field `agents`"))?,
+                    })),
+                }
+            }
+        }
+
+        deserializer.deserialize_map(EntryVisitor)
+    }
 }
 
 /// One agent: today's orchestrator (spec §3.3). `model`/`prompt` stay
