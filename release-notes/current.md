@@ -9,3 +9,9 @@ This file is the working draft for the next release. When a version is tagged, t
 - **Per-profile tab colour.** Each profile now has a colour. Set it with `ui.color` (one of red, orange, yellow, green, teal, blue, purple, pink). If unset, a stable colour is derived from the profile name.
 - Conversation tabs show a coloured top accent. The selection chip and conversation picker rows show a colour dot.
 - Conversation list entries now carry their profile. The conversation index is rebuilt once on upgrade.
+- **Remote profiles (config).** A profile can now point at another PeakBot server with `remote: { url, token, ca, profile, agent? }`. Rules:
+  - `ca` is `sha256:<fingerprint>` or `system`.
+  - Plain `http://` is allowed only for loopback.
+  - Remote profiles are allowed only in the global config.
+  - They are validated at load, and the token is never logged.
+  - They are listed by `/profile` but can't be opened yet; opening from the web UI lands in a later release.

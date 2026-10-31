@@ -14,7 +14,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::config::ModelRegistry;
-use crate::config::resolve::{Bound, Catalog, Origin, OverrideRejection, ResolvedAgent};
+use crate::config::resolve::{
+    Bound, Catalog, CatalogEntry, Origin, OverrideRejection, ResolvedAgent,
+};
 
 /// One selection command line, classified.
 #[derive(Debug, PartialEq)]
@@ -226,11 +228,11 @@ pub fn override_warning(rej: &OverrideRejection, agent: &ResolvedAgent) -> Strin
 }
 
 /// One `/profile <name>` | `/agent <name>` decision (spec §6.6).
-/// Precedence: locked (`has_turns`) > pin > unknown > apply. Selecting a
-/// profile picks its first agent; selecting an agent keeps the current
-/// profile. Under a pin only the pinned profile may be selected (selecting
-/// it applies); agent switches are always allowed within the current
-/// (pinned) profile.
+/// Precedence: locked (`has_turns`) > pin > remote > unknown > apply.
+/// Selecting a profile picks its first agent; selecting an agent keeps the
+/// current profile. Under a pin only the pinned profile may be selected
+/// (selecting it applies); agent switches are always allowed within the
+/// current (pinned) profile.
 #[derive(Debug)]
 pub enum SelectChoice {
     /// The selection applies; the handler formats the confirmation line.
@@ -260,6 +262,13 @@ pub fn resolve_selection_choice(
             {
                 return SelectChoice::Refuse(format!(
                     "the profile is pinned by --profile {pin} — restart without --profile to switch."
+                ));
+            }
+            // §5.10: a remote profile is never a local selection, and it is
+            // never a silent no-op — the web UI's picker is its door.
+            if cat.remote(&name).is_some() {
+                return SelectChoice::Refuse(format!(
+                    "'{name}' is a remote profile — remote profiles open from the web UI's profile picker"
                 ));
             }
             let Some(profile) = cat.profile(&name).cloned() else {
@@ -301,11 +310,12 @@ pub fn resolve_selection_choice(
     }
 }
 
-/// `/profile` listing (spec §6.6): one line per profile in catalog order —
-/// `→ ` marks the current, `📁 ` marks a repo profile, the first line gets
-/// `  (default)` (never under a pin, whose effective default is the pin),
-/// and a repo profile shadowing a same-named global gets
-/// `  (overrides global <name>)`. Under a pin the header gets
+/// `/profile` listing (spec §6.6): one line per catalogue entry in catalog
+/// order — `→ ` marks the current, `📁 ` marks a repo profile, the first
+/// LOCAL line gets `  (default)` (never under a pin, whose effective
+/// default is the pin), a repo profile shadowing a same-named global gets
+/// `  (overrides global <name>)`, and a remote profile lists web-only
+/// (design §5.10). Under a pin the header gets
 /// ` (pinned by --profile X)` appended.
 pub fn render_profile_list(cat: &Catalog, cur: &Bound, pin: Option<&str>) -> String {
     let mut lines = vec!["Profiles (📁 = this repo; first = default):".to_string()];
@@ -314,31 +324,45 @@ pub fn render_profile_list(cat: &Catalog, cur: &Bound, pin: Option<&str>) -> Str
         lines[0].push_str(pin);
         lines[0].push(')');
     }
-    for (i, profile) in cat.iter().enumerate() {
-        let marker = if profile.name == cur.profile.name {
-            "→ "
-        } else {
-            "  "
-        };
-        let repo = match profile.origin {
-            Origin::Global => "",
-            Origin::Repo { .. } => "📁 ",
-        };
-        let mut line = format!("{marker}{repo}{}", profile.name);
-        if i == 0 && pin.is_none() {
-            line.push_str("  (default)");
-        }
-        if matches!(
-            profile.origin,
-            Origin::Repo {
-                overrides_global: true
+    let mut first_local = true;
+    for entry in cat.entries() {
+        match entry {
+            CatalogEntry::Local(profile) => {
+                let marker = if profile.name == cur.profile.name {
+                    "→ "
+                } else {
+                    "  "
+                };
+                let repo = match profile.origin {
+                    Origin::Global => "",
+                    Origin::Repo { .. } => "📁 ",
+                };
+                let mut line = format!("{marker}{repo}{}", profile.name);
+                if first_local && pin.is_none() {
+                    line.push_str("  (default)");
+                }
+                first_local = false;
+                if matches!(
+                    profile.origin,
+                    Origin::Repo {
+                        overrides_global: true
+                    }
+                ) {
+                    line.push_str("  (overrides global ");
+                    line.push_str(&profile.name);
+                    line.push(')');
+                }
+                lines.push(line);
             }
-        ) {
-            line.push_str("  (overrides global ");
-            line.push_str(&profile.name);
-            line.push(')');
+            // §5.10: the TUI/stdio can't open a remote profile — it lists
+            // as web-only and the select refusal is the one rule.
+            CatalogEntry::Remote(remote) => {
+                lines.push(format!(
+                    "  {} (remote · open it in the web UI or desktop app)",
+                    remote.name
+                ));
+            }
         }
-        lines.push(line);
     }
     lines.join("\n")
 }
@@ -1054,6 +1078,31 @@ profiles:
         );
     }
 
+    /// §5.10: a remote profile lists web-only in the TUI, in catalog order
+    /// (before the locals when it is first in the file), and the
+    /// `(default)` note stays on the first LOCAL line.
+    #[test]
+    fn render_profile_list_marks_remote_entries_web_only() {
+        let yaml = "providers:\n  - name: patchnotes\n    type: openai\n    base_url: https://ai.patchnotes.com/v1\n    api_key: pn-test\n    models:\n      - { name: anthropic/claude-sonnet-4.5, alias: sonnet, max_tokens: 8192 }\nprofiles:\n  home-dev:\n    remote:\n      url: https://10.2.0.48:7823\n      token: pito\n      ca: sha256:3f9a0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab\n      profile: dev\n  dev:\n    agents:\n      team:\n        model: sonnet\n";
+        let catalog = Config::parse(
+            Source {
+                path: std::path::Path::new("/global/config.yaml"),
+                text: yaml,
+            },
+            None,
+            &ParseCtx { known_skills: &[] },
+        )
+        .expect("remote+local fixture parses")
+        .catalog;
+        let cur = catalog.resolve("dev", "team").expect("dev/team resolves");
+        assert_eq!(
+            render_profile_list(&catalog, &cur, None),
+            r#"Profiles (📁 = this repo; first = default):
+  home-dev (remote · open it in the web UI or desktop app)
+→ dev  (default)"#
+        );
+    }
+
     // ── render_agent_list (/agent, spec §6.6) ──────────────────────────────
 
     /// §6.6, verbatim: the spec's own example — current agent marked with
@@ -1550,6 +1599,139 @@ profiles:
         assert!(
             warnings.is_empty(),
             "keeping the pin is quiet: {warnings:?}"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// T3 RED tests (remote-profiles design §5.10, task 3): the "remote" arm of
+// the selection precedence — locked > pin > REMOTE > unknown > apply.
+// Written BEFORE the arm exists: the fixture catalog carries a remote
+// profile, so these compile only once `config::remote` and the
+// `CatalogEntry` catalogue land.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod t3_remote_selection_tests {
+    use std::path::Path;
+
+    use crate::config::resolve::{Bound, Catalog, Config, ParseCtx, Source};
+    use crate::selection::{SelectChoice, SelectSubmission, resolve_selection_choice};
+
+    /// One local profile (`dev`) and one remote profile (`home-dev`) — the
+    /// §5.10 example pair.
+    const GLOBAL_YAML: &str = r#"
+providers:
+  - name: patchnotes
+    type: openai
+    base_url: https://ai.patchnotes.com/v1
+    api_key: pn-test
+    models:
+      - { name: anthropic/claude-sonnet-4.5, alias: sonnet, max_tokens: 8192 }
+profiles:
+  dev:
+    agents:
+      team: { model: sonnet }
+  home-dev:
+    remote:
+      url: https://10.2.0.48:7823
+      token: pito
+      ca: sha256:3f9a0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab
+      profile: dev
+"#;
+
+    fn ctx() -> ParseCtx<'static> {
+        ParseCtx { known_skills: &[] }
+    }
+
+    fn catalog() -> Catalog {
+        Config::parse(
+            Source {
+                path: Path::new("/global/config.yaml"),
+                text: GLOBAL_YAML,
+            },
+            None,
+            &ctx(),
+        )
+        .expect("the remote+local fixture must parse")
+        .catalog
+    }
+
+    fn bound() -> Bound {
+        catalog().resolve("dev", "team").expect("dev/team resolves")
+    }
+
+    /// Unwrap a `Refuse` (panicking with the bound if the choice went the
+    /// other way) — the refusal tests then assert the exact copy string.
+    fn refuse(choice: SelectChoice, what: &str) -> String {
+        match choice {
+            SelectChoice::Apply(bound) => {
+                panic!(
+                    "expected Refuse for {what}, got Apply({:?})",
+                    bound.selection()
+                )
+            }
+            SelectChoice::Refuse(msg) => msg,
+        }
+    }
+
+    /// §5.10, verbatim: `/profile home-dev` (zero turns, no pin) refuses with
+    /// the exact system message — a remote profile is never a local
+    /// selection, and it is never a silent no-op.
+    #[test]
+    fn profile_selecting_a_remote_profile_refuses_with_the_exact_message() {
+        let msg = refuse(
+            resolve_selection_choice(
+                &catalog(),
+                &bound(),
+                SelectSubmission::Profile("home-dev".into()),
+                false,
+                None,
+            ),
+            "selecting a remote profile",
+        );
+        assert_eq!(
+            msg,
+            "'home-dev' is a remote profile — remote profiles open from the web UI's profile picker"
+        );
+    }
+
+    /// Precedence: the lock beats the remote arm — a conversation with turns
+    /// is refused with the LOCK message, not the remote one.
+    #[test]
+    fn locked_conversation_beats_the_remote_refusal() {
+        let msg = refuse(
+            resolve_selection_choice(
+                &catalog(),
+                &bound(),
+                SelectSubmission::Profile("home-dev".into()),
+                true,
+                None,
+            ),
+            "locked + remote profile switch",
+        );
+        assert_eq!(
+            msg,
+            "the profile is locked once the conversation has started — /new for a fresh one."
+        );
+    }
+
+    /// Precedence: the pin beats the remote arm — under `--profile dev`,
+    /// naming `home-dev` is refused with the PIN message.
+    #[test]
+    fn pin_beats_the_remote_refusal() {
+        let msg = refuse(
+            resolve_selection_choice(
+                &catalog(),
+                &bound(),
+                SelectSubmission::Profile("home-dev".into()),
+                false,
+                Some("dev"),
+            ),
+            "pinned + remote profile switch",
+        );
+        assert_eq!(
+            msg,
+            "the profile is pinned by --profile dev — restart without --profile to switch."
         );
     }
 }

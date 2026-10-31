@@ -677,6 +677,19 @@ fn model_after_cd(
         .ok_or_else(|| "current model not found in registry".to_string())
 }
 
+/// The web UI's catalogue: `infos()` minus the remote entries — the SPA
+/// cannot route to them until the remote-profiles T9 routing lands. T9
+/// emits the remote entries together with that routing.
+fn ui_catalog(
+    catalog: &crate::config::resolve::Catalog,
+) -> Vec<crate::config::resolve::ProfileInfo> {
+    catalog
+        .infos()
+        .into_iter()
+        .filter(|p| p.origin != "remote")
+        .collect()
+}
+
 fn reload_config(
     ctx: &mut RebuildContext,
     sm: &Arc<StateManager>,
@@ -731,7 +744,7 @@ fn reload_config(
 
     // 5. Adopt.
     ctx.config = Arc::new(fresh);
-    sm.set_catalog(ctx.config.catalog.infos());
+    sm.set_catalog(ui_catalog(&ctx.config.catalog));
 
     // 6. Rebind.
     let catalog = &ctx.config.catalog;
@@ -4159,6 +4172,41 @@ profiles:
         cfg.catalog
             .resolve(profile, agent)
             .expect("fixture bound resolves")
+    }
+
+    /// Remote entries are in `infos()` (the `/profile` listing and the
+    /// relay use them) but NOT in the web UI's catalogue until the SPA
+    /// routing for them lands (remote-profiles T9).
+    #[test]
+    fn ui_catalog_drops_remote_entries_until_t9() {
+        use crate::config::resolve::{ParseCtx, Source};
+        let yaml = "providers:\n  - name: patchnotes\n    type: openai\n    base_url: https://ai.patchnotes.com/v1\n    api_key: pn-test\n    models:\n      - { name: anthropic/claude-sonnet-4.5, alias: sonnet, max_tokens: 8192 }\nprofiles:\n  home-dev:\n    remote:\n      url: https://10.2.0.48:7823\n      token: pito\n      ca: sha256:3f9a0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab\n      profile: dev\n  dev:\n    agents:\n      team:\n        model: sonnet\n";
+        let cfg = Config::parse(
+            Source {
+                path: std::path::Path::new("/global/config.yaml"),
+                text: yaml,
+            },
+            None,
+            &ParseCtx { known_skills: &[] },
+        )
+        .expect("remote+local fixture parses");
+        let infos = cfg.catalog.infos();
+        assert!(
+            infos
+                .iter()
+                .any(|p| p.name == "home-dev" && p.origin == "remote"),
+            "infos() keeps the remote entry"
+        );
+        let ui = ui_catalog(&cfg.catalog);
+        assert!(
+            ui.iter().all(|p| p.origin != "remote"),
+            "the UI catalogue has no remote entries: {ui:?}"
+        );
+        assert_eq!(
+            ui.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            vec!["dev"],
+            "the locals are untouched"
+        );
     }
 
     // --- panic_text (shared catch_unwind payload renderer) -------------------

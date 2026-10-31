@@ -54,7 +54,9 @@ impl<T> Named<T> {
 /// §4.3 N1, verbatim (the "1–64" is an en dash, U+2013).
 const INVALID_NAME_SUFFIX: &str = "' must be 1–64 characters of letters, digits, space, '_', '.', '-' with no leading/trailing space";
 
-fn invalid_name_error(name: &str) -> String {
+/// `pub(super)`: the remote kind reuses the same rule for
+/// `remote.profile` / `remote.agent` (design §4.4 row 9).
+pub(super) fn invalid_name_error(name: &str) -> String {
     format!("name '{name}{INVALID_NAME_SUFFIX}")
 }
 
@@ -85,8 +87,9 @@ pub(super) fn named_failure(message: &str) -> Option<NamedFailure<'_>> {
 }
 
 /// §4.2: `^[A-Za-z0-9_ .-]{1,64}$` plus "trimmed == raw". Plain char checks —
-/// no regex dependency for a 64-character whitelist.
-fn valid_name(name: &str) -> bool {
+/// no regex dependency for a 64-character whitelist. `pub(super)`: the
+/// remote kind reuses it for `remote.profile` / `remote.agent` (row 9).
+pub(super) fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.chars().count() <= 64
         && name.trim() == name
