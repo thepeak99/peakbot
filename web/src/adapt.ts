@@ -52,7 +52,7 @@ function toClock(iso: string): string {
   return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-export function adaptMessage(m: WireChatMessage): ChatMessage {
+export function adaptMessage(m: WireChatMessage, base = ""): ChatMessage {
   // ToolCall/ToolResult carry structured fields; the `content` already holds
   // the display string the TUI renders, so we pass it through verbatim.
   // Thinking blocks are flattened to plain strings — the wire serializer has
@@ -78,7 +78,10 @@ export function adaptMessage(m: WireChatMessage): ChatMessage {
       m.attachments && m.attachments.length > 0
         ? m.attachments.map((a) => ({
             ...a,
-            url: `/api/uploads/${a.convo}/${a.id}`,
+            // `base` is the `/r/<L>` proxy prefix for a remote conversation.
+            // Markdown image URLs in `content` arrive already re-rooted by the
+            // relay, so only attachments are prefixed here.
+            url: `${base}/api/uploads/${a.convo}/${a.id}`,
           }))
         : undefined,
   };

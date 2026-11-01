@@ -14,8 +14,16 @@ This file is the working draft for the next release. When a version is tagged, t
   - Plain `http://` is allowed only for loopback.
   - Remote profiles are allowed only in the global config.
   - They are validated at load, and the token is never logged.
-  - They are listed by `/profile` but can't be opened yet; opening from the web UI lands in a later release.
+  - They are listed by `/profile` in the TUI as web-only. See "Remote profiles in the web UI" below.
 - **Server side of remote profiles.** The web socket's `attach` frame now accepts `profile` and `agent` and starts a new conversation on that pair (an unknown profile, an unknown agent or a `--profile` pin conflict is refused with an error). A conversation that already has turns keeps its saved selection. The `ready` frame carries a protocol version (`v`).
 - New token-gated `GET /api/conversations` and `POST /api/conversations/{id}/kill` return this server's own conversation list.
-- **Remote profiles (relay + proxy).** A socket attached to a remote profile is relayed to that server. The conversation list now merges remote rows (tagged with the local profile name, newest first; a down remote simply contributes no rows), and killing a remote conversation is routed to its server. Remote uploads and images stream through the token-gated `/r/{profile}/…` routes. Remote profiles named `.` or `..` are a config error. (Reachable from the UI in a later release.)
+- **Remote profiles (relay + proxy).** A socket attached to a remote profile is relayed to that server. The conversation list now merges remote rows (tagged with the local profile name, newest first; a down remote simply contributes no rows), and killing a remote conversation is routed to its server. Remote uploads and images stream through the token-gated `/r/{profile}/…` routes. Remote profiles named `.` or `..` are a config error.
 - The HTTPS startup banner prints the CA fingerprint (`sha256:…`), the value a remote profile's `ca` pins.
+- **Remote profiles in the web UI.** Remote profiles are now selectable in the web UI.
+  - They show next to your local profiles in the profile picker, marked `remote` and colour-coded.
+  - Each tab can be local or remote, side by side. Picking a profile on the other side of that line starts a new conversation on it.
+  - The conversation list merges local and remote conversations into one list. Opening or killing a remote row goes to its own server.
+  - Uploads and images are proxied through your local server.
+  - The remote's token and pinned CA stay on the local server. The browser never sees them.
+  - The protocol versions must match exactly; a mismatch is refused with an error naming both versions.
+  - The TUI and stdio refuse remote profiles.

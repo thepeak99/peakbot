@@ -32,6 +32,9 @@ const MB = 1024 * 1024;
 export function useAttachments(
   convo: string | null,
   limits: UploadLimits,
+  // `/r/<L>` proxy prefix of the conversation's profile ("" = local); read
+  // when the upload starts, never stored on a chip.
+  base = "",
 ): Attachments {
   const [pending, setPending] = useState<Pending[]>([]);
   // Mirror of `pending` that is current within one event: add() may run twice
@@ -110,8 +113,12 @@ export function useAttachments(
       }
       commit(next);
       for (const { key, file } of started) {
-        const handle = uploadFile(convo!, file, (progress) =>
-          patch(key, (c) => (c.state === "uploading" ? { ...c, progress } : c)),
+        const handle = uploadFile(
+          convo!,
+          file,
+          (progress) =>
+            patch(key, (c) => (c.state === "uploading" ? { ...c, progress } : c)),
+          base,
         );
         // abort() only exists once the XHR does, so wire it in after the call.
         patch(key, (c) =>
@@ -137,7 +144,7 @@ export function useAttachments(
         );
       }
     },
-    [convo, limits.max_file_mb, limits.max_files, commit, patch],
+    [convo, base, limits.max_file_mb, limits.max_files, commit, patch],
   );
 
   // A conversation switch invalidates every stored id (uploads are per-convo).

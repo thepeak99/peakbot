@@ -203,7 +203,7 @@ afterEach(() => {
   delete (URL as unknown as Record<string, unknown>)["revokeObjectURL"];
 });
 
-const tab = (id: string, convo: string | null, title: string) => ({ id, convo, title });
+const tab = (id: string, convo: string | null, title: string) => ({ id, convo, title, profile: null });
 const tabsState = (tabs: ReturnType<typeof tab>[], active = 0): TabsState =>
   ({ tabs, active }) as unknown as TabsState;
 
@@ -447,13 +447,13 @@ describe("App (desktop) — each tab keeps its own text and attachments", () => 
     await typeInto(theVisibleTextbox(), "hello A");
     await attachViaInput(composerOf(theVisibleTextbox()), fa);
     expect(uploadFileMock).toHaveBeenCalledTimes(1);
-    expect(uploadFileMock).toHaveBeenCalledWith("a", fa, expect.any(Function));
+    expect(uploadFileMock).toHaveBeenCalledWith("a", fa, expect.any(Function), "");
     expect(chipOf(composerOf(theVisibleTextbox()), "fa.pdf")).not.toBeNull();
 
     // 3. Click tab B; the app asks to switch, then the server binds "b".
     await clickTab(1);
     expect(agent.switchConvo).toHaveBeenCalledTimes(1);
-    expect(agent.switchConvo).toHaveBeenCalledWith("b");
+    expect(agent.switchConvo).toHaveBeenCalledWith("b", null);
     bindServer("b");
     await rerenderApp();
 
@@ -464,7 +464,7 @@ describe("App (desktop) — each tab keeps its own text and attachments", () => 
     await typeInto(theVisibleTextbox(), "hello B");
     await attachViaInput(composerOf(theVisibleTextbox()), fb);
     expect(uploadFileMock).toHaveBeenCalledTimes(2);
-    expect(uploadFileMock).toHaveBeenLastCalledWith("b", fb, expect.any(Function));
+    expect(uploadFileMock).toHaveBeenLastCalledWith("b", fb, expect.any(Function), "");
 
     // A's upload was NOT aborted by switching away.
     expect(uploads[0].abort).not.toHaveBeenCalled();
@@ -583,7 +583,7 @@ describe("App (desktop) — dropping files targets the active tab", () => {
     await dropFiles(f1);
 
     expect(uploadFileMock).toHaveBeenCalledTimes(1);
-    expect(uploadFileMock).toHaveBeenCalledWith("a", f1, expect.any(Function));
+    expect(uploadFileMock).toHaveBeenCalledWith("a", f1, expect.any(Function), "");
     expect(chipOf(composerOf(theVisibleTextbox()), "dropped-a.pdf")).not.toBeNull();
     expect(chipOf(composerOf(hiddenBox()), "dropped-a.pdf")).toBeNull();
   });
@@ -665,7 +665,7 @@ describe("App (desktop) — closing a tab", () => {
     await typeInto(theVisibleTextbox(), "draft A");
 
     await closeTabAt(0); // close A (active) → B becomes active
-    expect(agent.switchConvo).toHaveBeenLastCalledWith("b");
+    expect(agent.switchConvo).toHaveBeenLastCalledWith("b", null);
     bindServer("b");
     await rerenderApp();
 
@@ -706,14 +706,14 @@ describe("App (web, initialTabs = null) — unchanged single composer", () => {
     const f = pdf("web.pdf");
     await attachViaInput(composerOf(theVisibleTextbox()), f);
     expect(uploadFileMock).toHaveBeenCalledTimes(1);
-    expect(uploadFileMock).toHaveBeenCalledWith("w1", f, expect.any(Function));
+    expect(uploadFileMock).toHaveBeenCalledWith("w1", f, expect.any(Function), "");
   });
 
   it("uploads dropped files under state.conversation.id", async () => {
     await mountApp(null, "w1");
     const f = pdf("dropped.pdf");
     await dropFiles(f);
-    expect(uploadFileMock).toHaveBeenCalledWith("w1", f, expect.any(Function));
+    expect(uploadFileMock).toHaveBeenCalledWith("w1", f, expect.any(Function), "");
     expect(chipOf(composerOf(theVisibleTextbox()), "dropped.pdf")).not.toBeNull();
   });
 

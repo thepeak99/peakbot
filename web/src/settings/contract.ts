@@ -752,6 +752,10 @@ export interface SelectionChipProps {
   /** Called with `Next conversation: …` / `Overrides reset for …`. */
   onToast?(message: string): void;
   dropUp?: boolean;
+  /** T9: a pick that crosses the local/remote boundary (`chipAction` →
+   *  "reattach") opens a fresh socket on (profile, agent) instead of sending
+   *  `select`. Optional so a chip without a socket owner just selects. */
+  onReattach?(profile: string, agent: string): void;
 }
 // data-testids (the chip owns all of them):
 //   `selection-chip`        — the <button>. textContent =

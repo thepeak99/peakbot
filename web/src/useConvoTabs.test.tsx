@@ -286,7 +286,7 @@ describe("useConvoTabs — user ops", () => {
     });
 
     expect(agent.switchConvo).toHaveBeenCalledTimes(1);
-    expect(agent.switchConvo).toHaveBeenCalledWith("b");
+    expect(agent.switchConvo).toHaveBeenCalledWith("b", null);
     expect(views()[1].active).toBe(true);
     // The persisted store follows.
     expect(JSON.parse(localStorage.getItem("peakbot.desktop.tabs")!)["active"]).toBe(1);
@@ -315,7 +315,7 @@ describe("useConvoTabs — user ops", () => {
       (api as { close(i: number): void }).close(0);
     });
 
-    expect(agent.switchConvo).toHaveBeenCalledWith("b");
+    expect(agent.switchConvo).toHaveBeenCalledWith("b", null);
     expect(views()).toHaveLength(2);
     expect(views()[0].key).toBe("id-b");
   });
@@ -344,7 +344,7 @@ describe("useConvoTabs — user ops", () => {
       (api as { close(i: number): void }).close(0);
     });
 
-    expect(agent.switchConvo).toHaveBeenCalledWith(null);
+    expect(agent.switchConvo).toHaveBeenCalledWith(null, null);
     const v = views();
     expect(v).toHaveLength(1);
     // The closed tab's id must not survive: the replacement is a NEW tab (I5).
@@ -362,7 +362,7 @@ describe("useConvoTabs — user ops", () => {
       (api as { newTab(): void }).newTab();
     });
 
-    expect(agent.switchConvo).toHaveBeenCalledWith(null);
+    expect(agent.switchConvo).toHaveBeenCalledWith(null, null);
     const v = views();
     expect(v).toHaveLength(2);
     expect(v[1]).toMatchObject({ key: expect.any(String), active: true, untitled: true });
@@ -379,7 +379,7 @@ describe("useConvoTabs — user ops", () => {
       (api as { open(convo: string): void }).open("d");
     });
 
-    expect(agent.switchConvo).toHaveBeenCalledWith("d");
+    expect(agent.switchConvo).toHaveBeenCalledWith("d", null);
     const v = views();
     expect(v).toHaveLength(2);
     // The key is the minted tab id (I5), not the convo.
@@ -399,7 +399,7 @@ describe("useConvoTabs — user ops", () => {
     });
 
     expect(agent.switchConvo).toHaveBeenCalledTimes(1);
-    expect(agent.switchConvo).toHaveBeenCalledWith("b");
+    expect(agent.switchConvo).toHaveBeenCalledWith("b", null);
     expect(views()).toHaveLength(2); // no append
   });
 });
@@ -577,7 +577,7 @@ describe("useConvoTabs — keyboard shortcuts", () => {
     const e = key({ key: "t", code: "KeyT", ctrlKey: true });
 
     expect(e.defaultPrevented).toBe(true);
-    expect(agent.switchConvo).toHaveBeenCalledWith(null);
+    expect(agent.switchConvo).toHaveBeenCalledWith(null, null);
     expect(views()).toHaveLength(4);
   });
 
@@ -587,7 +587,7 @@ describe("useConvoTabs — keyboard shortcuts", () => {
 
     key({ key: "t", code: "KeyT", metaKey: true });
 
-    expect(agent.switchConvo).toHaveBeenCalledWith(null);
+    expect(agent.switchConvo).toHaveBeenCalledWith(null, null);
   });
 
   it("Ctrl+W closes the active tab", async () => {
@@ -599,7 +599,7 @@ describe("useConvoTabs — keyboard shortcuts", () => {
     expect(e.defaultPrevented).toBe(true);
     expect(views()).toHaveLength(2);
     expect(views()[0].key).toBe("id-b"); // right neighbour
-    expect(agent.switchConvo).toHaveBeenCalledWith("b");
+    expect(agent.switchConvo).toHaveBeenCalledWith("b", null);
   });
 
   it("Ctrl+Tab cycles forward and Ctrl+Shift+Tab backward", async () => {

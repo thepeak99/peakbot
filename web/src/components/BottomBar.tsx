@@ -25,6 +25,7 @@ export function BottomBar({
   recentDirs,
   send,
   onLoadConversation,
+  onReattach,
   catalog,
   selection,
   selectionLocked = false,
@@ -40,7 +41,9 @@ export function BottomBar({
   dirListing: DirListing | null;
   recentDirs: string[];
   send: (msg: InboundMessage) => void;
-  onLoadConversation: (id: string) => void;
+  onLoadConversation: (id: string, profile: string | null) => void;
+  /** Chip pick across local/remote: re-attach on (profile, agent). */
+  onReattach?(profile: string, agent: string): void;
   // T32 chat chip (optional — absent ⇒ no chip, as on older servers).
   catalog?: CatalogProfile[];
   selection?: Selection | null;
@@ -69,6 +72,7 @@ export function BottomBar({
         pinned={profilePinned}
         send={send}
         onToast={onToast}
+        onReattach={onReattach}
         dropUp
       />
       <ConversationsPicker
@@ -77,7 +81,9 @@ export function BottomBar({
         hasTranscript={hasTranscript}
         onOpen={() => send({ type: "request_conversations" })}
         onLoad={onLoadConversation}
-        onKill={(id) => send({ type: "kill_session", convo: id })}
+        onKill={(id, profile) =>
+          send({ type: "kill_session", convo: id, ...(profile ? { profile } : {}) })
+        }
         dropUp
         catalog={catalog}
       />

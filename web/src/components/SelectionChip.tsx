@@ -18,7 +18,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { boundAgentOf } from "../adapt";
-import { select } from "../state";
+import { chipAction, select } from "../state";
 import type { CatalogAgent } from "../types";
 import {
   EMPTY_TEAM,
@@ -65,6 +65,7 @@ export function SelectionChip({
   send,
   onToast,
   dropUp = false,
+  onReattach,
 }: SelectionChipProps) {
   const [open, setOpen] = useState(false);
   const [nav, setNav] = useState<Nav>({ pane: "profile" });
@@ -155,7 +156,14 @@ export function SelectionChip({
   // clean), then drill into its Team. The popover stays open.
   const pickAgent = (agent: string) => {
     if (!(browsedProfile.name === selection.profile && agent === selection.agent)) {
-      send(select(browsedProfile.name, agent));
+      const target = { profile: browsedProfile.name, agent, subagentModels: {} };
+      // Crossing local/remote needs a fresh socket: a `select` for a profile
+      // on the other server would be refused (design §6.3 #10).
+      if (onReattach && chipAction(selection, target, catalog) === "reattach") {
+        onReattach(target.profile, agent);
+      } else {
+        send(select(target.profile, agent));
+      }
       onToast?.(`Next conversation: ${browsedProfile.name} › ${agent}`);
     }
     setNav({ pane: "team" });

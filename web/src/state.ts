@@ -4,6 +4,8 @@
 // The adapter (`adapt.ts`) maps these into the camelCase view types the
 // components consume.
 
+import type { CatalogProfile, Selection } from "./types";
+
 export type WireRole =
   | "user"
   | "agent"
@@ -401,4 +403,53 @@ export function select(
     frame.subagent_models = { ...models.subagentModels };
   }
   return frame;
+}
+
+// ── Remote-profile routing (design §6.4) ──────────────────────────────
+
+const isRemote = (profile: string, catalog: readonly CatalogProfile[]): boolean =>
+  catalog.find((p) => p.name === profile)?.origin === "remote";
+
+/** A pick on the chip either rewrites this socket's selection ("select") or
+ * needs a fresh socket on the other server ("reattach"). Reattach iff the
+ * profile changes and at least one side is remote (remote→remote across two
+ * remotes reattaches too); a profile missing from the catalogue counts as
+ * local. */
+export function chipAction(
+  current: Selection,
+  target: Selection,
+  catalog: readonly CatalogProfile[],
+): "select" | "reattach" {
+  if (target.profile === current.profile) return "select";
+  return isRemote(current.profile, catalog) || isRemote(target.profile, catalog)
+    ? "reattach"
+    : "select";
+}
+
+/** URL prefix of the local `/r/<L>` proxy for a remote profile, else "". */
+export function apiBase(profile: string | null, catalog: readonly CatalogProfile[]): string {
+  return profile && isRemote(profile, catalog) ? `/r/${encodeURIComponent(profile)}` : "";
+}
+
+export function profileFromUrl(): string | null {
+  return new URLSearchParams(window.location.search).get("profile");
+}
+
+/** Write `?convo`/`?profile` into the address bar without a navigation
+ * (idempotent per param). `null` removes the param. */
+export function setConvoInUrl(convo: string | null, profile: string | null): void {
+  const url = new URL(window.location.href);
+  let changed = false;
+  for (const [key, value] of [["convo", convo], ["profile", profile]] as const) {
+    if (value === null) {
+      if (url.searchParams.has(key)) {
+        url.searchParams.delete(key);
+        changed = true;
+      }
+    } else if (url.searchParams.get(key) !== value) {
+      url.searchParams.set(key, value);
+      changed = true;
+    }
+  }
+  if (changed) window.history.replaceState(null, "", url);
 }

@@ -43,7 +43,20 @@ export function ProfilePane({
         >
           <span className={p.name === selectedProfile ? "font-medium text-emerald-400" : "text-zinc-200"}>
             {p.origin === "repo" && <span aria-hidden>📁 </span>}
+            {p.origin === "remote" && p.color && (
+              <span
+                data-testid="selection-profile-color"
+                aria-hidden
+                className="mr-1 inline-block h-2 w-2 shrink-0 rounded-full align-middle"
+                style={{ backgroundColor: `var(--profile-${p.color})` }}
+              />
+            )}
             {p.name}
+            {p.origin === "remote" && (
+              <span className="ml-1.5 rounded bg-zinc-800 px-1 text-[10px] font-normal text-zinc-400">
+                remote
+              </span>
+            )}
           </span>
           <span className="text-[10px] text-zinc-500">
             {pinned ? "pinned" : i === 0 ? "default" : ""}
