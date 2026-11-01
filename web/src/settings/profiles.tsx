@@ -11,11 +11,20 @@
 import { useEffect, useRef, useState } from "react";
 import { useSettingsCtx } from "./context";
 import { get, type Doc } from "./yamlDoc";
+import { errAt } from "./paths";
 import { parseFilter, serializeFilter, type FilterState } from "./filter";
 import { duplicateInsertIndex, duplicateName, makeDefault } from "./profileOps";
+import { defaultRemoteName, parsePairingLink } from "./pairingLink";
 import { useToast } from "./Toast";
 import { Badge, Field, FilterBlock, KvRows, SecretInput, Toggle, type KvRow } from "./widgets";
 import type { Seg } from "./types";
+
+// The 8 TabColor names (config §4.2 — the order is a server contract).
+const TAB_COLORS = ["red", "orange", "yellow", "green", "teal", "blue", "purple", "pink"];
+
+/// §4.4 locked message — shown under an empty `ca` (pin or system, no default).
+const CA_REQUIRED_HINT =
+  "pin the server's CA (`ca: sha256:…` from its pairing link) or use `ca: system` for a publicly trusted certificate";
 
 // ── shared derivations ───────────────────────────────────────────────────
 
@@ -26,6 +35,18 @@ function asRecord(v: unknown): Record<string, unknown> {
 
 function agentsOf(profileDef: unknown): Record<string, unknown> {
   return asRecord(asRecord(profileDef).agents);
+}
+
+/** The configured `ui.color` name, if any (the card's colour indicator). */
+function colorOf(profileDef: unknown): string | undefined {
+  const c = asRecord(asRecord(profileDef).ui).color;
+  return typeof c === "string" && c !== "" ? c : undefined;
+}
+
+/** True iff the entry carries a `remote:` block (a remote profile, §4.1). */
+function isRemoteEntry(profileDef: unknown): boolean {
+  const r = asRecord(profileDef).remote;
+  return r !== undefined && r !== null;
 }
 
 function subAgentsOf(agentDef: unknown): Record<string, unknown> {
@@ -185,6 +206,12 @@ export function ProfilesPane({ onOpenProfile, otherScopeNames }: ProfilesPanePro
   const { scope, meta, doc, edit } = useSettingsCtx();
   const { toast } = useToast();
 
+  // The "Add remote profile" paste step (§8.4): the split only fills the
+  // form — an invalid link shows its error and edits nothing.
+  const [addingRemote, setAddingRemote] = useState(false);
+  const [remoteLink, setRemoteLink] = useState("");
+  const [remoteAddError, setRemoteAddError] = useState<string | null>(null);
+
   const profiles = asRecord(get(doc, ["profiles"]));
   const names = Object.keys(profiles);
   // Repo profiles exist for this cwd → the global "default" is not the
@@ -210,6 +237,27 @@ export function ProfilesPane({ onOpenProfile, otherScopeNames }: ProfilesPanePro
     edit(["profiles"], { ...profiles, [name]: { agents: { main: { model: first ?? "" } } } });
   }
 
+  function applyRemoteLink() {
+    let fields;
+    try {
+      fields = parsePairingLink(remoteLink);
+    } catch (e) {
+      setRemoteAddError(e instanceof Error ? e.message : String(e));
+      return;
+    }
+    const host = new URL(fields.url).hostname;
+    const name = defaultRemoteName(fields.profile, host);
+    // A `ca` key only when the link carries one — no silent system trust.
+    const remote: Record<string, unknown> = { url: fields.url, token: fields.token };
+    if (fields.ca !== null) remote.ca = fields.ca;
+    remote.profile = fields.profile ?? "";
+    edit(["profiles"], { ...profiles, [name]: { remote } });
+    setAddingRemote(false);
+    setRemoteLink("");
+    setRemoteAddError(null);
+    onOpenProfile?.(name);
+  }
+
   return (
     <div data-testid="profiles-pane" className="space-y-3">
       <div className="rounded-lg border border-zinc-800 bg-zinc-900/40 px-3 py-2">
@@ -229,6 +277,8 @@ export function ProfilesPane({ onOpenProfile, otherScopeNames }: ProfilesPanePro
         const def = profiles[name];
         const agentEntries = Object.entries(agentsOf(def));
         const shadowed = otherScopeNames?.includes(name) ?? false;
+        const colour = colorOf(def);
+        const remote = isRemoteEntry(def);
         return (
           <div
             key={name}
@@ -244,6 +294,19 @@ export function ProfilesPane({ onOpenProfile, otherScopeNames }: ProfilesPanePro
                 <Badge testid="profile-badge-default" tone="green">
                   {dftLabel}
                 </Badge>
+              )}
+              {remote && (
+                <Badge testid="profile-remote-badge" tone="neutral">
+                  remote
+                </Badge>
+              )}
+              {colour !== undefined && (
+                <span
+                  data-testid={`profile-color-${i}`}
+                  className="rounded border border-zinc-700 bg-zinc-900 px-1.5 py-0.5 font-mono text-[10px] text-zinc-400"
+                >
+                  {colour}
+                </span>
               )}
               {shadowed && (
                 <Badge tone={scope === "global" ? "amber" : "green"}>
@@ -287,9 +350,57 @@ export function ProfilesPane({ onOpenProfile, otherScopeNames }: ProfilesPanePro
         );
       })}
 
-      <button data-testid="profile-add" type="button" onClick={addProfile} className={GHOST_BTN}>
-        + New profile
-      </button>
+      <div className="flex flex-wrap items-center gap-2">
+        <button data-testid="profile-add" type="button" onClick={addProfile} className={GHOST_BTN}>
+          + New profile
+        </button>
+        <button
+          data-testid="profile-add-remote"
+          type="button"
+          onClick={() => {
+            setAddingRemote(true);
+            setRemoteAddError(null);
+          }}
+          className={GHOST_BTN}
+        >
+          + Add remote profile
+        </button>
+      </div>
+
+      {addingRemote && (
+        <div data-testid="remote-add-paste" className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-3">
+          <span className="mb-1 block text-[11px] text-zinc-400">
+            Paste a pairing link (Settings → General → Connect a phone, on the remote server).
+          </span>
+          <input
+            data-testid="remote-add-input"
+            value={remoteLink}
+            placeholder="https://host:port/?token=…&ca=sha256:…"
+            onChange={(e) => setRemoteLink(e.target.value)}
+            className="w-full rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1.5 font-mono text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-zinc-500 focus:outline-none"
+          />
+          <div className="mt-2 flex items-center gap-2">
+            <button data-testid="remote-add-apply" type="button" onClick={applyRemoteLink} className={GHOST_BTN}>
+              Add
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setAddingRemote(false);
+                setRemoteAddError(null);
+              }}
+              className={GHOST_BTN}
+            >
+              Cancel
+            </button>
+          </div>
+          {remoteAddError !== null && (
+            <span data-testid="remote-add-error" className="mt-2 block text-[11px] text-red-400">
+              {remoteAddError}
+            </span>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -330,6 +441,7 @@ export function ProfilePage({
   const profiles = asRecord(get(doc, ["profiles"]));
   const names = Object.keys(profiles);
   const def = profiles[profile];
+  const isRemote = isRemoteEntry(def);
   const first = names[0] === profile;
   const repoPresent = scope === "global" && meta?.repo_exists === true;
   const dftLabel = repoPresent ? "GLOBAL DEFAULT" : "DEFAULT";
@@ -525,6 +637,12 @@ export function ProfilePage({
         </div>
       </div>
 
+      {isRemote ? (
+        // A remote entry has NO local capabilities (RP1): the remote form
+        // replaces the agents editor and every local card.
+        <RemoteProfileForm profile={profile} />
+      ) : (
+        <>
       <div className="rounded-lg border border-sky-900/60 bg-sky-950/30 px-3 py-2 text-xs text-sky-300">
         Capabilities below (Tools, MCP access, Environment, Memory, Knowledge, Interface) apply
         identically to the agent and all its subagents.
@@ -810,6 +928,109 @@ export function ProfilePage({
               </button>
             </div>
           </div>
+        )}
+      </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ── Remote profile form (T10, design §8.4) ───────────────────────────────
+// A `remote:` entry's editor. Reads/writes the draft by segment array
+// (`remote.<field>`, `ui.color`); the token is a masked SecretInput (the
+// mask never reaches the draft — the server keeps the full text).
+
+function strOf(v: unknown): string | undefined {
+  return typeof v === "string" && v !== "" ? v : undefined;
+}
+
+const REMOTE_INPUT_CLS =
+  "w-full rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-zinc-500 focus:outline-none";
+
+export function RemoteProfileForm({ profile }: { profile: string }) {
+  const { doc, edit, errors } = useSettingsCtx();
+  const remote = asRecord(get(doc, ["profiles", profile, "remote"]));
+  const base: Seg[] = ["profiles", profile, "remote"];
+  const ca = strOf(remote.ca);
+  const colour = strOf(get(doc, ["profiles", profile, "ui", "color"]));
+
+  function field(key: string, label: string, value: string | undefined, hint?: string) {
+    // A 422 error at this exact path renders under the field (spec §9.6).
+    const err = errAt(errors, [...base, key]);
+    return (
+      <div>
+        <Field
+          testid={`remote-${key}`}
+          label={label}
+          value={value}
+          onChange={(v) => edit([...base, key], v)}
+          hint={hint}
+        />
+        {err !== undefined && (
+          <span data-testid={`remote-${key}-error`} className="mt-1 block text-[11px] text-red-400">
+            {err}
+          </span>
+        )}
+      </div>
+    );
+  }
+
+  const colourErr = errAt(errors, ["profiles", profile, "ui", "color"]);
+
+  return (
+    <div data-testid="remote-form" className="space-y-3 rounded-lg border border-zinc-800 bg-zinc-900/40 p-3">
+      <div className="flex items-baseline justify-between gap-2">
+        <h3 className="text-sm font-semibold">Remote profile</h3>
+        <span className="text-[10px] text-zinc-500">relays to another PeakBot — the remote owns the conversation</span>
+      </div>
+      <p className="text-[11px] text-zinc-500">
+        Takes effect on the next attach. No local capabilities here — agents and tools live on the
+        remote server.
+      </p>
+      {field("url", "remote.url", strOf(remote.url), "scheme://host[:port] — https, or http on loopback")}
+      <SecretInput
+        testid="remote-token"
+        label="remote.token"
+        value={strOf(remote.token)}
+        onChange={(v) => edit([...base, "token"], v)}
+        hint="The remote server's web token (from its pairing link). Never sent to the remote in a URL."
+        invalid={errAt(errors, [...base, "token"])}
+      />
+      {field(
+        "ca",
+        "remote.ca",
+        ca,
+        ca === undefined ? undefined : "sha256:<fingerprint> from the pairing link, or system.",
+      )}
+      {ca === undefined && (
+        <span data-testid="remote-ca-required" className="block text-[11px] text-amber-400/90">
+          {CA_REQUIRED_HINT}
+        </span>
+      )}
+      {field("profile", "remote.profile", strOf(remote.profile), "REQUIRED — the profile ON THE REMOTE")}
+      {field("agent", "remote.agent", strOf(remote.agent), "optional — pin one agent of that profile")}
+      <div>
+        <span className="mb-1 block text-[11px] text-zinc-400">ui.color</span>
+        <select
+          data-testid="remote-color"
+          value={colour ?? ""}
+          onChange={(e) =>
+            edit(["profiles", profile, "ui", "color"], e.target.value === "" ? undefined : e.target.value)
+          }
+          className={REMOTE_INPUT_CLS + " cursor-pointer"}
+        >
+          <option value="">(derived from the name)</option>
+          {TAB_COLORS.map((c) => (
+            <option key={c} value={c}>
+              {c}
+            </option>
+          ))}
+        </select>
+        {colourErr !== undefined && (
+          <span data-testid="remote-color-error" className="mt-1 block text-[11px] text-red-400">
+            {colourErr}
+          </span>
         )}
       </div>
     </div>

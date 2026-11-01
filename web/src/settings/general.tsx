@@ -9,9 +9,12 @@
 // Repo scope: read-only (general-readonly banner, every control disabled,
 // no edits).
 
+import { useEffect, useState } from "react";
+import { getPairing } from "./api";
 import { useSettingsCtx } from "./context";
 import { get, type Doc } from "./yamlDoc";
 import { errAt } from "./paths";
+import { ConnectPhonePane, decodePairing, type Pairing } from "./connectPhone";
 import { Badge, Field, SecretInput, Toggle } from "./widgets";
 import type { Seg } from "./types";
 
@@ -153,6 +156,27 @@ export function GeneralPane() {
   const compactionModel = asString(ctx.compaction_model);
   const maxTurns = asNumber(g(["agent_max_turns"]));
   const costTracking = g(["cost_tracking"]) !== false;
+
+  // The pairing panel (design §8.4): GET /api/pairing facts + the GLOBAL
+  // LOCAL profile names for its dropdown (a remote entry can't be the
+  // target of its own server).
+  const [pairing, setPairing] = useState<Pairing | null>(null);
+  useEffect(() => {
+    let live = true;
+    getPairing()
+      .then((j) => {
+        if (live) setPairing(decodePairing(j));
+      })
+      .catch(() => {
+        // Pairing facts unavailable (no server, 404 on an old build) —
+        // the panel stays hidden.
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
+  const profileMap = asRecord(get(paneDoc, ["profiles"]));
+  const localProfiles = Object.keys(profileMap).filter((n) => asRecord(profileMap[n]).remote === undefined);
 
   function ed(path: Seg[], value: unknown) {
     if (readOnly) return;
@@ -619,6 +643,11 @@ export function GeneralPane() {
           </div>
         </div>
       </fieldset>
+
+      {/* 9. Pairing (design §8.4) — machine-wide facts, outside the fieldset */}
+      {pairing !== null && (
+        <ConnectPhonePane pairing={pairing} profiles={localProfiles} />
+      )}
     </div>
   );
 }

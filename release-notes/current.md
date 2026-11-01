@@ -27,3 +27,4 @@ This file is the working draft for the next release. When a version is tagged, t
   - The remote's token and pinned CA stay on the local server. The browser never sees them.
   - The protocol versions must match exactly; a mismatch is refused with an error naming both versions.
   - The TUI and stdio refuse remote profiles.
+- **Remote profiles in Settings.** The Profiles pane lists remote entries with a `remote` badge and their tab colour, and edits them (URL, masked token, CA pin, target profile, optional agent pin, tab colour) — with a `ca` required hint when the pin is empty. "+ Add remote profile" pastes a pairing link and creates the entry named `<profile> on <host>`. Settings → General gains a "Connect a phone or another PeakBot" panel: the pairing links (host labels only, the token URL behind Show QR), a profile dropdown, and Copy link.
