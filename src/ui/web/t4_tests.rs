@@ -848,3 +848,188 @@ async fn kill_with_malformed_uuid_is_400() {
     }
     assert!(h.registry.active_ids().contains(&live));
 }
+
+// ═══ Part T9 — remote entries in the local session's catalogue ══════════
+//
+// Design §9 T9 ("same commit: the server emits remote entries in
+// `AppState.catalog`"): the SPA cannot route to a profile the server never
+// advertises, so the web UI's catalogue (`ui_catalog`) must INCLUDE the
+// remote entries — `origin` `"remote"`, a resolved colour — on the
+// `state` frames of LOCAL sessions, with no token/URL/fingerprint on the
+// wire (§7). The §5.10 refusal for selecting one on a local session stays.
+
+/// The first `state` frame on a local socket (panics on an `error` frame).
+async fn next_state(ws: &mut Ws) -> Value {
+    for _ in 0..200 {
+        match next_frame(ws, 15).await {
+            Ok(f) if f["type"] == "state" => return f,
+            Ok(f) if f["type"] == "error" => panic!("unexpected error frame: {f}"),
+            Ok(_) => continue,
+            Err(closed) => panic!(
+                "socket {} before a state frame",
+                if closed { "closed" } else { "timed out" }
+            ),
+        }
+    }
+    panic!("no state frame")
+}
+
+/// A fresh local socket: attach (no profile), wait `attached` + `ready`.
+async fn local_socket(h: &Harness) -> Ws {
+    let addr = spawn_ws(h).await;
+    let mut ws = ws_connect(addr).await;
+    ws_send(&mut ws, attach(None, None, None, false)).await;
+    let first = next_frame(&mut ws, 15).await.expect("attached");
+    assert_eq!(first["type"], "attached", "first frame: {first}");
+    let second = next_frame(&mut ws, 15).await.expect("ready");
+    assert_eq!(second["type"], "ready", "second frame: {second}");
+    ws
+}
+
+/// The `state.catalog` rows of a `state` frame, as `(name, origin)`.
+fn catalog_rows(frame: &Value) -> Vec<(String, String)> {
+    frame["state"]["catalog"]
+        .as_array()
+        .expect("a catalog array")
+        .iter()
+        .map(|p| {
+            (
+                p["name"].as_str().expect("a name").to_string(),
+                p["origin"].as_str().expect("an origin").to_string(),
+            )
+        })
+        .collect()
+}
+
+/// A LOCAL session's catalogue carries the remote entries (origin
+/// `"remote"`, a colour, no secrets) next to the locals.
+#[tokio::test]
+async fn local_session_state_catalog_includes_remote_entries() {
+    let h = harness(WITH_REMOTE_YAML, None);
+    let mut ws = local_socket(&h).await;
+
+    let state = next_state(&mut ws).await;
+    let rows = catalog_rows(&state);
+    assert!(
+        rows.iter().any(|(n, o)| n == "home-dev" && o == "remote"),
+        "the remote entry is in the SPA catalogue with origin \"remote\": {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|(n, o)| n == "dev" && o == "global"),
+        "the locals: {rows:?}"
+    );
+
+    let remote = state["state"]["catalog"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "home-dev")
+        .expect("the remote row");
+    assert_eq!(remote["overrides_global"], false);
+    assert!(
+        remote["color"].is_string(),
+        "the colour is resolved (RP8): {remote}"
+    );
+
+    // §7: no token, URL or fingerprint on the wire.
+    let wire = state.to_string();
+    assert!(!wire.contains("pito"), "the token reaches the SPA");
+    assert!(
+        !wire.contains("10.2.0.48"),
+        "the remote URL reaches the SPA"
+    );
+}
+
+/// A remote entry's configured `ui.color` is what the SPA catalogue
+/// carries (the dot colour of chip rows and tabs).
+#[tokio::test]
+async fn local_session_state_catalog_remote_entry_carries_configured_color() {
+    let yaml = r#"
+providers:
+  - name: ollama
+    type: ollama
+    models:
+      - { name: llama3, alias: local }
+general:
+  context:
+    enabled: false
+profiles:
+  dev:
+    agents:
+      team:
+        model: local
+  home-dev:
+    remote:
+      url: https://10.2.0.48:7823
+      token: pito
+      ca: system
+      profile: dev
+    ui:
+      color: pink
+"#;
+    let h = harness(yaml, None);
+    let mut ws = local_socket(&h).await;
+
+    let state = next_state(&mut ws).await;
+    let remote = state["state"]["catalog"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "home-dev")
+        .expect("the remote row");
+    assert_eq!(remote["color"], "pink", "ui.color wins (RP8): {remote}");
+}
+
+/// §5.10 guard (web socket kind): a local session receiving
+/// `select{profile: <remote>}` gets the locked refusal as a system message —
+/// the binding does not move, and the socket stays up.
+#[tokio::test]
+async fn local_session_refuses_a_select_for_a_remote_profile() {
+    let h = harness(WITH_REMOTE_YAML, None);
+    let mut ws = local_socket(&h).await;
+
+    ws_send(
+        &mut ws,
+        json!({ "type": "select", "profile": "home-dev", "agent": "team" }),
+    )
+    .await;
+
+    let mut saw_refusal = false;
+    for _ in 0..200 {
+        match next_frame(&mut ws, 15).await {
+            Ok(f) if f["type"] == "state" => {
+                if let Some(s) = sel(&f) {
+                    assert_eq!(
+                        s,
+                        ("dev".to_string(), "team".to_string()),
+                        "a refused select must not move the binding: {s:?}"
+                    );
+                }
+                let messages = f["state"]["chat"]["messages"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                let line = messages
+                    .iter()
+                    .filter_map(|m| m["content"].as_str())
+                    .find(|c| c.contains("is a remote profile"));
+                if line.is_some() {
+                    saw_refusal = true;
+                    break;
+                }
+            }
+            Ok(f) if f["type"] == "error" => {
+                panic!("the refusal is a transcript line, not a socket error: {f}")
+            }
+            Ok(_) => continue,
+            Err(closed) => panic!(
+                "socket {} while waiting for the refusal",
+                if closed { "closed" } else { "timed out" }
+            ),
+        }
+    }
+    assert!(
+        saw_refusal,
+        "the §5.10 refusal line must reach the transcript"
+    );
+}

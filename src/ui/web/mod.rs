@@ -726,18 +726,41 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
         .clone()
         .expect("ws_handler is mounted only with deps; the needs_setup guard replaces it");
 
+    // §5.11 (freshness): the remote decision — is L a remote profile *right
+    // now*, its target P and agent pin, and the relay's catalogue — comes
+    // from ONE fresh global-config parse, never the boot catalogue: a
+    // remote added or edited after boot must route on the NEXT attach.
+    // Only an attach naming a profile that is not LOCAL in the boot
+    // catalogue pays for the parse — a name has one kind per config, so a
+    // no-profile or boot-local attach can never be remote (local freshness
+    // is the session's own reload's job).
+    let (remote_profile, fresh_catalog) = match profile
+        .as_deref()
+        .filter(|p| !boot_has_local(registry.boot_catalog(), p))
+    {
+        Some(p) => match remote::fresh_attach(p) {
+            Ok(found) => found,
+            // E-CONFIG: exactly one locked error frame, then close. A
+            // broken global config disables remote attaches — it never
+            // falls back to a local session.
+            Err(e) => {
+                refuse(out_tx, writer_task, e.to_string()).await;
+                return;
+            }
+        },
+        None => (None, Vec::new()),
+    };
+
     // E-CHAIN (design §5.9): a relay may not reach through a remote profile.
     // Checked before `attach` so a refused chain never mints a session.
-    if relayed
-        && let Some(p) = profile.as_deref()
-        && registry.boot_catalog().remote(p).is_some()
-    {
+    if relayed && let Some(remote) = remote_profile.as_ref() {
         refuse(
             out_tx,
             writer_task,
             format!(
-                "profile '{p}' on this server is itself a remote profile — \
-                 chaining remote profiles isn't supported"
+                "profile '{}' on this server is itself a remote profile — \
+                 chaining remote profiles isn't supported",
+                remote.name
             ),
         )
         .await;
@@ -746,10 +769,7 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
 
     // Remote(L) (design §5.1): relay and RETURN — no path from here reaches
     // `registry.attach`, so a failed remote never falls back to a local session.
-    if let Some(remote) = profile
-        .as_deref()
-        .and_then(|p| registry.boot_catalog().remote(p))
-    {
+    if let Some(remote) = remote_profile {
         if let Some(pin) = registry.profile_pin() {
             refuse(out_tx, writer_task, pinned_message(pin)).await;
             return;
@@ -758,7 +778,7 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
             name: remote.name.clone(),
             target_profile: remote.target.profile.clone(),
             target_agent: remote.target.agent.clone(),
-            catalog: registry.boot_catalog().infos(),
+            catalog: fresh_catalog,
         };
         remote::relay::run(ws_stream, out_tx, writer_task, registry, view, convo, agent).await;
         return;
@@ -912,8 +932,10 @@ fn ensure_selection(
         return Ok(());
     }
     let state = sm.get_state();
-    // The session's own (fresh, cwd-aware) catalogue; remote entries are
-    // filtered out of it, so a remote name reads as unknown here.
+    // The session's own (fresh, cwd-aware) catalogue. A remote name can't
+    // get here: attach routing (remote-profiles §5.11) relays it — or
+    // refuses with E-CONFIG — before `registry.attach` runs, and repo
+    // files never define remotes.
     let Some(info) = state.catalog.iter().find(|p| p.name == profile) else {
         return Err(format!("Unknown profile '{profile}'."));
     };
@@ -948,6 +970,14 @@ fn ensure_selection(
 /// E-PINNED (design §5.12).
 fn pinned_message(pin: &str) -> String {
     format!("This server is pinned to profile '{pin}' (--profile).")
+}
+
+/// True when the boot catalogue has `name` as a LOCAL entry — the attach
+/// shapes that can never be remote, so the §5.11 fresh parse is skipped.
+fn boot_has_local(catalog: &crate::config::resolve::Catalog, name: &str) -> bool {
+    catalog
+        .entries()
+        .any(|e| matches!(e, crate::config::resolve::CatalogEntry::Local(l) if l.name == name))
 }
 
 /// Await the first text frame of a connection, skipping non-text control

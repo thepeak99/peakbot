@@ -31,7 +31,7 @@ use url::{Host, Url};
 use uuid::Uuid;
 
 use crate::config::remote::{CaFingerprint, Endpoint, RemoteProfile, Trust};
-use crate::config::resolve::{CatalogEntry, Config, LoadError, ParseCtx, RepoMode};
+use crate::config::resolve::{CatalogEntry, Config, LoadError, ParseCtx, ProfileInfo, RepoMode};
 use crate::ui::wire::ConversationSummaryWire;
 
 pub(super) mod listing;
@@ -56,6 +56,9 @@ mod t7_tests;
 
 #[cfg(test)]
 mod t8_tests;
+
+#[cfg(test)]
+mod t9_tests;
 
 pub type WsStream = tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -714,4 +717,17 @@ fn snapshot(name: &str) -> Result<Arc<RemoteProfile>, RemoteError> {
         .ok_or_else(|| RemoteError::Config {
             message: format!("no remote profile named '{name}'"),
         })
+}
+
+/// The attach-time remote decision (design §5.11), from ONE fresh
+/// global-config parse — the same path `Directory` uses on every call:
+/// is `name` a remote profile *right now* (added or edited after boot),
+/// and if so its definition, plus the fresh `infos()` a relay's
+/// `LocalView.catalog` swaps into the SPA catalogue. `Err` is the locked
+/// E-CONFIG string.
+pub fn fresh_attach(
+    name: &str,
+) -> Result<(Option<Arc<RemoteProfile>>, Vec<ProfileInfo>), RemoteError> {
+    let cfg = load_config()?;
+    Ok((cfg.catalog.remote(name).cloned(), cfg.catalog.infos()))
 }
