@@ -322,6 +322,14 @@ impl Ui for WebUi {
                 bind: self.addr,
                 token_source: self.settings.token_source,
                 tls: self.tls,
+                // The `GET /api/pairing` facts (design §8.4): the effective
+                // token, the --tls-name extras and the cert dir. A
+                // `default_tls_dir` failure with TLS on (no usable home
+                // dir) means pairing reports no fingerprint to offer, and
+                // `serve_tls` still refuses to boot with the real error.
+                token: self.token.as_ref().map(|t| t.to_string()),
+                extra_sans: self.extra_sans.clone(),
+                tls_dir: self.tls.then(|| tls::default_tls_dir().ok()).flatten(),
             },
         };
         app = app.merge(settings::router(settings_state));
