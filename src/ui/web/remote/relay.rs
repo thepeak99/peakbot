@@ -4,7 +4,7 @@
 //! server, re-attached there as profile P. Inbound frames are classified by
 //! the §6.3 table, outbound `state` is localized; nothing local is touched.
 
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
@@ -14,11 +14,10 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message as TMsg;
 
-use super::{Directory, WsStream};
+use super::{DIRECTORY, WsStream};
 use crate::config::resolve::ProfileInfo;
 use crate::ui::app_state::AppState;
 use crate::ui::outbound::{Disconnected, OutboundTx};
-use crate::ui::web::conversations::local_rows;
 use crate::ui::web::images::rewrite_markdown_images;
 use crate::ui::web::refuse;
 use crate::ui::web::registry::SessionRegistry;
@@ -33,10 +32,6 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 const CHIP_REFUSAL: &str = "switch profiles from the chip";
 const E_SHUTDOWN: &str = "shutdown isn't available in a remote profile.";
-
-/// Process-wide because `WsState` is built in many places (tests included);
-/// it re-reads the global config on every call anyway (§5.11).
-static DIRECTORY: LazyLock<Directory> = LazyLock::new(Directory::new);
 
 /// What the local side knows about the tab: L, its remote target P (and
 /// agent pin), and the local catalogue the SPA's chip shows.
@@ -335,16 +330,29 @@ async fn inbound(
                 message: format!("invalid inbound JSON: {e}"),
             }
         }
-        // T7 replaces this with the merged local + remote list (§5.6).
+        // Answered locally with the merged list (§5.6), in a spawned task
+        // so the reader loop never blocks on the ≤ 2 s remote fetches.
         InboundDisposition::InterceptLocal(LocalVerb::RequestConversations) => {
-            OutboundMessage::ConversationsList {
-                items: local_rows(registry),
-                error: None,
-            }
+            let registry = registry.clone();
+            let out_tx = out_tx.clone();
+            tokio::spawn(async move {
+                let items = super::listing::merged_items(&registry).await;
+                let _ = out_tx.send(OutboundMessage::ConversationsList { items, error: None });
+            });
+            return None;
         }
-        // T7 routes the kill by `profile` (§5.6); until then it is dropped.
+        // Routed by `profile` (§5.6): a remote profile goes to its server,
+        // anything else is the local kill. Spawned like the list.
         InboundDisposition::InterceptLocal(LocalVerb::KillSession { convo, profile }) => {
-            tracing::debug!(%convo, ?profile, "relay: kill_session awaits T7 routing");
+            let registry = registry.clone();
+            let out_tx = out_tx.clone();
+            tokio::spawn(async move {
+                if let Some((items, error)) =
+                    super::listing::answer_kill(&registry, &convo, profile.as_deref()).await
+                {
+                    let _ = out_tx.send(OutboundMessage::ConversationsList { items, error });
+                }
+            });
             return None;
         }
     };

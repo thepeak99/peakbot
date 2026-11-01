@@ -57,8 +57,7 @@ use crate::ui::Ui;
 use crate::ui::outbound::{OutboundRx, OutboundTx, outbound_channel};
 use crate::ui::ui_trait::builtin_commands;
 use crate::ui::wire::{
-    InboundMessage, ModelInfo, OutboundMessage, build_conversations_snapshot, build_dir_listing,
-    build_recent_dirs,
+    InboundMessage, ModelInfo, OutboundMessage, build_dir_listing, build_recent_dirs,
 };
 use crate::{StateManager, UiAction};
 use anyhow::Result;
@@ -74,7 +73,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures::{Sink, SinkExt, StreamExt};
-use registry::{KillOutcome, SessionRegistry};
+use registry::SessionRegistry;
 use rust_embed::RustEmbed;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -338,6 +337,11 @@ impl Ui for WebUi {
         if self.deps.is_some() {
             app = app.merge(conversations::router(self.ws_state.clone()));
         }
+
+        // The `/r/` proxy (remote-profiles §6.2): the three allowlisted
+        // routes plus a catch-all 404 for everything else under `/r/`.
+        // Before the token layer, so token-gated like `/api/uploads`.
+        app = app.merge(remote::proxy::router());
 
         // Gate every route behind the shared secret when one is configured.
         // Open by default (loopback); `main` guarantees a token exists before
@@ -1002,35 +1006,34 @@ fn dispatch_inbound(
             })
             .is_ok(),
         Ok(InboundMessage::ListDir { path }) => out_tx.send(build_dir_listing(&path)).is_ok(),
+        // Spawned: the merged list fetches the remotes (≤ 2 s each, §5.6)
+        // and the reader loop must not block on it.
         Ok(InboundMessage::RequestConversations) => {
-            let items = build_conversations_snapshot(
-                state_manager,
-                &registry.active_ids(),
-                &registry.running_ids(),
-            );
-            out_tx
-                .send(OutboundMessage::ConversationsList { items, error: None })
-                .is_ok()
+            let registry = registry.clone();
+            let out_tx = out_tx.clone();
+            tokio::spawn(async move {
+                let items = remote::listing::merged_items(&registry).await;
+                let _ = out_tx.send(OutboundMessage::ConversationsList { items, error: None });
+            });
+            true
         }
         Ok(InboundMessage::RequestRecentDirs) => {
             let dirs = build_recent_dirs(state_manager);
             out_tx.send(OutboundMessage::RecentDirs { dirs }).is_ok()
         }
-        Ok(InboundMessage::KillSession { convo, .. }) => {
-            let Ok(id) = Uuid::parse_str(&convo) else {
-                return true;
-            };
-            let refused = registry.kill(id) == KillOutcome::Running;
-            // Active ids are read after the kill so the row reflects it.
-            let items = build_conversations_snapshot(
-                state_manager,
-                &registry.active_ids(),
-                &registry.running_ids(),
-            );
-            let error = refused.then(|| KILL_RUNNING_MSG.to_string());
-            out_tx
-                .send(OutboundMessage::ConversationsList { items, error })
-                .is_ok()
+        // Routed by `profile` (§5.6): a remote profile goes to its server,
+        // anything else is today's local kill. Spawned like the list.
+        Ok(InboundMessage::KillSession { convo, profile }) => {
+            let registry = registry.clone();
+            let out_tx = out_tx.clone();
+            tokio::spawn(async move {
+                if let Some((items, error)) =
+                    remote::listing::answer_kill(&registry, &convo, profile.as_deref()).await
+                {
+                    let _ = out_tx.send(OutboundMessage::ConversationsList { items, error });
+                }
+            });
+            true
         }
         // Re-attach mid-stream is a client bug; ignore rather than reset.
         Ok(InboundMessage::Attach { .. }) => true,

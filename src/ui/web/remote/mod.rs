@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use reqwest::StatusCode;
@@ -31,9 +31,11 @@ use url::{Host, Url};
 use uuid::Uuid;
 
 use crate::config::remote::{CaFingerprint, Endpoint, RemoteProfile, Trust};
-use crate::config::resolve::{Config, LoadError, ParseCtx, RepoMode};
+use crate::config::resolve::{CatalogEntry, Config, LoadError, ParseCtx, RepoMode};
 use crate::ui::wire::ConversationSummaryWire;
 
+pub(super) mod listing;
+pub(super) mod proxy;
 pub(super) mod relay;
 
 #[cfg(test)]
@@ -44,6 +46,16 @@ mod relay_tests;
 
 #[cfg(test)]
 mod test_support;
+
+// T7/T8 (merged list, kill routing, `/r/` proxy): shared fixture + tests.
+#[cfg(test)]
+mod t78_support;
+
+#[cfg(test)]
+mod t7_tests;
+
+#[cfg(test)]
+mod t8_tests;
 
 pub type WsStream = tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -63,6 +75,25 @@ impl Default for ClientOpts {
             dial_timeout: Duration::from_secs(20),
         }
     }
+}
+
+/// The T7 list merge groups by origin (one fetch per server, RP4).
+pub struct RemoteRef {
+    /// L — the local profile name.
+    pub name: String,
+    /// `scheme://host[:port]` without a trailing slash.
+    pub origin: String,
+    /// P — the profile on the remote server.
+    pub target: String,
+}
+
+/// The remote's answer to a proxied request (T8): its status, its response
+/// headers (the proxy copies an allowlist of them) and its body, left for
+/// streaming.
+pub struct Upstream {
+    pub status: StatusCode,
+    pub headers: reqwest::header::HeaderMap,
+    pub body: reqwest::Response,
 }
 
 /// A remote failure; `Display` is the §5.12 locked string. Carries
@@ -488,7 +519,6 @@ impl Client {
     }
 
     /// `GET /api/conversations` — the remote's local rows (T4 shape).
-    #[allow(dead_code)] // first non-test caller is T7's merged list
     pub async fn list(&self) -> Result<Vec<ConversationSummaryWire>, RemoteError> {
         #[derive(Deserialize)]
         struct Items {
@@ -506,7 +536,6 @@ impl Client {
 
     /// `POST /api/conversations/{id}/kill`; `Some(msg)` is the remote's
     /// refusal (`error`, §6.2), `None` a clean kill.
-    #[allow(dead_code)] // first non-test caller is T7's kill routing
     pub async fn kill(&self, id: &Uuid) -> Result<Option<String>, RemoteError> {
         #[derive(Deserialize)]
         struct KillReply {
@@ -520,6 +549,63 @@ impl Client {
                 .down(format!("unexpected reply to POST /{path}: {e}"))
         })?;
         Ok(parsed.error)
+    }
+
+    /// `GET <origin>/<path>` for the `/r/` proxy (T8): the token cookie is
+    /// the only credential (§7), a 401 is E-AUTH, and the body is left for
+    /// the proxy to stream.
+    pub async fn get(&self, path: &str) -> Result<Upstream, RemoteError> {
+        let resp = self
+            .http
+            .get(self.url(path))
+            .header(COOKIE, self.cookie.clone())
+            .send()
+            .await
+            .map_err(|e| self.peer.classify_reqwest(&e))?;
+        if resp.status() == StatusCode::UNAUTHORIZED {
+            return Err(self.peer.auth());
+        }
+        Ok(Upstream {
+            status: resp.status(),
+            headers: resp.headers().clone(),
+            body: resp,
+        })
+    }
+
+    /// `POST /api/uploads?convo=&name=` (T8): the query is rebuilt from the
+    /// parsed parts only (§6.2), and the browser's `Content-Type` is the one
+    /// browser header copied (§7). The body streams through.
+    pub async fn post_upload(
+        &self,
+        convo: &Uuid,
+        name: &str,
+        content_type: Option<HeaderValue>,
+        body: reqwest::Body,
+    ) -> Result<Upstream, RemoteError> {
+        let mut url = self.url("api/uploads");
+        url.query_pairs_mut()
+            .append_pair("convo", &convo.as_hyphenated().to_string())
+            .append_pair("name", name);
+        let mut request = self
+            .http
+            .post(url)
+            .header(COOKIE, self.cookie.clone())
+            .body(body);
+        if let Some(content_type) = content_type {
+            request = request.header(reqwest::header::CONTENT_TYPE, content_type);
+        }
+        let resp = request
+            .send()
+            .await
+            .map_err(|e| self.peer.classify_reqwest(&e))?;
+        if resp.status() == StatusCode::UNAUTHORIZED {
+            return Err(self.peer.auth());
+        }
+        Ok(Upstream {
+            status: resp.status(),
+            headers: resp.headers().clone(),
+            body: resp,
+        })
     }
 
     fn url(&self, path: &str) -> Url {
@@ -579,26 +665,49 @@ impl Directory {
         Ok(client)
     }
 
+    /// Every remote profile in a fresh global-config parse (§5.11) — the
+    /// T7 list merge groups these by origin (one fetch per server, RP4).
+    pub fn remotes(&self) -> Result<Vec<RemoteRef>, RemoteError> {
+        Ok(load_config()?
+            .catalog
+            .entries()
+            .filter_map(|entry| match entry {
+                CatalogEntry::Remote(r) => Some(RemoteRef {
+                    name: r.name.clone(),
+                    origin: r.endpoint.origin_without_slash(),
+                    target: r.target.profile.clone(),
+                }),
+                _ => None,
+            })
+            .collect())
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, ClientCache> {
         self.clients.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
 
+/// Process-wide because `WsState` is built in many places (tests included);
+/// it re-reads the global config on every call anyway (§5.11).
+pub(super) static DIRECTORY: LazyLock<Directory> = LazyLock::new(Directory::new);
+
 /// The global config only (repo files never define remotes, §5.11).
-fn snapshot(name: &str) -> Result<Arc<RemoteProfile>, RemoteError> {
+fn load_config() -> Result<Config, RemoteError> {
     let ctx = ParseCtx { known_skills: &[] };
-    let config =
-        Config::load(Path::new("."), RepoMode::Ignore, &ctx).map_err(|e| RemoteError::Config {
-            message: match e {
-                LoadError::Invalid(errors) => crate::config_errors_summary(&errors),
-                LoadError::Missing(path) => format!("{} does not exist", path.display()),
-                LoadError::Legacy(path) => {
-                    format!("{}: {}", path.display(), crate::config::resolve::L1_MESSAGE)
-                }
-                LoadError::Io(path, e) => format!("cannot read {}: {e}", path.display()),
-            },
-        })?;
-    config
+    Config::load(Path::new("."), RepoMode::Ignore, &ctx).map_err(|e| RemoteError::Config {
+        message: match e {
+            LoadError::Invalid(errors) => crate::config_errors_summary(&errors),
+            LoadError::Missing(path) => format!("{} does not exist", path.display()),
+            LoadError::Legacy(path) => {
+                format!("{}: {}", path.display(), crate::config::resolve::L1_MESSAGE)
+            }
+            LoadError::Io(path, e) => format!("cannot read {}: {e}", path.display()),
+        },
+    })
+}
+
+fn snapshot(name: &str) -> Result<Arc<RemoteProfile>, RemoteError> {
+    load_config()?
         .catalog
         .remote(name)
         .cloned()
