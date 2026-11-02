@@ -17,7 +17,7 @@
 
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
-import { MIN_TAB_PX, TAB_GAP_PX } from "./components/ConvoTabBar";
+import { MIN_TAB_PX, NAV_PADDING_PX, TAB_GAP_PX } from "./components/ConvoTabBar";
 
 // Vitest stubs CSS imports to "" (even with ?raw), so read the file directly.
 const css = readFileSync(decodeURIComponent(new URL("./index.css", import.meta.url).pathname), "utf8");
@@ -269,5 +269,64 @@ describe("index.css — per-profile tab colour (remote-profiles T2)", () => {
       light,
       "the light theme (html.light) must define all 8 --profile-<c> variables",
     ).toBeDefined();
+  });
+});
+
+// ─── .ctabbar right-edge clearance for the TabbedDrawer rail ─────────────
+//
+// The drawer's handle rail (fixed, right-0, z-40) overlaps the tab bar
+// (z-20). The bar's right padding must clear the rail, else the "+" button
+// is hidden behind it. RED before the fix: padding is 8px, rail is 40px.
+
+const drawer = readFileSync(
+  decodeURIComponent(new URL("./components/TabbedDrawer.tsx", import.meta.url).pathname),
+  "utf8",
+);
+
+/** Rail handle width in px: the role="tab" button's Tailwind w-<n> class (1 unit = 4px). */
+function railHandleWidthPx(): number {
+  const btn = /<button[\s\S]*?role="tab"[\s\S]*?<\/button>/.exec(drawer);
+  expect(btn, 'TabbedDrawer must render a role="tab" handle button').not.toBeNull();
+  const w = /\bw-(\d+(?:\.\d+)?)\b/.exec(btn![0]);
+  expect(w, "the handle button must carry a Tailwind w-<n> width class").not.toBeNull();
+  return parseFloat(w![1]) * 4;
+}
+
+/** Horizontal padding of `.ctabbar` in px, left and right kept separate. */
+function ctabbarPadding(): { left: number; right: number } {
+  const body = ruleBody(".ctabbar");
+  expect(body, "index.css must have a .ctabbar rule").not.toBeNull();
+  const px = (v: string | null) => (v ? parseFloat(v) || 0 : 0);
+  let left = 0;
+  let right = 0;
+  const pad = decl(body, "padding");
+  if (pad) {
+    const p = pad.split(" ");
+    const r = p[1] ?? p[0];
+    const l = p[3] ?? r;
+    left = px(l);
+    right = px(r);
+  }
+  left = decl(body, "padding-left") ? px(decl(body, "padding-left")) : left;
+  right = decl(body, "padding-right") ? px(decl(body, "padding-right")) : right;
+  return { left, right };
+}
+
+describe("index.css — .ctabbar clears the drawer rail", () => {
+  it("has right padding ≥ rail handle width + 8px so the \"+\" stays visible and clickable", () => {
+    const rail = railHandleWidthPx();
+    const { right } = ctabbarPadding();
+    expect(
+      right,
+      `.ctabbar padding-right is ${right}px; the rail handle is ${rail}px wide and needs ${rail + 8}px (rail + 8px gap) of clearance`,
+    ).toBeGreaterThanOrEqual(rail + 8);
+  });
+
+  it("keeps NAV_PADDING_PX in sync with the .ctabbar left+right padding (overflow math)", () => {
+    const { left, right } = ctabbarPadding();
+    expect(
+      NAV_PADDING_PX,
+      "NAV_PADDING_PX feeds tabsOverflow and must equal the bar's left+right padding",
+    ).toBe(left + right);
   });
 });

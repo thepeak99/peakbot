@@ -19,7 +19,7 @@ export const TAB_GAP_PX = 2; // == .ctab-scroll { gap } in index.css
 // while hidden — the decision must not depend on the arrows' own state)
 // and the bar's child gaps. Subtracting a constant, not the arrows' live
 // offsetWidth, is what makes the overflow decision stateless and flicker-free.
-const NAV_PADDING_PX = 8 * 2; // .ctabbar padding 0 8px
+export const NAV_PADDING_PX = 8 + 48; // .ctabbar padding-left 8px + padding-right 48px (drawer rail clearance)
 const PLUS_PX = 26 + 2; // .ctab-btn (26px) + .ctab-btn.plus margin-left
 const ARROW_PX = 22 * 2; // .ctab-btn.arrow width, both of them
 const BAR_GAPS_PX = 2 * 3; // .ctabbar gap 2px × up to 3 child gaps

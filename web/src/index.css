@@ -168,7 +168,8 @@ html.light .markdown-body a {
    light-theme remap applies; the hex fallbacks cover vars Tailwind didn't emit. */
 .ctabbar { display: flex; align-items: stretch; height: 36px; flex: none;
            background: var(--color-zinc-950); border-bottom: 1px solid var(--color-zinc-800);
-           padding: 0 8px 0 8px; gap: 2px; position: relative; z-index: 20; }
+           /* right 48px clears the fixed 40px TabbedDrawer rail */
+           padding: 0 48px 0 8px; gap: 2px; position: relative; z-index: 20; }
 .ctab-scroll { display: flex; align-items: flex-end; flex: 0 1 auto; min-width: 0;
                overflow-x: auto; overflow-y: hidden; scrollbar-width: none; gap: 2px; padding-top: 4px; }
 .ctab-scroll::-webkit-scrollbar { display: none; }
