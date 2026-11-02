@@ -180,10 +180,18 @@ export function Composer({
   };
 
   const onPaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-    const files = Array.from(e.clipboardData.files);
-    if (files.length > 0) {
+    const cd = e.clipboardData;
+    let list = Array.from(cd.files ?? []);
+    if (list.length === 0) {
+      // Some browsers expose a pasted image only via items; never union with files (Chrome lists both).
+      list = Array.from(cd.items ?? [])
+        .filter((it) => it.kind === "file")
+        .map((it) => it.getAsFile())
+        .filter((f): f is File => f !== null);
+    }
+    if (list.length > 0) {
       e.preventDefault();
-      attachments.add(files);
+      attachments.add(list);
     }
   };
 
