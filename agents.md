@@ -597,7 +597,7 @@ The load-bearing guarantee: sub-agent turns are filtered out of the agent's wire
 
 Delegation tokens/cost roll into the parent `/stats` lane-agnostically (exception: Ollama sub-agents are hookless — untracked).
 
-Orchestrator reply: rig returns only the last response's text, so prose from responses that also carried tool calls is staged by the hook (`StateManager::stage_prose`) and committed with the final text as one row (`commit_reply`) at the end of the turn (also on Stop/Error). An empty final reply is re-requested once with a wire-only nudge, then a `⚠` system row is shown.
+Orchestrator reply: each orchestrator response becomes at most one Agent row — the hook writes the row for a response that carried tool calls (that response's own prose, byte-identical), the turn loop writes the final reply (a blank final writes nothing). The wire replays rows grouped by `response_id`: one Assistant message per response, one User per tool result; System rows never reach the model. An empty final reply succeeds when the turn already has a prose row, else it is re-requested once with a wire-only nudge, then a `⚠` system row is shown.
 
 ### Context meter
 

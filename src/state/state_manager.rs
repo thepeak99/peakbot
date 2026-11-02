@@ -190,11 +190,6 @@ pub struct StateManager {
     /// The response currently being materialised into transcript rows.
     /// See [`ResponseSlot`].
     response: RwLock<ResponseSlot>,
-
-    /// Orchestrator prose from responses that also carried tool calls, staged
-    /// by the hook and merged into the turn's single reply row by
-    /// [`Self::commit_reply`]. Cleared at every user-turn boundary.
-    turn_prose: RwLock<Vec<String>>,
 }
 
 /// The response currently being materialised into transcript rows.
@@ -280,7 +275,6 @@ impl StateManager {
                 id: 0,
                 thinking: Vec::new(),
             }),
-            turn_prose: RwLock::new(Vec::new()),
         }
     }
 
@@ -2185,67 +2179,52 @@ impl StateManager {
         }
     }
 
-    /// Stage prose from an orchestrator response that also carried tool
-    /// calls; rig returns only the last response's text, so this is the only
-    /// path by which earlier prose reaches the transcript. Blank text is ignored.
-    pub fn stage_prose(&self, text: String) {
-        if !text.trim().is_empty() {
-            self.turn_prose.write().unwrap().push(text);
-        }
-    }
-
-    /// Commit the turn's reply as ONE row: staged prose followed by
-    /// `final_text`, blank and duplicate chunks (by trimmed text) dropped.
-    /// Returns false, pushing nothing, when no chunk survives.
-    ///
-    /// The row goes through [`Self::add_assistant_message`] so it carries the
-    /// open response's id and claims its thinking blocks; with no row to
-    /// carry them they are dropped so they cannot attach to a later row.
-    pub fn commit_reply(&self, final_text: &str) -> bool {
-        let staged = std::mem::take(&mut *self.turn_prose.write().unwrap());
-        let mut seen: Vec<String> = Vec::new();
-        let mut parts: Vec<String> = Vec::new();
-        for chunk in staged
-            .into_iter()
-            .chain(std::iter::once(final_text.to_string()))
-        {
-            let key = chunk.trim();
-            if key.is_empty() || seen.iter().any(|s| s == key) {
-                continue;
-            }
-            seen.push(key.to_string());
-            parts.push(chunk);
-        }
-        if parts.is_empty() {
-            self.clear_response_thinking();
-            return false;
-        }
-        self.add_assistant_message(parts.join("\n\n"));
-        true
-    }
-
     /// Reset per-turn state at a user-turn boundary.
     fn begin_turn(&self) {
         self.clear_response_thinking();
-        self.turn_prose.write().unwrap().clear();
     }
 
     /// Add an assistant message to chat and persist.
     ///
+    /// A blank reply is not a message: trim-empty content pushes no row, so
+    /// the transcript never holds a blank orchestrator Agent row.
+    ///
     /// Compaction is **NOT** triggered here — see [`add_user_message`].
     pub fn add_assistant_message(&self, content: String) {
+        if content.trim().is_empty() {
+            return;
+        }
         self.push_assistant(MessageSource::Human, content, Vec::new());
+    }
+
+    /// True iff the current turn — the rows after the last User row on the
+    /// orchestrator lane — already has an Agent row. The reply test the
+    /// empty-final nudge consults: a blank final answer after a tool-call
+    /// response's prose row is a finished turn, not an empty one.
+    pub fn turn_has_reply(&self) -> bool {
+        use crate::ui::app_state::MessageRole;
+
+        let state = self.state.read().unwrap();
+        state
+            .chat
+            .messages
+            .iter()
+            .rev()
+            .filter(|m| m.source.is_orchestrator_lane())
+            .take_while(|m| m.role != MessageRole::User)
+            .any(|m| m.role == MessageRole::Agent)
     }
 
     /// Add an assistant message tagged with the producing lane, and persist.
     ///
-    /// The orchestrator's own prose is staged by the hook and committed once
-    /// per turn by [`Self::commit_reply`]. A **sub-agent**'s prose has no
-    /// such return path — its final text becomes the `delegate` ToolResult, and
-    /// its intermediate prose would otherwise vanish. So `process_event_for_ui`
-    /// calls this with the `SubAgent { role }` lane for sub-agent
-    /// `CompletionResponse`s, surfacing that prose on its own `🧩 role` lane.
-    /// Persistence keeps the lane on the serialized message.
+    /// Orchestrator-lane rows are owned by the hook (responses that carried
+    /// tool calls) and the turn loop (the final reply) — never by the event
+    /// path. This seam exists for the **sub-agent** lane: its prose has no
+    /// other return path (its final text becomes the `delegate` ToolResult),
+    /// so `process_event_for_ui` calls this with the `SubAgent { role }`
+    /// lane for sub-agent `CompletionResponse`s, surfacing that prose on its
+    /// own `🧩 role` lane. Persistence keeps the lane on the serialized
+    /// message.
     pub fn add_assistant_message_sourced(&self, source: MessageSource, content: String) {
         self.push_assistant(source, content, Vec::new());
     }
@@ -2292,14 +2271,16 @@ impl StateManager {
     /// Open a new model response and stage the thinking blocks it produced.
     ///
     /// Called synchronously from `SessionHook::on_completion_response` for
-    /// EVERY orchestrator response — thinking-bearing or not (the hook also
-    /// stages that response's prose when it carries a tool call). That is the
-    /// whole point: the returned id is the only record of where one
-    /// response ends and the next begins, and a response that emitted no
-    /// thinking still has to close the previous one's group. Rig awaits
-    /// that hook inline and `prompt_with_history` returns only afterwards,
-    /// so the next `push_assistant`/`add_tool_call` is guaranteed to see
-    /// what this opened.
+    /// EVERY orchestrator response. The hook stages the blocks only when the
+    /// response produces a transcript row — it speaks, or it carries a tool
+    /// call (whose row it writes itself) — and passes an empty vec
+    /// otherwise, so a row-less response's blocks can never leak onto a
+    /// later row. Either way the call is what matters: the returned id is
+    /// the only record of where one response ends and the next begins, and a
+    /// response that emitted no thinking still has to close the previous
+    /// one's group. Rig awaits that hook inline and `prompt_with_history`
+    /// returns only afterwards, so the next `push_assistant`/`add_tool_call`
+    /// is guaranteed to see what this opened.
     ///
     /// Replaces the staged blocks rather than appending — a non-empty slot
     /// here always means a consumer was skipped, and accumulating would
@@ -2481,6 +2462,13 @@ impl StateManager {
 
     // ── History Conversion for Agent ───────────────────────────────────────────
 
+    /// The wire boundary's live filter: the orchestrator's live context
+    /// (`is_orchestrator_context`) minus System rows — those are
+    /// presentation-only and must never reach the model.
+    fn is_wire_row(m: &crate::ui::app_state::ChatMessage) -> bool {
+        m.is_orchestrator_context() && m.role != crate::ui::app_state::MessageRole::System
+    }
+
     /// Convert chat messages to rig_core::Message for agent history.
     /// Produces proper rig message types:
     /// - User → `Message::User` with text content
@@ -2523,7 +2511,7 @@ impl StateManager {
             .iter()
             .enumerate()
             .rev()
-            .find(|(_, msg)| msg.is_orchestrator_context());
+            .find(|(_, msg)| Self::is_wire_row(msg));
         let skip_last_idx = last_live
             .filter(|(_, msg)| msg.role == MessageRole::User)
             .map(|(i, _)| i);
@@ -2535,10 +2523,11 @@ impl StateManager {
             .enumerate()
             // Isolation boundary: a sub-agent's internal turns live in the
             // transcript (for display + persistence) but must NEVER enter the
-            // orchestrator model's context. `is_orchestrator_context()` is the
-            // single definition of this set — see also `uncompacted_message_count`,
-            // `ContextManager::compact`, `build_resumption_from_tail`.
-            .filter(|(_, msg)| msg.is_orchestrator_context())
+            // orchestrator model's context, and neither may System rows.
+            // `is_wire_row` is the single definition of this set — see also
+            // `uncompacted_message_count`, `ContextManager::compact`,
+            // `build_resumption_from_tail`.
+            .filter(|(_, msg)| Self::is_wire_row(msg))
             .filter(|(i, _)| Some(*i) != skip_last_idx)
             .map(|(_, msg)| msg)
             .collect();
@@ -2567,18 +2556,21 @@ impl StateManager {
     /// blocks alone would split a response's thinking from the tool_uses it
     /// was generated with. [`Self::convert_history_to_rig`] is the only
     /// constructor of `AssistantContent::Reasoning`.
+    ///
+    /// Returns `None` for a System row: the `is_wire_row` filter excludes
+    /// them from every caller — this arm is a defensive skip, not a panic.
     fn last_msg_to_rig(
         msg: &crate::ui::app_state::ChatMessage,
         supports_vision: bool,
         store: &crate::attachments::UploadStore,
-    ) -> rig_core::completion::message::Message {
+    ) -> Option<rig_core::completion::message::Message> {
         use crate::ui::app_state::MessageRole;
         use rig_core::completion::message::{
             AssistantContent, Message as RigMessage, Text, ToolCall, ToolFunction, ToolResult,
             ToolResultContent, UserContent,
         };
         use rig_core::one_or_many::OneOrMany;
-        match msg.role {
+        let rig_message = match msg.role {
             MessageRole::User => RigMessage::User {
                 content: user_content_from_chat_message(msg, supports_vision, store),
             },
@@ -2590,12 +2582,12 @@ impl StateManager {
                 let tool_name = match msg.tool_name.as_deref() {
                     Some(n) => n,
                     None => {
-                        return RigMessage::Assistant {
+                        return Some(RigMessage::Assistant {
                             id: None,
                             content: OneOrMany::one(AssistantContent::Text(Text::new(
                                 msg.content.clone(),
                             ))),
-                        };
+                        });
                     }
                 };
                 let args_str = msg.tool_args.as_deref().unwrap_or("{}");
@@ -2614,11 +2606,11 @@ impl StateManager {
                 let tool_name = match msg.tool_name.as_deref() {
                     Some(n) => n,
                     None => {
-                        return RigMessage::User {
+                        return Some(RigMessage::User {
                             content: OneOrMany::one(UserContent::Text(Text::new(
                                 msg.content.clone(),
                             ))),
-                        };
+                        });
                     }
                 };
                 let result_text = msg.tool_result.as_deref().unwrap_or("");
@@ -2637,10 +2629,10 @@ impl StateManager {
                     msg.content
                 )))),
             },
-            MessageRole::System => RigMessage::User {
-                content: OneOrMany::one(UserContent::Text(Text::new(msg.content.clone()))),
-            },
-        }
+            // Defensive: `is_wire_row` excludes System rows upstream.
+            MessageRole::System => return None,
+        };
+        Some(rig_message)
     }
 
     /// Convert a sanitised chat slice into the rig wire array.
@@ -2656,21 +2648,20 @@ impl StateManager {
     /// `TC,TR,TC,TR…`), which is exactly why it is recorded.
     ///
     /// Each segment then converts in one of two shapes:
-    ///   - **Thinking-bearing segment** (its rows carry at least one
-    ///     replayable `ThinkingBlock`): coalesced into ONE
-    ///     `RigMessage::Assistant` whose content order is
-    ///     `[Reasoning…, Text?, ToolCall…]`, followed by one
-    ///     `RigMessage::User` per `ToolResult` of that segment. Anthropic's
-    ///     wire contract.
-    ///   - **No thinking**: one `RigMessage::Assistant` per Agent row and
-    ///     one per ToolCall row — byte-identical to the pre-change
-    ///     output for every non-Anthropic provider and every knob-off
-    ///     run.
+    ///   - **Segment with a `response_id`** (every row this process wrote):
+    ///     ONE `RigMessage::Assistant` whose content order is
+    ///     `[Reasoning…, Text?, ToolCall…]` — the response as the model
+    ///     produced it, byte-identical, never split or rejoined — followed by
+    ///     one `RigMessage::User` per `ToolResult` of that segment. The
+    ///     Assistant message is omitted when nothing survives (no blocks, no
+    ///     text, no calls — a blank legacy row).
+    ///   - **Segment without one** (legacy transcript, row appended with no
+    ///     response open): the legacy one-message-per-row shape, unchanged.
     ///
-    /// Blocks are dropped (collapsing the first case into the second) when
-    /// `wire_reasoning == false` — so a foreign provider running a Claude
-    /// transcript cannot 400 — and when the segment's `response_id` is
-    /// `None`, because a block whose response group is unknown has nothing
+    /// Blocks are dropped (collapsing the first case's `Reasoning…` to empty)
+    /// when `wire_reasoning == false` — so a foreign provider running a
+    /// Claude transcript cannot 400 — and when the segment's `response_id`
+    /// is `None`, because a block whose response group is unknown has nothing
     /// to anchor its signature to.
     ///
     /// This is the ONLY constructor of `AssistantContent::Reasoning`; see
@@ -2709,6 +2700,7 @@ impl StateManager {
                     i += 1;
                 }
                 MessageRole::System => {
+                    // Defensive: `is_wire_row` excludes System rows upstream.
                     i += 1;
                 }
                 MessageRole::Agent | MessageRole::ToolCall => {
@@ -2783,11 +2775,12 @@ impl StateManager {
     /// Emit ONE response segment: the rows of a single model response (plus
     /// the ToolResults that came back for it) in transcript order.
     ///
-    /// `key` is the segment's `response_id`. `None` means the rows don't know
-    /// which response produced them (legacy transcript, sub-agent row, row
-    /// appended with no response open) — such a segment never replays
-    /// reasoning, because a signature with no group is exactly what Anthropic
-    /// rejects.
+    /// `key` is the segment's `response_id`. `Some` — the rows know their
+    /// response — coalesces into ONE Assistant message (the response as the
+    /// model produced it); `None` (legacy transcript, row appended with no
+    /// response open) keeps the legacy one-message-per-row shape and never
+    /// replays reasoning, because a signature with no group is exactly what
+    /// Anthropic rejects.
     fn push_response_segment_to_rig(
         out: &mut Vec<rig_core::completion::message::Message>,
         segment: &[crate::ui::app_state::ChatMessage],
@@ -2829,16 +2822,11 @@ impl StateManager {
             Vec::new()
         };
 
-        if blocks_kept.is_empty() {
-            // No-thinking path — must be BYTE-IDENTICAL to the pre-change
-            // per-message rebuild (design §3.2: "byte-identical"). Iterate
-            // the segment in transcript order and emit each row on its own,
-            // matching the legacy single-message-per-ChatMessage shape.
-            // The reasoning-bearing branch below is the only one that
-            // coalesces. ToolResults are emitted inline here so the
-            // transcript order matches the legacy per-row output; the
-            // after-block re-emission below is therefore skipped (the
-            // thinking-bearing branch is the only caller that needs it).
+        if key.is_none() {
+            // Legacy per-row shape: the rows don't know which response
+            // produced them, so there is nothing to coalesce — one message
+            // per row, the legacy single-message-per-ChatMessage output.
+            // ToolResults are emitted inline to keep transcript order.
             for m in segment {
                 match m.role {
                     MessageRole::Agent => {
@@ -2900,7 +2888,7 @@ impl StateManager {
                 }
             }
             if let Some(agent) = agent_row
-                && !agent.content.is_empty()
+                && !agent.content.trim().is_empty()
             {
                 content.push(AssistantContent::Text(Text::new(agent.content.clone())));
             }
@@ -2917,15 +2905,17 @@ impl StateManager {
                     ToolFunction::new(tool_name.to_string(), arguments),
                 )));
             }
-            out.push(RigMessage::Assistant {
-                id: None,
-                content: OneOrMany::many(content).expect("non-empty: at least one thinking block"),
-            });
+            // A blank legacy row leaves nothing to say — never emit an
+            // empty Assistant message.
+            if !content.is_empty() {
+                out.push(RigMessage::Assistant {
+                    id: None,
+                    content: OneOrMany::many(content).expect("non-empty: checked above"),
+                });
+            }
 
-            // Thinking-bearing path: ToolResults stay as separate
-            // Message::User entries (not coalesced into the
-            // Assistant message — only Thinking+Text+ToolCall go
-            // together per the Anthropic wire contract).
+            // The response's ToolResults stay as separate `Message::User`
+            // entries — only the response's own content is coalesced.
             for tr in &tool_result_rows {
                 let Some(tool_name) = tr.tool_name.as_deref() else {
                     continue;
@@ -3012,10 +3002,8 @@ impl StateManager {
         let state = self.state.read().unwrap();
         let messages = &state.chat.messages;
 
-        let live: Vec<&crate::ui::app_state::ChatMessage> = messages
-            .iter()
-            .filter(|m| m.is_orchestrator_context())
-            .collect();
+        let live: Vec<&crate::ui::app_state::ChatMessage> =
+            messages.iter().filter(|m| Self::is_wire_row(m)).collect();
         let sanitized = crate::tool_use_validator::sanitize_tool_pairs(live);
         let (tail, head) = sanitized.split_last()?;
 
@@ -3039,7 +3027,11 @@ impl StateManager {
         // Mirror the pre-change shape — for a single message at the tail of
         // the transcript, the resumption helper keeps it as a one-element
         // rig message regardless of whether it carries thinking.
-        let prompt = Self::last_msg_to_rig(tail, supports_vision, self.uploads());
+        let Some(prompt) = Self::last_msg_to_rig(tail, supports_vision, self.uploads()) else {
+            // A System tail never reaches here (is_wire_row) — nothing to
+            // resume from.
+            return None;
+        };
 
         Some((prompt, history))
     }
@@ -8772,7 +8764,8 @@ mod tests {
             text: "thinking text".to_string(),
             signature: "sig.SGXabc123XYZ-==".to_string(),
         }];
-        let rig = StateManager::last_msg_to_rig(&msg, false, &dummy_store());
+        let rig = StateManager::last_msg_to_rig(&msg, false, &dummy_store())
+            .expect("a ToolCall row converts");
         match rig {
             rig_core::completion::message::Message::Assistant { content, .. } => {
                 let kinds: Vec<&str> = content

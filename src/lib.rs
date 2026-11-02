@@ -2695,13 +2695,14 @@ impl AgentRunner {
                 sm.add_request(&source, usage.input_tokens, usage.output_tokens, usage.cost);
 
                 // Surface a **sub-agent's** prose on its own lane. The
-                // orchestrator's prose is staged by the hook and committed once
-                // per turn by `commit_reply`, so adding it here too would
-                // double it — hence the orchestrator-lane guard. A
-                // sub-agent's final answer legitimately appears twice in the
-                // transcript: once here on its `🧩 role` lane (it *said* it) and
-                // once as the orchestrator's `delegate` ToolResult (it *received*
-                // it) — distinct lanes, not a duplicate bug.
+                // orchestrator's rows are owned elsewhere — the hook writes
+                // them for tool-call-carrying responses, the turn loop writes
+                // the final reply — so adding them here would double them;
+                // hence the orchestrator-lane guard. A sub-agent's final
+                // answer legitimately appears twice in the transcript: once
+                // here on its `🧩 role` lane (it *said* it) and once as the
+                // orchestrator's `delegate` ToolResult (it *received* it) —
+                // distinct lanes, not a duplicate bug.
                 if !thinking.is_empty() && !source.is_orchestrator_lane() {
                     // Sub-agent emitted thinking — carry blocks onto its lane
                     // so the rebuilt orchestrator wire never sees them
@@ -2745,8 +2746,8 @@ impl AgentRunner {
         }
     }
 
-    /// Internal process_message — takes the already-built current-turn `Message`
-    /// (text or multimodal) and history from `StateManager`, runs the agent,
+    /// The turn loop: takes the already-built current-turn `Message` (text
+    /// or multimodal) and history from `StateManager`, runs the agent,
     /// writes the response back to state. Retries on transient errors.
     ///
     /// **In-loop compaction (`mid-compaction.md`).** When the wired
@@ -2758,23 +2759,6 @@ impl AgentRunner {
     /// against infinite terminate-restart cycles is in
     /// `apply_compaction` — see that fn's doc and `SessionStats::clear_last_input_tokens`.
     async fn process_message_internal(
-        current_turn: rig_core::completion::message::Message,
-        state_manager: &Option<Arc<StateManager>>,
-        agent: &Arc<DynAgent>,
-        config: &Config,
-    ) -> CompletionResult {
-        let result = Self::run_turn(current_turn, state_manager, agent, config).await;
-        // Flushes prose staged this turn on exits that never reach a final
-        // reply (Stop, Error); a no-op after a successful commit.
-        if let Some(sm) = state_manager.as_ref() {
-            sm.commit_reply("");
-        }
-        result
-    }
-
-    /// The retry / compaction / empty-reply-nudge loop behind
-    /// [`Self::process_message_internal`].
-    async fn run_turn(
         mut current_turn: rig_core::completion::message::Message,
         state_manager: &Option<Arc<StateManager>>,
         agent: &Arc<DynAgent>,
@@ -2838,9 +2822,10 @@ impl AgentRunner {
                     let Some(sm) = state_manager.as_ref() else {
                         return CompletionResult::Success;
                     };
-                    // One row per turn (staged prose + final text), persisted by
-                    // StateManager.
-                    if sm.commit_reply(&response) {
+                    // The final reply is its own row (blank → no-op); the
+                    // tool-call responses' rows already landed from the hook.
+                    sm.add_assistant_message(response);
+                    if sm.turn_has_reply() {
                         sm.set_final_broadcast(true);
                         // Fire-and-forget: upgrade the provisional title
                         // after the first reply
@@ -2852,7 +2837,7 @@ impl AgentRunner {
                         sm.set_final_broadcast(true);
                         return CompletionResult::Success;
                     }
-                    // Blank reply with nothing staged: ask once more. The nudge
+                    // Blank reply with no prose row: ask once more. The nudge
                     // rides the wire only, so the transcript never shows it.
                     nudged = true;
                     tracing::warn!(target: "peakbot", "empty final reply; nudging the model once");

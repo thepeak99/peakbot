@@ -2554,20 +2554,27 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
         // text-turn thinking. The gate is the lane predicate — sub-agent hooks
         // carry no StateManager, so the lane check is what excludes them.
         //
-        // Note there is deliberately no `!thinking.is_empty()` condition: a
-        // response that emitted no thinking still ends the previous response's
-        // group, and rows appended after it must NOT inherit the previous
-        // response's blocks.
+        // Blocks are staged only for a response that produces a transcript
+        // row — it speaks, or it carries a tool call (whose row the hook
+        // writes right below). A row-less response stages nothing, so its
+        // blocks cannot leak onto the next row; the call itself still runs,
+        // because a response without thinking must close the previous
+        // response's group.
         if self.source.is_orchestrator_lane()
             && let Some(weak) = self.state_manager.as_ref()
             && let Some(sm) = weak.upgrade()
         {
-            sm.begin_response(thinking.clone());
-            // Staged inline (not via the event task) so it happens-before rig
-            // returns. A tool-call response is never rig's final one, so staged
-            // prose and the returned text never overlap.
+            let speaks = !parts.text.trim().is_empty();
+            sm.begin_response(if speaks || parts.has_tool_call {
+                thinking.clone()
+            } else {
+                Vec::new()
+            });
+            // Inline (not via the event task) so the row lands before rig
+            // returns and precedes this response's ToolCall rows. A blank
+            // text writes no row — never a blank Agent row.
             if parts.has_tool_call {
-                sm.stage_prose(parts.text.clone());
+                sm.add_assistant_message(parts.text.clone());
             }
         }
 
