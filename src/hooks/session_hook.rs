@@ -1765,24 +1765,20 @@ mod tests {
         );
     }
 
-    // ── Orchestrator reply: staged prose (ticket #294) ────────────────────
+    // ── Orchestrator reply: the hook writes the prose row (ticket #294) ───
     //
-    // Written FIRST against the locked design. `AssistantParts` gains
-    // `has_tool_call` (set in the ToolCall match arm of
-    // `extract_content_from_response`), and `on_completion_response` stages
-    // `parts.text` on the wired StateManager for orchestrator-lane responses
-    // that carried a tool call. Sub-agent hooks never stage.
-    //
-    // RED state: `parts.has_tool_call` and `sm.commit_reply` do not exist
-    // yet — this test fails to COMPILE on exactly those names (the intended
-    // RED). Staging is observed through the public commit seam
-    // (`commit_reply("")` flushes whatever was staged).
+    // Written FIRST against the locked design. `on_completion_response`
+    // writes ONE Agent row, via `StateManager::add_assistant_message`, for an
+    // orchestrator-lane response that carried a tool call: the response's
+    // `parts.text` byte-identical, stamped with the response it just opened.
+    // A text-only response writes nothing (the turn loop owns the final row).
+    // Sub-agent hooks carry no StateManager and never write.
 
     /// H-1 — a response carrying [Text "A", ToolCall] sets `has_tool_call`
-    /// and stages "A" on the orchestrator's StateManager; a [Text "A"]-only
-    /// response sets it false and stages nothing.
+    /// and the hook writes exactly one Agent row "A" stamped with the open
+    /// response's id; a [Text "A"]-only response writes no row.
     #[tokio::test]
-    async fn orchestrator_hook_stages_prose_only_when_the_response_carried_a_tool_call() {
+    async fn orchestrator_hook_writes_the_prose_row_only_when_the_response_carried_a_tool_call() {
         use crate::state::StateManager;
         use crate::ui::app_state::MessageRole;
 
@@ -1806,8 +1802,8 @@ mod tests {
             "a text-only response must not set has_tool_call"
         );
 
-        // (b) on_completion_response stages the prose for (a), observable
-        //     through the commit seam: flush → ONE agent row "A".
+        // (b) on_completion_response writes the row for (a): exactly one
+        //     Agent row "A", stamped with the response the hook opened.
         let sm = StateManager::new_arc();
         let (hook, _rx) = SessionHook::with_channel();
         let hook = hook.with_state_manager(&sm);
@@ -1828,10 +1824,6 @@ mod tests {
             )
             .await;
         assert_eq!(action, HookAction::Continue);
-        assert!(
-            sm.commit_reply(""),
-            "the staged prose must be in the staging buffer"
-        );
         let state = sm.get_state();
         let agent_rows: Vec<&crate::ui::app_state::ChatMessage> = state
             .chat
@@ -1839,11 +1831,25 @@ mod tests {
             .iter()
             .filter(|m| m.role == MessageRole::Agent)
             .collect();
-        assert_eq!(agent_rows.len(), 1, "exactly one row from the flush");
+        assert_eq!(
+            agent_rows.len(),
+            1,
+            "the hook writes exactly one row; transcript={:?}",
+            state.chat.messages
+        );
         assert_eq!(agent_rows[0].content, "A");
+        assert!(
+            agent_rows[0].response_id.is_some(),
+            "the row is stamped with the response the hook opened"
+        );
+        assert_eq!(
+            agent_rows[0].response_id,
+            sm.current_response_id(),
+            "the row's response_id is the open response's id"
+        );
 
-        // (c) (b)-shape: the text-only response stages NOTHING — a flush
-        //     commits nothing and no row is pushed.
+        // (c) the text-only response writes NO row — the turn loop owns the
+        //     final reply's row.
         let sm = StateManager::new_arc();
         let (hook, _rx) = SessionHook::with_channel();
         let hook = hook.with_state_manager(&sm);
@@ -1865,12 +1871,123 @@ mod tests {
             .await;
         assert_eq!(action, HookAction::Continue);
         assert!(
-            !sm.commit_reply(""),
-            "a text-only response must stage nothing"
+            sm.get_state().chat.messages.is_empty(),
+            "a text-only response must write no row"
         );
+    }
+
+    /// H-2 — the row is the response text BYTE-IDENTICAL: no trim, and a
+    /// tool-call response whose text is blank writes no row at all.
+    #[tokio::test]
+    async fn orchestrator_hook_row_is_byte_identical_and_blank_prose_writes_no_row() {
+        use crate::state::StateManager;
+        use crate::ui::app_state::MessageRole;
+
+        async fn on_response(hook: &SessionHook, choice: OneOrMany<AssistantContent>) {
+            let response = CompletionResponse {
+                choice,
+                usage: rig_core::completion::Usage::default(),
+                raw_response: crate::mock::completion_model::MockModelResponse {
+                    content: String::new(),
+                    is_tool_call: true,
+                },
+                message_id: None,
+            };
+            let action =
+                rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_completion_response(
+                    hook,
+                    &user_msg("next"),
+                    &response,
+                )
+                .await;
+            assert_eq!(action, HookAction::Continue);
+        }
+
+        // Surrounding whitespace survives: no trim.
+        let sm = StateManager::new_arc();
+        let (hook, _rx) = SessionHook::with_channel();
+        let hook = hook.with_state_manager(&sm);
+        let choice = OneOrMany::many([
+            AssistantContent::text("  padded\n\n"),
+            AssistantContent::tool_call("1", "todo", serde_json::json!({})),
+        ])
+        .unwrap();
+        on_response(&hook, choice).await;
+        let rows: Vec<String> = sm
+            .get_state()
+            .chat
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Agent)
+            .map(|m| m.content.clone())
+            .collect();
+        assert_eq!(rows, vec!["  padded\n\n".to_string()], "byte-identical");
+
+        // Blank prose + a tool call: no row (never a blank Agent row).
+        let sm = StateManager::new_arc();
+        let (hook, _rx) = SessionHook::with_channel();
+        let hook = hook.with_state_manager(&sm);
+        let choice = OneOrMany::many([
+            AssistantContent::text("   "),
+            AssistantContent::tool_call("1", "todo", serde_json::json!({})),
+        ])
+        .unwrap();
+        on_response(&hook, choice).await;
         assert!(
             sm.get_state().chat.messages.is_empty(),
-            "no row may be pushed"
+            "blank prose must write no row"
+        );
+    }
+
+    /// N10 — a response that will produce NO row (blank text, no tool call)
+    /// must not leave its thinking staged: the NEXT row appended
+    /// (`add_assistant_message("x")`) carries no thinking blocks. (I5 —
+    /// thinking is staged only for responses that produce a row.)
+    #[tokio::test]
+    async fn rowless_response_does_not_leak_its_thinking_into_the_next_row() {
+        use crate::state::StateManager;
+
+        let sm = StateManager::new_arc();
+        let (hook, _rx) = SessionHook::with_channel();
+        let hook = hook.with_state_manager(&sm).with_preserve_reasoning(true);
+
+        // Blank text, no tool call, WITH a thinking block.
+        let choice = OneOrMany::many([
+            AssistantContent::Reasoning(
+                rig_core::completion::message::Reasoning::new_with_signature(
+                    "private thoughts",
+                    Some("sig-1".to_string()),
+                ),
+            ),
+            AssistantContent::text(""),
+        ])
+        .unwrap();
+        let response = CompletionResponse {
+            choice,
+            usage: rig_core::completion::Usage::default(),
+            raw_response: crate::mock::completion_model::MockModelResponse {
+                content: String::new(),
+                is_tool_call: false,
+            },
+            message_id: None,
+        };
+        let action =
+            rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_completion_response(
+                &hook,
+                &user_msg("next"),
+                &response,
+            )
+            .await;
+        assert_eq!(action, HookAction::Continue);
+
+        sm.add_assistant_message("x".to_string());
+        let state = sm.get_state();
+        let last = state.chat.messages.last().expect("the row exists");
+        assert_eq!(last.content, "x");
+        assert!(
+            last.thinking.is_empty(),
+            "a row-less response's thinking must not attach to a later row; got {:?}",
+            last.thinking
         );
     }
 
@@ -2437,20 +2554,27 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
         // text-turn thinking. The gate is the lane predicate — sub-agent hooks
         // carry no StateManager, so the lane check is what excludes them.
         //
-        // Note there is deliberately no `!thinking.is_empty()` condition: a
-        // response that emitted no thinking still ends the previous response's
-        // group, and rows appended after it must NOT inherit the previous
-        // response's blocks.
+        // Blocks are staged only for a response that produces a transcript
+        // row — it speaks, or it carries a tool call (whose row the hook
+        // writes right below). A row-less response stages nothing, so its
+        // blocks cannot leak onto the next row; the call itself still runs,
+        // because a response without thinking must close the previous
+        // response's group.
         if self.source.is_orchestrator_lane()
             && let Some(weak) = self.state_manager.as_ref()
             && let Some(sm) = weak.upgrade()
         {
-            sm.begin_response(thinking.clone());
-            // Staged inline (not via the event task) so it happens-before rig
-            // returns. A tool-call response is never rig's final one, so staged
-            // prose and the returned text never overlap.
+            let speaks = !parts.text.trim().is_empty();
+            sm.begin_response(if speaks || parts.has_tool_call {
+                thinking.clone()
+            } else {
+                Vec::new()
+            });
+            // Inline (not via the event task) so the row lands before rig
+            // returns and precedes this response's ToolCall rows. A blank
+            // text writes no row — never a blank Agent row.
             if parts.has_tool_call {
-                sm.stage_prose(parts.text.clone());
+                sm.add_assistant_message(parts.text.clone());
             }
         }
 

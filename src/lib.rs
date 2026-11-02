@@ -2695,13 +2695,14 @@ impl AgentRunner {
                 sm.add_request(&source, usage.input_tokens, usage.output_tokens, usage.cost);
 
                 // Surface a **sub-agent's** prose on its own lane. The
-                // orchestrator's prose is staged by the hook and committed once
-                // per turn by `commit_reply`, so adding it here too would
-                // double it — hence the orchestrator-lane guard. A
-                // sub-agent's final answer legitimately appears twice in the
-                // transcript: once here on its `🧩 role` lane (it *said* it) and
-                // once as the orchestrator's `delegate` ToolResult (it *received*
-                // it) — distinct lanes, not a duplicate bug.
+                // orchestrator's rows are owned elsewhere — the hook writes
+                // them for tool-call-carrying responses, the turn loop writes
+                // the final reply — so adding them here would double them;
+                // hence the orchestrator-lane guard. A sub-agent's final
+                // answer legitimately appears twice in the transcript: once
+                // here on its `🧩 role` lane (it *said* it) and once as the
+                // orchestrator's `delegate` ToolResult (it *received* it) —
+                // distinct lanes, not a duplicate bug.
                 if !thinking.is_empty() && !source.is_orchestrator_lane() {
                     // Sub-agent emitted thinking — carry blocks onto its lane
                     // so the rebuilt orchestrator wire never sees them
@@ -2745,8 +2746,8 @@ impl AgentRunner {
         }
     }
 
-    /// Internal process_message — takes the already-built current-turn `Message`
-    /// (text or multimodal) and history from `StateManager`, runs the agent,
+    /// The turn loop: takes the already-built current-turn `Message` (text
+    /// or multimodal) and history from `StateManager`, runs the agent,
     /// writes the response back to state. Retries on transient errors.
     ///
     /// **In-loop compaction (`mid-compaction.md`).** When the wired
@@ -2758,23 +2759,6 @@ impl AgentRunner {
     /// against infinite terminate-restart cycles is in
     /// `apply_compaction` — see that fn's doc and `SessionStats::clear_last_input_tokens`.
     async fn process_message_internal(
-        current_turn: rig_core::completion::message::Message,
-        state_manager: &Option<Arc<StateManager>>,
-        agent: &Arc<DynAgent>,
-        config: &Config,
-    ) -> CompletionResult {
-        let result = Self::run_turn(current_turn, state_manager, agent, config).await;
-        // Flushes prose staged this turn on exits that never reach a final
-        // reply (Stop, Error); a no-op after a successful commit.
-        if let Some(sm) = state_manager.as_ref() {
-            sm.commit_reply("");
-        }
-        result
-    }
-
-    /// The retry / compaction / empty-reply-nudge loop behind
-    /// [`Self::process_message_internal`].
-    async fn run_turn(
         mut current_turn: rig_core::completion::message::Message,
         state_manager: &Option<Arc<StateManager>>,
         agent: &Arc<DynAgent>,
@@ -2838,9 +2822,10 @@ impl AgentRunner {
                     let Some(sm) = state_manager.as_ref() else {
                         return CompletionResult::Success;
                     };
-                    // One row per turn (staged prose + final text), persisted by
-                    // StateManager.
-                    if sm.commit_reply(&response) {
+                    // The final reply is its own row (blank → no-op); the
+                    // tool-call responses' rows already landed from the hook.
+                    sm.add_assistant_message(response);
+                    if sm.turn_has_reply() {
                         sm.set_final_broadcast(true);
                         // Fire-and-forget: upgrade the provisional title
                         // after the first reply
@@ -2852,7 +2837,7 @@ impl AgentRunner {
                         sm.set_final_broadcast(true);
                         return CompletionResult::Success;
                     }
-                    // Blank reply with nothing staged: ask once more. The nudge
+                    // Blank reply with no prose row: ask once more. The nudge
                     // rides the wire only, so the transcript never shows it.
                     nudged = true;
                     tracing::warn!(target: "peakbot", "empty final reply; nudging the model once");
@@ -7033,8 +7018,9 @@ headers:
     }
 
     /// The orchestrator's own `CompletionResponse` text must NOT be added by
-    /// the event path — it already enters via `prompt_with_history`'s return
-    /// value (`add_assistant_message`). Adding it here too would double it.
+    /// the event path — that row is owned elsewhere: the hook writes it for
+    /// tool-call-carrying responses, and the turn loop writes the final reply
+    /// (`add_assistant_message`). Adding it here too would double it.
     /// Only stats move for an orchestrator-lane completion.
     #[test]
     fn orchestrator_completion_prose_is_not_double_added() {
@@ -7228,34 +7214,33 @@ headers:
     }
 
     // =========================================================================
-    // ─── orchestrator reply: staged prose + empty-reply nudge (ticket #294) ───
+    // ─── orchestrator prose: faithful rows, no merge (ticket #294 rework) ───
     //
-    // Written FIRST against the locked design (TDD — production code absent):
-    //   1. `AssistantParts` gains `has_tool_call`; the orchestrator hook
-    //      stages `parts.text` via `StateManager::stage_prose` for every
-    //      response that carried a tool call (sub-agent hooks never stage).
-    //   2. `StateManager::commit_reply(final_text) -> bool` merges the staged
-    //      chunks + the final text into ONE assistant row — blank-dropped,
-    //      deduped by trimmed text (first occurrence wins), joined with
-    //      `"\n\n"`; a single chunk stays byte-identical. False when nothing
-    //      remains (no row, open-response thinking cleared).
-    //   3. `process_message_internal` calls `commit_reply(&response)` in the
-    //      Ok arm; a false commit nudges ONCE with the NON-persisted
-    //      `crate::EMPTY_REPLY_NUDGE` user message, and a second false commit
-    //      warns with `crate::EMPTY_REPLY_WARNING`. The wrapper flushes staged
-    //      prose on every exit (`commit_reply("")`), so Stop/Error still keep
-    //      the prose.
-    //
-    // RED state: `stage_prose` / `commit_reply` / `EMPTY_REPLY_NUDGE` /
-    // `EMPTY_REPLY_WARNING` do not exist yet, so the suite fails to COMPILE on
-    // exactly those names — the intended RED. (T4 is a pure no-regression
-    // guard: once the suite compiles it is green on old AND new behaviour.)
+    // Written FIRST against the locked design (TDD — the merge is still in
+    // place, so the new expectations are RED on the old behaviour):
+    //   * The orchestrator hook writes ONE Agent row per tool-call-carrying
+    //     response — the response's `parts.text` byte-identical (never
+    //     blank) — via `StateManager::add_assistant_message`. The row
+    //     precedes that response's ToolCall rows and carries the open
+    //     response's id + thinking blocks.
+    //   * The turn loop's Ok arm calls `add_assistant_message(response)`
+    //     (blank → no-op), then `turn_has_reply()`: a reply row exists →
+    //     Success; none and not yet nudged → nudge ONCE with the
+    //     NON-persisted `crate::EMPTY_REPLY_NUDGE`; none and already nudged
+    //     → `crate::EMPTY_REPLY_WARNING`. The nudge fires only when the
+    //     final is blank AND the turn has no prose row.
+    //   * `turn_prose` / `stage_prose` / `commit_reply` are GONE — no join,
+    //     no dedupe, no flush wrapper.
+    //   * The wire groups rows by `response_id`: one Assistant message per
+    //     response ([Reasoning…, Text, ToolCall…]), one User per ToolResult;
+    //     rows without an id keep the legacy one-message-per-row shape.
     //
     // Pattern: `stop_mid_tool_persists_interrupted_result` — create_mock_agent,
     // event pump, `process_message_internal`. `fu(x)` below is
     // `MockResponse::tool_call_with_follow_up("todo", …, x)`: one response
-    // carrying a tool call AND the prose `x` (the dropped-prose shape of
-    // ticket #294).
+    // carrying a tool call AND the prose `x` — the shape whose prose the old
+    // pipeline merged into the final reply (and replayed back into the
+    // model's own history).
 
     /// One `todo` tool call plus the prose `follow_up` in the SAME response —
     /// the exact wire shape that used to lose `follow_up` on the orchestrator
@@ -7271,8 +7256,8 @@ headers:
 
     /// Boot conversation + one user turn + mock agent + event pump + the
     /// turn task. `responses` are queued in order. The pump writes the
-    /// ToolCall/ToolResult rows (the assistant row itself is written
-    /// synchronously by the commit seam, so no assertion here races it).
+    /// ToolCall/ToolResult rows; the Agent rows are written by the hook
+    /// (tool-call responses) and the turn loop (the final reply).
     #[cfg(feature = "mock")]
     fn staged_reply_fixture(
         responses: Vec<crate::mock::MockResponse>,
@@ -7329,12 +7314,15 @@ headers:
             .collect()
     }
 
-    /// T1 — prose in a tool-call response is NOT dropped: it is staged and
-    /// committed into the final reply, which lands as exactly ONE orchestrator
-    /// agent row, `"\n\n"`-joined with the closing text.
+    /// T1 — prose in a tool-call response lands as its OWN row: the
+    /// orchestrator Agent rows are ["ANSWER", "🙏 amen"] in order (each
+    /// byte-identical to its response text), the "ANSWER" row precedes the
+    /// ToolCall row, and the wire carries ONE Assistant message with Text
+    /// "ANSWER" + the ToolCall. "ANSWER" appears once; two requests (no
+    /// nudge).
     #[cfg(feature = "mock")]
     #[tokio::test(flavor = "multi_thread")]
-    async fn t1_tool_call_prose_is_staged_into_the_final_reply() {
+    async fn t1_tool_call_prose_lands_as_its_own_row() {
         let (sm, model, turn) = staged_reply_fixture(vec![
             fu("ANSWER"),
             crate::mock::MockResponse::text("🙏 amen"),
@@ -7349,28 +7337,78 @@ headers:
         let msgs = sm.get_state().chat.messages;
         let rows = agent_rows_after_user(&msgs);
         assert_eq!(
-            rows.len(),
+            rows.iter().map(|r| r.content.as_str()).collect::<Vec<_>>(),
+            vec!["ANSWER", "🙏 amen"],
+            "the tool-call prose and the final reply are two separate rows, \
+             in order, byte-identical; transcript={msgs:?}"
+        );
+
+        // The prose row precedes the ToolCall row of its response.
+        let user_idx = msgs
+            .iter()
+            .position(|m| m.role == crate::ui::app_state::MessageRole::User)
+            .expect("the user message is in the transcript");
+        let prose_idx = msgs[user_idx..]
+            .iter()
+            .position(|m| {
+                m.role == crate::ui::app_state::MessageRole::Agent && m.content == "ANSWER"
+            })
+            .expect("the ANSWER row exists");
+        let tc_idx = msgs
+            .iter()
+            .position(|m| m.role == crate::ui::app_state::MessageRole::ToolCall)
+            .expect("the ToolCall row exists");
+        assert!(
+            user_idx + prose_idx < tc_idx,
+            "the prose row must precede the ToolCall row; transcript={msgs:?}"
+        );
+
+        // The wire: ONE Assistant message carrying Text "ANSWER" and the
+        // ToolCall — never a merged "ANSWER\n\n🙏 amen" text.
+        let history = sm.get_agent_history();
+        let answer_msgs: Vec<&rig_core::completion::message::Message> = history
+            .iter()
+            .filter(|m| {
+                matches!(
+                m,
+                rig_core::completion::message::Message::Assistant { content, .. }
+                    if content.iter().any(|c| matches!(
+                        c,
+                        rig_core::completion::message::AssistantContent::Text(t)
+                            if t.text == "ANSWER"
+                    )))
+            })
+            .collect();
+        assert_eq!(
+            answer_msgs.len(),
             1,
-            "exactly one orchestrator agent row after the user msg; transcript={msgs:?}"
+            "exactly one Assistant message carries the ANSWER text; history={history:?}"
+        );
+        assert!(
+            matches!(
+                answer_msgs[0],
+                rig_core::completion::message::Message::Assistant { content, .. }
+                    if content.iter().any(|c| matches!(
+                        c,
+                        rig_core::completion::message::AssistantContent::ToolCall(tc)
+                            if tc.function.name == "todo"
+                    ))
+            ),
+            "the ANSWER message must also carry the ToolCall; history={history:?}"
         );
         assert_eq!(
-            rows[0].content, "ANSWER\n\n🙏 amen",
-            "staged tool-call prose + closing text, joined with a blank line"
-        );
-        // The wire context carries "ANSWER" exactly once (inside the merged row).
-        assert_eq!(
-            count_occurrences(&sm.get_agent_history(), "ANSWER"),
+            count_occurrences(&history, "ANSWER"),
             1,
             "ANSWER must occur once in get_agent_history()"
         );
         assert_eq!(model.request_count(), 2, "no nudge on a non-empty final");
     }
 
-    /// T2 — a final reply duplicating the staged prose collapses to ONE row.
-    /// Dedup is by trimmed text, first occurrence wins.
+    /// T2 — repeated prose stays repeated: there is NO dedup — the rows are
+    /// ["X", "X"], both byte-identical.
     #[cfg(feature = "mock")]
     #[tokio::test(flavor = "multi_thread")]
-    async fn t2_duplicate_final_reply_collapses_to_one_row() {
+    async fn t2_repeated_prose_persists_both_rows() {
         let (sm, _model, turn) =
             staged_reply_fixture(vec![fu("X"), crate::mock::MockResponse::text("X")]);
 
@@ -7382,15 +7420,18 @@ headers:
 
         let msgs = sm.get_state().chat.messages;
         let rows = agent_rows_after_user(&msgs);
-        assert_eq!(rows.len(), 1, "one row; transcript={msgs:?}");
-        assert_eq!(rows[0].content, "X", "dedup keeps the first occurrence");
+        assert_eq!(
+            rows.iter().map(|r| r.content.as_str()).collect::<Vec<_>>(),
+            vec!["X", "X"],
+            "no dedup — both rows are persisted; transcript={msgs:?}"
+        );
     }
 
-    /// T3 — multiple staged chunks join in order with blank lines; a
-    /// duplicated chunk collapses to its first occurrence.
+    /// T3 — multiple prose responses keep every row, in order: ["A", "B",
+    /// "C"] — no joining.
     #[cfg(feature = "mock")]
     #[tokio::test(flavor = "multi_thread")]
-    async fn t3_multiple_staged_chunks_join_with_blank_lines() {
+    async fn t3_multiple_prose_responses_keep_every_row() {
         let (sm, _model, turn) =
             staged_reply_fixture(vec![fu("A"), fu("B"), crate::mock::MockResponse::text("C")]);
 
@@ -7402,13 +7443,17 @@ headers:
 
         let msgs = sm.get_state().chat.messages;
         let rows = agent_rows_after_user(&msgs);
-        assert_eq!(rows.len(), 1, "one row; transcript={msgs:?}");
-        assert_eq!(rows[0].content, "A\n\nB\n\nC");
+        assert_eq!(
+            rows.iter().map(|r| r.content.as_str()).collect::<Vec<_>>(),
+            vec!["A", "B", "C"],
+            "every response's prose is its own row, in order; transcript={msgs:?}"
+        );
     }
 
+    /// T3 — duplicated prose is NOT collapsed: the rows are ["A", "A", "C"].
     #[cfg(feature = "mock")]
     #[tokio::test(flavor = "multi_thread")]
-    async fn t3_duplicate_staged_chunk_collapses() {
+    async fn t3_repeated_prose_keeps_every_row() {
         let (sm, _model, turn) =
             staged_reply_fixture(vec![fu("A"), fu("A"), crate::mock::MockResponse::text("C")]);
 
@@ -7420,8 +7465,11 @@ headers:
 
         let msgs = sm.get_state().chat.messages;
         let rows = agent_rows_after_user(&msgs);
-        assert_eq!(rows.len(), 1, "one row; transcript={msgs:?}");
-        assert_eq!(rows[0].content, "A\n\nC", "the duplicate chunk is dropped");
+        assert_eq!(
+            rows.iter().map(|r| r.content.as_str()).collect::<Vec<_>>(),
+            vec!["A", "A", "C"],
+            "no dedup — the duplicate row is kept; transcript={msgs:?}"
+        );
     }
 
     /// T4 — the common path must not move: a plain text reply is persisted
@@ -7449,12 +7497,12 @@ headers:
         );
     }
 
-    /// T5 — an empty final reply after staged prose commits the staged prose
-    /// (the reply is NOT empty once staged), so NO nudge fires: exactly two
-    /// requests, one row with the staged text.
+    /// T5 — an empty final reply after a prose row: the turn succeeds on the
+    /// hook's row — one row "ANSWER", no blank row, exactly two requests (no
+    /// nudge: the turn HAS a reply).
     #[cfg(feature = "mock")]
     #[tokio::test(flavor = "multi_thread")]
-    async fn t5_empty_final_after_staged_prose_commits_without_nudge() {
+    async fn t5_empty_final_after_prose_row_succeeds_without_nudge() {
         let (sm, model, turn) =
             staged_reply_fixture(vec![fu("ANSWER"), crate::mock::MockResponse::text("")]);
 
@@ -7466,12 +7514,20 @@ headers:
 
         let msgs = sm.get_state().chat.messages;
         let rows = agent_rows_after_user(&msgs);
-        assert_eq!(rows.len(), 1, "one row; transcript={msgs:?}");
-        assert_eq!(rows[0].content, "ANSWER");
+        assert_eq!(
+            rows.iter().map(|r| r.content.as_str()).collect::<Vec<_>>(),
+            vec!["ANSWER"],
+            "the hook's prose row is the turn's only row; transcript={msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| m.content.trim().is_empty()
+                && m.role == crate::ui::app_state::MessageRole::Agent),
+            "no blank agent row may be persisted; transcript={msgs:?}"
+        );
         assert_eq!(
             model.request_count(),
             2,
-            "the staged prose made the reply non-empty — no nudge"
+            "the prose row made the turn a reply — no nudge"
         );
     }
 
@@ -7671,13 +7727,14 @@ headers:
         );
     }
 
-    /// T9 — Stop mid-tool: the staged prose of the interrupted response is
-    /// flushed by the wrapper's `commit_reply("")` on the Stopped exit — the
-    /// agent row "PARTIAL" lands after the INTERRUPTED tool result, and the
-    /// staging buffer is empty afterwards.
+    /// T9 — Stop mid-tool: the interrupted response's prose lands as an
+    /// Agent row BEFORE its ToolCall row; the INTERRUPTED result answers the
+    /// call; the stop System row is last, and NO agent row follows the
+    /// result. The next wire replay is Asst[Text "PARTIAL", TC bash] ·
+    /// User[TR].
     #[cfg(feature = "mock")]
     #[tokio::test(flavor = "multi_thread")]
-    async fn t9_stop_mid_tool_flushes_staged_prose_as_final_row() {
+    async fn t9_stop_mid_tool_keeps_the_prose_row_before_the_call() {
         use crate::ui::app_state::MessageRole;
 
         let storage: Arc<dyn crate::storage::ConversationStorage> =
@@ -7689,7 +7746,7 @@ headers:
         let (agent, _info, mut events, _hook, model) =
             crate::providers::create_mock_agent("test prompt", 4, sm.clone())
                 .expect("mock agent builds");
-        // A real in-flight tool (30s sleep) carrying the staged prose.
+        // A real in-flight tool (30s sleep) carrying the prose.
         model.add_response(crate::mock::MockResponse::tool_call_with_follow_up(
             "bash",
             serde_json::json!({ "command": "sleep 30" }),
@@ -7722,7 +7779,10 @@ headers:
                     && tail.role == MessageRole::ToolCall
                     && tail.tool_name.as_deref() == Some("bash")
                 {
-                    return tail.call_id.clone();
+                    return tail
+                        .call_id
+                        .clone()
+                        .expect("the ToolCall row carries its id");
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
@@ -7742,11 +7802,29 @@ headers:
             "a cancelled turn must report Stopped"
         );
 
+        // The agent loop's drain arm posts the stop row once the turn
+        // reports Stopped — this fixture runs the turn directly, so post it
+        // here exactly as the drain arm would.
+        sm.add_system_message("Agent stopped by user".to_string());
+
         let msgs = sm.get_state().chat.messages;
-        // The INTERRUPTED result is answered for the in-flight call…
+        // The prose row exists and precedes its ToolCall row…
+        let prose_idx = msgs
+            .iter()
+            .position(|m| m.role == MessageRole::Agent && m.content == "PARTIAL")
+            .expect("the prose row exists; transcript={msgs:?}");
+        let tc_idx = msgs
+            .iter()
+            .position(|m| m.role == MessageRole::ToolCall && m.call_id == Some(call_id.clone()))
+            .expect("the bash ToolCall row exists");
+        assert!(
+            prose_idx < tc_idx,
+            "the prose row must precede its ToolCall row; transcript={msgs:?}"
+        );
+        // …and the INTERRUPTED result answers the in-flight call.
         let interrupted_idx = msgs
             .iter()
-            .rposition(|m| m.role == MessageRole::ToolResult && m.call_id == call_id)
+            .rposition(|m| m.role == MessageRole::ToolResult && m.call_id == Some(call_id.clone()))
             .expect("the INTERRUPTED result row exists");
         let interrupted = &msgs[interrupted_idx];
         assert!(
@@ -7756,42 +7834,62 @@ headers:
                 .unwrap_or_default()
                 .starts_with("INTERRUPTED")
         );
-        // …and the staged prose lands as the final agent row, after it.
-        let rows: Vec<&crate::ui::app_state::ChatMessage> = msgs
-            .iter()
-            .skip(interrupted_idx + 1)
-            .filter(|m| m.role == MessageRole::Agent && m.source.is_orchestrator_lane())
-            .collect();
-        assert_eq!(
-            rows.len(),
-            1,
-            "exactly one agent row after the INTERRUPTED result; transcript={msgs:?}"
-        );
-        assert_eq!(
-            rows[0].content, "PARTIAL",
-            "the staged prose is the flushed final row"
-        );
-        // Staging is empty afterwards: another flush commits nothing.
-        let before = msgs.len();
+        // No agent row after the result; the stop System row is last.
         assert!(
-            !sm.commit_reply(""),
-            "staging must be empty after the flush"
+            !msgs[interrupted_idx + 1..]
+                .iter()
+                .any(|m| m.role == MessageRole::Agent && m.source.is_orchestrator_lane()),
+            "no agent row may follow the INTERRUPTED result; transcript={msgs:?}"
         );
         assert_eq!(
-            sm.get_state().chat.messages.len(),
-            before,
-            "no further row may appear"
+            msgs.last().map(|m| m.role),
+            Some(MessageRole::System),
+            "the stop row is the last row; transcript={msgs:?}"
+        );
+
+        // The next wire replay: User go · Asst[Text "PARTIAL", TC bash] ·
+        // User[TR].
+        let history = sm.get_agent_history();
+        let tail_msgs = &history[history.len().saturating_sub(2)..];
+        assert!(
+            matches!(
+                tail_msgs.first(),
+                Some(rig_core::completion::message::Message::Assistant { content, .. })
+                    if content.iter().any(|c| matches!(
+                        c,
+                        rig_core::completion::message::AssistantContent::Text(t)
+                            if t.text == "PARTIAL"
+                    ))
+                        && content.iter().any(|c| matches!(
+                            c,
+                            rig_core::completion::message::AssistantContent::ToolCall(tc)
+                                if tc.function.name == "bash"
+                        ))
+            ),
+            "the PARTIAL message must carry Text + the bash ToolCall; history={history:?}"
+        );
+        assert!(
+            matches!(
+                tail_msgs.last(),
+                Some(rig_core::completion::message::Message::User { content })
+                    if content.iter().any(|c| matches!(
+                        c,
+                        rig_core::completion::message::UserContent::ToolResult(tr)
+                            if tr.id == call_id
+                    ))
+            ),
+            "the wire tail must be the INTERRUPTED ToolResult; history={history:?}"
         );
 
         pump.abort();
     }
 
-    /// T10 — a non-transient LLM error after staged prose: the turn reports
-    /// Error with its ❌ system message, and the staged prose is still
-    /// persisted as the agent row (the wrapper's flush-on-exit).
+    /// T10 — a non-transient LLM error after a prose row: the turn reports
+    /// Error with its ❌ system message LAST, and the prose row "A" sits
+    /// before the ToolCall row (where the response put it).
     #[cfg(feature = "mock")]
     #[tokio::test(flavor = "multi_thread")]
-    async fn t10_hard_error_flushes_staged_prose_and_keeps_error_row() {
+    async fn t10_hard_error_keeps_the_prose_row_and_the_error_row() {
         let (sm, _model, turn) = staged_reply_fixture(vec![
             fu("A"),
             crate::mock::MockResponse::error("authentication failed"),
@@ -7808,26 +7906,44 @@ headers:
 
         let msgs = sm.get_state().chat.messages;
         let rows = agent_rows_after_user(&msgs);
-        assert_eq!(rows.len(), 1, "one row; transcript={msgs:?}");
         assert_eq!(
-            rows[0].content, "A",
-            "the staged prose survives the error exit"
+            rows.iter().map(|r| r.content.as_str()).collect::<Vec<_>>(),
+            vec!["A"],
+            "the prose row survives the error exit; transcript={msgs:?}"
         );
+        // "A" before the ToolCall…
+        let user_idx = msgs
+            .iter()
+            .position(|m| m.role == crate::ui::app_state::MessageRole::User)
+            .expect("the user message is in the transcript");
+        let prose_idx = msgs[user_idx..]
+            .iter()
+            .position(|m| m.role == crate::ui::app_state::MessageRole::Agent && m.content == "A")
+            .expect("the prose row exists");
+        let tc_idx = msgs
+            .iter()
+            .position(|m| m.role == crate::ui::app_state::MessageRole::ToolCall)
+            .expect("the ToolCall row exists");
         assert!(
-            msgs.iter().any(|m| {
+            user_idx + prose_idx < tc_idx,
+            "the prose row must precede its ToolCall row; transcript={msgs:?}"
+        );
+        // …and the ❌ failure row is the last row.
+        assert!(
+            msgs.last().is_some_and(|m| {
                 m.role == crate::ui::app_state::MessageRole::System && m.content.starts_with('❌')
             }),
-            "the ❌ failure message must be present; transcript={msgs:?}"
+            "the ❌ failure message must be the last row; transcript={msgs:?}"
         );
     }
 
-    /// T11 — persistence: after the T1 shape (staged prose + closing text),
-    /// reloading the conversation from storage yields "ANSWER" exactly ONCE in
-    /// the messages and exactly ONCE in the rebuilt wire history — the merged
-    /// row round-trips, and nothing duplicates.
+    /// T11 — persistence: after the T1 shape (prose row + final row),
+    /// `get_agent_history()` is IDENTICAL before and after reload, and
+    /// "ANSWER" occurs exactly once — the faithful rows (with their
+    /// `response_id`s) round-trip, and nothing duplicates.
     #[cfg(feature = "mock")]
     #[tokio::test(flavor = "multi_thread")]
-    async fn t11_merged_reply_survives_reload_without_duplicating() {
+    async fn t11_faithful_rows_survive_reload_without_duplicating() {
         use crate::storage::{ConversationStorage, InMemoryStorage};
 
         let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::new());
@@ -7864,6 +7980,8 @@ headers:
             .expect("no panic");
         assert!(matches!(result, CompletionResult::Success));
 
+        let before = sm.get_agent_history();
+
         // Reload from storage into the SAME StateManager.
         let id = sm
             .get_current_conversation_id()
@@ -7871,18 +7989,16 @@ headers:
         sm.load_conversation(id).expect("conversation reloads");
 
         let msgs = sm.get_state().chat.messages;
-        let containing: Vec<&crate::ui::app_state::ChatMessage> = msgs
-            .iter()
-            .filter(|m| m.content.contains("ANSWER"))
-            .collect();
+        let rows = agent_rows_after_user(&msgs);
         assert_eq!(
-            containing.len(),
-            1,
-            "ANSWER must live in exactly one reloaded message; messages={msgs:?}"
+            rows.iter().map(|r| r.content.as_str()).collect::<Vec<_>>(),
+            vec!["ANSWER", "🙏 amen"],
+            "both rows survive the reload; messages={msgs:?}"
         );
         assert_eq!(
-            containing[0].content, "ANSWER\n\n🙏 amen",
-            "the merged row round-trips byte-identical"
+            sm.get_agent_history(),
+            before,
+            "the wire history must be identical before and after reload"
         );
         assert_eq!(
             count_occurrences(&sm.get_agent_history(), "ANSWER"),
@@ -7896,7 +8012,121 @@ headers:
     // T12 — no-regression pin (pre-existing, must stay UNCHANGED):
     // `orchestrator_completion_prose_is_not_double_added` (above) — an
     // orchestrator `CompletionResponse` event adds NO transcript row; the
-    // commit path owns that row.
+    // hook (tool-call responses) and the turn loop (the final reply) own
+    // that row.
+
+    /// N9 — two consecutive turns: turn 1 is `fu("A")` + `text("B")` (a
+    /// prose row and a final row), turn 2 is `text("C")`. The THIRD request's
+    /// history carries ONE Assistant message with Text "A" + the ToolCall and
+    /// a separate Asst[Text "B"] — no message anywhere contains the merged
+    /// "A\n\nB".
+    #[cfg(feature = "mock")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn n9_next_turn_history_replays_separate_rows_not_the_merge() {
+        let (sm, _model, turn) =
+            staged_reply_fixture(vec![fu("A"), crate::mock::MockResponse::text("B")]);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), turn)
+            .await
+            .expect("turn 1 finishes")
+            .expect("no panic");
+        assert!(matches!(result, CompletionResult::Success));
+
+        // Turn 2: a fresh user message, a fresh mock agent whose model
+        // answers "C" — its FIRST request is the third LLM request overall.
+        sm.add_user_message("again".to_string());
+        let current_turn = sm
+            .build_current_turn_message()
+            .expect("the second user turn was dispatched");
+        let (agent, _info, mut events, _hook, model2) =
+            crate::providers::create_mock_agent("test prompt", 4, sm.clone())
+                .expect("mock agent builds");
+        model2.add_response(crate::mock::MockResponse::text("C"));
+        let sm_opt_pump = Some(sm.clone());
+        let pump = tokio::spawn(async move {
+            while let Some(ev) = events.recv().await {
+                AgentRunner::process_event_for_ui(&sm_opt_pump, ev);
+            }
+        });
+        sm.set_running(true);
+        let agent = Arc::new(agent);
+        let config = test_config();
+        let sm_opt = Some(sm.clone());
+        let turn2 = tokio::spawn(async move {
+            AgentRunner::process_message_internal(current_turn, &sm_opt, &agent, &config).await
+        });
+        let result2 = tokio::time::timeout(std::time::Duration::from_secs(15), turn2)
+            .await
+            .expect("turn 2 finishes")
+            .expect("no panic");
+        assert!(matches!(result2, CompletionResult::Success));
+
+        let requests = model2.get_recorded_requests();
+        assert_eq!(requests.len(), 1, "turn 2 makes exactly one request");
+        let payload = &requests[0].chat_history;
+
+        // Exactly ONE Assistant message carries Text "A" — and it also
+        // carries the ToolCall.
+        let a_msgs: Vec<&rig_core::completion::message::Message> = payload
+            .iter()
+            .filter(|m| {
+                matches!(
+                m,
+                rig_core::completion::message::Message::Assistant { content, .. }
+                    if content.iter().any(|c| matches!(
+                        c,
+                        rig_core::completion::message::AssistantContent::Text(t)
+                            if t.text == "A"
+                    )))
+            })
+            .collect();
+        assert_eq!(
+            a_msgs.len(),
+            1,
+            "exactly one Assistant message carries Text A; payload={payload:?}"
+        );
+        assert!(
+            matches!(
+                a_msgs[0],
+                rig_core::completion::message::Message::Assistant { content, .. }
+                    if content.iter().any(|c| matches!(
+                        c,
+                        rig_core::completion::message::AssistantContent::ToolCall(_tc)
+                    ))
+            ),
+            "the Text A message must also carry the ToolCall; payload={payload:?}"
+        );
+        // A separate Assistant message is exactly [Text "B"].
+        let b_msgs: Vec<&rig_core::completion::message::Message> = payload
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m,
+                    rig_core::completion::message::Message::Assistant { content, .. }
+                        if content.len() == 1
+                            && matches!(
+                                content.first_ref(),
+                                rig_core::completion::message::AssistantContent::Text(t)
+                                    if t.text == "B"
+                            )
+                )
+            })
+            .collect();
+        assert_eq!(
+            b_msgs.len(),
+            1,
+            "exactly one Assistant message is [Text B]; payload={payload:?}"
+        );
+        // No message anywhere contains the merged shape.
+        assert!(
+            !payload
+                .iter()
+                .any(|m| message_texts(m).iter().any(|t| t.contains("A\n\nB"))),
+            "no message may contain the merged 'A\\n\\nB'; payload={payload:?}"
+        );
+
+        pump.abort();
+    }
 
     /// c — teardown mid-tool: when the action channel closes with a turn in
     /// flight, `run_loop` must abort the agent task and answer the in-flight

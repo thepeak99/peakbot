@@ -72,11 +72,13 @@ fn thinking_response()
     use rig_core::completion::message::Text as RigText;
 
     let reasoning = Reasoning::new_with_signature(THINKING_TEXT, Some(FAKE_SIGNATURE.to_string()));
-    let choice = OneOrMany::one(AssistantContent::Reasoning(reasoning));
-    // Some completions return prose alongside reasoning — include a Text
-    // block to ensure the staging race is exercised exactly the way the
-    // production loop sees it (a real CompletionResponse with prose).
-    let _ = RigText::new("prose after thinking"); // documents intent; unused
+    // Prose alongside the reasoning: a response that speaks produces a row,
+    // so its thinking is staged (a blank, tool-less response stages nothing).
+    let choice = OneOrMany::many([
+        AssistantContent::Reasoning(reasoning),
+        AssistantContent::Text(RigText::new("prose after thinking")),
+    ])
+    .expect("two parts");
     rig_core::completion::CompletionResponse {
         choice,
         usage: RigUsage::new(),

@@ -190,11 +190,6 @@ pub struct StateManager {
     /// The response currently being materialised into transcript rows.
     /// See [`ResponseSlot`].
     response: RwLock<ResponseSlot>,
-
-    /// Orchestrator prose from responses that also carried tool calls, staged
-    /// by the hook and merged into the turn's single reply row by
-    /// [`Self::commit_reply`]. Cleared at every user-turn boundary.
-    turn_prose: RwLock<Vec<String>>,
 }
 
 /// The response currently being materialised into transcript rows.
@@ -280,7 +275,6 @@ impl StateManager {
                 id: 0,
                 thinking: Vec::new(),
             }),
-            turn_prose: RwLock::new(Vec::new()),
         }
     }
 
@@ -2185,67 +2179,52 @@ impl StateManager {
         }
     }
 
-    /// Stage prose from an orchestrator response that also carried tool
-    /// calls; rig returns only the last response's text, so this is the only
-    /// path by which earlier prose reaches the transcript. Blank text is ignored.
-    pub fn stage_prose(&self, text: String) {
-        if !text.trim().is_empty() {
-            self.turn_prose.write().unwrap().push(text);
-        }
-    }
-
-    /// Commit the turn's reply as ONE row: staged prose followed by
-    /// `final_text`, blank and duplicate chunks (by trimmed text) dropped.
-    /// Returns false, pushing nothing, when no chunk survives.
-    ///
-    /// The row goes through [`Self::add_assistant_message`] so it carries the
-    /// open response's id and claims its thinking blocks; with no row to
-    /// carry them they are dropped so they cannot attach to a later row.
-    pub fn commit_reply(&self, final_text: &str) -> bool {
-        let staged = std::mem::take(&mut *self.turn_prose.write().unwrap());
-        let mut seen: Vec<String> = Vec::new();
-        let mut parts: Vec<String> = Vec::new();
-        for chunk in staged
-            .into_iter()
-            .chain(std::iter::once(final_text.to_string()))
-        {
-            let key = chunk.trim();
-            if key.is_empty() || seen.iter().any(|s| s == key) {
-                continue;
-            }
-            seen.push(key.to_string());
-            parts.push(chunk);
-        }
-        if parts.is_empty() {
-            self.clear_response_thinking();
-            return false;
-        }
-        self.add_assistant_message(parts.join("\n\n"));
-        true
-    }
-
     /// Reset per-turn state at a user-turn boundary.
     fn begin_turn(&self) {
         self.clear_response_thinking();
-        self.turn_prose.write().unwrap().clear();
     }
 
     /// Add an assistant message to chat and persist.
     ///
+    /// A blank reply is not a message: trim-empty content pushes no row, so
+    /// the transcript never holds a blank orchestrator Agent row.
+    ///
     /// Compaction is **NOT** triggered here — see [`add_user_message`].
     pub fn add_assistant_message(&self, content: String) {
+        if content.trim().is_empty() {
+            return;
+        }
         self.push_assistant(MessageSource::Human, content, Vec::new());
+    }
+
+    /// True iff the current turn — the rows after the last User row on the
+    /// orchestrator lane — already has an Agent row. The reply test the
+    /// empty-final nudge consults: a blank final answer after a tool-call
+    /// response's prose row is a finished turn, not an empty one.
+    pub fn turn_has_reply(&self) -> bool {
+        use crate::ui::app_state::MessageRole;
+
+        let state = self.state.read().unwrap();
+        state
+            .chat
+            .messages
+            .iter()
+            .rev()
+            .filter(|m| m.source.is_orchestrator_lane())
+            .take_while(|m| m.role != MessageRole::User)
+            .any(|m| m.role == MessageRole::Agent)
     }
 
     /// Add an assistant message tagged with the producing lane, and persist.
     ///
-    /// The orchestrator's own prose is staged by the hook and committed once
-    /// per turn by [`Self::commit_reply`]. A **sub-agent**'s prose has no
-    /// such return path — its final text becomes the `delegate` ToolResult, and
-    /// its intermediate prose would otherwise vanish. So `process_event_for_ui`
-    /// calls this with the `SubAgent { role }` lane for sub-agent
-    /// `CompletionResponse`s, surfacing that prose on its own `🧩 role` lane.
-    /// Persistence keeps the lane on the serialized message.
+    /// Orchestrator-lane rows are owned by the hook (responses that carried
+    /// tool calls) and the turn loop (the final reply) — never by the event
+    /// path. This seam exists for the **sub-agent** lane: its prose has no
+    /// other return path (its final text becomes the `delegate` ToolResult),
+    /// so `process_event_for_ui` calls this with the `SubAgent { role }`
+    /// lane for sub-agent `CompletionResponse`s, surfacing that prose on its
+    /// own `🧩 role` lane. Persistence keeps the lane on the serialized
+    /// message.
     pub fn add_assistant_message_sourced(&self, source: MessageSource, content: String) {
         self.push_assistant(source, content, Vec::new());
     }
@@ -2292,14 +2271,16 @@ impl StateManager {
     /// Open a new model response and stage the thinking blocks it produced.
     ///
     /// Called synchronously from `SessionHook::on_completion_response` for
-    /// EVERY orchestrator response — thinking-bearing or not (the hook also
-    /// stages that response's prose when it carries a tool call). That is the
-    /// whole point: the returned id is the only record of where one
-    /// response ends and the next begins, and a response that emitted no
-    /// thinking still has to close the previous one's group. Rig awaits
-    /// that hook inline and `prompt_with_history` returns only afterwards,
-    /// so the next `push_assistant`/`add_tool_call` is guaranteed to see
-    /// what this opened.
+    /// EVERY orchestrator response. The hook stages the blocks only when the
+    /// response produces a transcript row — it speaks, or it carries a tool
+    /// call (whose row it writes itself) — and passes an empty vec
+    /// otherwise, so a row-less response's blocks can never leak onto a
+    /// later row. Either way the call is what matters: the returned id is
+    /// the only record of where one response ends and the next begins, and a
+    /// response that emitted no thinking still has to close the previous
+    /// one's group. Rig awaits that hook inline and `prompt_with_history`
+    /// returns only afterwards, so the next `push_assistant`/`add_tool_call`
+    /// is guaranteed to see what this opened.
     ///
     /// Replaces the staged blocks rather than appending — a non-empty slot
     /// here always means a consumer was skipped, and accumulating would
@@ -2481,6 +2462,13 @@ impl StateManager {
 
     // ── History Conversion for Agent ───────────────────────────────────────────
 
+    /// The wire boundary's live filter: the orchestrator's live context
+    /// (`is_orchestrator_context`) minus System rows — those are
+    /// presentation-only and must never reach the model.
+    fn is_wire_row(m: &crate::ui::app_state::ChatMessage) -> bool {
+        m.is_orchestrator_context() && m.role != crate::ui::app_state::MessageRole::System
+    }
+
     /// Convert chat messages to rig_core::Message for agent history.
     /// Produces proper rig message types:
     /// - User → `Message::User` with text content
@@ -2523,7 +2511,7 @@ impl StateManager {
             .iter()
             .enumerate()
             .rev()
-            .find(|(_, msg)| msg.is_orchestrator_context());
+            .find(|(_, msg)| Self::is_wire_row(msg));
         let skip_last_idx = last_live
             .filter(|(_, msg)| msg.role == MessageRole::User)
             .map(|(i, _)| i);
@@ -2535,10 +2523,11 @@ impl StateManager {
             .enumerate()
             // Isolation boundary: a sub-agent's internal turns live in the
             // transcript (for display + persistence) but must NEVER enter the
-            // orchestrator model's context. `is_orchestrator_context()` is the
-            // single definition of this set — see also `uncompacted_message_count`,
-            // `ContextManager::compact`, `build_resumption_from_tail`.
-            .filter(|(_, msg)| msg.is_orchestrator_context())
+            // orchestrator model's context, and neither may System rows.
+            // `is_wire_row` is the single definition of this set — see also
+            // `uncompacted_message_count`, `ContextManager::compact`,
+            // `build_resumption_from_tail`.
+            .filter(|(_, msg)| Self::is_wire_row(msg))
             .filter(|(i, _)| Some(*i) != skip_last_idx)
             .map(|(_, msg)| msg)
             .collect();
@@ -2567,18 +2556,21 @@ impl StateManager {
     /// blocks alone would split a response's thinking from the tool_uses it
     /// was generated with. [`Self::convert_history_to_rig`] is the only
     /// constructor of `AssistantContent::Reasoning`.
+    ///
+    /// Returns `None` for a System row: the `is_wire_row` filter excludes
+    /// them from every caller — this arm is a defensive skip, not a panic.
     fn last_msg_to_rig(
         msg: &crate::ui::app_state::ChatMessage,
         supports_vision: bool,
         store: &crate::attachments::UploadStore,
-    ) -> rig_core::completion::message::Message {
+    ) -> Option<rig_core::completion::message::Message> {
         use crate::ui::app_state::MessageRole;
         use rig_core::completion::message::{
             AssistantContent, Message as RigMessage, Text, ToolCall, ToolFunction, ToolResult,
             ToolResultContent, UserContent,
         };
         use rig_core::one_or_many::OneOrMany;
-        match msg.role {
+        let rig_message = match msg.role {
             MessageRole::User => RigMessage::User {
                 content: user_content_from_chat_message(msg, supports_vision, store),
             },
@@ -2590,12 +2582,12 @@ impl StateManager {
                 let tool_name = match msg.tool_name.as_deref() {
                     Some(n) => n,
                     None => {
-                        return RigMessage::Assistant {
+                        return Some(RigMessage::Assistant {
                             id: None,
                             content: OneOrMany::one(AssistantContent::Text(Text::new(
                                 msg.content.clone(),
                             ))),
-                        };
+                        });
                     }
                 };
                 let args_str = msg.tool_args.as_deref().unwrap_or("{}");
@@ -2614,11 +2606,11 @@ impl StateManager {
                 let tool_name = match msg.tool_name.as_deref() {
                     Some(n) => n,
                     None => {
-                        return RigMessage::User {
+                        return Some(RigMessage::User {
                             content: OneOrMany::one(UserContent::Text(Text::new(
                                 msg.content.clone(),
                             ))),
-                        };
+                        });
                     }
                 };
                 let result_text = msg.tool_result.as_deref().unwrap_or("");
@@ -2637,10 +2629,10 @@ impl StateManager {
                     msg.content
                 )))),
             },
-            MessageRole::System => RigMessage::User {
-                content: OneOrMany::one(UserContent::Text(Text::new(msg.content.clone()))),
-            },
-        }
+            // Defensive: `is_wire_row` excludes System rows upstream.
+            MessageRole::System => return None,
+        };
+        Some(rig_message)
     }
 
     /// Convert a sanitised chat slice into the rig wire array.
@@ -2656,21 +2648,20 @@ impl StateManager {
     /// `TC,TR,TC,TR…`), which is exactly why it is recorded.
     ///
     /// Each segment then converts in one of two shapes:
-    ///   - **Thinking-bearing segment** (its rows carry at least one
-    ///     replayable `ThinkingBlock`): coalesced into ONE
-    ///     `RigMessage::Assistant` whose content order is
-    ///     `[Reasoning…, Text?, ToolCall…]`, followed by one
-    ///     `RigMessage::User` per `ToolResult` of that segment. Anthropic's
-    ///     wire contract.
-    ///   - **No thinking**: one `RigMessage::Assistant` per Agent row and
-    ///     one per ToolCall row — byte-identical to the pre-change
-    ///     output for every non-Anthropic provider and every knob-off
-    ///     run.
+    ///   - **Segment with a `response_id`** (every row this process wrote):
+    ///     ONE `RigMessage::Assistant` whose content order is
+    ///     `[Reasoning…, Text?, ToolCall…]` — the response as the model
+    ///     produced it, byte-identical, never split or rejoined — followed by
+    ///     one `RigMessage::User` per `ToolResult` of that segment. The
+    ///     Assistant message is omitted when nothing survives (no blocks, no
+    ///     text, no calls — a blank legacy row).
+    ///   - **Segment without one** (legacy transcript, row appended with no
+    ///     response open): the legacy one-message-per-row shape, unchanged.
     ///
-    /// Blocks are dropped (collapsing the first case into the second) when
-    /// `wire_reasoning == false` — so a foreign provider running a Claude
-    /// transcript cannot 400 — and when the segment's `response_id` is
-    /// `None`, because a block whose response group is unknown has nothing
+    /// Blocks are dropped (collapsing the first case's `Reasoning…` to empty)
+    /// when `wire_reasoning == false` — so a foreign provider running a
+    /// Claude transcript cannot 400 — and when the segment's `response_id`
+    /// is `None`, because a block whose response group is unknown has nothing
     /// to anchor its signature to.
     ///
     /// This is the ONLY constructor of `AssistantContent::Reasoning`; see
@@ -2709,6 +2700,7 @@ impl StateManager {
                     i += 1;
                 }
                 MessageRole::System => {
+                    // Defensive: `is_wire_row` excludes System rows upstream.
                     i += 1;
                 }
                 MessageRole::Agent | MessageRole::ToolCall => {
@@ -2783,11 +2775,12 @@ impl StateManager {
     /// Emit ONE response segment: the rows of a single model response (plus
     /// the ToolResults that came back for it) in transcript order.
     ///
-    /// `key` is the segment's `response_id`. `None` means the rows don't know
-    /// which response produced them (legacy transcript, sub-agent row, row
-    /// appended with no response open) — such a segment never replays
-    /// reasoning, because a signature with no group is exactly what Anthropic
-    /// rejects.
+    /// `key` is the segment's `response_id`. `Some` — the rows know their
+    /// response — coalesces into ONE Assistant message (the response as the
+    /// model produced it); `None` (legacy transcript, row appended with no
+    /// response open) keeps the legacy one-message-per-row shape and never
+    /// replays reasoning, because a signature with no group is exactly what
+    /// Anthropic rejects.
     fn push_response_segment_to_rig(
         out: &mut Vec<rig_core::completion::message::Message>,
         segment: &[crate::ui::app_state::ChatMessage],
@@ -2829,16 +2822,11 @@ impl StateManager {
             Vec::new()
         };
 
-        if blocks_kept.is_empty() {
-            // No-thinking path — must be BYTE-IDENTICAL to the pre-change
-            // per-message rebuild (design §3.2: "byte-identical"). Iterate
-            // the segment in transcript order and emit each row on its own,
-            // matching the legacy single-message-per-ChatMessage shape.
-            // The reasoning-bearing branch below is the only one that
-            // coalesces. ToolResults are emitted inline here so the
-            // transcript order matches the legacy per-row output; the
-            // after-block re-emission below is therefore skipped (the
-            // thinking-bearing branch is the only caller that needs it).
+        if key.is_none() {
+            // Legacy per-row shape: the rows don't know which response
+            // produced them, so there is nothing to coalesce — one message
+            // per row, the legacy single-message-per-ChatMessage output.
+            // ToolResults are emitted inline to keep transcript order.
             for m in segment {
                 match m.role {
                     MessageRole::Agent => {
@@ -2900,7 +2888,7 @@ impl StateManager {
                 }
             }
             if let Some(agent) = agent_row
-                && !agent.content.is_empty()
+                && !agent.content.trim().is_empty()
             {
                 content.push(AssistantContent::Text(Text::new(agent.content.clone())));
             }
@@ -2917,15 +2905,17 @@ impl StateManager {
                     ToolFunction::new(tool_name.to_string(), arguments),
                 )));
             }
-            out.push(RigMessage::Assistant {
-                id: None,
-                content: OneOrMany::many(content).expect("non-empty: at least one thinking block"),
-            });
+            // A blank legacy row leaves nothing to say — never emit an
+            // empty Assistant message.
+            if !content.is_empty() {
+                out.push(RigMessage::Assistant {
+                    id: None,
+                    content: OneOrMany::many(content).expect("non-empty: checked above"),
+                });
+            }
 
-            // Thinking-bearing path: ToolResults stay as separate
-            // Message::User entries (not coalesced into the
-            // Assistant message — only Thinking+Text+ToolCall go
-            // together per the Anthropic wire contract).
+            // The response's ToolResults stay as separate `Message::User`
+            // entries — only the response's own content is coalesced.
             for tr in &tool_result_rows {
                 let Some(tool_name) = tr.tool_name.as_deref() else {
                     continue;
@@ -3012,10 +3002,8 @@ impl StateManager {
         let state = self.state.read().unwrap();
         let messages = &state.chat.messages;
 
-        let live: Vec<&crate::ui::app_state::ChatMessage> = messages
-            .iter()
-            .filter(|m| m.is_orchestrator_context())
-            .collect();
+        let live: Vec<&crate::ui::app_state::ChatMessage> =
+            messages.iter().filter(|m| Self::is_wire_row(m)).collect();
         let sanitized = crate::tool_use_validator::sanitize_tool_pairs(live);
         let (tail, head) = sanitized.split_last()?;
 
@@ -3039,7 +3027,11 @@ impl StateManager {
         // Mirror the pre-change shape — for a single message at the tail of
         // the transcript, the resumption helper keeps it as a one-element
         // rig message regardless of whether it carries thinking.
-        let prompt = Self::last_msg_to_rig(tail, supports_vision, self.uploads());
+        let Some(prompt) = Self::last_msg_to_rig(tail, supports_vision, self.uploads()) else {
+            // A System tail never reaches here (is_wire_row) — nothing to
+            // resume from.
+            return None;
+        };
 
         Some((prompt, history))
     }
@@ -8772,7 +8764,8 @@ mod tests {
             text: "thinking text".to_string(),
             signature: "sig.SGXabc123XYZ-==".to_string(),
         }];
-        let rig = StateManager::last_msg_to_rig(&msg, false, &dummy_store());
+        let rig = StateManager::last_msg_to_rig(&msg, false, &dummy_store())
+            .expect("a ToolCall row converts");
         match rig {
             rig_core::completion::message::Message::Assistant { content, .. } => {
                 let kinds: Vec<&str> = content
@@ -9219,42 +9212,15 @@ mod tests {
         serde_json::to_string(msgs).expect("rig messages serialise")
     }
 
-    /// The four cases the rewrite must leave BYTE-IDENTICAL to the
-    /// pre-change rebuild.
+    /// The cases the rewrite must leave BYTE-IDENTICAL to the pre-change
+    /// rebuild.
     ///
-    /// The one case that deliberately differs — a transcript with blocks
-    /// but no `response_id` (a legacy file) — is pinned the other way by
-    /// `rows_without_response_id_never_replay_reasoning`: those blocks are
-    /// dropped, which is what heals the reported 400 for existing
-    /// conversations.
+    /// The cases that deliberately differ — ids-bearing rows (moved to
+    /// `wire_coalesces_each_response_into_one_assistant_message`) and a
+    /// transcript with blocks but no `response_id` (a legacy file, pinned by
+    /// `rows_without_response_id_never_replay_reasoning`) — are the fix.
     #[test]
     fn segmentation_is_byte_identical_to_the_legacy_rebuild_for_unchanged_cases() {
-        // 1. wire_reasoning == false — blocks and ids present, gate closed.
-        let t = two_response_transcript(true, true);
-        assert_eq!(
-            wire_json(&StateManager::convert_history_to_rig(
-                &t,
-                false,
-                false,
-                &dummy_store()
-            )),
-            wire_json(&legacy_convert_history_to_rig(&t, false)),
-            "with the wire gate closed the rebuild must be byte-identical to the legacy one",
-        );
-
-        // 2. No captured blocks anywhere (ids still present).
-        let t = two_response_transcript(false, true);
-        assert_eq!(
-            wire_json(&StateManager::convert_history_to_rig(
-                &t,
-                true,
-                false,
-                &dummy_store()
-            )),
-            wire_json(&legacy_convert_history_to_rig(&t, true)),
-            "a transcript with no thinking blocks must be byte-identical to the legacy rebuild",
-        );
-
         // 3. All-`None` transcript (legacy rows), no blocks.
         let t = two_response_transcript(false, false);
         assert_eq!(
@@ -9310,6 +9276,579 @@ mod tests {
             wire_json(&legacy_convert_history_to_rig(&t, true)),
             "a two-response run with replayable blocks MUST differ from the legacy rebuild — \
              that difference is the fix",
+        );
+    }
+
+    /// The former byte-identical cases 1–2, now expecting the NEW shape:
+    /// every ids-bearing response coalesces into ONE Assistant message
+    /// ([Reasoning…, Text, ToolCall…]), followed by one User per ToolResult.
+    /// The final reply "done" is its OWN response (id 3) — in production the
+    /// final text response always gets a fresh id, so it is never merged
+    /// into the tool-call response's message.
+    #[test]
+    fn wire_coalesces_each_response_into_one_assistant_message() {
+        use rig_core::completion::message::{
+            AssistantContent, Message as RigMessage, Text, ToolCall, ToolFunction, ToolResult,
+            ToolResultContent, UserContent,
+        };
+        use rig_core::one_or_many::OneOrMany;
+
+        let sig = |s: &str| crate::reasoning::ThinkingBlock::Thinking {
+            text: format!("plan {s}"),
+            signature: format!("sig.{s}-=="),
+        };
+        let transcript = |blocks: bool| {
+            let mut tc1 = ChatMessage::tool_call("bash", r#"{"command":"ls"}"#, Some("c1".into()));
+            tc1.response_id = Some(1);
+            if blocks {
+                tc1.thinking = vec![sig("A")];
+            }
+            let mut tc2 = ChatMessage::tool_call("bash", r#"{"command":"ls"}"#, Some("c2".into()));
+            tc2.response_id = Some(1);
+            let mut tc3 = ChatMessage::tool_call("bash", r#"{"command":"ls"}"#, Some("c3".into()));
+            tc3.response_id = Some(2);
+            if blocks {
+                tc3.thinking = vec![sig("B")];
+            }
+            let mut done = ChatMessage::agent("done".to_string());
+            done.response_id = Some(3);
+            vec![
+                ChatMessage::user("go".to_string()),
+                tc1,
+                ChatMessage::tool_result("bash", r#"{"command":"ls"}"#, "ok", Some("c1".into())),
+                tc2,
+                ChatMessage::tool_result("bash", r#"{"command":"ls"}"#, "ok", Some("c2".into())),
+                tc3,
+                ChatMessage::tool_result("bash", r#"{"command":"ls"}"#, "ok", Some("c3".into())),
+                done,
+            ]
+        };
+
+        let tc = |id: &str| {
+            AssistantContent::ToolCall(ToolCall::new(
+                id.to_string(),
+                ToolFunction::new("bash".to_string(), serde_json::json!({"command": "ls"})),
+            ))
+        };
+        let tr = |id: &str| RigMessage::User {
+            content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                id: id.to_string(),
+                call_id: None,
+                content: ToolResultContent::from_tool_output("ok"),
+            })),
+        };
+        let expected = vec![
+            RigMessage::User {
+                content: OneOrMany::one(UserContent::Text(Text::new("go"))),
+            },
+            RigMessage::Assistant {
+                id: None,
+                content: OneOrMany::many(vec![tc("c1"), tc("c2")]).expect("two tool calls"),
+            },
+            tr("c1"),
+            tr("c2"),
+            RigMessage::Assistant {
+                id: None,
+                content: OneOrMany::one(tc("c3")),
+            },
+            tr("c3"),
+            RigMessage::Assistant {
+                id: None,
+                content: OneOrMany::one(AssistantContent::Text(Text::new("done"))),
+            },
+        ];
+
+        // 1. wire_reasoning == false — blocks and ids present, gate closed:
+        //    no Reasoning parts, the coalesced shape stands.
+        let t = transcript(true);
+        assert_eq!(
+            wire_json(&StateManager::convert_history_to_rig(
+                &t,
+                false,
+                false,
+                &dummy_store()
+            )),
+            wire_json(&expected),
+            "gate closed: one Assistant message per response, no Reasoning"
+        );
+
+        // 2. No captured blocks anywhere (ids still present), gate open.
+        let t = transcript(false);
+        assert_eq!(
+            wire_json(&StateManager::convert_history_to_rig(
+                &t,
+                true,
+                false,
+                &dummy_store()
+            )),
+            wire_json(&expected),
+            "no blocks: the coalesced shape is identical"
+        );
+    }
+
+    /// N1 — no-thinking wire faithfulness: rows
+    /// `U go · A"Let me look"#1 · TC c1#1 · TR c1 · A"Done"#2` replay as
+    /// `User go · Asst[Text "Let me look", TC c1] · User[TR c1] ·
+    /// Asst[Text "Done"]` — exactly.
+    #[test]
+    fn n1_no_thinking_wire_replays_one_assistant_message_per_response() {
+        use rig_core::completion::message::{
+            AssistantContent, Message as RigMessage, Text, ToolCall, ToolFunction, ToolResult,
+            ToolResultContent, UserContent,
+        };
+        use rig_core::one_or_many::OneOrMany;
+
+        let mut a1 = ChatMessage::agent("Let me look".to_string());
+        a1.response_id = Some(1);
+        let mut tc1 = ChatMessage::tool_call("bash", r#"{"command":"ls"}"#, Some("c1".into()));
+        tc1.response_id = Some(1);
+        let mut a2 = ChatMessage::agent("Done".to_string());
+        a2.response_id = Some(2);
+        let rows = vec![
+            ChatMessage::user("go".to_string()),
+            a1,
+            tc1,
+            ChatMessage::tool_result("bash", r#"{"command":"ls"}"#, "ok", Some("c1".into())),
+            a2,
+        ];
+
+        let expected = vec![
+            RigMessage::User {
+                content: OneOrMany::one(UserContent::Text(Text::new("go"))),
+            },
+            RigMessage::Assistant {
+                id: None,
+                content: OneOrMany::many(vec![
+                    AssistantContent::Text(Text::new("Let me look")),
+                    AssistantContent::ToolCall(ToolCall::new(
+                        "c1".to_string(),
+                        ToolFunction::new("bash".to_string(), serde_json::json!({"command": "ls"})),
+                    )),
+                ])
+                .expect("text + tool call"),
+            },
+            RigMessage::User {
+                content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                    id: "c1".to_string(),
+                    call_id: None,
+                    content: ToolResultContent::from_tool_output("ok"),
+                })),
+            },
+            RigMessage::Assistant {
+                id: None,
+                content: OneOrMany::one(AssistantContent::Text(Text::new("Done"))),
+            },
+        ];
+
+        assert_eq!(
+            wire_json(&StateManager::convert_history_to_rig(
+                &rows,
+                false,
+                false,
+                &dummy_store()
+            )),
+            wire_json(&expected),
+            "no-thinking wire: one Assistant message per response, Text + ToolCalls, \
+             then one User per ToolResult"
+        );
+    }
+
+    /// N2 — the same rows with thinking blocks and the wire gate open lead
+    /// the merged message with [Reasoning, …]; with the Reasoning parts
+    /// stripped, the wire equals the no-thinking N1 shape.
+    #[test]
+    fn n2_thinking_on_leads_the_merged_message_and_stripping_equals_n1() {
+        use rig_core::completion::message::{
+            AssistantContent, Message as RigMessage, Reasoning, Text, ToolCall, ToolFunction,
+            ToolResult, ToolResultContent, UserContent,
+        };
+        use rig_core::one_or_many::OneOrMany;
+
+        let mut a1 = ChatMessage::agent("Let me look".to_string());
+        a1.response_id = Some(1);
+        a1.thinking = vec![crate::reasoning::ThinkingBlock::Thinking {
+            text: "the model thought".to_string(),
+            signature: "sig-1".to_string(),
+        }];
+        let mut tc1 = ChatMessage::tool_call("bash", r#"{"command":"ls"}"#, Some("c1".into()));
+        tc1.response_id = Some(1);
+        let mut a2 = ChatMessage::agent("Done".to_string());
+        a2.response_id = Some(2);
+        let rows = vec![
+            ChatMessage::user("go".to_string()),
+            a1,
+            tc1,
+            ChatMessage::tool_result("bash", r#"{"command":"ls"}"#, "ok", Some("c1".into())),
+            a2,
+        ];
+
+        let tr = RigMessage::User {
+            content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                id: "c1".to_string(),
+                call_id: None,
+                content: ToolResultContent::from_tool_output("ok"),
+            })),
+        };
+        let tc = AssistantContent::ToolCall(ToolCall::new(
+            "c1".to_string(),
+            ToolFunction::new("bash".to_string(), serde_json::json!({"command": "ls"})),
+        ));
+        let expected = vec![
+            RigMessage::User {
+                content: OneOrMany::one(UserContent::Text(Text::new("go"))),
+            },
+            RigMessage::Assistant {
+                id: None,
+                content: OneOrMany::many(vec![
+                    AssistantContent::Reasoning(Reasoning::new_with_signature(
+                        "the model thought",
+                        Some("sig-1".to_string()),
+                    )),
+                    AssistantContent::Text(Text::new("Let me look")),
+                    tc,
+                ])
+                .expect("reasoning + text + tool call"),
+            },
+            tr,
+            RigMessage::Assistant {
+                id: None,
+                content: OneOrMany::one(AssistantContent::Text(Text::new("Done"))),
+            },
+        ];
+
+        let wire = StateManager::convert_history_to_rig(&rows, true, false, &dummy_store());
+        assert_eq!(
+            wire_json(&wire),
+            wire_json(&expected),
+            "gate open: [Reasoning, Text, ToolCall] in ONE Assistant message"
+        );
+
+        // With the Reasoning parts stripped, the wire equals the no-thinking
+        // N1 shape.
+        let stripped: Vec<RigMessage> = wire
+            .into_iter()
+            .map(|m| match m {
+                RigMessage::Assistant { id, content } => {
+                    let parts: Vec<AssistantContent> = content
+                        .into_iter()
+                        .filter(|c| !matches!(c, AssistantContent::Reasoning(_)))
+                        .collect();
+                    RigMessage::Assistant {
+                        id,
+                        content: OneOrMany::many(parts).expect("a non-reasoning part remains"),
+                    }
+                }
+                other => other,
+            })
+            .collect();
+        let expected_no_reasoning: Vec<RigMessage> = expected
+            .into_iter()
+            .map(|m| match m {
+                RigMessage::Assistant { id, content } => {
+                    let parts: Vec<AssistantContent> = content
+                        .into_iter()
+                        .filter(|c| !matches!(c, AssistantContent::Reasoning(_)))
+                        .collect();
+                    RigMessage::Assistant {
+                        id,
+                        content: OneOrMany::many(parts).expect("a non-reasoning part remains"),
+                    }
+                }
+                other => other,
+            })
+            .collect();
+        assert_eq!(
+            wire_json(&stripped),
+            wire_json(&expected_no_reasoning),
+            "stripping Reasoning must leave the no-thinking shape"
+        );
+    }
+
+    /// N3 — multiple tool calls in one response: one Asst[Text, TC c1,
+    /// TC c2] followed by one User per result.
+    #[test]
+    fn n3_multiple_tool_calls_in_one_response_share_one_assistant_message() {
+        use rig_core::completion::message::{
+            AssistantContent, Message as RigMessage, Text, ToolCall, ToolFunction, ToolResult,
+            ToolResultContent, UserContent,
+        };
+        use rig_core::one_or_many::OneOrMany;
+
+        let mut a1 = ChatMessage::agent("Two of them".to_string());
+        a1.response_id = Some(1);
+        let mut tc1 = ChatMessage::tool_call("bash", r#"{"command":"ls"}"#, Some("c1".into()));
+        tc1.response_id = Some(1);
+        let mut tc2 = ChatMessage::tool_call("bash", r#"{"command":"pwd"}"#, Some("c2".into()));
+        tc2.response_id = Some(1);
+        let rows = vec![
+            ChatMessage::user("go".to_string()),
+            a1,
+            tc1,
+            tc2,
+            ChatMessage::tool_result("bash", r#"{"command":"ls"}"#, "ok1", Some("c1".into())),
+            ChatMessage::tool_result("bash", r#"{"command":"pwd"}"#, "ok2", Some("c2".into())),
+        ];
+
+        let tc = |id: &str, args: serde_json::Value| {
+            AssistantContent::ToolCall(ToolCall::new(
+                id.to_string(),
+                ToolFunction::new("bash".to_string(), args),
+            ))
+        };
+        let tr = |id: &str, output: &str| RigMessage::User {
+            content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                id: id.to_string(),
+                call_id: None,
+                content: ToolResultContent::from_tool_output(output),
+            })),
+        };
+        let expected = vec![
+            RigMessage::User {
+                content: OneOrMany::one(UserContent::Text(Text::new("go"))),
+            },
+            RigMessage::Assistant {
+                id: None,
+                content: OneOrMany::many(vec![
+                    AssistantContent::Text(Text::new("Two of them")),
+                    tc("c1", serde_json::json!({"command": "ls"})),
+                    tc("c2", serde_json::json!({"command": "pwd"})),
+                ])
+                .expect("text + two tool calls"),
+            },
+            tr("c1", "ok1"),
+            tr("c2", "ok2"),
+        ];
+
+        assert_eq!(
+            wire_json(&StateManager::convert_history_to_rig(
+                &rows,
+                false,
+                false,
+                &dummy_store()
+            )),
+            wire_json(&expected),
+            "both tool calls ride the response's ONE Assistant message, then two TRs"
+        );
+    }
+
+    /// N4 — rows with no `response_id` keep the legacy one-message-per-row
+    /// shape (a no-regression pin: this output must NOT change).
+    #[test]
+    fn n4_rows_without_response_id_keep_the_one_message_per_row_shape() {
+        use rig_core::completion::message::{
+            AssistantContent, Message as RigMessage, Text, ToolCall, ToolFunction, ToolResult,
+            ToolResultContent, UserContent,
+        };
+        use rig_core::one_or_many::OneOrMany;
+
+        // No ids stamped — the legacy shape.
+        let rows = vec![
+            ChatMessage::user("go".to_string()),
+            ChatMessage::agent("hi".to_string()),
+            ChatMessage::tool_call("bash", r#"{"command":"ls"}"#, Some("c1".into())),
+            ChatMessage::tool_result("bash", r#"{"command":"ls"}"#, "ok", Some("c1".into())),
+        ];
+
+        let expected = vec![
+            RigMessage::User {
+                content: OneOrMany::one(UserContent::Text(Text::new("go"))),
+            },
+            RigMessage::Assistant {
+                id: None,
+                content: OneOrMany::one(AssistantContent::Text(Text::new("hi"))),
+            },
+            RigMessage::Assistant {
+                id: None,
+                content: OneOrMany::one(AssistantContent::ToolCall(ToolCall::new(
+                    "c1".to_string(),
+                    ToolFunction::new("bash".to_string(), serde_json::json!({"command": "ls"})),
+                ))),
+            },
+            RigMessage::User {
+                content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                    id: "c1".to_string(),
+                    call_id: None,
+                    content: ToolResultContent::from_tool_output("ok"),
+                })),
+            },
+        ];
+
+        assert_eq!(
+            wire_json(&StateManager::convert_history_to_rig(
+                &rows,
+                true,
+                false,
+                &dummy_store()
+            )),
+            wire_json(&expected),
+            "id-less rows stay one message per row, gate open or closed"
+        );
+    }
+
+    /// N5 — an old MERGED row (`TC#1 · TR · A"N1\n\nF"#2`, the #294 shape)
+    /// replays byte-exact: the merged text is ONE Text part, never split or
+    /// rejoined.
+    #[test]
+    fn n5_legacy_merged_row_replays_byte_exact() {
+        use rig_core::completion::message::{
+            AssistantContent, Message as RigMessage, Text, ToolCall, ToolFunction, ToolResult,
+            ToolResultContent, UserContent,
+        };
+        use rig_core::one_or_many::OneOrMany;
+
+        let mut tc1 = ChatMessage::tool_call("bash", r#"{"command":"ls"}"#, Some("c1".into()));
+        tc1.response_id = Some(1);
+        let mut merged = ChatMessage::agent("N1\n\nF".to_string());
+        merged.response_id = Some(2);
+        let rows = vec![
+            ChatMessage::user("go".to_string()),
+            tc1,
+            ChatMessage::tool_result("bash", r#"{"command":"ls"}"#, "ok", Some("c1".into())),
+            merged,
+        ];
+
+        let expected = vec![
+            RigMessage::User {
+                content: OneOrMany::one(UserContent::Text(Text::new("go"))),
+            },
+            RigMessage::Assistant {
+                id: None,
+                content: OneOrMany::one(AssistantContent::ToolCall(ToolCall::new(
+                    "c1".to_string(),
+                    ToolFunction::new("bash".to_string(), serde_json::json!({"command": "ls"})),
+                ))),
+            },
+            RigMessage::User {
+                content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                    id: "c1".to_string(),
+                    call_id: None,
+                    content: ToolResultContent::from_tool_output("ok"),
+                })),
+            },
+            RigMessage::Assistant {
+                id: None,
+                content: OneOrMany::one(AssistantContent::Text(Text::new("N1\n\nF"))),
+            },
+        ];
+
+        assert_eq!(
+            wire_json(&StateManager::convert_history_to_rig(
+                &rows,
+                false,
+                false,
+                &dummy_store()
+            )),
+            wire_json(&expected),
+            "the legacy merged row is ONE byte-exact Text part"
+        );
+    }
+
+    /// N6 — an old blank Agent row carrying a `response_id` emits NO message.
+    #[test]
+    fn n6_blank_agent_row_with_id_emits_no_message() {
+        use rig_core::completion::message::{Message as RigMessage, Text, UserContent};
+        use rig_core::one_or_many::OneOrMany;
+
+        let mut blank = ChatMessage::agent(String::new());
+        blank.response_id = Some(1);
+        let rows = vec![ChatMessage::user("go".to_string()), blank];
+
+        let expected = vec![RigMessage::User {
+            content: OneOrMany::one(UserContent::Text(Text::new("go"))),
+        }];
+
+        assert_eq!(
+            wire_json(&StateManager::convert_history_to_rig(
+                &rows,
+                false,
+                false,
+                &dummy_store()
+            )),
+            wire_json(&expected),
+            "a blank ids-bearing Agent row must not reach the wire"
+        );
+    }
+
+    /// N7 — System rows never reach the resumption wire:
+    /// `build_resumption_from_tail` after `…TC · TR · S"Context compacted"`
+    /// prompts with User[TR] — not the System text — and the history carries
+    /// no System text. (N7b below pins the `get_agent_history` half.)
+    #[test]
+    fn n7_system_rows_never_reach_the_wire() {
+        use rig_core::completion::message::{
+            AssistantContent, Message as RigMessage, Text, ToolCall, ToolFunction, UserContent,
+        };
+        use rig_core::one_or_many::OneOrMany;
+
+        // …TC · TR · S.
+        let sm = StateManager::new();
+        sm.add_user_message("go".to_string());
+        sm.add_tool_call(
+            crate::ui::app_state::MessageSource::Human,
+            None,
+            "bash".to_string(),
+            r#"{"command":"ls"}"#.to_string(),
+            Some("c1".to_string()),
+        );
+        sm.add_tool_result(
+            crate::ui::app_state::MessageSource::Human,
+            "bash".to_string(),
+            r#"{"command":"ls"}"#.to_string(),
+            "ok".to_string(),
+            Some("c1".to_string()),
+        );
+        sm.add_system_message("Context compacted: 5 → 2 messages, 3 compacted".to_string());
+
+        let (prompt, history) = sm
+            .build_resumption_from_tail()
+            .expect("a resumption is available");
+        assert!(
+            matches!(
+                &prompt,
+                RigMessage::User { content }
+                    if content.iter().any(|c| matches!(
+                        c,
+                        UserContent::ToolResult(tr) if tr.id == "c1"
+                    ))
+            ),
+            "the resumption prompt must be the ToolResult, not the System text; prompt={prompt:?}"
+        );
+        assert!(
+            !wire_json(&history).contains("Context compacted")
+                && !wire_json(std::slice::from_ref(&prompt)).contains("Context compacted"),
+            "no System text may reach the resumption wire; history={history:?}"
+        );
+        // The history itself is the faithful replay of the pre-tail rows.
+        let expected_history = vec![
+            RigMessage::User {
+                content: OneOrMany::one(UserContent::Text(Text::new("go"))),
+            },
+            RigMessage::Assistant {
+                id: None,
+                content: OneOrMany::one(AssistantContent::ToolCall(ToolCall::new(
+                    "c1".to_string(),
+                    ToolFunction::new("bash".to_string(), serde_json::json!({"command": "ls"})),
+                ))),
+            },
+        ];
+        assert_eq!(
+            wire_json(&history),
+            wire_json(&expected_history),
+            "the history is everything before the ToolResult, System row excluded"
+        );
+    }
+
+    /// N7b — `get_agent_history` on `[.., U, S]` still strips the trailing
+    /// User: a System row does not shield it (the user turn is the prompt,
+    /// never history).
+    #[test]
+    fn n7b_system_row_does_not_shield_the_trailing_user_from_history() {
+        let sm = StateManager::new();
+        sm.add_user_message("q".to_string());
+        sm.add_system_message("a note".to_string());
+        assert!(
+            sm.get_agent_history().is_empty(),
+            "the trailing User is stripped even when a System row follows it"
         );
     }
 
@@ -10591,98 +11130,53 @@ mod two_stage_stop_tests {
 }
 
 // =========================================================================
-// ─── orchestrator reply: staged prose + commit seam (ticket #294) ──────────
+// ─── orchestrator reply: faithful rows (ticket #294 rework) ────────────────
 //
-// Written FIRST against the locked design. `stage_prose` / `commit_reply` do
-// not exist yet, so this module fails to COMPILE on exactly those names —
-// the intended RED.
-//
-// Contract under test:
-//   * `stage_prose(text)` appends a chunk for the CURRENT turn; blank /
-//     whitespace-only chunks are ignored.
-//   * `commit_reply(final_text) -> bool` takes the staged chunks, chains
-//     `final_text`, drops blank and duplicate entries (by trimmed text,
-//     first occurrence wins), joins with "\n\n", and pushes ONE assistant
-//     row (carrying the open response's id + thinking blocks). Returns
-//     false — pushing NOTHING and clearing the open response's thinking —
-//     when nothing remains. A single chunk is byte-identical (no
-//     trim/rejoin of the content).
-//   * The user-turn boundary (`add_user_message*`) clears both the open
-//     response's thinking and the staged chunks (`begin_turn`).
+// Written FIRST against the locked design. `stage_prose` / `commit_reply` /
+// `turn_prose` are being DELETED by the fix; the contract under test is
+// `add_assistant_message` and the row the hook writes for it:
+//   * `add_assistant_message(content)` is a NO-OP on blank (trim-empty)
+//     content — never a blank orchestrator Agent row.
+//   * Otherwise it pushes the content BYTE-IDENTICAL (no trim/join/dedupe),
+//     stamped with the open response's id and claiming that response's
+//     thinking blocks.
+//   * The wire replays the row with its blocks: [Reasoning, Text].
 #[cfg(test)]
 mod orchestrator_reply_tests {
     use super::*;
     use crate::reasoning::ThinkingBlock;
     use crate::ui::app_state::MessageRole;
 
-    /// SM-1 — blank staging is a no-op, and `commit_reply("")` with nothing
-    /// staged returns false and pushes no row.
+    /// SM-1 — blank (trim-empty) assistant text pushes no row.
     #[test]
-    fn stage_prose_ignores_blank_and_empty_commit_pushes_nothing() {
+    fn add_assistant_message_ignores_blank_text() {
         let sm = StateManager::new();
-        sm.stage_prose("  ".to_string());
-        sm.stage_prose(String::new());
-
         let before = sm.get_state().chat.messages.len();
-        assert!(!sm.commit_reply(""), "nothing staged + blank final → false");
+        sm.add_assistant_message("  ".to_string());
+        sm.add_assistant_message(String::new());
+
         assert_eq!(
             sm.get_state().chat.messages.len(),
             before,
-            "no row may be pushed"
+            "blank assistant text must push no row"
         );
     }
 
-    /// SM-2 — the user-turn boundary clears the staging: prose staged for a
-    /// previous turn must not leak into the next turn's reply.
+    /// SM-3 — a row appended while a response is open carries that
+    /// response's thinking blocks, and the wire rebuild replays
+    /// [Reasoning, Text].
     #[test]
-    fn user_turn_boundary_clears_staged_prose() {
-        let sm = StateManager::new();
-        sm.stage_prose("old".to_string());
-        sm.add_user_message("next turn".to_string());
-
-        assert!(sm.commit_reply("new"), "the final text commits");
-        let msgs = sm.get_state().chat.messages;
-        let last = msgs.last().expect("a row exists");
-        assert_eq!(last.role, MessageRole::Agent);
-        assert_eq!(
-            last.content, "new",
-            "only the final text — the stale stage must be gone"
-        );
-        assert!(
-            !msgs.iter().any(|m| m.content == "old"),
-            "the stale staged prose must not surface anywhere"
-        );
-    }
-
-    /// SM-3 — `commit_reply("")` with nothing to commit clears the open
-    /// response's thinking blocks; a non-empty commit pushes ONE row that
-    /// carries the blocks, and the wire rebuild replays [Reasoning, Text].
-    #[test]
-    fn empty_commit_clears_open_response_thinking_and_commit_carries_blocks() {
+    fn assistant_row_carries_the_open_response_thinking_and_wire_replays_reasoning_first() {
         let blocks = vec![ThinkingBlock::Thinking {
             text: "the model thought".to_string(),
             signature: "sig-1".to_string(),
         }];
 
-        // (a) begin_response + empty commit → false, thinking cleared: a row
-        //     appended afterwards must NOT inherit the blocks.
-        let sm = StateManager::new();
-        sm.begin_response(blocks.clone());
-        assert!(!sm.commit_reply(""), "nothing to commit → false");
-        sm.add_assistant_message("x".to_string());
-        let state = sm.get_state();
-        let last = state.chat.messages.last().expect("the row exists");
-        assert!(
-            last.thinking.is_empty(),
-            "the open response's thinking must be cleared by the empty commit"
-        );
-
-        // (b) begin_response + non-empty commit → ONE row carrying the blocks.
         let sm = StateManager::new();
         sm.set_wire_reasoning(true);
         sm.add_user_message("q".to_string());
         sm.begin_response(blocks.clone());
-        assert!(sm.commit_reply("x"), "a final text commits");
+        sm.add_assistant_message("x".to_string());
         let msgs = sm.get_state().chat.messages;
         let last = msgs.last().expect("the row exists");
         assert_eq!(last.role, MessageRole::Agent);

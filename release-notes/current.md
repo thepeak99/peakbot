@@ -23,3 +23,4 @@ This file is the working draft for the next release. When a version is tagged, t
 ### Fixes
 
 - Desktop: the conversation tab bar's "+" button is no longer hidden behind the Session drawer handle.
+- The orchestrator's earlier messages are no longer pasted into its final reply. Each response is now kept as its own message and replayed to the model exactly as it was produced (a response's text and its tool calls travel together, in order). If the final reply comes back empty, the chat shows the last thing the agent said instead of an error. System notices (compaction, stop, warnings) are never sent to the model. Conversations saved with the old merged replies keep working unchanged.
