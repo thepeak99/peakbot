@@ -1,8 +1,6 @@
-// Tests for the Focus-mode core rule (plan-focus-mode.md §4) — written
-// FIRST, expected to be RED until `web/src/focus.ts` and
-// `web/src/useFocusMode.ts` exist. Both imports below resolve to
-// not-yet-created modules, so this whole file fails at collection for the
-// right reason (missing feature), not for a setup bug.
+// Tests for the Focus-mode core rule (plan-focus-mode.md §4) — pure TS, no
+// DOM: `focusView` (web/src/focus.ts) and `readFocusPref`
+// (web/src/useFocusMode.ts).
 //
 // The contract under test:
 //
@@ -368,6 +366,16 @@ describe("focusView blank answer rows", () => {
     const b2 = a("   ");
     const view = focusView([m1, b1, b2], false);
     expectVisible(view, m1);
+    expect(view.activity).toBeNull();
+  });
+
+  it("V-4: a finished turn keeps the narration row (the only agent row), hides the tool rows", () => {
+    const m1 = u("q");
+    const narration = a("narration");
+    const t1 = tc("bash");
+    const r1 = tr("bash");
+    const view = focusView([m1, narration, t1, r1], false);
+    expectVisible(view, m1, narration);
     expect(view.activity).toBeNull();
   });
 });
