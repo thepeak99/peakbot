@@ -1800,9 +1800,7 @@ impl AgentRunner {
                     }
 
                     QueueMessage::Command(cmd) => {
-                        if let Some(ref sm) = state_manager {
-                            sm.set_running(true);
-                        }
+                        Self::mark_command_running(&state_manager, true);
                         // The conversation *before* the command. `/load` swaps it;
                         // an unchanged id after means there is nothing to re-bind.
                         let conversation_before = state_manager
@@ -1838,9 +1836,7 @@ impl AgentRunner {
                             )
                             .await;
                         }
-                        if let Some(ref sm) = state_manager {
-                            sm.set_running(false);
-                        }
+                        Self::mark_command_running(&state_manager, false);
                         completion_tx.send(CompletionResult::CommandDone).ok();
                     }
 
@@ -1861,9 +1857,7 @@ impl AgentRunner {
                         // re-reads config first (picking up newly-added
                         // aliases) and re-resolves, emitting a clean error if
                         // the alias vanished under a reload.
-                        if let Some(ref sm) = state_manager {
-                            sm.set_running(true);
-                        }
+                        Self::mark_command_running(&state_manager, true);
                         let outcome = Self::handle_switch_model(
                             &alias,
                             &mut agent,
@@ -1875,8 +1869,8 @@ impl AgentRunner {
                         .await;
                         if let Some(ref sm) = state_manager {
                             sm.decrement_pending_input();
-                            sm.set_running(false);
                         }
+                        Self::mark_command_running(&state_manager, false);
                         match outcome {
                             Ok(()) => {
                                 completion_tx.send(CompletionResult::CommandDone).ok();
@@ -1896,9 +1890,7 @@ impl AgentRunner {
                         // agent on the *current* model, then reset the
                         // conversation like /new. The View already validated
                         // the path; we re-validate defensively.
-                        if let Some(ref sm) = state_manager {
-                            sm.set_running(true);
-                        }
+                        Self::mark_command_running(&state_manager, true);
                         let outcome = Self::handle_change_cwd(
                             &path,
                             &mut agent,
@@ -1910,8 +1902,8 @@ impl AgentRunner {
                         .await;
                         if let Some(ref sm) = state_manager {
                             sm.decrement_pending_input();
-                            sm.set_running(false);
                         }
+                        Self::mark_command_running(&state_manager, false);
                         if let Err(msg) = outcome
                             && let Some(ref sm) = state_manager
                         {
@@ -1921,9 +1913,7 @@ impl AgentRunner {
                     }
 
                     QueueMessage::Select(request) => {
-                        if let Some(ref sm) = state_manager {
-                            sm.set_running(true);
-                        }
+                        Self::mark_command_running(&state_manager, true);
                         Self::handle_select(
                             request,
                             &mut agent,
@@ -1935,8 +1925,8 @@ impl AgentRunner {
                         .await;
                         if let Some(ref sm) = state_manager {
                             sm.decrement_pending_input();
-                            sm.set_running(false);
                         }
+                        Self::mark_command_running(&state_manager, false);
                         completion_tx.send(CompletionResult::CommandDone).ok();
                     }
                 }
@@ -1950,6 +1940,7 @@ impl AgentRunner {
                 if let Some(ref sm) = state_manager {
                     sm.close_interrupted_tool_call();
                     sm.set_running(false);
+                    sm.set_command_running(false);
                     sm.add_system_message(format!("⚠ internal error: {what} — turn aborted"));
                 }
                 completion_tx.send(CompletionResult::Error).ok();
@@ -2659,6 +2650,23 @@ impl AgentRunner {
         }
     }
 
+    /// One seam for the command-running flag pair so the two flags can't
+    /// desync. `command_running` leads on entry and trails on exit: no
+    /// broadcast frame may ever carry `is_running=true` with
+    /// `command_running=false` for a command, or focus mode reads it as a
+    /// live turn and hides the last answer (the /compact bug).
+    fn mark_command_running(state_manager: &Option<Arc<StateManager>>, on: bool) {
+        if let Some(sm) = state_manager {
+            if on {
+                sm.set_command_running(true);
+                sm.set_running(true);
+            } else {
+                sm.set_running(false);
+                sm.set_command_running(false);
+            }
+        }
+    }
+
     /// Process a `SourcedEvent` and update StateManager accordingly.
     ///
     /// This is the Controller's responsibility — it decides how domain events
@@ -2691,8 +2699,17 @@ impl AgentRunner {
             } => {
                 // Roll tokens/cost into session stats, keyed by lane: the
                 // parent `/stats` sees sub-agent cost too, and can break it
-                // down per role.
-                sm.add_request(&source, usage.input_tokens, usage.output_tokens, usage.cost);
+                // down per role. `usage.generation` is the stamp the hook
+                // read at response time — a pre-compaction event landing
+                // late books tokens/cost but cannot move the orchestrator
+                // meter (see `SessionStats::add_request`).
+                sm.add_request(
+                    &source,
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cost,
+                    usage.generation,
+                );
 
                 // Surface a **sub-agent's** prose on its own lane. The
                 // orchestrator's rows are owned elsewhere — the hook writes
@@ -6883,6 +6900,7 @@ headers:
                         output_tokens: 50,
                         total_tokens: 150,
                         cost: 0.02,
+                        generation: 0,
                     },
                     timestamp: chrono::Utc::now(),
                 },
@@ -6998,6 +7016,7 @@ headers:
                         output_tokens: 8,
                         total_tokens: 18,
                         cost: 0.0,
+                        generation: 0,
                     },
                     timestamp: chrono::Utc::now(),
                 },
@@ -7044,6 +7063,7 @@ headers:
                         output_tokens: 3,
                         total_tokens: 8,
                         cost: 0.0,
+                        generation: 0,
                     },
                     timestamp: chrono::Utc::now(),
                 },

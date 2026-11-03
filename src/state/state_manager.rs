@@ -549,7 +549,10 @@ impl StateManager {
             .unwrap_or(0) as usize
     }
 
-    /// Clear the live `last_input_tokens` signal without touching cumulative stats.
+    /// Clear the live `last_input_tokens` signal without touching cumulative
+    /// cost / API-call bookkeeping. Zeroes the meter and its persisted
+    /// fallback; bumps the stats' compaction generation so a late
+    /// pre-compaction usage event cannot move the meter.
     pub fn clear_last_input_tokens(&self) {
         self.stats.lock().unwrap().clear_last_input_tokens();
         self.sync_stats_to_ui();
@@ -604,8 +607,8 @@ impl StateManager {
         // to the message-count fallback. Next on_completion_response overwrites
         // with honest data.
         self.stats.lock().unwrap().clear_last_input_tokens();
-        // Sync state.context.current_usage so the status bar reflects the
-        // post-compaction wire-size estimate (it self-heals on next response).
+        // Sync state.context.current_usage: the meter reads 0 from here until
+        // the next orchestrator response reports real usage.
         self.sync_stats_to_ui();
     }
 
@@ -640,13 +643,31 @@ impl StateManager {
     /// `source` keys the per-lane breakdown: orchestrator turns bucket under
     /// `"orchestrator"`, a sub-agent's under its role. The flat grand totals
     /// accumulate regardless of lane.
-    pub fn add_request(&self, source: &MessageSource, input: u64, output: u64, cost: f64) {
+    ///
+    /// `generation` is the compaction generation stamped on the event at
+    /// hook time (the freshness fact). A stale stamp — the event of a
+    /// pre-compaction request landing after the compaction — books tokens
+    /// and cost but cannot move the orchestrator meter.
+    pub fn add_request(
+        &self,
+        source: &MessageSource,
+        input: u64,
+        output: u64,
+        cost: f64,
+        generation: u64,
+    ) {
         {
             let mut stats = self.stats.lock().unwrap();
-            stats.add_request(source.lane_label(), input, output, cost);
+            stats.add_request(source.lane_label(), input, output, cost, generation);
         }
         // Sync to UI
         self.sync_stats_to_ui();
+    }
+
+    /// The stats' compaction generation — the stamp a live usage event must
+    /// carry to move the orchestrator meter (see [`Self::add_request`]).
+    pub fn compaction_generation(&self) -> u64 {
+        self.stats.lock().unwrap().compaction_generation()
     }
 
     /// Get a clone of the current stats
@@ -994,6 +1015,18 @@ impl StateManager {
         self.clear_all_todos();
         self.clear_bg();
         self.reset_bash_panel();
+    }
+
+    /// Set whether a slash command (not an agent turn) is running.
+    /// Broadcasts like `set_running` — the web focus view needs the frame.
+    /// Deliberately does NOT touch `is_running` / the cancel token: a
+    /// command is not a turn, and Stop mid-command must behave exactly as
+    /// before. Callers pair it with `set_running` through the one seam in
+    /// `lib.rs` (`mark_command_running`) so the two flags can't desync.
+    pub fn set_command_running(&self, running: bool) {
+        let mut state = self.state.write().unwrap();
+        state.command_running = running;
+        self.notify_update(&state);
     }
 
     /// Set whether the agent is currently running (processing a message).
@@ -3920,7 +3953,13 @@ mod tests {
     #[test]
     fn test_add_request() {
         let sm = StateManager::new();
-        sm.add_request(&crate::ui::app_state::MessageSource::Human, 100, 50, 0.123);
+        sm.add_request(
+            &crate::ui::app_state::MessageSource::Human,
+            100,
+            50,
+            0.123,
+            sm.compaction_generation(),
+        );
         let state = sm.get_state();
         assert_eq!(state.stats.total_input_tokens, 100);
         assert_eq!(state.stats.total_output_tokens, 50);
@@ -3935,7 +3974,13 @@ mod tests {
     fn add_request_exposes_lane_breakdown_on_state() {
         use crate::ui::app_state::MessageSource;
         let sm = StateManager::new();
-        sm.add_request(&MessageSource::Human, 100, 40, 0.10);
+        sm.add_request(
+            &MessageSource::Human,
+            100,
+            40,
+            0.10,
+            sm.compaction_generation(),
+        );
         sm.add_request(
             &MessageSource::SubAgent {
                 role: "researcher".into(),
@@ -3943,6 +3988,7 @@ mod tests {
             200,
             80,
             0.20,
+            sm.compaction_generation(),
         );
 
         let lanes = sm.get_state().stats.lanes;
@@ -3996,11 +4042,29 @@ mod tests {
             role: "junior".into(),
         };
         // Three orchestrator requests and two junior ones, all realistic sizes.
-        sm.add_request(&MessageSource::Human, 4_000, 200, 0.01);
-        sm.add_request(&junior, 5_000, 300, 0.02);
-        sm.add_request(&MessageSource::Human, 4_500, 250, 0.01);
-        sm.add_request(&junior, 6_000, 400, 0.02);
-        sm.add_request(&MessageSource::Human, 5_000, 100, 0.01);
+        sm.add_request(
+            &MessageSource::Human,
+            4_000,
+            200,
+            0.01,
+            sm.compaction_generation(),
+        );
+        sm.add_request(&junior, 5_000, 300, 0.02, sm.compaction_generation());
+        sm.add_request(
+            &MessageSource::Human,
+            4_500,
+            250,
+            0.01,
+            sm.compaction_generation(),
+        );
+        sm.add_request(&junior, 6_000, 400, 0.02, sm.compaction_generation());
+        sm.add_request(
+            &MessageSource::Human,
+            5_000,
+            100,
+            0.01,
+            sm.compaction_generation(),
+        );
 
         let lanes = sm.get_state().stats.lanes;
         let orch = &lanes[0];
@@ -4055,8 +4119,20 @@ mod tests {
     #[test]
     fn test_stats_accumulation() {
         let sm = StateManager::new();
-        sm.add_request(&crate::ui::app_state::MessageSource::Human, 100, 50, 0.10);
-        sm.add_request(&crate::ui::app_state::MessageSource::Human, 200, 100, 0.20);
+        sm.add_request(
+            &crate::ui::app_state::MessageSource::Human,
+            100,
+            50,
+            0.10,
+            sm.compaction_generation(),
+        );
+        sm.add_request(
+            &crate::ui::app_state::MessageSource::Human,
+            200,
+            100,
+            0.20,
+            sm.compaction_generation(),
+        );
         let state = sm.get_state();
         // Tokens are overwritten per request (not accumulated)
         assert_eq!(state.stats.total_input_tokens, 200); // last value
@@ -4069,7 +4145,13 @@ mod tests {
     #[test]
     fn test_reset_stats() {
         let sm = StateManager::new();
-        sm.add_request(&crate::ui::app_state::MessageSource::Human, 100, 50, 0.10);
+        sm.add_request(
+            &crate::ui::app_state::MessageSource::Human,
+            100,
+            50,
+            0.10,
+            sm.compaction_generation(),
+        );
         sm.reset_stats();
         let state = sm.get_state();
         assert_eq!(state.stats.total_input_tokens, 0);
@@ -4096,8 +4178,20 @@ mod tests {
             "test-model".into(),
             String::new(),
         );
-        sm.add_request(&crate::ui::app_state::MessageSource::Human, 1234, 567, 0.42);
-        sm.add_request(&crate::ui::app_state::MessageSource::Human, 2000, 800, 0.10); // cost accumulates → 0.52
+        sm.add_request(
+            &crate::ui::app_state::MessageSource::Human,
+            1234,
+            567,
+            0.42,
+            sm.compaction_generation(),
+        );
+        sm.add_request(
+            &crate::ui::app_state::MessageSource::Human,
+            2000,
+            800,
+            0.10,
+            sm.compaction_generation(),
+        ); // cost accumulates → 0.52
         let conv_a_id = sm.get_current_conversation_id().expect("convo A id");
         sm.save_conversation();
 
@@ -4111,7 +4205,13 @@ mod tests {
             "test-model".into(),
             String::new(),
         );
-        sm.add_request(&crate::ui::app_state::MessageSource::Human, 99, 99, 9.99);
+        sm.add_request(
+            &crate::ui::app_state::MessageSource::Human,
+            99,
+            99,
+            9.99,
+            sm.compaction_generation(),
+        );
 
         // Load A back. Its stats should override the session-B stats.
         sm.load_conversation(conv_a_id).expect("load A");
@@ -4174,7 +4274,13 @@ mod tests {
         );
 
         // 2. Orchestrator turn — this is what the meter must keep showing.
-        sm.add_request(&MessageSource::Human, 4_000, 200, 0.01);
+        sm.add_request(
+            &MessageSource::Human,
+            4_000,
+            200,
+            0.01,
+            sm.compaction_generation(),
+        );
         // 3. Sub-agent turn afterwards — must not move the orchestrator signal.
         sm.add_request(
             &MessageSource::SubAgent {
@@ -4183,6 +4289,7 @@ mod tests {
             60_000,
             400,
             0.02,
+            sm.compaction_generation(),
         );
 
         // Pre-persist sanity: the orchestrator-scoped signal must be the
@@ -4465,7 +4572,13 @@ mod tests {
         let sm = StateManager::new();
 
         // Add stats via StateManager
-        sm.add_request(&crate::ui::app_state::MessageSource::Human, 100, 50, 0.01);
+        sm.add_request(
+            &crate::ui::app_state::MessageSource::Human,
+            100,
+            50,
+            0.01,
+            sm.compaction_generation(),
+        );
 
         // Get AppState and verify stats are synced
         let app_state = sm.get_state();
@@ -4481,7 +4594,13 @@ mod tests {
         let stats_arc = sm.stats_arc();
 
         // Add request first
-        sm.add_request(&crate::ui::app_state::MessageSource::Human, 100, 50, 0.01);
+        sm.add_request(
+            &crate::ui::app_state::MessageSource::Human,
+            100,
+            50,
+            0.01,
+            sm.compaction_generation(),
+        );
 
         // Verify the Arc contains the updated data (testing Arc sharing)
         let stats = stats_arc.lock().unwrap();
@@ -5592,7 +5711,13 @@ mod tests {
         let sm = StateManager::new();
 
         // The orchestrator turn sets the meter.
-        sm.add_request(&MessageSource::Human, 1_000, 100, 0.0);
+        sm.add_request(
+            &MessageSource::Human,
+            1_000,
+            100,
+            0.0,
+            sm.compaction_generation(),
+        );
         assert_eq!(
             sm.get_state().context.current_usage,
             1_000,
@@ -5607,6 +5732,7 @@ mod tests {
             50,
             10,
             0.0,
+            sm.compaction_generation(),
         );
         assert_eq!(
             sm.get_state().context.current_usage,
@@ -5632,7 +5758,13 @@ mod tests {
             sm.add_assistant_message(format!("a{i}"));
         }
 
-        sm.add_request(&MessageSource::Human, 1_000, 100, 0.0);
+        sm.add_request(
+            &MessageSource::Human,
+            1_000,
+            100,
+            0.0,
+            sm.compaction_generation(),
+        );
         sm.add_request(
             &MessageSource::SubAgent {
                 role: "junior".into(),
@@ -5640,6 +5772,7 @@ mod tests {
             50,
             10,
             0.0,
+            sm.compaction_generation(),
         );
 
         // The one invariant: what the user sees IS what the gate decides on.
@@ -5684,7 +5817,13 @@ mod tests {
         );
 
         // Drive last_input_tokens past 80% of 1_000 = 800.
-        sm.add_request(&crate::ui::app_state::MessageSource::Human, 900, 50, 0.0);
+        sm.add_request(
+            &crate::ui::app_state::MessageSource::Human,
+            900,
+            50,
+            0.0,
+            sm.compaction_generation(),
+        );
         assert!(
             sm.needs_compaction(),
             "token branch must fire when last_input_tokens > threshold"
@@ -5741,7 +5880,13 @@ mod tests {
         }
 
         // Push last_input_tokens above the threshold (600 > 500).
-        sm.add_request(&crate::ui::app_state::MessageSource::Human, 600, 50, 0.0);
+        sm.add_request(
+            &crate::ui::app_state::MessageSource::Human,
+            600,
+            50,
+            0.0,
+            sm.compaction_generation(),
+        );
         assert!(
             sm.needs_compaction(),
             "precondition: needs_compaction must be true before we compact"
@@ -5849,7 +5994,13 @@ mod tests {
         }
 
         // 600 > 500 threshold → the gate is live.
-        sm.add_request(&MessageSource::Human, 600, 50, 0.0);
+        sm.add_request(
+            &MessageSource::Human,
+            600,
+            50,
+            0.0,
+            sm.compaction_generation(),
+        );
         assert!(
             sm.needs_compaction(),
             "precondition: needs_compaction must be true before we compact"
@@ -5862,7 +6013,8 @@ mod tests {
                 "force_compact must produce a result with mock summarizer queued"
             );
             assert_eq!(
-                sm.get_state().context.current_usage, 0,
+                sm.get_state().context.current_usage,
+                0,
                 "precondition: the live meter reads 0 immediately after compaction"
             );
 
@@ -5877,7 +6029,8 @@ mod tests {
             sm2.load_conversation(conv_id).expect("load conversation");
 
             assert_eq!(
-                sm2.get_state().context.current_usage, 0,
+                sm2.get_state().context.current_usage,
+                0,
                 "the meter must stay 0 after reload — today restore() re-seeds \
                  it from the stale pre-compaction total_input_tokens (got {})",
                 sm2.get_state().context.current_usage
@@ -5900,7 +6053,13 @@ mod tests {
     #[test]
     fn reset_stats_zeroes_context_meter() {
         let sm = StateManager::new();
-        sm.add_request(&MessageSource::Human, 600, 50, 0.0);
+        sm.add_request(
+            &MessageSource::Human,
+            600,
+            50,
+            0.0,
+            sm.compaction_generation(),
+        );
         assert_eq!(
             sm.get_state().context.current_usage,
             600,
@@ -5932,7 +6091,13 @@ mod tests {
             sm.add_user_message(format!("user msg {i}"));
             sm.add_assistant_message(format!("assistant reply {i}"));
         }
-        sm.add_request(&MessageSource::Human, 600, 50, 0.0);
+        sm.add_request(
+            &MessageSource::Human,
+            600,
+            50,
+            0.0,
+            sm.compaction_generation(),
+        );
 
         let mut rx = sm.subscribe();
         // Drain the initial "current state" frame so what we read below is
@@ -5965,19 +6130,20 @@ mod tests {
     /// event-task path (src/lib.rs `process_event_for_ui` →
     /// `sm.add_request`) records the usage of an LLM request that was issued
     /// BEFORE compaction but whose response event is processed AFTER it.
-    /// Today `SessionStats::add_request` unconditionally re-sets
-    /// `last_orchestrator_input_tokens`, so the stale reading walks back in
-    /// and the meter/gate re-fire on a just-compacted conversation.
+    /// The event carries the compaction generation live when the hook saw
+    /// the response; `SessionStats` refuses to let a stamp older than the
+    /// current generation move the orchestrator gate, so the stale reading
+    /// can't walk back in and re-fire the gate on a just-compacted
+    /// conversation.
     ///
     /// The test drives the EXACT production write — `sm.add_request` is the
-    /// event task's only write path — and expresses "pre-compaction" by
-    /// event order, because no freshness API exists yet. The fix must give
-    /// the SM a way to tell such an event apart (e.g. a compaction
-    /// generation stamped on the event) without changing the contract here:
-    /// the meter stays 0 and the gate stays false — and a genuinely NEW
-    /// post-compaction request MUST still set the meter (the companion
-    /// assertion guards against an over-corrective "never set after
-    /// compaction" fix).
+    /// event task's only write path — and expresses "pre-compaction" the way
+    /// production does: by stamp. The late write reuses the pre-compaction
+    /// generation; the fresh write carries the current one. The contract:
+    /// the meter stays 0 and the gate stays false after the late event — and
+    /// a genuinely NEW post-compaction request MUST still set the meter
+    /// (the companion assertion guards against an over-corrective
+    /// "never set after compaction" fix).
     #[tokio::test]
     async fn late_pre_compaction_event_does_not_resurrect_meter() {
         let sm = StateManager::new_arc();
@@ -5987,7 +6153,10 @@ mod tests {
             sm.add_user_message(format!("user msg {i}"));
             sm.add_assistant_message(format!("assistant reply {i}"));
         }
-        sm.add_request(&MessageSource::Human, 600, 50, 0.0);
+        // The stamp this request carries: the generation live at hook time.
+        let pre_compaction = sm.compaction_generation();
+        sm.add_request(&MessageSource::Human, 600, 50, 0.0, pre_compaction);
+
         assert!(
             sm.needs_compaction(),
             "precondition: needs_compaction must be true before we compact"
@@ -6000,13 +6169,15 @@ mod tests {
                 "force_compact must produce a result with mock summarizer queued"
             );
             assert_eq!(
-                sm.get_state().context.current_usage, 0,
+                sm.get_state().context.current_usage,
+                0,
                 "precondition: the meter is zero right after compaction"
             );
 
             // The late event-task write: the usage event of the 600-token
             // pre-compaction request, processed after the compaction landed.
-            sm.add_request(&MessageSource::Human, 600, 50, 0.0);
+            // Same stamp as before — now stale.
+            sm.add_request(&MessageSource::Human, 600, 50, 0.0, pre_compaction);
 
             assert_eq!(
                 sm.get_state().context.current_usage,
@@ -6023,9 +6194,16 @@ mod tests {
             // A genuinely fresh post-compaction request still sets the meter
             // — the fix must discriminate by request age, not blanket-ignore
             // post-compaction readings.
-            sm.add_request(&MessageSource::Human, 700, 40, 0.0);
+            sm.add_request(
+                &MessageSource::Human,
+                700,
+                40,
+                0.0,
+                sm.compaction_generation(),
+            );
             assert_eq!(
-                sm.get_state().context.current_usage, 700,
+                sm.get_state().context.current_usage,
+                700,
                 "a NEW post-compaction request must set the meter"
             );
         }
@@ -6910,7 +7088,13 @@ mod tests {
         let count_a_t = count_a.clone();
         let t_a = thread::spawn(move || {
             while !stop_a.load(Ordering::Relaxed) {
-                sm_a.add_request(&crate::ui::app_state::MessageSource::Human, 100, 50, 0.001);
+                sm_a.add_request(
+                    &crate::ui::app_state::MessageSource::Human,
+                    100,
+                    50,
+                    0.001,
+                    sm_a.compaction_generation(),
+                );
                 count_a_t.fetch_add(1, Ordering::Relaxed);
             }
         });
@@ -8416,7 +8600,13 @@ mod tests {
         }
 
         // Orchestrator's last request: 100 tokens — well below the 500-token gate.
-        sm.add_request(&crate::ui::app_state::MessageSource::Human, 100, 10, 0.0);
+        sm.add_request(
+            &crate::ui::app_state::MessageSource::Human,
+            100,
+            10,
+            0.0,
+            sm.compaction_generation(),
+        );
 
         // A sub-agent then makes a 900-token request. Today this overwrites
         // `last_input_tokens` → 900 → `needs_compaction()` reads true.
@@ -8427,6 +8617,7 @@ mod tests {
             900,
             10,
             0.0,
+            sm.compaction_generation(),
         );
 
         // The pin: a sub-agent's 900-token request must NOT trip the
