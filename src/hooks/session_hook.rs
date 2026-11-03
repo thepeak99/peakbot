@@ -631,6 +631,32 @@ mod tests {
         );
     }
 
+    /// `reset` must clear the orchestrator gate reading. `/new` and `/reset`
+    /// funnel through `StateManager::reset_stats` → `SessionStats::reset`,
+    /// and a stale `last_orchestrator_input_tokens` is exactly how the
+    /// "Orchestrator context" meter survives a reset (and how
+    /// `needs_compaction()` would fire on a brand-new conversation) —
+    /// meter-and-focus ticket, Bug C.
+    #[test]
+    fn reset_clears_last_orchestrator_input_tokens() {
+        let mut stats = SessionStats::new();
+        stats.add_request("orchestrator", 600, 50, 0.05);
+        assert_eq!(
+            stats.last_orchestrator_input_tokens(),
+            Some(600),
+            "precondition: the gate reads the last orchestrator request"
+        );
+
+        stats.reset();
+
+        assert!(
+            stats.last_orchestrator_input_tokens().is_none(),
+            "reset must clear last_orchestrator_input_tokens (got {:?}) — a stale \
+             reading keeps the context meter alive across /new and /reset",
+            stats.last_orchestrator_input_tokens()
+        );
+    }
+
     /// Per-lane aggregation keeps a bucket per lane while the flat
     /// grand total still accumulates across all lanes. Two lanes → two
     /// buckets, orchestrator sorted first.

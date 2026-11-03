@@ -5768,6 +5768,308 @@ mod tests {
         let _ = compaction_model;
     }
 
+    // ── Compaction meter regressions (meter-and-focus ticket) ──────────────
+    //
+    // The "Orchestrator context" meter (`AppState.context.current_usage`)
+    // and the compaction gate read the SAME signal:
+    // `SessionStats::last_orchestrator_input_tokens`. Compaction clears it
+    // (`apply_compaction` → `clear_last_input_tokens`) so the meter reads 0
+    // while the session is live. These tests pin that the zero STICKS —
+    // across save/load, across `/new`-style resets, and against a late
+    // usage event for a request issued before the compaction.
+    //
+    // WARNING: these drive the meter at the StateManager level on purpose.
+    // `TestRunner::process_session_hook_events` (src/test_runner.rs) replays
+    // hook requests and re-seeds the old value — the scenarios harness
+    // cannot see this bug. Do not port these to tests/scenarios.
+
+    /// Context manager with a queued mock summary — the shape the neighbours
+    /// build inline, factored so a test can stamp one on TWO StateManagers
+    /// (pre- and post-reload). 1_000 window @ 0.5 → threshold 500,
+    /// `keep_recent` 3.
+    #[cfg(feature = "mock")]
+    fn mock_compaction_cm() -> ContextManager {
+        use crate::config::ContextConfig;
+        let (model, mock) = crate::providers::create_mock_compaction_model();
+        mock.add_response(crate::mock::MockResponse::text("Summary."));
+        let cfg = ContextConfig {
+            threshold: 0.5,
+            keep_recent: 3,
+            enabled: true,
+            compaction_model: None,
+        };
+        ContextManager::new(cfg, 1_000, Some(Arc::new(model)))
+    }
+
+    /// Same manager, no compaction model — the not(mock) stand-in so the
+    /// tests compile without the feature (they then can't drive compaction
+    /// and skip their mock-gated asserts, like the neighbours).
+    #[cfg(not(feature = "mock"))]
+    fn mock_compaction_cm() -> ContextManager {
+        use crate::config::ContextConfig;
+        let cfg = ContextConfig {
+            threshold: 0.5,
+            keep_recent: 3,
+            enabled: true,
+            compaction_model: None,
+        };
+        ContextManager::new(cfg, 1_000, None)
+    }
+
+    /// **Persistence of the post-compaction zero (Bug A).** `apply_compaction`
+    /// zeroes the live meter, but `clear_last_input_tokens` leaves
+    /// `total_input_tokens` at the pre-compaction value and the
+    /// orchestrator-scoped field is `None` (skipped in serialization,
+    /// src/conversation.rs). `SessionStats::restore` on `/load` then re-seeds
+    /// `last_orchestrator_input_tokens = Some(total_input_tokens)` from that
+    /// stale value — so after a reload the meter shows the PRE-compaction
+    /// size and `needs_compaction()` fires again on a conversation that was
+    /// just compacted. The persisted fallback must round-trip the cleared
+    /// reading, not the stale grand total.
+    #[tokio::test]
+    async fn compaction_then_reload_keeps_meter_zero() {
+        use crate::storage::InMemoryStorage;
+
+        let storage = Arc::new(InMemoryStorage::default());
+        let sm = StateManager::new_arc_with_storage(storage.clone());
+        sm.init_context_manager(mock_compaction_cm());
+
+        sm.create_conversation(
+            "post-compact".into(),
+            "test-prov".into(),
+            "test-model".into(),
+            String::new(),
+        );
+
+        // Enough messages to clear the `keep_recent` floor and give the
+        // summarizer work.
+        for i in 0..10 {
+            sm.add_user_message(format!("user msg {i}"));
+            sm.add_assistant_message(format!("assistant reply {i}"));
+        }
+
+        // 600 > 500 threshold → the gate is live.
+        sm.add_request(&MessageSource::Human, 600, 50, 0.0);
+        assert!(
+            sm.needs_compaction(),
+            "precondition: needs_compaction must be true before we compact"
+        );
+
+        #[cfg(feature = "mock")]
+        {
+            assert!(
+                sm.force_compact().await.is_some(),
+                "force_compact must produce a result with mock summarizer queued"
+            );
+            assert_eq!(
+                sm.get_state().context.current_usage, 0,
+                "precondition: the live meter reads 0 immediately after compaction"
+            );
+
+            sm.save_conversation();
+            let conv_id = sm.get_current_conversation_id().expect("convo id");
+
+            // A FRESH StateManager (the reload path): same context-manager
+            // config as boot, so the gate is live and can observe a stale
+            // value.
+            let sm2 = StateManager::new_arc_with_storage(storage.clone());
+            sm2.init_context_manager(mock_compaction_cm());
+            sm2.load_conversation(conv_id).expect("load conversation");
+
+            assert_eq!(
+                sm2.get_state().context.current_usage, 0,
+                "the meter must stay 0 after reload — today restore() re-seeds \
+                 it from the stale pre-compaction total_input_tokens (got {})",
+                sm2.get_state().context.current_usage
+            );
+            assert!(
+                !sm2.needs_compaction(),
+                "a just-compacted conversation must not re-fire the compaction \
+                 gate after reload"
+            );
+        }
+        #[cfg(not(feature = "mock"))]
+        let _ = storage;
+    }
+
+    /// **`/new` / `/reset` must zero the meter (Bug C).** `reset_stats` calls
+    /// `SessionStats::reset`, which clears the cumulative totals but NOT
+    /// `last_orchestrator_input_tokens` — so the context meter keeps showing
+    /// the previous session's wire size after a reset (and the compaction
+    /// gate would fire on a brand-new conversation).
+    #[test]
+    fn reset_stats_zeroes_context_meter() {
+        let sm = StateManager::new();
+        sm.add_request(&MessageSource::Human, 600, 50, 0.0);
+        assert_eq!(
+            sm.get_state().context.current_usage,
+            600,
+            "precondition: the meter shows the last orchestrator request"
+        );
+
+        sm.reset_stats();
+
+        assert_eq!(
+            sm.get_state().context.current_usage,
+            0,
+            "reset_stats must zero the context meter — today reset() leaves \
+             last_orchestrator_input_tokens behind (got {})",
+            sm.get_state().context.current_usage
+        );
+    }
+
+    /// **Characterization (GREEN today):** the last broadcast frame after
+    /// `force_compact` carries `current_usage == 0`. Web clients render the
+    /// meter from these frames; this pins that the post-compaction frame —
+    /// the one a client sees while `/compact` runs — is zero, so the
+    /// focus-mode regression (Bug 2) can't hide behind a stale frame.
+    #[tokio::test]
+    async fn force_compact_broadcasts_zero_meter() {
+        let sm = StateManager::new_arc();
+        sm.init_context_manager(mock_compaction_cm());
+
+        for i in 0..10 {
+            sm.add_user_message(format!("user msg {i}"));
+            sm.add_assistant_message(format!("assistant reply {i}"));
+        }
+        sm.add_request(&MessageSource::Human, 600, 50, 0.0);
+
+        let mut rx = sm.subscribe();
+        // Drain the initial "current state" frame so what we read below is
+        // strictly the frames compaction produced.
+        while rx.try_recv().is_ok() {}
+
+        #[cfg(feature = "mock")]
+        {
+            assert!(
+                sm.force_compact().await.is_some(),
+                "force_compact must produce a result with mock summarizer queued"
+            );
+            // Everything after the model await is synchronous — every
+            // notification is already in the channel.
+            let mut last = None;
+            while let Ok(s) = rx.try_recv() {
+                last = Some(s);
+            }
+            let last = last.expect("compaction must broadcast at least one frame");
+            assert_eq!(
+                last.context.current_usage, 0,
+                "the last broadcast frame after force_compact must carry a zeroed meter"
+            );
+        }
+        #[cfg(not(feature = "mock"))]
+        let _ = rx;
+    }
+
+    /// **Late usage event for a pre-compaction request (Bug B).** The
+    /// event-task path (src/lib.rs `process_event_for_ui` →
+    /// `sm.add_request`) records the usage of an LLM request that was issued
+    /// BEFORE compaction but whose response event is processed AFTER it.
+    /// Today `SessionStats::add_request` unconditionally re-sets
+    /// `last_orchestrator_input_tokens`, so the stale reading walks back in
+    /// and the meter/gate re-fire on a just-compacted conversation.
+    ///
+    /// The test drives the EXACT production write — `sm.add_request` is the
+    /// event task's only write path — and expresses "pre-compaction" by
+    /// event order, because no freshness API exists yet. The fix must give
+    /// the SM a way to tell such an event apart (e.g. a compaction
+    /// generation stamped on the event) without changing the contract here:
+    /// the meter stays 0 and the gate stays false — and a genuinely NEW
+    /// post-compaction request MUST still set the meter (the companion
+    /// assertion guards against an over-corrective "never set after
+    /// compaction" fix).
+    #[tokio::test]
+    async fn late_pre_compaction_event_does_not_resurrect_meter() {
+        let sm = StateManager::new_arc();
+        sm.init_context_manager(mock_compaction_cm());
+
+        for i in 0..10 {
+            sm.add_user_message(format!("user msg {i}"));
+            sm.add_assistant_message(format!("assistant reply {i}"));
+        }
+        sm.add_request(&MessageSource::Human, 600, 50, 0.0);
+        assert!(
+            sm.needs_compaction(),
+            "precondition: needs_compaction must be true before we compact"
+        );
+
+        #[cfg(feature = "mock")]
+        {
+            assert!(
+                sm.force_compact().await.is_some(),
+                "force_compact must produce a result with mock summarizer queued"
+            );
+            assert_eq!(
+                sm.get_state().context.current_usage, 0,
+                "precondition: the meter is zero right after compaction"
+            );
+
+            // The late event-task write: the usage event of the 600-token
+            // pre-compaction request, processed after the compaction landed.
+            sm.add_request(&MessageSource::Human, 600, 50, 0.0);
+
+            assert_eq!(
+                sm.get_state().context.current_usage,
+                0,
+                "a late pre-compaction usage event must not resurrect the meter \
+                 (got {})",
+                sm.get_state().context.current_usage
+            );
+            assert!(
+                !sm.needs_compaction(),
+                "the compaction gate must not re-fire from a stale pre-compaction event"
+            );
+
+            // A genuinely fresh post-compaction request still sets the meter
+            // — the fix must discriminate by request age, not blanket-ignore
+            // post-compaction readings.
+            sm.add_request(&MessageSource::Human, 700, 40, 0.0);
+            assert_eq!(
+                sm.get_state().context.current_usage, 700,
+                "a NEW post-compaction request must set the meter"
+            );
+        }
+    }
+
+    /// **New wire field (Bug 2, locked design):** `AppState.command_running`
+    /// is `true` while a slash command runs — the Command arm and the
+    /// SwitchModel/ChangeCwd/Select arms that also `set_running` — and false
+    /// after. It is distinct from `is_running`: the frontend must NOT treat
+    /// `is_running` alone as "a turn is in flight" during a command, or
+    /// focus mode hides the last answer.
+    ///
+    /// RED by compile: `AppState::command_running` and
+    /// `StateManager::set_command_running` do not exist yet. The fix adds
+    /// the field (manual `Serialize` — the `serialize_struct` count goes
+    /// 26 → 27) plus the StateManager setter.
+    #[test]
+    fn set_command_running_round_trips() {
+        let sm = StateManager::new();
+        assert!(!sm.get_state().command_running, "default is false");
+
+        sm.set_command_running(true);
+        assert!(
+            sm.get_state().command_running,
+            "set_command_running(true) must set the field"
+        );
+        let json = serde_json::to_string(&sm.get_state()).expect("serialize AppState");
+        assert!(
+            json.contains("\"command_running\":true"),
+            "the wire JSON must carry command_running, got: {json}"
+        );
+
+        sm.set_command_running(false);
+        assert!(
+            !sm.get_state().command_running,
+            "set_command_running(false) must clear the field"
+        );
+        let json = serde_json::to_string(&sm.get_state()).expect("serialize AppState");
+        assert!(
+            json.contains("\"command_running\":false"),
+            "the wire JSON must carry command_running=false, got: {json}"
+        );
+    }
+
     // ── Vision / multimodal history ───────────────────────────────────────
 
     /// A reference-only attachment (no file on disk) — enough for wire
