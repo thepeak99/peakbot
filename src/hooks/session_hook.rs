@@ -103,6 +103,11 @@ pub struct SessionStats {
     /// `/stats`, and the compaction loop-guard has to zero this without lying
     /// to the user about what the orchestrator's last request cost.
     last_orchestrator_input_tokens: Option<u64>,
+    /// Bumped by every wholesale invalidation of the gate reading
+    /// (`clear_last_input_tokens`, `reset`, `restore`). A usage event stamped
+    /// with an OLDER generation is a pre-compaction (or pre-reset) reading:
+    /// it still books tokens/cost honestly, but must not move the gate.
+    compaction_generation: u64,
 }
 
 impl SessionStats {
@@ -117,7 +122,13 @@ impl SessionStats {
     /// request's token usage is tracked. This mirrors rig's per-request usage reporting.
     /// API call count and total cost accumulate across all requests. The lane's
     /// bucket accumulates everything, tokens included.
-    pub fn add_request(&mut self, lane: &str, input: u64, output: u64, cost: f64) {
+    ///
+    /// `generation` is the compaction generation live when this request's
+    /// response was seen (the hook stamps it at that instant). Only a reading
+    /// from the CURRENT generation may move the orchestrator gate — a usage
+    /// event for a pre-compaction request must not resurrect the meter the
+    /// compaction just cleared.
+    pub fn add_request(&mut self, lane: &str, input: u64, output: u64, cost: f64, generation: u64) {
         self.total_input_tokens = input;
         self.total_output_tokens = output;
         self.total_api_calls += 1;
@@ -134,9 +145,17 @@ impl SessionStats {
         bucket.api_calls += 1;
         bucket.cost += cost;
 
-        if lane == crate::ui::app_state::ORCHESTRATOR_LANE {
+        if lane == crate::ui::app_state::ORCHESTRATOR_LANE
+            && generation >= self.compaction_generation
+        {
             self.last_orchestrator_input_tokens = Some(input);
         }
+    }
+
+    /// The compaction generation this stats object currently accepts —
+    /// the stamp a live request must carry to move the orchestrator gate.
+    pub fn compaction_generation(&self) -> u64 {
+        self.compaction_generation
     }
 
     /// Per-lane breakdown, sorted with `"orchestrator"` first then roles
@@ -177,6 +196,11 @@ impl SessionStats {
     }
 
     /// Reset all statistics
+    ///
+    /// Also clears the orchestrator gate reading and bumps the generation:
+    /// a fresh conversation starts with no live reading, and any usage event
+    /// still in flight from the retired conversation is stamped with the old
+    /// generation, so it can't seed the new conversation's meter or gate.
     pub fn reset(&mut self) {
         self.total_input_tokens = 0;
         self.total_output_tokens = 0;
@@ -184,6 +208,8 @@ impl SessionStats {
         self.total_cost = 0.0;
         self.requests.clear();
         self.lanes.clear();
+        self.last_orchestrator_input_tokens = None;
+        self.compaction_generation += 1;
     }
 
     /// Restore stats from a persisted snapshot (e.g. after `/load`).
@@ -210,6 +236,9 @@ impl SessionStats {
         }
         // /load must not blind the gate — seed it with the persisted input count.
         self.last_orchestrator_input_tokens = Some(input);
+        // Wholesale replacement: any usage event still in flight from the
+        // previous conversation is stamped with the old generation.
+        self.compaction_generation += 1;
     }
 
     /// Replace the per-lane breakdown wholesale (e.g. after `/load`). The flat
@@ -274,7 +303,7 @@ impl SessionStats {
     }
 
     /// Reset the "live context size" signal to 0 *without* touching cumulative
-    /// `total_*` bookkeeping or the API-call counter.
+    /// `total_cost` / `total_api_calls` or the per-lane buckets.
     ///
     /// Called from `StateManager::apply_compaction` so the next
     /// `last_input_tokens()` reads `Some(0)`, which makes
@@ -286,19 +315,29 @@ impl SessionStats {
     /// (Bug #2/#3) and the regression pin
     /// `force_compact_makes_needs_compaction_return_false`.
     ///
+    /// Also zeroes `total_input_tokens` — the LAST-request value (not the
+    /// cumulative sum), which `persist_current` writes and `restore` re-seeds
+    /// the gate from on `/load`. Left stale, it would resurrect the
+    /// pre-compaction meter on reload. And bumps the generation so a usage
+    /// event for a pre-compaction request, processed late, books its tokens
+    /// and cost but cannot move the gate.
+    ///
     /// Implementation: pushes a synthetic zero-token entry rather than
     /// popping/clearing real history. Symmetric with the seed trick in
     /// `restore()`: same one-extra-Vec-entry cost, no behaviour difference
-    /// for `total_input_tokens` / `total_cost` / `total_api_calls` because
-    /// none of those increment via direct `requests.push`.
+    /// for `total_cost` / `total_api_calls` because none of those increment
+    /// via direct `requests.push`.
     pub fn clear_last_input_tokens(&mut self) {
         self.requests.push(RequestStats {
             input_tokens: 0,
             output_tokens: 0,
             cost: 0.0,
         });
+        // The persisted fallback for the gate — zero it with the live reading.
+        self.total_input_tokens = 0;
         // Loop guard, same reason: the gate must not re-fire post-compaction.
         self.last_orchestrator_input_tokens = None;
+        self.compaction_generation += 1;
     }
 }
 
@@ -572,9 +611,11 @@ mod tests {
 
     /// `clear_last_input_tokens` makes `last_input_tokens()` return Some(0)
     /// so `ContextManager::needs_compaction` skips its token-based branch
-    /// and falls through to the message-count fallback. Cumulative
-    /// `total_*` fields and `total_api_calls` MUST be untouched —
-    /// `/stats` stays honest across compactions.
+    /// and falls through to the message-count fallback. The CUMULATIVE
+    /// bookkeeping (`total_cost`, `total_api_calls`, per-lane buckets) MUST
+    /// be untouched — `/stats` stays honest across compactions. The
+    /// LAST-request `total_input_tokens` value IS zeroed (it is the persisted
+    /// fallback for the gate, not a cumulative sum).
     ///
     /// Pinned by the in-loop compaction plan: the previous attempt
     /// (`compactfuck.md`) infinite-looped because nothing reset the stale
@@ -583,8 +624,20 @@ mod tests {
     #[test]
     fn clear_last_input_tokens_zeroes_last_without_touching_cumulative() {
         let mut stats = SessionStats::new();
-        stats.add_request("orchestrator", 500, 200, 0.05);
-        stats.add_request("orchestrator", 800, 300, 0.08);
+        stats.add_request(
+            "orchestrator",
+            500,
+            200,
+            0.05,
+            stats.compaction_generation(),
+        );
+        stats.add_request(
+            "orchestrator",
+            800,
+            300,
+            0.08,
+            stats.compaction_generation(),
+        );
 
         // Sanity: pre-clear, last_input_tokens reflects the most recent request.
         assert_eq!(stats.last_input_tokens(), Some(800));
@@ -631,15 +684,41 @@ mod tests {
         );
     }
 
+    /// `reset` must clear the orchestrator gate reading. `/new` and `/reset`
+    /// funnel through `StateManager::reset_stats` → `SessionStats::reset`,
+    /// and a stale `last_orchestrator_input_tokens` is exactly how the
+    /// "Orchestrator context" meter survives a reset (and how
+    /// `needs_compaction()` would fire on a brand-new conversation) —
+    /// meter-and-focus ticket, Bug C.
+    #[test]
+    fn reset_clears_last_orchestrator_input_tokens() {
+        let mut stats = SessionStats::new();
+        stats.add_request("orchestrator", 600, 50, 0.05, stats.compaction_generation());
+        assert_eq!(
+            stats.last_orchestrator_input_tokens(),
+            Some(600),
+            "precondition: the gate reads the last orchestrator request"
+        );
+
+        stats.reset();
+
+        assert!(
+            stats.last_orchestrator_input_tokens().is_none(),
+            "reset must clear last_orchestrator_input_tokens (got {:?}) — a stale \
+             reading keeps the context meter alive across /new and /reset",
+            stats.last_orchestrator_input_tokens()
+        );
+    }
+
     /// Per-lane aggregation keeps a bucket per lane while the flat
     /// grand total still accumulates across all lanes. Two lanes → two
     /// buckets, orchestrator sorted first.
     #[test]
     fn add_request_buckets_stats_per_lane() {
         let mut stats = SessionStats::new();
-        stats.add_request("orchestrator", 100, 20, 0.01);
-        stats.add_request("reviewer", 200, 40, 0.02);
-        stats.add_request("reviewer", 300, 60, 0.03);
+        stats.add_request("orchestrator", 100, 20, 0.01, stats.compaction_generation());
+        stats.add_request("reviewer", 200, 40, 0.02, stats.compaction_generation());
+        stats.add_request("reviewer", 300, 60, 0.03, stats.compaction_generation());
 
         // Flat grand total accumulates across lanes.
         assert_eq!(stats.total_api_calls, 3);
@@ -675,8 +754,8 @@ mod tests {
             },
         )]);
 
-        stats.add_request("junior", 2_000, 100, 0.02);
-        stats.add_request("junior", 3_000, 150, 0.03);
+        stats.add_request("junior", 2_000, 100, 0.02, stats.compaction_generation());
+        stats.add_request("junior", 3_000, 150, 0.03, stats.compaction_generation());
 
         let (_, junior) = stats
             .lanes_sorted()
@@ -964,10 +1043,11 @@ mod tests {
             "no usage reported yet must not trip the gate"
         );
 
+        let stamp = stats.lock().unwrap().compaction_generation();
         stats
             .lock()
             .unwrap()
-            .add_request("reviewer", 1_001, 10, 0.0);
+            .add_request("reviewer", 1_001, 10, 0.0, stamp);
         let over =
             rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_completion_call(
                 &hook,
@@ -990,10 +1070,11 @@ mod tests {
     #[tokio::test]
     async fn orchestrator_hook_has_no_sub_agent_gate() {
         let stats = Arc::new(Mutex::new(SessionStats::new()));
+        let stamp = stats.lock().unwrap().compaction_generation();
         stats
             .lock()
             .unwrap()
-            .add_request("orchestrator", 999_999, 10, 0.0);
+            .add_request("orchestrator", 999_999, 10, 0.0, stamp);
         let hook = SessionHook::with_context_tracking(None, stats);
 
         let prompt = user_msg("next");
@@ -1552,7 +1633,13 @@ mod tests {
             sm.add_user_message(format!("u{i}"));
             sm.add_assistant_message(format!("a{i}"));
         }
-        sm.add_request(&MessageSource::Human, 1_000, 100, 0.0);
+        sm.add_request(
+            &MessageSource::Human,
+            1_000,
+            100,
+            0.0,
+            sm.compaction_generation(),
+        );
         assert!(sm.needs_compaction(), "fixture: compaction would fire");
         sm.set_running(true);
 
@@ -2524,15 +2611,24 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
         }
 
         // Update the session stats with this request's usage
-        // This is critical for ContextManager to track actual token counts
-        if let Ok(mut stats) = self.stats.lock() {
-            stats.add_request(
-                self.source.lane_label(),
-                input_tokens,
-                usage.output_tokens,
-                0.0, // Cost is calculated externally
-            );
-        }
+        // This is critical for ContextManager to track actual token counts.
+        // The stamp is read here, at response time: it is the freshness fact
+        // for the gate, and the same value rides the event so the UI task's
+        // write of this same response is judged against the same generation.
+        let generation = match self.stats.lock() {
+            Ok(mut stats) => {
+                let generation = stats.compaction_generation();
+                stats.add_request(
+                    self.source.lane_label(),
+                    input_tokens,
+                    usage.output_tokens,
+                    0.0, // Cost is calculated externally
+                    generation,
+                );
+                generation
+            }
+            Err(_) => 0,
+        };
 
         // Extract content and reasoning from response using rig's API.
         let parts = extract_content_from_response(&response.choice);
@@ -2589,6 +2685,7 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
                     output_tokens: usage.output_tokens,
                     total_tokens: input_tokens + usage.output_tokens,
                     cost: 0.0, // Cost = 0 here, calculated by CostHandler
+                    generation,
                 },
                 timestamp: Utc::now(),
             };

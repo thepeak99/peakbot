@@ -106,12 +106,19 @@ async fn stats_accumulate_after_messages() {
     let state_manager = Arc::new(StateManager::new());
 
     // Add some stats
-    state_manager.add_request(&peakbot::ui::app_state::MessageSource::Human, 100, 50, 0.01);
+    state_manager.add_request(
+        &peakbot::ui::app_state::MessageSource::Human,
+        100,
+        50,
+        0.01,
+        state_manager.compaction_generation(),
+    );
     state_manager.add_request(
         &peakbot::ui::app_state::MessageSource::Human,
         200,
         100,
         0.02,
+        state_manager.compaction_generation(),
     );
 
     let stats = state_manager.get_stats();

@@ -601,7 +601,7 @@ Orchestrator reply: each orchestrator response becomes at most one Agent row —
 
 ### Context meter
 
-The Session tab context meter is sourced from the **main agent's lane** only (sub-agent turns do not move it). This is the same signal the compaction gate reads. Labelled "Orchestrator context" with a tooltip explaining the distinction. With no subagents, behaviour is identical to a single agent.
+The Session tab context meter is sourced from the **main agent's lane** only (sub-agent turns do not move it). This is the same signal the compaction gate reads. Labelled "Orchestrator context" with a tooltip explaining the distinction. With no subagents, behaviour is identical to a single agent. Compaction, `/new` and `/reset` zero the reading, and a usage event stamped with an older compaction generation (`SessionStats::compaction_generation`) is booked but cannot move it. While a slash command runs, `AppState.command_running` is true alongside `is_running`; web focus mode keys off `is_running && !command_running`.
 
 ### Prompt recipes
 

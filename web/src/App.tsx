@@ -86,6 +86,12 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
 
   // Swap favicon to a spinning loader while the agent is working
   const isRunning = state?.is_running ?? false;
+  // A slash command (e.g. /compact) sets is_running WITHOUT adding a user row
+  // — the trailing turn is already finished. Focus mode must not read that as
+  // a live turn, or it hides the last answer. Composer/spinner/Stop keep the
+  // plain is_running; only the focus view uses turnInFlight.
+  const commandRunning = state?.command_running ?? false;
+  const turnInFlight = isRunning && !commandRunning;
   useFavicon(isRunning);
 
   // Follow the newest message, but only while the user is pinned to the bottom
@@ -147,7 +153,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   // deriving from the full message list (D12). Global-only: a scoped lane
   // view means "show me everything" (D11).
   const focusing = focusMode.focus && view === "global";
-  const focused = focusing ? focusView(visibleMessages, isRunning) : null;
+  const focused = focusing ? focusView(visibleMessages, turnInFlight) : null;
   const transcriptMessages = focused ? focused.visible : visibleMessages;
 
   // Remount token for the transcript. Switching conversation or view, toggling
@@ -403,7 +409,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
             />
           )}
 
-          {focusing && isRunning && <ActivityRow step={focused?.activity ?? null} />}
+          {focusing && turnInFlight && <ActivityRow step={focused?.activity ?? null} />}
 
           {convoTabs ? (
             // Keep-alive: every tab's composer stays mounted, only the active
