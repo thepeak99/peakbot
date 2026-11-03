@@ -688,7 +688,7 @@ impl StateManager {
 
     /// Sync stats to AppState. Lock order: stats → state (load-bearing — see
     /// `add_request_and_persist_current_do_not_deadlock` regression test).
-    fn sync_stats_to_ui(&self) {
+    pub(crate) fn sync_stats_to_ui(&self) {
         // Snapshot under stats lock, release before acquiring state.write.
         let (input, output, calls, cost, last_input, lanes) = {
             let stats = self.stats.lock().unwrap();

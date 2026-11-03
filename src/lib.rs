@@ -2672,13 +2672,15 @@ impl AgentRunner {
     /// This is the Controller's responsibility — it decides how domain events
     /// affect the UI state. The Model (StateManager) is passive and only holds data.
     ///
-    /// The event carries the lane that produced it (`source`). Cost/token
-    /// roll-up is **lane-agnostic** — a sub-agent's usage counts toward the
-    /// parent `/stats` exactly like the orchestrator's (the #1 research fix:
-    /// a delegation's cost must never be silent). The lane *is* honoured when
-    /// stamping the resulting transcript ChatMessage, so the renderer can
-    /// label a sub-agent's turns and `get_agent_history` can filter them out
-    /// of the orchestrator's wire context.
+    /// The event carries the lane that produced it (`source`). Sub-agent
+    /// completions book into the shared `/stats` here — their hooks keep
+    /// private stats, so this is the lane's only shared booking, and a
+    /// delegation's cost must never be silent. Orchestrator-lane completions
+    /// are already booked inline by the hook; the event only syncs the UI.
+    /// The lane *is* honoured when stamping the resulting transcript
+    /// ChatMessage, so the renderer can label a sub-agent's turns and
+    /// `get_agent_history` can filter them out of the orchestrator's wire
+    /// context.
     pub(crate) fn process_event_for_ui(
         state_manager: &Option<Arc<StateManager>>,
         sourced: SourcedEvent,
@@ -2697,19 +2699,26 @@ impl AgentRunner {
                 thinking,
                 ..
             } => {
-                // Roll tokens/cost into session stats, keyed by lane: the
-                // parent `/stats` sees sub-agent cost too, and can break it
-                // down per role. `usage.generation` is the stamp the hook
-                // read at response time — a pre-compaction event landing
-                // late books tokens/cost but cannot move the orchestrator
-                // meter (see `SessionStats::add_request`).
-                sm.add_request(
-                    &source,
-                    usage.input_tokens,
-                    usage.output_tokens,
-                    usage.cost,
-                    usage.generation,
-                );
+                if source.is_orchestrator_lane() {
+                    // The hook already booked this response inline on the shared
+                    // stats (it is the sole CompletionResponse emitter — re-booking
+                    // here double-counts /stats); the inline write skips AppState,
+                    // so the event only syncs the UI.
+                    sm.sync_stats_to_ui();
+                } else {
+                    // Sub-agent hooks keep private stats, so this is the lane's
+                    // only booking into the shared `/stats`. `usage.generation` is
+                    // the stamp the hook read at response time — a pre-compaction
+                    // event landing late books tokens/cost but cannot move the
+                    // orchestrator meter (see `SessionStats::add_request`).
+                    sm.add_request(
+                        &source,
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        usage.cost,
+                        usage.generation,
+                    );
+                }
 
                 // Surface a **sub-agent's** prose on its own lane. The
                 // orchestrator's rows are owned elsewhere — the hook writes
@@ -7086,7 +7095,8 @@ headers:
         // ...and the event path books NOTHING for the orchestrator lane —
         // the hook's inline booking is the single source of truth.
         assert_eq!(
-            sm.get_stats().total_api_calls, 0,
+            sm.get_stats().total_api_calls,
+            0,
             "an orchestrator-lane CompletionResponse must not book stats on the \
              event path (the hook already booked it inline) — got {}",
             sm.get_stats().total_api_calls
@@ -7261,7 +7271,8 @@ headers:
             .unwrap()
             .add_request("orchestrator", 100, 10, 0.0, generation);
         assert_eq!(
-            sm.get_state().stats.total_api_calls, 0,
+            sm.get_state().stats.total_api_calls,
+            0,
             "precondition: the hook's inline booking is not visible to the UI"
         );
 
@@ -7330,7 +7341,10 @@ headers:
 
         // One REAL orchestrator response through the REAL hook: W1 books
         // inline on the shared stats during the prompt.
-        let reply = agent.prompt("hello").await.expect("the mock turn completes");
+        let reply = agent
+            .prompt("hello")
+            .await
+            .expect("the mock turn completes");
         assert_eq!(reply, "Done.");
 
         // ... and through the REAL event pump. The channel is unbounded and
