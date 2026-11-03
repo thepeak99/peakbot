@@ -7040,7 +7040,16 @@ headers:
     /// the event path — that row is owned elsewhere: the hook writes it for
     /// tool-call-carrying responses, and the turn loop writes the final reply
     /// (`add_assistant_message`). Adding it here too would double it.
-    /// Only stats move for an orchestrator-lane completion.
+    ///
+    /// And NO stats move for an orchestrator-lane completion: the hook
+    /// already booked this response inline on the shared stats (the single
+    /// booking — see `orchestrator_completion_event_does_not_double_book`),
+    /// so the event path is UI-sync-only for the orchestrator lane.
+    ///
+    /// NOTE (TDD): the old expectation (`total_api_calls == 1` — the event
+    /// path re-books the hook's response) pinned W2 of the /stats
+    /// double-count. It now expects 0 bookings from the event path, per the
+    /// locked fix. RED until the fix lands.
     #[test]
     fn orchestrator_completion_prose_is_not_double_added() {
         use crate::hooks::events::{AgentEvent, SourcedEvent, TokenUsage};
@@ -7074,8 +7083,297 @@ headers:
             before, after,
             "orchestrator completion must not add a transcript message (the return-value path owns that)"
         );
-        // ...but stats still moved.
-        assert_eq!(sm.get_stats().total_api_calls, 1);
+        // ...and the event path books NOTHING for the orchestrator lane —
+        // the hook's inline booking is the single source of truth.
+        assert_eq!(
+            sm.get_stats().total_api_calls, 0,
+            "an orchestrator-lane CompletionResponse must not book stats on the \
+             event path (the hook already booked it inline) — got {}",
+            sm.get_stats().total_api_calls
+        );
+    }
+
+    // ─── /stats double-count regression (orchestrator lane) ─────────────────
+    //
+    // In production every orchestrator-lane LLM response is booked TWICE into
+    // the shared SessionStats:
+    //   W1 (inline): `SessionHook::on_completion_response` books on the
+    //       shared stats — orchestrator hooks are built with
+    //       `with_context_tracking(…, state_manager.stats_arc())`
+    //       (providers/mod.rs) — then emits `AgentEvent::CompletionResponse`.
+    //   W2 (event task): `AgentRunner::process_event_for_ui` calls
+    //       `sm.add_request` for EVERY CompletionResponse, booking again.
+    // The locked fix makes W2 UI-sync-only for the orchestrator lane
+    // (`!source.is_orchestrator_lane()` around the `sm.add_request`).
+    // Sub-agent hooks book into PRIVATE stats (`SessionHook::new(sink)`), so
+    // for sub-agents W2 is the ONLY booking into the shared stats — it must
+    // stay. TestRunner/TestHarness are deliberately NOT used here: they
+    // replay hook stats and never run W2, so they hide the bug.
+    /// One orchestrator response = one booking. W1 is replayed exactly as the
+    /// hook does it (shared stats, cost 0.0), then the matching
+    /// CompletionResponse event goes through the event path. The event path
+    /// must not move any stats for the orchestrator lane — today it re-books
+    /// (2 calls, 200/20 tokens, the event's cost added on top).
+    #[test]
+    fn orchestrator_completion_event_does_not_double_book() {
+        use crate::hooks::events::{AgentEvent, SourcedEvent, TokenUsage};
+
+        let sm = Arc::new(StateManager::new());
+        let sm_opt: Option<Arc<StateManager>> = Some(sm.clone());
+        let generation = sm.compaction_generation();
+
+        // W1 — the hook's inline booking on the SHARED stats, exactly as
+        // `on_completion_response` does it (cost 0.0 there: "cost is
+        // calculated externally", so the event carries the cost).
+        sm.stats_arc()
+            .lock()
+            .unwrap()
+            .add_request("orchestrator", 100, 10, 0.0, generation);
+
+        // W2 — the event task then sees the hook's CompletionResponse.
+        AgentRunner::process_event_for_ui(
+            &sm_opt,
+            SourcedEvent {
+                source: MessageSource::Human,
+                event: AgentEvent::CompletionResponse {
+                    content: "Done.".to_string(),
+                    reasoning: None,
+                    thinking: vec![],
+                    usage: TokenUsage {
+                        input_tokens: 100,
+                        output_tokens: 10,
+                        total_tokens: 110,
+                        cost: 0.05,
+                        generation,
+                    },
+                    timestamp: chrono::Utc::now(),
+                },
+            },
+        );
+
+        let stats = sm.get_stats();
+        assert_eq!(
+            stats.total_api_calls, 1,
+            "one orchestrator response books exactly one API call — the event \
+             path must not re-book what the hook already booked"
+        );
+        let lane = stats
+            .lanes_sorted()
+            .into_iter()
+            .find(|(name, _)| name == "orchestrator")
+            .map(|(_, lane)| lane)
+            .expect("the orchestrator lane exists");
+        assert_eq!(lane.api_calls, 1, "orchestrator lane: 1 call, not 2");
+        assert_eq!(
+            lane.input_tokens, 100,
+            "orchestrator lane: 100 input tokens, not 200"
+        );
+        assert_eq!(
+            lane.output_tokens, 10,
+            "orchestrator lane: 10 output tokens, not 20"
+        );
+        assert!(
+            (stats.total_cost - 0.0).abs() < f64::EPSILON,
+            "cost is booked once (the hook's booking) — the event path must \
+             not add the event's cost on top (got {})",
+            stats.total_cost
+        );
+    }
+
+    /// A sub-agent's CompletionResponse is booked EXACTLY once — by the event
+    /// path, because the sub-agent hook books into private stats (no W1 on
+    /// the shared stats). GREEN today; must stay green after the fix (the
+    /// orchestrator-lane guard must not catch sub-agent lanes).
+    #[test]
+    fn sub_agent_completion_event_is_booked_once() {
+        use crate::hooks::events::{AgentEvent, SourcedEvent, TokenUsage};
+
+        let sm = Arc::new(StateManager::new());
+        let sm_opt: Option<Arc<StateManager>> = Some(sm.clone());
+        let generation = sm.compaction_generation();
+
+        // No W1 on the shared stats: the sub-agent hook books into PRIVATE
+        // stats (`SessionHook::new(sink)` — no `with_context_tracking`), so
+        // the event path is the ONLY booking into the shared stats. It must
+        // stay, exactly once.
+        AgentRunner::process_event_for_ui(
+            &sm_opt,
+            SourcedEvent {
+                source: MessageSource::SubAgent {
+                    role: "reviewer".to_string(),
+                },
+                event: AgentEvent::CompletionResponse {
+                    content: "Looks good.".to_string(),
+                    reasoning: None,
+                    thinking: vec![],
+                    usage: TokenUsage {
+                        input_tokens: 50,
+                        output_tokens: 7,
+                        total_tokens: 57,
+                        cost: 0.01,
+                        generation,
+                    },
+                    timestamp: chrono::Utc::now(),
+                },
+            },
+        );
+
+        let stats = sm.get_stats();
+        assert_eq!(
+            stats.total_api_calls, 1,
+            "a sub-agent completion books exactly one API call"
+        );
+        let lane = stats
+            .lanes_sorted()
+            .into_iter()
+            .find(|(name, _)| name == "reviewer")
+            .map(|(_, lane)| lane)
+            .expect("the reviewer lane exists");
+        assert_eq!(lane.api_calls, 1, "reviewer lane: 1 call");
+        assert_eq!(lane.input_tokens, 50, "reviewer lane: 50 input tokens");
+        assert_eq!(lane.output_tokens, 7, "reviewer lane: 7 output tokens");
+        assert!(
+            (stats.total_cost - 0.01).abs() < f64::EPSILON,
+            "the sub-agent's cost is booked once (got {})",
+            stats.total_cost
+        );
+    }
+
+    /// The orchestrator event must keep the UI in sync with the shared stats
+    /// even once it stops booking: the hook's inline write goes straight to
+    /// the stats Arc (no UI sync), so the event path is the only thing that
+    /// pushes the stats into the UI state for this response. GREEN today
+    /// (W2 books and syncs), and meaningful after the fix — drop the sync
+    /// and the UI stalls on the pre-event values.
+    #[test]
+    fn orchestrator_completion_event_still_syncs_ui() {
+        use crate::hooks::events::{AgentEvent, SourcedEvent, TokenUsage};
+
+        let sm = Arc::new(StateManager::new());
+        let sm_opt: Option<Arc<StateManager>> = Some(sm.clone());
+        let generation = sm.compaction_generation();
+
+        // The hook books directly on the stats Arc — that write does NOT
+        // reach the UI state (only `StateManager::add_request` →
+        // `sync_stats_to_ui` does). The UI is stale right after W1.
+        sm.stats_arc()
+            .lock()
+            .unwrap()
+            .add_request("orchestrator", 100, 10, 0.0, generation);
+        assert_eq!(
+            sm.get_state().stats.total_api_calls, 0,
+            "precondition: the hook's inline booking is not visible to the UI"
+        );
+
+        // The orchestrator's CompletionResponse event must leave the UI
+        // mirroring the shared stats — whatever the fix does to the booking.
+        AgentRunner::process_event_for_ui(
+            &sm_opt,
+            SourcedEvent {
+                source: MessageSource::Human,
+                event: AgentEvent::CompletionResponse {
+                    content: "Done.".to_string(),
+                    reasoning: None,
+                    thinking: vec![],
+                    usage: TokenUsage {
+                        input_tokens: 100,
+                        output_tokens: 10,
+                        total_tokens: 110,
+                        cost: 0.05,
+                        generation,
+                    },
+                    timestamp: chrono::Utc::now(),
+                },
+            },
+        );
+
+        let ui = sm.get_state().stats;
+        let stats = sm.get_stats();
+        assert_eq!(
+            ui.total_api_calls, stats.total_api_calls,
+            "UI api_calls must mirror the stats after the orchestrator event"
+        );
+        assert_eq!(
+            ui.total_input_tokens, stats.total_input_tokens,
+            "UI input tokens must mirror the stats after the orchestrator event"
+        );
+        assert_eq!(
+            ui.total_output_tokens, stats.total_output_tokens,
+            "UI output tokens must mirror the stats after the orchestrator event"
+        );
+        assert!(
+            (ui.total_cost - stats.total_cost).abs() < f64::EPSILON,
+            "UI cost must mirror the stats after the orchestrator event"
+        );
+    }
+
+    /// End-to-end: one REAL mock orchestrator response through the REAL hook
+    /// (W1, inline on the shared stats — `create_mock_agent` builds the hook
+    /// with `with_context_tracking(…, stats_arc())`) and the REAL event pump
+    /// (W2, `process_event_for_ui`). Exactly one call may reach the shared
+    /// stats. No TestRunner/TestHarness — they replay hook stats and never
+    /// run W2, so they hide the bug.
+    #[cfg(feature = "mock")]
+    #[tokio::test]
+    async fn one_orchestrator_response_counts_once_end_to_end() {
+        let sm = Arc::new(StateManager::new());
+        let (agent, _info, mut events, _hook, model) =
+            crate::providers::create_mock_agent("test prompt", 4, sm.clone())
+                .expect("the mock agent builds");
+        model.add_response(crate::mock::MockResponse::text_with_usage(
+            "Done.",
+            crate::mock::Usage {
+                input_tokens: 100,
+                output_tokens: 10,
+            },
+        ));
+
+        // One REAL orchestrator response through the REAL hook: W1 books
+        // inline on the shared stats during the prompt.
+        let reply = agent.prompt("hello").await.expect("the mock turn completes");
+        assert_eq!(reply, "Done.");
+
+        // ... and through the REAL event pump. The channel is unbounded and
+        // the hook sends inline, so every event is already queued when the
+        // prompt returns — drain it synchronously (no spawned-pump race) and
+        // feed it exactly as the runner would.
+        let sm_opt: Option<Arc<StateManager>> = Some(sm.clone());
+        let mut completions = 0;
+        while let Ok(sourced) = events.try_recv() {
+            if matches!(
+                sourced.event,
+                crate::hooks::AgentEvent::CompletionResponse { .. }
+            ) {
+                completions += 1;
+            }
+            AgentRunner::process_event_for_ui(&sm_opt, sourced);
+        }
+        assert_eq!(
+            completions, 1,
+            "the hook emitted exactly one CompletionResponse"
+        );
+
+        let stats = sm.get_stats();
+        assert_eq!(
+            stats.total_api_calls, 1,
+            "one orchestrator response counts once end-to-end — hook booking \
+             (W1) and event path (W2) must not both book"
+        );
+        let lane = stats
+            .lanes_sorted()
+            .into_iter()
+            .find(|(name, _)| name == "orchestrator")
+            .map(|(_, lane)| lane)
+            .expect("the orchestrator lane exists");
+        assert_eq!(lane.api_calls, 1, "orchestrator lane: 1 call, not 2");
+        assert_eq!(
+            lane.input_tokens, 100,
+            "orchestrator lane: 100 input tokens, not 200"
+        );
+        assert_eq!(
+            lane.output_tokens, 10,
+            "orchestrator lane: 10 output tokens, not 20"
+        );
     }
 
     /// T4 — stop message rendering. Pure-function test, no fixtures.
