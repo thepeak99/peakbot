@@ -10,11 +10,12 @@
 #     automation), and the removal of .release-version / NOTES / ALLOW_DIRTY
 #   - the auto-updater pipeline: shared RELEASE_ASSETS (10 = 8 legacy +
 #     macos-universal.app.tar.gz + latest.json), release order
-#     desktop-updater → release-publish → release-publish-github
-#     (curl+jq, idempotent, polls the GitHub tag ref, draft + trap-delete,
-#     10 uploads to uploads.github.com, PATCH make_latest true/false),
-#     release-check asserting the tauri.conf.json updater endpoint contains
-#     GH_MIRROR_REPO
+#     desktop-updater → release-publish → release-publish-shifu →
+#     release-publish-github (the shifu publish is rclone copyto-only to
+#     the public MinIO bucket, verified over the public URL, latest.json
+#     last for stable tags; GitHub stays the BRIDGE mirror),
+#     release-check asserting the tauri.conf.json updater endpoints are
+#     exactly ["<UPDATER_BASE_URL>/latest.json"] (the public shifu bucket)
 #   - .gitea/workflows/release.yml (tag-push → make release TAG=...), with
 #     the GH_RELEASE_TOKEN + TAURI_SIGNING_PRIVATE_KEY(_PASSWORD) secrets
 #     mapped to env, and desktop.yml + desktop/scripts/attach-release.sh
@@ -75,10 +76,10 @@ workdirs=""
 cleanup() { [ -n "$workdirs" ] && rm -rf $workdirs; }
 trap cleanup EXIT
 
-# ── Shared fake-curl infrastructure (T08, T26–T28, T45–T51, T58) ───────────
-# ONE fake `curl` on PATH serves BOTH the Gitea and the GitHub fakes. It
-# logs "METHOD URL [BODY=…] [FILE=…] [DATA=…] [ | -H …]" per invocation to
-# $CURL_LOG and answers by URL shape:
+# ── Shared fake infrastructure (T08, T26–T28, T45–T51, T58, T59–T71) ─────
+# ONE fake `curl` on PATH serves BOTH the Gitea and the GitHub fakes, and
+# (T59+) the public shifu bucket. It logs "METHOD URL [BODY=…] [FILE=…]
+# [DATA=…] [ | -H …]" per invocation to $CURL_LOG and answers by URL shape:
 #   git.fake.example   — legacy Gitea canned answers (release id 42).
 #   api.github.com     — GET git/ref/tags/<v>: 404 twice, then 200 (poll
 #                        counter in $CURL_LOG.refpoll); GH_REF_ALWAYS_404=1
@@ -91,9 +92,18 @@ trap cleanup EXIT
 #                        DELETE releases/<id> → 204; PATCH → 200.
 #   uploads.github.com — POST …/releases/<id>/assets?name=<f> → 201, or
 #                        422 when FAIL_UPLOAD=<f>.
+#   shifu.patchnotes.com — the public shifu bucket (fake MinIO): the URL
+#                        path is the object key, served from
+#                        $SHIFU_FAKE_ROOT; missing key → exit 22;
+#                        SHIFU_STALE=<key> serves "stale"; -I/--head with
+#                        -w '%header{content-length}' prints the size.
 # GitHub answers carry their HTTP status via -w %{http_code} (body on
 # stdout or via -o), so the implementation may check status and/or body.
-# Makefile contract under test: GH_MIRROR_REPO ?= thepeak99/peakbot,
+# Makefile contract under test: SHIFU_URL := https://shifu.patchnotes.com,
+# SHIFU_PREFIX := peakbot (the key prefix == the URL path segment),
+# UPDATER_BASE_URL := $(SHIFU_URL)/$(SHIFU_PREFIX) — the public updater
+# host, the literal appearing exactly ONCE in the Makefile; plus the
+# BRIDGE GH_MIRROR_REPO ?= thepeak99/peakbot,
 # GH_API ?= https://api.github.com, GH_UPLOADS ?= https://uploads.github.com,
 # poll GET <GH_API>/repos/<repo>/git/ref/tags/<v> GH_TAG_WAIT_TRIES (60) ×
 # GH_TAG_WAIT_SECS (10s), auth header "Authorization: Bearer <token>",
@@ -120,6 +130,7 @@ for a in "$@"; do
     -H|--header)     hdrs="$hdrs | $a"; prev=''; continue ;;
   esac
   case "$a" in
+    -I|--head)    method=HEAD; prev='' ;;
     -*) prev=$a ;;
     *) prev=''; if [ -z "$url" ]; then url=$a; fi ;;
   esac
@@ -178,6 +189,31 @@ case "$url" in
     if [ -n "$ofile" ]; then printf '%s\n' "$resp" > "$ofile"; else printf '%s\n' "$resp"; fi
     [ -n "$wfmt" ] && printf '%s\n' "$wfmt" | sed "s/%{http_code}/$status/g"
     exit 0 ;;
+  *shifu.patchnotes.com*)
+    # The public shifu bucket (fake MinIO): URL path == object key, served
+    # from $SHIFU_FAKE_ROOT. Missing key → 22 (like curl -f on a 404).
+    key=${url#*shifu.patchnotes.com/}
+    f="$SHIFU_FAKE_ROOT/$key"
+    if [ ! -f "$f" ]; then
+      echo "fake curl: no such shifu object: $key" >&2
+      exit 22
+    fi
+    if [ "$method" = "HEAD" ]; then
+      # SHIFU_STALE=<key> on a HEAD reports a WRONG size (actual + 1) — the
+      # public object differs from what was uploaded.
+      sz=$(wc -c < "$f" | tr -d ' ')
+      [ "${SHIFU_STALE:-}" = "$key" ] && sz=$((sz+1))
+      [ -n "$wfmt" ] && printf '%s\n' "$wfmt" \
+        | sed "s/%header{content-length}/$sz/g"
+    else
+      if [ "${SHIFU_STALE:-}" = "$key" ]; then
+        if [ -n "$ofile" ]; then printf 'stale' > "$ofile"; else printf 'stale'; fi
+      else
+        # Byte-exact (cp/cat, never $(…), which would strip a trailing newline).
+        if [ -n "$ofile" ]; then cp "$f" "$ofile"; else cat "$f"; fi
+      fi
+    fi
+    exit 0 ;;
   *)
     # Gitea (git.fake.example) — legacy canned answers.
     case "$method" in
@@ -206,6 +242,63 @@ case "$url" in
 esac
 FAKECURL
 chmod +x "$D/bin/curl"
+
+# SHIFU_FAKE_ROOT — the fake MinIO bucket the fake rclone writes into and
+# the fake curl serves from (object key == URL path).
+SHIFU_FAKE_ROOT=$D/shifu
+mkdir -p "$SHIFU_FAKE_ROOT"
+
+# Fake rclone (T59–T71): speaks ONLY `copyto` to `shifu:shifu/<key>`.
+# Every invocation appends its argv to $RCLONE_LOG and its RCLONE_* env to
+# $RCLONE_LOG.env. The source file is written to $SHIFU_FAKE_ROOT/<key>
+# (headers to <key>.headers). With --immutable: an existing DIFFERENT
+# destination fails with `immutable file modified` (an identical one is a
+# no-op, like real rclone's --checksum skip). RCLONE_FAIL_KEY=<key> makes
+# the call for that key exit 1. Any other subcommand/destination is logged
+# and exits 1.
+cat > "$D/bin/rclone" <<'FAKERCLONE'
+#!/bin/sh
+: "${RCLONE_LOG:?fake rclone needs RCLONE_LOG}"
+: "${SHIFU_FAKE_ROOT:?fake rclone needs SHIFU_FAKE_ROOT}"
+printf '%s\n' "$*" >> "$RCLONE_LOG"
+env | grep '^RCLONE_' | sort >> "$RCLONE_LOG.env"
+[ "${1:-}" = "copyto" ] || { echo "fake rclone: unsupported subcommand: $*" >&2; exit 1; }
+shift
+immutable=0; src=''; dst=''; hdrs=''
+prev=''
+for a in "$@"; do
+  case "$prev" in
+    --header-upload) hdrs="${hdrs}${a}
+"; prev=''; continue ;;
+  esac
+  case "$a" in
+    --immutable)     immutable=1; prev=''; continue ;;
+    --checksum)      prev=''; continue ;;
+    --header-upload) prev=$a; continue ;;
+    -*)              prev=''; continue ;;
+    *)               if [ -z "$src" ]; then src=$a; else dst=$a; fi; prev='' ;;
+  esac
+done
+case "$dst" in
+  shifu:shifu/*) key=${dst#shifu:shifu/} ;;
+  *) echo "fake rclone: destination must be shifu:shifu/<key>, got: $dst" >&2; exit 1 ;;
+esac
+[ -n "$src" ] && [ -f "$src" ] || { echo "fake rclone: source missing: $src" >&2; exit 1; }
+dest="$SHIFU_FAKE_ROOT/$key"
+if [ "$immutable" = "1" ] && [ -f "$dest" ] && ! cmp -s "$src" "$dest"; then
+  echo "immutable file modified" >&2
+  exit 1
+fi
+if [ "${RCLONE_FAIL_KEY:-}" = "$key" ]; then
+  echo "fake rclone: forced failure for $key" >&2
+  exit 1
+fi
+mkdir -p "$(dirname "$dest")"
+cp "$src" "$dest"
+printf '%s' "$hdrs" > "$SHIFU_FAKE_ROOT/$key.headers"
+exit 0
+FAKERCLONE
+chmod +x "$D/bin/rclone"
 
 # ASSET10 — the 10 release asset basenames (8 legacy + the macOS updater
 # tarball + latest.json), in the spec order.
@@ -291,6 +384,34 @@ run_gh() {
       GH_RELEASE_TOKEN="$gh_tok" GH_TAG_WAIT_SECS=0 \
       ${GH_TAG_WAIT_TRIES:+GH_TAG_WAIT_TRIES=$GH_TAG_WAIT_TRIES} 2>&1 )
     G_RC=$?
+}
+
+# run_shifu <logfile> <tag> [knobs] → sets S_RC / S_OUT.
+# Runs `make release-publish-shifu` in $root with the fake rclone + curl on
+# PATH. No clone is needed: the target needs no notes file and no
+# TAG==Cargo-version check. The shifu credentials come from env with
+# defaults (SE/SA/SS — override, e.g. to "", via <knobs>); <knobs> is a
+# string of VAR=value assignments (like run_gh's ${GH_TAG_WAIT_TRIES:+…}
+# idiom) passed through to make's env. $logfile is the rclone argv log; the
+# curl log is $logfile.curl and the RCLONE_* env log $logfile.env. Seeds
+# $SHIFU_FAKE_ROOT/.healthcheck with "shifu-ok" (no newline) when it is
+# absent — a test that needs a broken canary (T66) overwrites it first and
+# restores it afterwards.
+run_shifu() {
+    rs_log=$1; rs_tag=$2; rs_knobs=${3:-}
+    [ -f "$SHIFU_FAKE_ROOT/.healthcheck" ] \
+        || printf 'shifu-ok' > "$SHIFU_FAKE_ROOT/.healthcheck"
+    rm -f "$rs_log" "$rs_log.curl" "$rs_log.env"; : > "$rs_log"
+    S_OUT=$( cd "$root" && \
+      { [ -z "$rs_knobs" ] || export $rs_knobs; } && \
+      RCLONE_LOG="$rs_log" CURL_LOG="$rs_log.curl" \
+      SHIFU_FAKE_ROOT="$SHIFU_FAKE_ROOT" \
+      SHIFU_S3_ENDPOINT="${SE-http://minio.fake:9000}" \
+      SHIFU_S3_ACCESS_KEY="${SA-AKfake}" \
+      SHIFU_S3_SECRET_KEY="${SS-shifu-secret-xyz}" \
+      PATH="$D/bin:$PATH" \
+      make release-publish-shifu TAG="$rs_tag" OUTPUT_DIR="$D/out" 2>&1 )
+    S_RC=$?
 }
 
 # ── A: Makefile static contract ────────────────────────────────────────────
@@ -1028,35 +1149,55 @@ else
 fi
 
 # T52: `make -n release` shows the order: desktop-updater BEFORE
-# release-publish BEFORE release-publish-github.
+# release-publish BEFORE release-publish-shifu BEFORE release-publish-github.
 EO2=$(make -n release TAG="$V" 2>&1)
 l_up=$(printf '%s\n' "$EO2" | grep -nF 'desktop-updater' | awk -F: 'NR==1 {print $1; exit}')
 l_pub=$(printf '%s\n' "$EO2" | grep -nF 'release-publish' | awk -F: 'NR==1 {print $1; exit}')
+l_sh=$(printf '%s\n' "$EO2" | grep -nF 'release-publish-shifu' | awk -F: 'NR==1 {print $1; exit}')
 l_gh=$(printf '%s\n' "$EO2" | grep -nF 'release-publish-github' | awk -F: 'NR==1 {print $1; exit}')
-if [ -n "$l_up" ] && [ -n "$l_pub" ] && [ -n "$l_gh" ] \
-    && [ "$l_up" -lt "$l_pub" ] && [ "$l_pub" -lt "$l_gh" ]; then
-    ok "T52 make -n release: desktop-updater → release-publish → release-publish-github"
+if [ -n "$l_up" ] && [ -n "$l_pub" ] && [ -n "$l_sh" ] && [ -n "$l_gh" ] \
+    && [ "$l_up" -lt "$l_pub" ] && [ "$l_pub" -lt "$l_sh" ] && [ "$l_sh" -lt "$l_gh" ]; then
+    ok "T52 make -n release: desktop-updater → release-publish → release-publish-shifu → release-publish-github"
 else
-    bad "T52 make -n release: desktop-updater → release-publish → release-publish-github (up=${l_up:-?} pub=${l_pub:-?} gh=${l_gh:-?})"
+    bad "T52 make -n release: desktop-updater → release-publish → release-publish-shifu → release-publish-github (up=${l_up:-?} pub=${l_pub:-?} sh=${l_sh:-?} gh=${l_gh:-?})"
 fi
 
-# T53: release-check fails when tauri.conf.json plugins.updater endpoints do
-# NOT contain GH_MIRROR_REPO (the updater would fetch from the wrong host).
-# Same clone-mutation pattern as T24/T25 — the worktree stays untouched.
+# T53: release-check fails when tauri.conf.json plugins.updater endpoints are
+# NOT exactly ["<UPDATER_BASE_URL>/latest.json"] (the updater would fetch
+# from the wrong host). Two mutation shapes, same clone-mutation pattern as
+# T24/T25 — the worktree stays untouched:
+#   (a) the shifu host is rewritten to a different bucket path
+#   (b) a SECOND endpoint (the old GitHub URL) is appended via jq
 git clone -q --depth 1 "$root" "$FIX/repo4" 2>/dev/null \
     || { echo "❌ fixture clone repo4 failed" >&2; exit 1; }
-sed -i 's#thepeak99/peakbot#wrongorg/wrongrepo#' "$FIX/repo4/desktop/src-tauri/tauri.conf.json"
+sed -i 's#shifu\.patchnotes\.com/peakbot#shifu.patchnotes.com/wrong#' "$FIX/repo4/desktop/src-tauri/tauri.conf.json"
 out=$(make -C "$FIX/repo4" release-check TAG="$V" 2>&1); rc=$?
-if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qiE 'endpoint|mirror'; then
-    ok "T53 release-check: updater endpoint without GH_MIRROR_REPO → fails, names it"
+if ! grep -qF 'shifu.patchnotes.com/wrong' "$FIX/repo4/desktop/src-tauri/tauri.conf.json"; then
+    # Guard against a vacuous pass: the mutation must really have applied.
+    bad "T53a release-check: shifu endpoint rewritten to the wrong path → fails, names it (fixture mutation did not apply: tauri.conf.json has no shifu.patchnotes.com/peakbot endpoint yet)"
+elif [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qi 'endpoint'; then
+    ok "T53a release-check: shifu endpoint rewritten to the wrong path → fails, names it"
 else
-    bad "T53 release-check: updater endpoint without GH_MIRROR_REPO → fails, names it (rc=$rc: $(printf '%s' "$out" | head -1))"
+    bad "T53a release-check: shifu endpoint rewritten to the wrong path → fails, names it (rc=$rc: $(printf '%s' "$out" | head -1))"
+fi
+git clone -q --depth 1 "$root" "$FIX/repo5" 2>/dev/null \
+    || { echo "❌ fixture clone repo5 failed" >&2; exit 1; }
+jq '.plugins.updater.endpoints += ["https://github.com/thepeak99/peakbot/releases/latest/download/latest.json"]' \
+    "$FIX/repo5/desktop/src-tauri/tauri.conf.json" > "$FIX/repo5/tauri.conf.json.tmp" \
+    && mv "$FIX/repo5/tauri.conf.json.tmp" "$FIX/repo5/desktop/src-tauri/tauri.conf.json"
+out=$(make -C "$FIX/repo5" release-check TAG="$V" 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qi 'endpoint'; then
+    ok "T53b release-check: a second (GitHub) endpoint appended → fails, names it"
+else
+    bad "T53b release-check: a second (GitHub) endpoint appended → fails, names it (rc=$rc: $(printf '%s' "$out" | head -1))"
 fi
 
-# T54: release.yml maps the new secrets into env (GH_RELEASE_TOKEN,
-# TAURI_SIGNING_PRIVATE_KEY, TAURI_SIGNING_PRIVATE_KEY_PASSWORD), each with
-# a non-empty preflight BEFORE `make release` (the T43 pattern for
-# GITEA_TOKEN).
+# T54: release.yml maps the release secrets/vars into env — GH_RELEASE_TOKEN,
+# TAURI_SIGNING_PRIVATE_KEY(_PASSWORD), and the shifu trio (SHIFU_S3_ENDPOINT
+# as a Gitea VARIABLE, the access/secret keys as secrets — never
+# secrets.SHIFU_S3_ENDPOINT) — each with a non-empty preflight BEFORE
+# `make release` (the T43 pattern for GITEA_TOKEN). rclone is installed
+# (apk add) and in the tool loop, both before `make release`.
 t54=1; why=""
 fail54() { t54=0; why="${why}${why:+; }$1"; }
 grep -qF 'secrets.GH_RELEASE_TOKEN' "$RY" 2>/dev/null \
@@ -1065,8 +1206,17 @@ grep -qF 'secrets.TAURI_SIGNING_PRIVATE_KEY }' "$RY" 2>/dev/null \
     || fail54 "no secrets.TAURI_SIGNING_PRIVATE_KEY mapping"
 grep -qF 'secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD' "$RY" 2>/dev/null \
     || fail54 "no secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD mapping"
+grep -qF 'vars.SHIFU_S3_ENDPOINT' "$RY" 2>/dev/null \
+    || fail54 "no vars.SHIFU_S3_ENDPOINT mapping (a Gitea VARIABLE, not a secret)"
+grep -qF 'secrets.SHIFU_S3_ACCESS_KEY' "$RY" 2>/dev/null \
+    || fail54 "no secrets.SHIFU_S3_ACCESS_KEY mapping"
+grep -qF 'secrets.SHIFU_S3_SECRET_KEY' "$RY" 2>/dev/null \
+    || fail54 "no secrets.SHIFU_S3_SECRET_KEY mapping"
+grep -qF 'secrets.SHIFU_S3_ENDPOINT' "$RY" 2>/dev/null \
+    && fail54 "secrets.SHIFU_S3_ENDPOINT must NOT exist (the endpoint is a variable)"
 mr_line=$(grep -nF -- 'make release' "$RY" 2>/dev/null | head -n 1 | cut -d: -f1)
-for var in GH_RELEASE_TOKEN TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD; do
+for var in GH_RELEASE_TOKEN TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD \
+           SHIFU_S3_ENDPOINT SHIFU_S3_ACCESS_KEY SHIFU_S3_SECRET_KEY; do
     # Single-quoted like T43's tok_re: the pattern must keep \$ (escaped
     # dollar) and \{? / \}? — a double-quoted pattern would turn \$ into a
     # bare mid-pattern $ (an anchor in grep's ERE) and never match.
@@ -1079,10 +1229,17 @@ for var in GH_RELEASE_TOKEN TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_
         fail54 "$var non-empty test is not before make release"
     fi
 done
+apk_line=$(grep -nF -- 'apk add --no-cache rclone' "$RY" 2>/dev/null | head -n 1 | cut -d: -f1)
+[ -n "$apk_line" ] || fail54 "no 'apk add --no-cache rclone' step"
+if [ -n "$apk_line" ] && [ -n "$mr_line" ] && [ "$apk_line" -ge "$mr_line" ]; then
+    fail54 "rclone install (line $apk_line) is not before make release (line $mr_line)"
+fi
+grep -qE 'for[[:space:]]+t[[:space:]]+in[[:space:]]+[^;#]*rclone' "$RY" 2>/dev/null \
+    || fail54 "rclone is not in the preflight tool loop"
 if [ "$t54" -eq 1 ]; then
-    ok "T54 release.yml: GH_RELEASE_TOKEN + TAURI_SIGNING* secrets → env, non-empty preflight before make release"
+    ok "T54 release.yml: GH/TAURI secrets + shifu trio (vars endpoint, secret keys) → env, non-empty preflight + rclone install before make release"
 else
-    bad "T54 release.yml: GH_RELEASE_TOKEN + TAURI_SIGNING* secrets → env, non-empty preflight before make release ($why)"
+    bad "T54 release.yml: GH/TAURI secrets + shifu trio (vars endpoint, secret keys) → env, non-empty preflight + rclone install before make release ($why)"
 fi
 
 # ── J: .dockerignore — the updater signing build context ───────────────────
@@ -1224,6 +1381,407 @@ if [ "$t58" -eq 1 ]; then
     ok "T58 release-publish-github: published release with a size mismatch → fails, names the asset, no uploads"
 else
     bad "T58 release-publish-github: published release with a size mismatch → fails, names the asset, no uploads ($why)"
+fi
+
+# ── K: shifu updater host (release-publish-shifu) ────────────────────────────
+# The public MinIO bucket behind shifu.patchnotes.com: rclone copyto-ONLY
+# (10 immutable assets + SHA256SUMS under peakbot/<v>/, the mutable
+# peakbot/latest.json LAST and only for stable tags), public verification
+# over the public URL before the pointer moves, .healthcheck canary last.
+# Fakes: $D/bin/rclone (argv + RCLONE_* env log, immutable semantics,
+# RCLONE_FAIL_KEY) and the fake curl's shifu branch (serves
+# $SHIFU_FAKE_ROOT by URL path, -I/--head, SHIFU_STALE).
+#
+# T60 (the copy-only invariant) runs at the END of this section: it scans
+# the rclone logs of every dynamic run T61–T71.
+
+mkdir -p "$D/rclone-logs"
+
+# T59: static Makefile contract — the target exists and is .PHONY,
+# UPDATER_BASE_URL is derived from SHIFU_URL/SHIFU_PREFIX, the host literal
+# appears exactly ONCE in the Makefile, `make help` lists the target, and
+# the recipe preconditions rclone.
+t59=1; why=""
+fail59() { t59=0; why="${why}${why:+; }$1"; }
+sed -n '/^\.PHONY:/,/^$/p' "$MK" 2>/dev/null | grep -qF 'release-publish-shifu' \
+    || fail59 "release-publish-shifu is not in .PHONY"
+grep -qE '^release-publish-shifu:' "$MK" 2>/dev/null \
+    || fail59 "no release-publish-shifu target"
+grep -qF 'UPDATER_BASE_URL := $(SHIFU_URL)/$(SHIFU_PREFIX)' "$MK" 2>/dev/null \
+    || fail59 "no 'UPDATER_BASE_URL := \$(SHIFU_URL)/\$(SHIFU_PREFIX)'"
+nhost=$(grep -cF 'https://shifu.patchnotes.com' "$MK" 2>/dev/null || true)
+[ "${nhost:-0}" = "1" ] \
+    || fail59 "https://shifu.patchnotes.com appears ${nhost:-0} times in the Makefile, want exactly 1"
+make help 2>/dev/null | grep -qF 'release-publish-shifu' \
+    || fail59 "make help does not list release-publish-shifu"
+sed -n '/^release-publish-shifu:/,/^##/p' "$MK" 2>/dev/null | grep -qF 'command -v rclone' \
+    || fail59 "the recipe has no 'command -v rclone' precondition"
+if [ "$t59" -eq 1 ]; then
+    ok "T59 Makefile: release-publish-shifu target (.PHONY, shifu vars, host literal once, help, command -v rclone)"
+else
+    bad "T59 Makefile: release-publish-shifu target ($why)"
+fi
+
+# T61: happy path, stable $ST — exactly 12 rclone copyto calls in the fixed
+# order (the 10 assets, then SHA256SUMS, then latest.json LAST), --immutable
+# + --checksum + the immutable Cache-Control on #1-11, the mutable pointer
+# last without --immutable, the stored objects verify, the RCLONE_* env
+# carries the MinIO config, and the public verification ran over the
+# public URL (10 HEADs, the latest.json GET, the canary GET last).
+make_assets "$D/out" "$ST"
+run_shifu "$D/rclone-logs/t61" "$ST"
+L=$D/rclone-logs/t61
+t61=1; why=""
+fail61() { t61=0; why="${why}${why:+; }$1"; }
+[ "$S_RC" -eq 0 ] || fail61 "rc=$S_RC: $(printf '%s' "$S_OUT" | grep '❌' | head -1)"
+ncalls=$(wc -l < "$L" 2>/dev/null | tr -d ' ')
+[ "${ncalls:-0}" = "12" ] || fail61 "rclone calls: ${ncalls:-0}, want 12"
+keys10=""
+i=1
+while [ "$i" -le 10 ]; do
+    k=$(sed -n "${i}p" "$L" 2>/dev/null | awk '{print $NF}')
+    k=${k#shifu:shifu/}
+    [ -n "$k" ] || { fail61 "rclone call #$i missing"; break; }
+    keys10="${keys10}${k}
+"
+    i=$((i+1))
+done
+want10=""
+for n10 in $ASSET10_ST; do want10="${want10}peakbot/$ST/$n10
+"; done
+[ "$(printf '%s' "$keys10" | sort)" = "$(printf '%s' "$want10" | sort)" ] \
+    || fail61 "calls #1-10 are not the 10 peakbot/$ST/<asset> keys"
+k11=$(sed -n '11p' "$L" 2>/dev/null | awk '{print $NF}')
+[ "$k11" = "shifu:shifu/peakbot/$ST/SHA256SUMS" ] \
+    || fail61 "call #11 is '$k11', want shifu:shifu/peakbot/$ST/SHA256SUMS"
+k12=$(sed -n '12p' "$L" 2>/dev/null | awk '{print $NF}')
+[ "$k12" = "shifu:shifu/peakbot/latest.json" ] \
+    || fail61 "call #12 is '$k12', want shifu:shifu/peakbot/latest.json (LAST)"
+i=1
+while [ "$i" -le 11 ]; do
+    line=$(sed -n "${i}p" "$L" 2>/dev/null)
+    printf '%s\n' "$line" | grep -qF -- '--immutable' \
+        || fail61 "call #$i lacks --immutable"
+    printf '%s\n' "$line" | grep -qF -- '--checksum' \
+        || fail61 "call #$i lacks --checksum"
+    printf '%s\n' "$line" | grep -qF 'Cache-Control: public, max-age=31536000, immutable' \
+        || fail61 "call #$i lacks the immutable Cache-Control header"
+    i=$((i+1))
+done
+line12=$(sed -n '12p' "$L" 2>/dev/null)
+printf '%s\n' "$line12" | grep -qF 'Cache-Control: no-cache' \
+    || fail61 "call #12 lacks 'Cache-Control: no-cache'"
+printf '%s\n' "$line12" | grep -qF 'Content-Type: application/json' \
+    || fail61 "call #12 lacks 'Content-Type: application/json'"
+printf '%s\n' "$line12" | grep -qF -- '--immutable' \
+    && fail61 "call #12 (latest.json) must not be --immutable"
+# The stored SHA256SUMS: 10 lines of bare filenames, hashes matching $D/out.
+sums="$SHIFU_FAKE_ROOT/peakbot/$ST/SHA256SUMS"
+[ -f "$sums" ] || fail61 "no stored peakbot/$ST/SHA256SUMS"
+if [ -f "$sums" ]; then
+    [ "$(wc -l < "$sums" | tr -d ' ')" = "10" ] \
+        || fail61 "stored SHA256SUMS has $(wc -l < "$sums") lines, want 10"
+    awk '{ if (NF < 2 || $2 ~ /\//) exit 1 }' "$sums" \
+        || fail61 "stored SHA256SUMS lines are not bare filenames"
+    while read -r h n2; do
+        case $n2 in peakbot-*) p="$D/out/$n2" ;; *) p="$D/out/desktop/$n2" ;; esac
+        [ -f "$p" ] && [ "$(sha256sum "$p" | awk '{print $1}')" = "$h" ] \
+            || fail61 "stored SHA256SUMS hash for $n2 does not match $D/out"
+    done < "$sums"
+fi
+cmp -s "$SHIFU_FAKE_ROOT/peakbot/latest.json" "$D/out/desktop/latest.json" 2>/dev/null \
+    || fail61 "stored peakbot/latest.json is not byte-identical to the local file"
+for e in RCLONE_CONFIG_SHIFU_TYPE=s3 RCLONE_CONFIG_SHIFU_PROVIDER=Minio \
+         RCLONE_CONFIG_SHIFU_ENDPOINT=http://minio.fake:9000 \
+         RCLONE_CONFIG_SHIFU_REGION=us-east-1 \
+         RCLONE_CONFIG_SHIFU_FORCE_PATH_STYLE=true \
+         RCLONE_S3_NO_CHECK_BUCKET=true; do
+    grep -qxF "$e" "$L.env" 2>/dev/null || fail61 "env log lacks $e"
+done
+headn=$(grep -cF "HEAD https://shifu.patchnotes.com/peakbot/$ST/" "$L.curl" 2>/dev/null || true)
+[ "${headn:-0}" = "10" ] || fail61 "curl log: ${headn:-0} HEAD …/peakbot/$ST/ lines, want 10"
+grep -qF "GET https://shifu.patchnotes.com/peakbot/latest.json" "$L.curl" 2>/dev/null \
+    || fail61 "curl log: no GET of /peakbot/latest.json"
+lastsh=$(grep -F 'shifu.patchnotes.com' "$L.curl" 2>/dev/null | tail -n 1)
+[ "$lastsh" = "GET https://shifu.patchnotes.com/.healthcheck" ] \
+    || fail61 "last shifu curl line is '$lastsh', want the .healthcheck canary GET"
+if [ "$t61" -eq 1 ]; then
+    ok "T61 release-publish-shifu: happy path (12 copyto in order, immutable flags, stored objects verify, env config, public verification)"
+else
+    bad "T61 release-publish-shifu: happy path ($why)"
+fi
+
+# T62: no secret leaks — shifu-secret-xyz appears ONLY in the rclone env log
+# (as RCLONE_CONFIG_SHIFU_SECRET_ACCESS_KEY): never in stdout/stderr, the
+# rclone argv log, the curl log, or `make -n` output.
+run_shifu "$D/rclone-logs/t62" "$ST"
+L=$D/rclone-logs/t62
+t62=1; why=""
+fail62() { t62=0; why="${why}${why:+; }$1"; }
+[ "$S_RC" -eq 0 ] || fail62 "rc=$S_RC: $(printf '%s' "$S_OUT" | grep '❌' | head -1)"
+printf '%s' "$S_OUT" | grep -qF 'shifu-secret-xyz' \
+    && fail62 "secret leaked into stdout/stderr"
+grep -qF 'shifu-secret-xyz' "$L" 2>/dev/null \
+    && fail62 "secret leaked into the rclone argv log"
+grep -qF 'shifu-secret-xyz' "$L.curl" 2>/dev/null \
+    && fail62 "secret leaked into the curl log"
+mn_out=$( cd "$root" && \
+  SHIFU_S3_ENDPOINT=http://minio.fake:9000 SHIFU_S3_ACCESS_KEY=AKfake \
+  SHIFU_S3_SECRET_KEY=shifu-secret-xyz \
+  make -n release-publish-shifu TAG="$ST" OUTPUT_DIR="$D/out" 2>&1 )
+printf '%s' "$mn_out" | grep -qF 'shifu-secret-xyz' \
+    && fail62 "secret leaked into 'make -n' output"
+grep -qxF 'RCLONE_CONFIG_SHIFU_SECRET_ACCESS_KEY=shifu-secret-xyz' "$L.env" 2>/dev/null \
+    || fail62 "env log lacks RCLONE_CONFIG_SHIFU_SECRET_ACCESS_KEY=shifu-secret-xyz"
+if [ "$t62" -eq 1 ]; then
+    ok "T62 release-publish-shifu: no secret leaks (only the rclone env log carries it)"
+else
+    bad "T62 release-publish-shifu: no secret leaks ($why)"
+fi
+
+# T63: prerelease tag 0.9.0-rc.1 — 11 calls, NO call targets
+# peakbot/latest.json, no top-level latest.json in the bucket, output
+# mentions prerelease.
+make_assets "$D/out" 0.9.0-rc.1
+# A FRESH bucket: T61 (stable) already wrote peakbot/latest.json into the
+# shared one, which would make "no top-level latest.json" unsatisfiable.
+SHIFU_ROOT_MAIN=$SHIFU_FAKE_ROOT
+SHIFU_FAKE_ROOT=$D/shifu-rc; mkdir -p "$SHIFU_FAKE_ROOT"
+run_shifu "$D/rclone-logs/t63" 0.9.0-rc.1
+rc_root=$SHIFU_FAKE_ROOT
+SHIFU_FAKE_ROOT=$SHIFU_ROOT_MAIN
+L=$D/rclone-logs/t63
+t63=1; why=""
+fail63() { t63=0; why="${why}${why:+; }$1"; }
+[ "$S_RC" -eq 0 ] || fail63 "rc=$S_RC: $(printf '%s' "$S_OUT" | grep '❌' | head -1)"
+ncalls=$(wc -l < "$L" 2>/dev/null | tr -d ' ')
+[ "${ncalls:-0}" = "11" ] || fail63 "rclone calls: ${ncalls:-0}, want 11"
+grep -qF 'shifu:shifu/peakbot/latest.json' "$L" 2>/dev/null \
+    && fail63 "a call targets peakbot/latest.json for a prerelease tag"
+[ ! -e "$rc_root/peakbot/latest.json" ] \
+    || fail63 "top-level latest.json exists in the bucket after a prerelease run"
+printf '%s' "$S_OUT" | grep -qi 'prerelease' \
+    || fail63 "output does not mention prerelease"
+if [ "$t63" -eq 1 ]; then
+    ok "T63 release-publish-shifu: prerelease tag → 11 calls, latest.json untouched"
+else
+    bad "T63 release-publish-shifu: prerelease tag ($why)"
+fi
+
+# T64: preconditions before ANY network — empty SHIFU_S3_ENDPOINT, empty
+# SHIFU_S3_ACCESS_KEY, empty SHIFU_S3_SECRET_KEY, TAG=../evil, empty TAG:
+# each → non-zero, EMPTY rclone and curl logs, message naming the variable
+# or TAG.
+make_assets "$D/out" "$ST"
+t64=1; why64=""
+fail64() { t64=0; why64="${why64}${why64:+; }$1"; }
+check64() { # $1 = log basename, $2 = pattern the failure message must match
+    [ "$S_RC" -ne 0 ] || { fail64 "$1: rc=0"; return; }
+    [ ! -s "$D/rclone-logs/$1" ] || fail64 "$1: rclone log not empty"
+    [ ! -s "$D/rclone-logs/$1.curl" ] || fail64 "$1: curl log not empty"
+    printf '%s' "$S_OUT" | grep -q "$2" || fail64 "$1: message does not name ($2)"
+}
+run_shifu "$D/rclone-logs/t64-se" "$ST" "SE=";    check64 t64-se 'SHIFU_S3_ENDPOINT'
+run_shifu "$D/rclone-logs/t64-sa" "$ST" "SA=";    check64 t64-sa 'SHIFU_S3_ACCESS_KEY'
+run_shifu "$D/rclone-logs/t64-ss" "$ST" "SS=";    check64 t64-ss 'SHIFU_S3_SECRET_KEY'
+run_shifu "$D/rclone-logs/t64-tag" "../evil";     check64 t64-tag 'TAG'
+run_shifu "$D/rclone-logs/t64-empty" "";          check64 t64-empty 'TAG'
+if [ "$t64" -eq 1 ]; then
+    ok "T64 release-publish-shifu: preconditions (creds, TAG shape) fail before any network"
+else
+    bad "T64 release-publish-shifu: preconditions fail before any network ($why64)"
+fi
+
+# T65: a release asset missing → non-zero, message names it, ZERO rclone
+# and curl calls.
+make_assets "$D/out" "$ST"
+rm -f "$D/out/desktop/PeakBot-Desktop-$ST-macos-universal.app.tar.gz"
+run_shifu "$D/rclone-logs/t65" "$ST"
+t65=1; why=""
+[ "$S_RC" -ne 0 ] || { t65=0; why="rc=0"; }
+[ ! -s "$D/rclone-logs/t65" ] || { t65=0; why="${why}${why:+; }rclone log not empty"; }
+[ ! -s "$D/rclone-logs/t65.curl" ] || { t65=0; why="${why}${why:+; }curl log not empty"; }
+printf '%s' "$S_OUT" | grep -qF "PeakBot-Desktop-$ST-macos-universal.app.tar.gz" \
+    || { t65=0; why="${why}${why:+; }message does not name the asset"; }
+make_assets "$D/out" "$ST"   # restore for the later runs
+if [ "$t65" -eq 1 ]; then
+    ok "T65 release-publish-shifu: missing asset → fails, names it, zero calls"
+else
+    bad "T65 release-publish-shifu: missing asset ($why)"
+fi
+
+# T66: the canary is broken (.healthcheck = "nope") → non-zero, message
+# names .healthcheck. The seed is overwritten for this run and restored.
+make_assets "$D/out" "$ST"
+printf 'nope' > "$SHIFU_FAKE_ROOT/.healthcheck"
+run_shifu "$D/rclone-logs/t66" "$ST"
+printf 'shifu-ok' > "$SHIFU_FAKE_ROOT/.healthcheck"   # restore the canary
+t66=1; why=""
+[ "$S_RC" -ne 0 ] || { t66=0; why="rc=0 despite a broken canary"; }
+printf '%s' "$S_OUT" | grep -qF '.healthcheck' \
+    || { t66=0; why="${why}${why:+; }message does not name .healthcheck"; }
+if [ "$t66" -eq 1 ]; then
+    ok "T66 release-publish-shifu: broken .healthcheck canary → fails, names it"
+else
+    bad "T66 release-publish-shifu: broken .healthcheck canary ($why)"
+fi
+
+# T67: idempotent — a second identical run on the same fake root → rc 0.
+run_shifu "$D/rclone-logs/t67" "$ST"
+if [ "$S_RC" -eq 0 ]; then
+    ok "T67 release-publish-shifu: re-run with identical bytes → rc 0 (idempotent)"
+else
+    bad "T67 release-publish-shifu: re-run with identical bytes → rc 0 (rc=$S_RC: $(printf '%s' "$S_OUT" | grep '❌' | head -1))"
+fi
+
+# T68: immutable — after a successful run, one asset's bytes change →
+# non-zero, 'immutable' in the output, NO latest.json call in that run,
+# the stored object unchanged.
+make_assets "$D/out" "$ST"
+cp "$D/out/peakbot-$ST-linux-amd64" "$D/t68-pristine"
+printf 'tampered-bytes' > "$D/out/peakbot-$ST-linux-amd64"
+run_shifu "$D/rclone-logs/t68" "$ST"
+L=$D/rclone-logs/t68
+t68=1; why=""
+fail68() { t68=0; why="${why}${why:+; }$1"; }
+[ "$S_RC" -ne 0 ] || fail68 "rc=0 despite a tampered immutable asset"
+printf '%s' "$S_OUT" | grep -qi 'immutable' \
+    || fail68 "output does not mention immutable"
+grep -qF 'shifu:shifu/peakbot/latest.json' "$L" 2>/dev/null \
+    && fail68 "latest.json was written despite the failure"
+cmp -s "$SHIFU_FAKE_ROOT/peakbot/$ST/peakbot-$ST-linux-amd64" "$D/t68-pristine" \
+    || fail68 "stored object changed"
+cp "$D/t68-pristine" "$D/out/peakbot-$ST-linux-amd64"   # restore
+if [ "$t68" -eq 1 ]; then
+    ok "T68 release-publish-shifu: changed immutable bytes → fails, pointer not moved, object unchanged"
+else
+    bad "T68 release-publish-shifu: changed immutable bytes ($why)"
+fi
+
+# T69: mid-upload failure (the 3rd asset in Makefile RELEASE_ASSETS order —
+# the Linux AppImage) → non-zero, the failing upload was attempted, the run
+# stops there (exactly 3 calls — no further uploads), NO SHA256SUMS call,
+# NO latest.json call.
+make_assets "$D/out" "$ST"
+run_shifu "$D/rclone-logs/t69" "$ST" "RCLONE_FAIL_KEY=peakbot/$ST/PeakBot-Desktop-$ST-linux-x86_64.AppImage"
+L=$D/rclone-logs/t69
+t69=1; why=""
+fail69() { t69=0; why="${why}${why:+; }$1"; }
+[ "$S_RC" -ne 0 ] || fail69 "rc=0 despite a failed upload"
+grep -qF "shifu:shifu/peakbot/$ST/PeakBot-Desktop-$ST-linux-x86_64.AppImage" "$L" 2>/dev/null \
+    || fail69 "failing upload never attempted"
+ncalls=$(wc -l < "$L" 2>/dev/null | tr -d ' ')
+[ "${ncalls:-0}" = "3" ] || fail69 "rclone calls: ${ncalls:-0}, want 3 (stop at the first failure)"
+grep -qF "shifu:shifu/peakbot/$ST/SHA256SUMS" "$L" 2>/dev/null \
+    && fail69 "SHA256SUMS uploaded after a failed asset"
+grep -qF "shifu:shifu/peakbot/latest.json" "$L" 2>/dev/null \
+    && fail69 "latest.json moved after a failed asset"
+if [ "$t69" -eq 1 ]; then
+    ok "T69 release-publish-shifu: mid-upload failure → no SHA256SUMS, no latest.json"
+else
+    bad "T69 release-publish-shifu: mid-upload failure ($why)"
+fi
+
+# T70: stale edge — the public latest.json serves "stale" → non-zero,
+# message names latest.json.
+run_shifu "$D/rclone-logs/t70" "$ST" "SHIFU_STALE=peakbot/latest.json"
+t70=1; why=""
+[ "$S_RC" -ne 0 ] || { t70=0; why="rc=0 despite a stale public latest.json"; }
+printf '%s' "$S_OUT" | grep -qF 'latest.json' \
+    || { t70=0; why="${why}${why:+; }message does not name latest.json"; }
+if [ "$t70" -eq 1 ]; then
+    ok "T70 release-publish-shifu: stale public latest.json → fails, names it"
+else
+    bad "T70 release-publish-shifu: stale public latest.json ($why)"
+fi
+
+# T70b (extra): the public SHA256SUMS differs from the local one (stale
+# edge) → non-zero, message names SHA256SUMS, and the pointer is NOT moved.
+run_shifu "$D/rclone-logs/t70b" "$ST" "SHIFU_STALE=peakbot/$ST/SHA256SUMS"
+t70b=1; why=""
+[ "$S_RC" -ne 0 ] || { t70b=0; why="rc=0 despite a stale public SHA256SUMS"; }
+printf '%s' "$S_OUT" | grep -qF 'SHA256SUMS' \
+    || { t70b=0; why="${why}${why:+; }message does not name SHA256SUMS"; }
+grep -qF 'shifu:shifu/peakbot/latest.json' "$D/rclone-logs/t70b" 2>/dev/null \
+    && { t70b=0; why="${why}${why:+; }latest.json moved despite the SHA256SUMS mismatch"; }
+if [ "$t70b" -eq 1 ]; then
+    ok "T70b release-publish-shifu: public SHA256SUMS mismatch → fails, names it, pointer not moved"
+else
+    bad "T70b release-publish-shifu: public SHA256SUMS mismatch ($why)"
+fi
+
+# T70c (extra): an asset's PUBLIC content-length differs from the local file
+# size → non-zero, message names the asset, the pointer is NOT moved.
+run_shifu "$D/rclone-logs/t70c" "$ST" "SHIFU_STALE=peakbot/$ST/peakbot-$ST-linux-amd64"
+t70c=1; why=""
+[ "$S_RC" -ne 0 ] || { t70c=0; why="rc=0 despite a public size mismatch"; }
+printf '%s' "$S_OUT" | grep -qF "peakbot-$ST-linux-amd64" \
+    || { t70c=0; why="${why}${why:+; }message does not name the asset"; }
+grep -qF 'shifu:shifu/peakbot/latest.json' "$D/rclone-logs/t70c" 2>/dev/null \
+    && { t70c=0; why="${why}${why:+; }latest.json moved despite the size mismatch"; }
+if [ "$t70c" -eq 1 ]; then
+    ok "T70c release-publish-shifu: public size ≠ local → fails, names the asset, pointer not moved"
+else
+    bad "T70c release-publish-shifu: public size ≠ local ($why)"
+fi
+
+# T71: threading — the shifu base URL flows make desktop-updater →
+# build-desktop.sh → Dockerfile.desktop-updater, and GH_MIRROR_REPO is
+# gone from both desktop-updater files.
+t71=1; why=""
+fail71() { t71=0; why="${why}${why:+; }$1"; }
+n_out=$(make -n desktop-updater 2>&1)
+printf '%s\n' "$n_out" | grep -qF 'UPDATER_BASE_URL="https://shifu.patchnotes.com/peakbot"' \
+    || fail71 "'make -n desktop-updater' lacks UPDATER_BASE_URL=\"https://shifu.patchnotes.com/peakbot\""
+grep -qF -- '--build-arg UPDATER_BASE_URL=' desktop/scripts/build-desktop.sh 2>/dev/null \
+    || fail71 "build-desktop.sh lacks '--build-arg UPDATER_BASE_URL='"
+grep -qF '"${UPDATER_BASE_URL}/${VERSION}"' Dockerfile.desktop-updater 2>/dev/null \
+    || fail71 'Dockerfile.desktop-updater lacks "${UPDATER_BASE_URL}/${VERSION}"'
+grep -qF 'GH_MIRROR_REPO' desktop/scripts/build-desktop.sh 2>/dev/null \
+    && fail71 "build-desktop.sh still references GH_MIRROR_REPO"
+grep -qF 'GH_MIRROR_REPO' Dockerfile.desktop-updater 2>/dev/null \
+    && fail71 "Dockerfile.desktop-updater still references GH_MIRROR_REPO"
+if [ "$t71" -eq 1 ]; then
+    ok "T71 desktop-updater: UPDATER_BASE_URL threaded (make → build-desktop.sh → Dockerfile), GH_MIRROR_REPO gone"
+else
+    bad "T71 desktop-updater: UPDATER_BASE_URL threaded ($why)"
+fi
+
+# T60: the copy-only invariant (runs LAST — it scans the rclone logs of
+# T61–T71). Static: the Makefile never calls a destructive or verbose
+# rclone subcommand (no sync/copy/move/delete/deletefile/purge/rmdir/
+# cleanup, no -vv/--dump). Dynamic: across every rclone log of the dynamic
+# runs, every call's first word is `copyto` and no key is .healthcheck.
+t60=1; why=""
+fail60() { t60=0; why="${why}${why:+; }$1"; }
+# Comment lines (incl. `# …` inside a continued recipe) may mention the
+# forbidden words in prose — only code lines count.
+mk_code=$(grep -v -E '^[[:space:]]*#' "$MK" 2>/dev/null)
+printf '%s\n' "$mk_code" | grep -q 'rclone' \
+    || fail60 "the Makefile never calls rclone (release-publish-shifu absent)"
+printf '%s\n' "$mk_code" | grep -E -q 'rclone[[:space:]]+(sync|copy[[:space:]]|move|delete|deletefile|purge|rmdir|cleanup)' \
+    && fail60 "Makefile calls a forbidden rclone subcommand"
+printf '%s\n' "$mk_code" | grep -F 'rclone' | grep -E -q '(-vv|--dump)' \
+    && fail60 "Makefile uses -vv/--dump with rclone"
+printf '%s\n' "$mk_code" | grep -E -q '(^|[[:space:];])set[[:space:]]+-[a-z]*x' \
+    && fail60 "Makefile uses set -x (would print the secret environment)"
+# Non-vacuity: the happy-path run must really have called rclone.
+[ -s "$D/rclone-logs/t61" ] \
+    || fail60 "no rclone call was logged by the T61 happy path (nothing to scan)"
+for L in "$D"/rclone-logs/t[67]*; do
+    case $L in *.curl|*.env) continue ;; esac
+    [ -f "$L" ] || continue
+    if grep -q -v -E '^copyto[[:space:]]' "$L" 2>/dev/null; then
+        badline=$(grep -v -E '^copyto[[:space:]]' "$L" 2>/dev/null | head -n 1)
+        fail60 "non-copyto rclone call in $L: $badline"
+    fi
+    grep -qF '.healthcheck' "$L" 2>/dev/null \
+        && fail60 "a rclone call targets .healthcheck in $L"
+done
+if [ "$t60" -eq 1 ]; then
+    ok "T60 release-publish-shifu: copy-only (no destructive/verbose rclone; every call copyto, never .healthcheck)"
+else
+    bad "T60 release-publish-shifu: copy-only ($why)"
 fi
 
 # ── Summary ────────────────────────────────────────────────────────────────
