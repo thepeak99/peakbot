@@ -2675,7 +2675,7 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
         }
 
         if let Some(ref sender) = self.event_sender {
-            // Emit event with per-request token counts; cost is computed in CostHandler.
+            // Emit event with per-request token counts; no cost model, so cost rides at 0.0.
             let event = AgentEvent::CompletionResponse {
                 content: parts.text,
                 reasoning: parts.reasoning,
@@ -2684,7 +2684,7 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
                     input_tokens,
                     output_tokens: usage.output_tokens,
                     total_tokens: input_tokens + usage.output_tokens,
-                    cost: 0.0, // Cost = 0 here, calculated by CostHandler
+                    cost: 0.0, // no cost model in live events
                     generation,
                 },
                 timestamp: Utc::now(),
