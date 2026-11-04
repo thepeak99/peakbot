@@ -57,7 +57,7 @@ W=$(mktemp -d); workdirs="$workdirs $W"
 # A version that is NOT the repo's current one: the contract must be
 # version-independent (the script takes <version> as an argument).
 V=0.25.0
-BASE="https://github.com/thepeak99/peakbot/releases/download/$V"
+BASE="https://shifu.patchnotes.com/peakbot/$V"
 
 # setup <dir> <version> — the three artifacts + three .sig files + notes.
 setup() {
@@ -244,7 +244,7 @@ fi
 
 # T14: a prerelease version (0.25.0-rc.1) works the same as stable.
 PV=0.25.0-rc.1
-PBASE="https://github.com/thepeak99/peakbot/releases/download/$PV"
+PBASE="https://shifu.patchnotes.com/peakbot/$PV"
 setup "$W/pre" "$PV"
 run_um "$W/pre" "$PV" "$PBASE" "$W/pre/notes.md"
 PJ="$W/pre/latest.json"

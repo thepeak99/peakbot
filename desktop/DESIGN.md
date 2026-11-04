@@ -1458,11 +1458,20 @@ Windows thumbprint match, tls off, Linux no-op, missing/garbage CA, service mode
 **Reason.** Released builds should update themselves (v1's "no auto-updater"
 decision, §2, is superseded).
 
-**Source.** The public GitHub mirror —
-`https://github.com/thepeak99/peakbot/releases/latest/download/latest.json`
+**Source.** The public shifu bucket (MinIO, anonymous read) —
+`https://shifu.patchnotes.com/peakbot/latest.json`
 (`plugins.updater.endpoints` in `tauri.conf.json`, minisign `pubkey` in the
-same file). No token in the app; the Gitea push-mirror syncs refs only, the
-pipeline publishes the release (agents.md, "Release pipeline").
+same file). No token in the app; the pipeline uploads each release to the
+bucket (agents.md, "Release pipeline").
+
+**Bridge note (2026-11-04).** Versions up to 0.26.1 were built against the
+GitHub mirror endpoint
+(`https://github.com/thepeak99/peakbot/releases/latest/download/latest.json`),
+so they can only discover an update there. 0.26.2 is the bridge release: its
+`latest.json` points the download URLs at shifu, and it is published to Gitea,
+shifu **and** GitHub, so those clients find it on GitHub and fetch it from
+shifu. From 0.26.2 on the app checks shifu itself; the GitHub publishing step
+is removed in a later PR.
 
 **Supported bundles.** Linux AppImage, the Windows NSIS-installed `setup.exe`,
 macOS `.app`. The Windows **portable** exe and **dev** builds are excluded —
@@ -1515,8 +1524,8 @@ minisign 0.11): `tauri signer sign --app-version <v>` on the AppImage,
 against the pubkey in `tauri.conf.json` (missing/empty sig = build failure);
 then `desktop/scripts/updater-manifest.sh` writes `latest.json` (platforms
 `linux-x86_64`, `windows-x86_64`, `darwin-x86_64` + `darwin-aarch64` —
-identical universal tarball + signature for the darwin pair; base URL = the
-mirror's `releases/download/<v>`). The private key enters only as a BuildKit
+identical universal tarball + signature for the darwin pair; base URL =
+`<UPDATER_BASE_URL>/<v>`, i.e. the shifu bucket's `peakbot/<v>/`). The private key enters only as a BuildKit
 secret from `TAURI_SIGNING_PRIVATE_KEY(_PASSWORD)` — never a layer, never a
 log.
 

@@ -62,7 +62,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 RUN npm install -g @tauri-apps/cli@2.12.3
 
 ARG VERSION
-ARG GH_MIRROR_REPO=thepeak99/peakbot
+ARG UPDATER_BASE_URL
 
 # The three update artifacts (staged in output/desktop/ by the desktop
 # pipelines — names must match build-desktop.sh).
@@ -78,6 +78,7 @@ COPY ${NOTES} /src/notes.md
 RUN --mount=type=secret,id=tauri_key \
     --mount=type=secret,id=tauri_key_pw \
     set -eu; \
+    [ -n "${UPDATER_BASE_URL:-}" ] || { echo "❌ UPDATER_BASE_URL build-arg is empty" >&2; exit 1; }; \
     [ -s /run/secrets/tauri_key ] \
         || { echo "❌ TAURI_SIGNING_PRIVATE_KEY is empty/missing — pass --secret id=tauri_key,src=<keyfile>" >&2; exit 1; }; \
     [ -s /run/secrets/tauri_key_pw ] \
@@ -107,7 +108,7 @@ RUN --mount=type=secret,id=tauri_key \
     rm -f /tmp/verify.msig /tmp/updater.pub; \
     echo "📄 Building latest.json..."; \
     sh /src/updater-manifest.sh "${VERSION}" /artifacts \
-        "https://github.com/${GH_MIRROR_REPO}/releases/download/${VERSION}" /src/notes.md; \
+        "${UPDATER_BASE_URL}/${VERSION}" /src/notes.md; \
     mkdir -p /out; \
     cp /artifacts/*.sig /out/; \
     cp /artifacts/latest.json /out/
