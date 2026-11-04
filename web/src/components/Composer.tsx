@@ -33,9 +33,11 @@
 // type. Each uploads immediately (`useAttachments`, owned by ComposerSlot — one
 // per tab) and shows as a chip above the input; submit sends only the uploaded
 // ids, never bytes. Send is blocked until every chip is done and none is in
-// error.
+// error. Linux desktop app: an image-only paste with no file data falls back
+// to `readClipboardImage()` (WebKit Bug 218519).
 
 import { useRef, useState, useLayoutEffect } from "react";
+import { isDesktop, readClipboardImage } from "../desktop";
 import type { SlashCommand } from "../state";
 import type { SubAgentRun } from "../types";
 import type { Attachments } from "../useAttachments";
@@ -192,7 +194,20 @@ export function Composer({
     if (list.length > 0) {
       e.preventDefault();
       attachments.add(list);
+      return;
     }
+    // Linux desktop app: WebKitGTK ≤ 2.50 hands paste events no image data
+    // (WebKit Bug 218519), so ask the app for the clipboard image. A paste
+    // carrying text keeps the default; nothing is prevented — with no files
+    // and no text the default inserts nothing.
+    if (!isDesktop() || !/Linux/.test(navigator.userAgent)) return;
+    if (cd.types.includes("text/plain")) return;
+    readClipboardImage().then(
+      (file) => {
+        if (file) attachments.add([file]);
+      },
+      () => {}, // older app / command unavailable: today's no-op
+    );
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {

@@ -165,7 +165,8 @@ fn main() {
             commands::theme_set,
             commands::theme_get,
             commands::update_status,
-            commands::update_install
+            commands::update_install,
+            commands::clipboard_image_png
         ])
         .setup(|app| {
             let handle = app.handle().clone();

@@ -2619,6 +2619,7 @@ name = "peakbot-desktop"
 version = "0.26.2"
 dependencies = [
  "gio",
+ "gtk",
  "libc",
  "log",
  "peakbot-desktop-core",

@@ -276,13 +276,15 @@ apply "on next /new" vs "restart required" (the server computes the boot-only
 list — the client keeps none). The gear is hidden when the active profile's
 `ui.tabs` filters out the `settings` tab, and the whole settings API is refused
 under a `--profile` pin. In the desktop app the web UI additionally gets
-**exactly three loopback-only IPC commands** (`theme_set`, `update_status`,
-`update_install`) granted to the `:7823` backend by the `remote-web` capability
-(`desktop/src-tauri/capabilities/remote-web.json`) — `theme_set` reports the web
-theme so the desktop's bundled pages follow it, and `update_status` /
-`update_install` drive the in-app **Update available** banner (slim bar under
-the top bar; polls `update_status` every 30 s; click = download, install,
-restart; dismissible until the version changes) — nothing else reaches the web
+**exactly four loopback-only IPC commands** (`theme_set`, `update_status`,
+`update_install`, `clipboard_image_png`) granted to the `:7823` backend by the
+`remote-web` capability (`desktop/src-tauri/capabilities/remote-web.json`) —
+`theme_set` reports the web theme so the desktop's bundled pages follow it,
+`update_status` / `update_install` drive the in-app **Update available** banner
+(slim bar under the top bar; polls `update_status` every 30 s; click =
+download, install, restart; dismissible until the version changes), and
+`clipboard_image_png` returns the clipboard image as PNG for the Linux paste
+fallback (WebKitGTK ≤ 2.50, WebKit Bug 218519) — nothing else reaches the web
 origin. The web-server settings live in Settings → General.
 
 **First run**: with no global config (or a failed migration) the chat is
