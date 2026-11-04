@@ -16,6 +16,10 @@
 //   - files AND items both list the same file (Chrome does this) → added ONCE.
 //   - non-image files    → same path as attached files (no image-only filter).
 //   - limits (max_files / max_file_mb) are enforced by the existing add() logic.
+//   - empty paste on the Linux desktop app (no files, no items, no text)
+//     → readClipboardImage() fallback: a File → add([file]) through the
+//       SAME path; null (0 bytes) or a rejection (older app) → nothing
+//       (WebKit Bug 218519: WebKitGTK ≤ 2.50 hands paste events no image).
 //
 // Two layers:
 //   1. <Composer> with a fake `attachments` api  → "calls add with the Files".
@@ -373,6 +377,158 @@ describe("Composer paste — files only reachable via clipboardData.items", () =
 
     expect(add).toHaveBeenCalledTimes(1);
     expect(add).toHaveBeenCalledWith([shot]);
+  });
+});
+
+// ─── Linux desktop clipboard fallback (WebKit Bug 218519) ────────────────
+// WebKitGTK ≤ 2.50 (the bundled desktop) never exposes a clipboard image
+// to DOM paste events, so an empty paste (no files, no items, no text)
+// on the Linux desktop app asks the app for the clipboard image via
+// readClipboardImage() (`clipboard_image_png` IPC): a File → add([file])
+// through the SAME path; null (0 bytes) or a rejection (older app) →
+// nothing. Never preventDefault — the default for a paste with no files
+// and no text inserts nothing.
+//
+// RED today: Composer.onPaste has no Linux fallback, so L1/L2/L3/L8 fail
+// (the IPC is never called). L4–L7 are regression guards and are green
+// before the implementation.
+//
+// The UA is ALWAYS stubbed: jsdom's default UA is "(linux)" on Linux CI
+// and "(darwin)" on a Mac, so leaving it unstubbed is non-deterministic.
+
+const WEBKITGTK_UA =
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko)";
+
+describe("Composer paste — Linux desktop clipboard fallback (WebKit Bug 218519)", () => {
+  let invoke: ReturnType<typeof vi.fn>;
+  let uaSpy: ReturnType<typeof vi.spyOn>;
+
+  // Settle the fire-and-forget readClipboardImage().then(…) chain after
+  // paste() so the attachment lands inside act.
+  const flush = () => act(async () => {});
+
+  beforeEach(() => {
+    (globalThis as { isTauri?: unknown }).isTauri = true;
+    invoke = vi.fn(async () => new Uint8Array([1, 2, 3]).buffer);
+    (globalThis as { __TAURI__?: unknown }).__TAURI__ = { core: { invoke } };
+    uaSpy = vi.spyOn(navigator, "userAgent", "get").mockReturnValue(WEBKITGTK_UA);
+  });
+
+  afterEach(() => {
+    delete (globalThis as { isTauri?: unknown }).isTauri;
+    delete (globalThis as { __TAURI__?: unknown }).__TAURI__;
+    vi.restoreAllMocks();
+  });
+
+  it("an empty paste on the Linux desktop adds the clipboard image as pasted-image.png", async () => {
+    const add = vi.fn();
+    const ta = await mountComposer(add);
+
+    const ev = await paste(ta, {});
+    await flush();
+
+    expect(add).toHaveBeenCalledTimes(1);
+    const passed = add.mock.calls[0][0] as File[];
+    expect(passed).toHaveLength(1);
+    expect(passed[0].name).toBe("pasted-image.png");
+    expect(passed[0].type).toBe("image/png");
+    expect(passed[0].size).toBe(3);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith("clipboard_image_png");
+    expect(ev.defaultPrevented).toBe(false);
+  });
+
+  it("an empty clipboard image (0 bytes) adds nothing", async () => {
+    invoke.mockImplementation(async () => new ArrayBuffer(0));
+    const add = vi.fn();
+    const ta = await mountComposer(add);
+
+    await paste(ta, {});
+    await flush();
+
+    expect(add).not.toHaveBeenCalled();
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it("a rejected command (older app) adds nothing and does not throw", async () => {
+    // The rejection is swallowed by the fallback; Vitest's
+    // unhandled-rejection check is the "does not throw" proof.
+    invoke.mockImplementation(async () => {
+      throw "command clipboard_image_png not found";
+    });
+    const add = vi.fn();
+    const ta = await mountComposer(add);
+
+    await paste(ta, {});
+    await flush();
+
+    expect(add).not.toHaveBeenCalled();
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it("a paste with text keeps the default and never asks the app", async () => {
+    const add = vi.fn();
+    const ta = await mountComposer(add);
+
+    const ev = await paste(ta, { text: "hi" });
+    await flush();
+
+    expect(invoke).not.toHaveBeenCalled();
+    expect(ev.defaultPrevented).toBe(false);
+  });
+
+  it("a paste with files uses the files and never asks the app", async () => {
+    const add = vi.fn();
+    const ta = await mountComposer(add);
+    const shot = png();
+
+    await paste(ta, { files: [shot] });
+    await flush();
+
+    expect(add).toHaveBeenCalledWith([shot]);
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("in a browser an empty paste never asks the app", async () => {
+    delete (globalThis as { isTauri?: unknown }).isTauri;
+    const add = vi.fn();
+    const ta = await mountComposer(add);
+
+    await paste(ta, {});
+    await flush();
+
+    expect(invoke).not.toHaveBeenCalled();
+    expect(add).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      "macOS",
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)",
+    ],
+    [
+      "Windows",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
+    ],
+  ])("on the %s desktop app an empty paste never asks the app", async (_os, ua) => {
+    uaSpy.mockReturnValue(ua);
+    const add = vi.fn();
+    const ta = await mountComposer(add);
+
+    await paste(ta, {});
+    await flush();
+
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("a Linux-desktop clipboard image becomes a chip and starts an upload", async () => {
+    const ta = await mountSlot();
+
+    await paste(ta, {});
+    await flush();
+
+    expect(uploads).toHaveLength(1);
+    expect(uploads[0].file.name).toBe("pasted-image.png");
   });
 });
 

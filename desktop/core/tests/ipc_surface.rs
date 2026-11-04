@@ -1,8 +1,8 @@
 //! Static surface test for the scoped-remote-IPC design (desktop
-//! auto-update plan, section "Glue"): the PeakBot web UI runs on the
-//! default loopback backend and may do exactly THREE things from a
-//! remote origin — `theme_set`, `update_status`, `update_install` —
-//! and NOTHING ELSE, ever.
+//! auto-update plan, section "Glue"; §15 amendment): the PeakBot web
+//! UI runs on the default loopback backend and may do exactly FOUR
+//! things from a remote origin — `theme_set`, `update_status`,
+//! `update_install`, `clipboard_image_png` — and NOTHING ELSE, ever.
 //!
 //! The enforcement lives in the committed Tauri files, so this test
 //! reads them as text/JSON (no Tauri, no GUI, no network, no
@@ -14,10 +14,10 @@
 //!     - remote URLs: exactly the four loopback URLPattern entries on
 //!       the desktop's fixed port (`…:7823/*`, never `/**`)
 //!     - permissions: exactly `allow-theme-set`, `allow-update-status`,
-//!       `allow-update-install` — never `allow-act` / `allow-status`
-//!       (the status page stays a local page; `act` carries `quit`),
-//!       never `allow-theme-get`, never the deleted
-//!       `allow-settings-get` / `allow-toggle-background`
+//!       `allow-update-install`, `allow-clipboard-image-png` — never
+//!       `allow-act` / `allow-status` (the status page stays a local
+//!       page; `act` carries `quit`), never `allow-theme-get`, never
+//!       the deleted `allow-settings-get` / `allow-toggle-background`
 //!
 //!   `desktop/src-tauri/capabilities/local-pages.json`
 //!     - unchanged: NO `remote` key (local-only capability),
@@ -46,14 +46,20 @@
 //!       the settings permission files are deleted
 //!
 //!   `desktop/src-tauri/build.rs`
-//!     - AppManifest commands: exactly `act`, `status`, `theme_get`,
-//!       `theme_set`, `update_install`, `update_status`
+//!     - AppManifest commands: exactly `act`, `clipboard_image_png`,
+//!       `status`, `theme_get`, `theme_set`, `update_install`,
+//!       `update_status`
 //!
-//! RED before implementation: `remote-web.json` does not exist yet
-//! (the old `remote-theme.json` still does), `tauri.conf.json` still
-//! lists `remote-theme` and has no `plugins.updater`, and `build.rs`
-//! still lists only the four old commands — so the assertions below
-//! fail for exactly the "change absent" reasons, file by file.
+//!   `desktop/src-tauri/src/main.rs`
+//!     - `generate_handler![…]` registers exactly the same seven
+//!       commands (forgetting one gives a runtime "command not found"
+//!       the JS swallows — only a test can catch it)
+//!
+//! RED before implementation (the §15 amendment): `remote-web.json`
+//! has no `allow-clipboard-image-png` permission, `build.rs` lists
+//! only the six old commands, and `main.rs` does not register
+//! `clipboard_image_png` — so the three assertions below fail for
+//! exactly the "change absent" reasons, file by file.
 
 use std::path::Path;
 
@@ -199,11 +205,12 @@ fn remote_web_urls_are_the_four_loopback_entries() {
 }
 
 #[test]
-fn remote_web_permissions_are_theme_set_and_the_update_commands() {
+fn remote_web_permissions_are_theme_set_the_update_commands_and_clipboard_image_png() {
     let cap = read_json("src-tauri/capabilities/remote-web.json");
     let perms = permissions(&cap);
 
     let mut expected = [
+        "allow-clipboard-image-png",
         "allow-theme-set",
         "allow-update-status",
         "allow-update-install",
@@ -213,7 +220,7 @@ fn remote_web_permissions_are_theme_set_and_the_update_commands() {
     got.sort_unstable();
     assert_eq!(
         got, expected,
-        "the remote web UI gets EXACTLY theme_set + update_status + update_install — nothing else, ever"
+        "EXACTLY theme_set + update_status + update_install + clipboard_image_png — nothing else, ever"
     );
 
     for forbidden in [
@@ -401,7 +408,7 @@ fn theme_js_reads_the_reported_theme() {
 // ── build.rs: the AppManifest command list ──────────────────────────────
 
 #[test]
-fn build_rs_manifest_lists_exactly_six_commands() {
+fn build_rs_manifest_lists_exactly_seven_commands() {
     let build = read("src-tauri/build.rs");
     // The `.commands(&[ ... ])` list: extract the slice body.
     let start = build
@@ -421,6 +428,7 @@ fn build_rs_manifest_lists_exactly_six_commands() {
     got.sort_unstable();
     let mut expected = [
         "act",
+        "clipboard_image_png",
         "status",
         "theme_get",
         "theme_set",
@@ -430,6 +438,50 @@ fn build_rs_manifest_lists_exactly_six_commands() {
     expected.sort_unstable();
     assert_eq!(
         got, expected,
-        "exactly act/status/theme_get/theme_set/update_install/update_status — the two update commands are new, settings_get/toggle_background stay deleted"
+        "exactly act/clipboard_image_png/status/theme_get/theme_set/update_install/update_status — settings_get/toggle_background stay deleted"
+    );
+}
+
+// ── main.rs: the generate_handler! registration ─────────────────────────
+
+#[test]
+fn main_rs_registers_exactly_the_manifest_commands() {
+    let main = read("src-tauri/src/main.rs");
+    // The `generate_handler![ ... ]` list: extract the macro body
+    // (slicing copied from the build.rs test — no shared helper).
+    let start = main
+        .find("generate_handler![")
+        .expect("main.rs has a tauri::generate_handler![ … ] list");
+    let body_start = start + "generate_handler![".len();
+    let body_end = main[body_start..]
+        .find(']')
+        .expect("the handler list is closed")
+        + body_start;
+    let body = &main[body_start..body_end];
+    let mut got: Vec<String> = body
+        .split(',')
+        .map(|c| {
+            c.trim()
+                .strip_prefix("commands::")
+                .unwrap_or(c)
+                .trim()
+                .to_string()
+        })
+        .filter(|c| !c.is_empty())
+        .collect();
+    got.sort_unstable();
+    let mut expected = [
+        "act",
+        "clipboard_image_png",
+        "status",
+        "theme_get",
+        "theme_set",
+        "update_install",
+        "update_status",
+    ];
+    expected.sort_unstable();
+    assert_eq!(
+        got, expected,
+        "generate_handler! registers EXACTLY the seven AppManifest commands — a missing entry is a runtime 'command not found' that the JS seam swallows"
     );
 }
