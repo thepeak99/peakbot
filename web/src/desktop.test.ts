@@ -9,13 +9,15 @@
 //
 // Runs under `node` (no jsdom needed): the only globals involved are
 // `globalThis.isTauri` (set and deleted per test) and the
-// `globalThis.__TAURI__.core.invoke` stub for the theme and update commands.
+// `globalThis.__TAURI__.core.invoke` stub for the theme, update and
+// clipboard-image commands.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   getUpdateStatus,
   installUpdate,
   isDesktop,
+  readClipboardImage,
   setDesktopTheme,
 } from "./desktop";
 
@@ -60,7 +62,8 @@ describe("isDesktop", () => {
 // The web page's ONLY way to talk to the desktop app is the seam in
 // desktop.ts: setDesktopTheme(theme) → invoke("theme_set", { theme }),
 // getUpdateStatus() → invoke("update_status"), installUpdate() →
-// invoke("update_install"). The
+// invoke("update_install"), readClipboardImage() →
+// invoke("clipboard_image_png"). The
 // stub is installed by setting globalThis.__TAURI__ = { core: { invoke } }
 // and deleted after every test.
 
@@ -169,6 +172,7 @@ describe("update IPC seam", () => {
   it.each([
     ["getUpdateStatus", () => getUpdateStatus()],
     ["installUpdate", () => installUpdate()],
+    ["readClipboardImage", () => readClipboardImage()],
   ] as [string, () => Promise<unknown>][])(
     "%s rejects with 'no desktop IPC' when __TAURI__ is absent",
     async (_name, call) => {
@@ -177,19 +181,98 @@ describe("update IPC seam", () => {
   );
 });
 
+// ── clipboard image IPC seam (Linux desktop paste fallback) ──────────────
+// `readClipboardImage()` → invoke("clipboard_image_png") returns the
+// clipboard image as PNG bytes; 0 bytes = no image. Tauri delivers the
+// raw bytes as an ArrayBuffer, or as a number[] when its custom-protocol
+// IPC is blocked — the seam takes both.
+//
+// RED today: desktop.ts does not export readClipboardImage, so this
+// describe block fails for exactly the "feature absent" reason.
+
+describe("clipboard image IPC seam", () => {
+  afterEach(() => {
+    delete tg.__TAURI__;
+  });
+
+  it("readClipboardImage invokes clipboard_image_png with the one-arg form", async () => {
+    const invoke = vi.fn(async () => new Uint8Array([1, 2, 3]).buffer);
+    tg.__TAURI__ = { core: { invoke } };
+
+    await readClipboardImage();
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith("clipboard_image_png");
+  });
+
+  it("ArrayBuffer bytes become a pasted-image.png image/png File with the same bytes", async () => {
+    const invoke = vi.fn(async () => new Uint8Array([137, 80, 78, 71]).buffer);
+    tg.__TAURI__ = { core: { invoke } };
+
+    const file = (await readClipboardImage()) as File;
+
+    expect(file).toBeInstanceOf(File);
+    expect(file.name).toBe("pasted-image.png");
+    expect(file.type).toBe("image/png");
+    expect(file.size).toBe(4);
+    expect(new Uint8Array(await file.arrayBuffer())).toEqual(
+      new Uint8Array([137, 80, 78, 71]),
+    );
+  });
+
+  it("number[] bytes (custom-protocol IPC blocked) become the same File", async () => {
+    const invoke = vi.fn(async () => [137, 80, 78, 71]);
+    tg.__TAURI__ = { core: { invoke } };
+
+    const file = (await readClipboardImage()) as File;
+
+    expect(file).toBeInstanceOf(File);
+    expect(file.name).toBe("pasted-image.png");
+    expect(file.type).toBe("image/png");
+    expect(file.size).toBe(4);
+    expect(new Uint8Array(await file.arrayBuffer())).toEqual(
+      new Uint8Array([137, 80, 78, 71]),
+    );
+  });
+
+  it.each([
+    ["an empty ArrayBuffer", new ArrayBuffer(0)],
+    ["an empty number[]", []],
+  ] as const)("empty payload %s resolves null", async (_label, raw) => {
+    const invoke = vi.fn(async () => raw);
+    tg.__TAURI__ = { core: { invoke } };
+
+    await expect(readClipboardImage()).resolves.toBeNull();
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it("readClipboardImage rejects with the command's string reason", async () => {
+    const invoke = vi.fn(async () => {
+      throw "clipboard image is larger than 50 MB";
+    });
+    tg.__TAURI__ = { core: { invoke } };
+
+    await expect(readClipboardImage()).rejects.toBe(
+      "clipboard image is larger than 50 MB",
+    );
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+});
+
 // ── module surface (close-to-tray removal + auto-update) ─────────────────
 // The Desktop pane is gone: `DesktopView`, `getDesktopSettings` and
 // `toggleDesktopBackground` are no longer exported. The seam now carries
-// exactly four exports: detection, the theme command, and the two update
-// commands.
+// exactly five exports: detection, the theme command, the two update
+// commands, and the clipboard-image read.
 
 describe("module surface", () => {
-  it("exports exactly isDesktop, setDesktopTheme, getUpdateStatus, installUpdate", async () => {
+  it("exports exactly isDesktop, setDesktopTheme, getUpdateStatus, installUpdate, readClipboardImage", async () => {
     const mod = await import("./desktop");
     expect(Object.keys(mod).sort()).toEqual([
       "getUpdateStatus",
       "installUpdate",
       "isDesktop",
+      "readClipboardImage",
       "setDesktopTheme",
     ]);
   });

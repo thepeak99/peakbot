@@ -9,6 +9,7 @@
 //! integration cases (unix only).
 
 pub mod ca_trust;
+pub mod clipboard;
 pub mod consts;
 pub mod controller;
 pub mod env;

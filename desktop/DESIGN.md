@@ -75,7 +75,7 @@ Dockerfile.desktop-macos
 - **No `tauri-plugin-shell`.** We spawn the sidecar with `std::process::Command` from Rust. `externalBin` is a *bundler* feature and works without the plugin. std gives us exact control over env, stdio, signals; the plugin would add a JS-facing capability surface we must then deny.
 - **No mode flag.** The desktop is always session mode; on every start it reads `peakbot service status` only to detect an old background service and offer its removal. The state files (§3.6) are process bookkeeping only, never a mode.
 - **No HTTP version endpoint / no backend API change for versions.** `<exe> --version` already exists.
-- **(amended §12: the remote origin gets exactly one command on loopback :7823 — `theme_set`.) No other IPC for the remote origin, no other `remote` capability, no `@tauri-apps/api` npm package, no frontend build.**
+- **(amended §12, then §14/§15: the remote origin gets exactly four commands on loopback :7823 — `theme_set`, `update_status`, `update_install`, `clipboard_image_png`.) No other IPC for the remote origin, no other `remote` capability, no `@tauri-apps/api` npm package, no frontend build.**
 - **No `PR_SET_PDEATHSIG`.** Linux-only, tied to the *spawning thread's* lifetime (subtle), and a second orphan mechanism. The pidfile reaper (§4.6) is portable and sufficient.
 - **(amended — auto-update, §14) No Apple notarization / Authenticode code signing, no Windows build** (decision 4). Design stays portable: Windows differences are isolated in `RealSys` (`interrupt` = kill) and `paths::sidecar_file_name`.
 - **No "Restart backend" / "Open in browser" tray items.** Not requested (YAGNI).
@@ -251,7 +251,7 @@ macOS `X.app/Contents/MacOS/peakbot`; dev `desktop/target/debug/peakbot` (tauri-
 3. `Phase::Ready(Session)` ⇒ `session.is_some()` and child not yet observed exited.
 4. A pidfile exists ⇔ a session child was spawned and not yet confirmed exited (modulo crash).
 5. The app keeps no mode state: whether an old background service exists is read from `peakbot service status` on each Start, and only ever leads to an offer to remove it.
-6. (**amended §12**) The remote origin may invoke ONLY `theme_set` (`capabilities/remote-theme.json`, the four loopback :7823 URLs); every other command and plugin stays ACL-denied (§5.4, §12).
+6. (**amended §12, §14, §15**) The remote origin may invoke ONLY `theme_set`, `update_status`, `update_install` and `clipboard_image_png` (`capabilities/remote-web.json`, the four loopback :7823 URLs); every other command and plugin stays ACL-denied (§5.4, §12–§15).
 7. Tokens never appear in argv, desktop logs, or `Debug` output (I7).
 8. The desktop never runs `service install` and never touches `~/.local/bin/peakbot`; its only service commands are `service status` (detection) and `service uninstall` (after a confirmed Remove).
 9. The session's bind/port/token/TLS come from `general.web` in `config.yaml` at launch time (§11); the desktop never writes it.
@@ -595,24 +595,25 @@ tauri_build::try_build(tauri_build::Attributes::new()
   "windows": ["main"],
   "permissions": ["allow-status", "allow-act", "allow-theme-get"] }
 ```
-**`capabilities/remote-theme.json`** (#376, §12 — renamed from `desktop-pane.json`):
+**`capabilities/remote-web.json`** (#376, §12 — renamed from `desktop-pane.json`; §14 carried the update IPC, §15 the clipboard read):
 ```json
 { "$schema": "../gen/schemas/desktop-schema.json",
-  "identifier": "remote-theme",
-  "description": "The PeakBot web UI on the default loopback backend: report its theme only. Nothing else, ever.",
+  "identifier": "remote-web",
+  "description": "The PeakBot web UI on the default loopback backend: report the theme, read the update state, start an update, and read the clipboard image (Linux paste fallback). Nothing else, ever.",
   "local": false,
   "windows": ["main"],
   "remote": { "urls": ["http://127.0.0.1:7823/*", "https://127.0.0.1:7823/*", "http://localhost:7823/*", "https://localhost:7823/*"] },
-  "permissions": ["allow-theme-set"] }
+  "permissions": ["allow-theme-set", "allow-update-status", "allow-update-install", "allow-clipboard-image-png"] }
 ```
 No `remote` key on `local-pages` ⇒ it applies to the bundled origin only; the PeakBot web UI origin
-(`http(s)://127.0.0.1:*`) gets **only** `theme_set` via `remote-theme` (§12) — no core, no plugins,
-no other app commands.
+(`http(s)://127.0.0.1:*`) gets **only** `theme_set`, `update_status`,
+`update_install` and `clipboard_image_png` via `remote-web` (§12, §14, §15) —
+no core, no plugins, no other app commands.
 
 | Command | Granted to | Capability file |
 |---|---|---|
 | `status`, `act`, `theme_get` | window `main`, local origin | `local-pages.json` |
-| `theme_set` | window `main`, remote loopback :7823 origin | `remote-theme.json` |
+| `theme_set`, `update_status`, `update_install`, `clipboard_image_png` | window `main`, remote loopback :7823 origin | `remote-web.json` |
 | anything else | remote PeakBot origin | none |
 
 **`tauri.conf.json`** (locked keys):
@@ -628,7 +629,7 @@ no other app commands.
     "withGlobalTauri": true,
     "security": {
       "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:",
-      "capabilities": ["local-pages", "remote-theme"]
+      "capabilities": ["local-pages", "remote-web"]
     }
   },
   "bundle": {
@@ -647,7 +648,7 @@ no other app commands.
 - No `devUrl`, no `beforeDevCommand`/`beforeBuildCommand` (nothing to build for the UI).
 - `windows: []` because the window must be built in Rust to attach `on_navigation`/`on_new_window`.
 - `capabilities` lists every capability file explicitly — **a capability file missing from this list is silently inactive** (#377).
-- `withGlobalTauri: true` so `status.js` / `theme.js` can call `window.__TAURI__.core.invoke` with no build step. The object is also visible on the remote page but inert (ACL denies everything except `theme_set`) — verified in the manual checklist.
+- `withGlobalTauri: true` so `status.js` / `theme.js` can call `window.__TAURI__.core.invoke` with no build step. The object is also visible on the remote page but inert (ACL denies everything except `theme_set`, `update_status`, `update_install`, `clipboard_image_png`) — verified in the manual checklist.
 
 **Custom-protocol (devUrl vs embedded) — addressed:** tauri's build script sets `cfg(dev)` iff the
 `tauri/custom-protocol` feature is OFF. `tauri build` (Linux) enables it automatically. The macOS
@@ -1538,3 +1539,54 @@ log.
   on the first install/update (More info → Run anyway).
 - 0.24.x and earlier have no updater — they must be updated to this version
   **manually once**.
+
+---
+
+## 15. AMENDMENT (linux-paste) — clipboard image command (2026-11-04)
+
+**Why.** WebKitGTK ≤ 2.50 (the bundled 2.50.4, AppImage built on ubuntu:22.04)
+never exposes a clipboard image to DOM paste events (WebKit Bug 218519):
+`clipboardData.files` and `items` are empty for a copied image. The web UI
+therefore cannot see the image; the app reads it.
+
+**The command.** `clipboard_image_png` — read-only, no arguments, no state.
+
+- Returns the clipboard image as a **raw `tauri::ipc::Response`** (PNG bytes),
+  bypassing the JSON IPC envelope.
+- Contract: **empty body = no image** (and nothing else). `Ok` carries a PNG of
+  at most 50 MiB (`MAX_PNG_MB` in `core::clipboard`, the single bound — the
+  default `uploads.max_file_mb`); over-cap images, an encode failure, and
+  non-Linux targets are an `Err`, never an empty body.
+- Rejected everywhere outside the desktop: the web seam's `invoke` rejects with
+  "no desktop IPC" in a browser, and the capability grant is `remote-web` only.
+- **Sync on purpose** (invariant I4): Tauri runs sync commands on the main
+  thread — the GTK thread, the only one where `gtk::Clipboard::get` (which
+  asserts the main thread) and `wait_for_image` (a nested main loop) are legal.
+- JS takes both delivery shapes: Tauri delivers raw bytes as an `ArrayBuffer`,
+  or as a `number[]` when its custom-protocol IPC is blocked — `Uint8Array`
+  accepts both; 0 bytes → `null`.
+
+**The web side** (`web/src/desktop.ts` `readClipboardImage()` → `File | null`;
+`Composer.onPaste` fallback). The files → items extraction is unchanged, then:
+
+| Paste carries | Behaviour |
+|---|---|
+| files (via `files` or `items[kind=file]`) | add them, `preventDefault` |
+| `text/plain` | default (text inserts) — nothing intercepted |
+| neither, and not the desktop app, or UA is not Linux | nothing (browser/macOS/Windows unchanged) |
+| neither, on the Linux desktop app | ask the app via `readClipboardImage()`; a `File` goes through the same `attachments.add` path — **never** `preventDefault` (with no files and no text the default inserts nothing); a rejection (older app) is today's no-op |
+
+**Removal path.** Once the AppImage bundles WebKitGTK ≥ 2.52 (the release that
+fixes Bug 218519), the DOM paste event carries the image again: delete
+`clipboard_image_png`, its permission file, its capability entry, the
+`readClipboardImage` seam and the `onPaste` fallback — and drop the
+`gtk` dependency from the Linux target.
+
+**Residual risk (accepted).** An XSS in the web UI (our own code on
+127.0.0.1:7823) can call `clipboard_image_png` at will and exfiltrate the
+current clipboard image — clipboard images can be more sensitive than page
+data (screenshots of secrets). Accepted: the grant is limited to the
+`remote-web` capability (main window, four loopback :7823 URLs, token-gated
+backend), the page ships no third-party code, and a paste-recency gate is
+unenforceable (it needs a spoofable 5th command). Bound: 50 MB per call; no
+write access.
