@@ -4,7 +4,7 @@
         desktop-updater \
         release release-check release-bump release-tag \
         release-build-linux release-build-windows release-build-macos release-build-android \
-        release-publish release-publish-github
+        release-publish release-publish-shifu release-publish-github
 
 # Config
 DOCKERFILE         := Dockerfile.windows
@@ -29,16 +29,22 @@ GITEA_URL  ?= $(shell echo $(ORIGIN_URL) | sed -E 's#(https?://[^/]+).*#\1#')
 OWNER      ?= $(shell echo $(ORIGIN_URL) | sed -E 's#https?://[^/]+/([^/]+)/.*#\1#')
 REPO       ?= $(shell basename -s .git $(ORIGIN_URL) 2>/dev/null)
 
-# GitHub mirror (public) — the auto-updater's download host; the pipeline
-# publishes the release there too (release-publish-github).
+# Public updater + download host: MinIO bucket `shifu`, anonymous read at
+# SHIFU_URL, object key == URL path. PeakBot owns the key prefix SHIFU_PREFIX/.
+# tauri.conf.json hardcodes the same URL (release-check enforces it).
+SHIFU_URL        := https://shifu.patchnotes.com
+SHIFU_PREFIX     := peakbot
+UPDATER_BASE_URL := $(SHIFU_URL)/$(SHIFU_PREFIX)
+
+# GitHub mirror — BRIDGE ONLY (release-publish-github). Removed after 0.26.2.
 GH_MIRROR_REPO    ?= thepeak99/peakbot
 GH_API            ?= https://api.github.com
 GH_UPLOADS        ?= https://uploads.github.com
 GH_TAG_WAIT_TRIES ?= 60
 GH_TAG_WAIT_SECS  ?= 10
 
-# The 10 release asset basenames, shared by release-publish (Gitea) and
-# release-publish-github (GitHub mirror). tests/release.sh T44 counts the
+# The 10 release asset basenames, shared by release-publish (Gitea),
+# release-publish-shifu and release-publish-github (GitHub mirror). tests/release.sh T44 counts the
 # words of the FIRST assignment block (name + '=' + 8 names = 10), so the
 # last two entries live in the += line.
 RELEASE_ASSETS = \
@@ -205,7 +211,7 @@ desktop-windows:
 ##                  as a BuildKit secret from TAURI_SIGNING_PRIVATE_KEY
 ##                  (+_PASSWORD) in the environment — never in a layer/log.
 desktop-updater:
-	GH_MIRROR_REPO="$(GH_MIRROR_REPO)" sh desktop/scripts/build-desktop.sh updater
+	UPDATER_BASE_URL="$(UPDATER_BASE_URL)" sh desktop/scripts/build-desktop.sh updater
 
 ## desktop: Build all desktop artifacts (linux + macos + windows)
 desktop:
@@ -227,7 +233,8 @@ PRUNE_STEP = if [ "$${PRUNE}" = "1" ]; then $(CONTAINER_BUILDER) builder prune -
 
 ## release-check: Verify TAG is set and equals the Cargo.toml version, desktop
 ##                version is in sync, release-notes/<TAG>.md exists, and the
-##                tauri.conf.json updater endpoints point at GH_MIRROR_REPO
+##                tauri.conf.json updater endpoints are exactly the shifu
+##                UPDATER_BASE_URL/latest.json
 release-check:
 	@set -eu; \
 	if [ -z "$(TAG)" ]; then \
@@ -240,21 +247,22 @@ release-check:
 	if [ ! -f "release-notes/$(TAG).md" ]; then \
 	  echo "❌ Release notes missing: release-notes/$(TAG).md"; exit 1; \
 	fi; \
-	if ! jq -r '.plugins.updater.endpoints[]?' desktop/src-tauri/tauri.conf.json 2>/dev/null | grep -qF "$(GH_MIRROR_REPO)"; then \
-	  echo "❌ tauri.conf.json plugins.updater endpoints do not contain GH_MIRROR_REPO ($(GH_MIRROR_REPO)) — the app would fetch updates from the wrong host"; exit 1; \
+	if ! jq -e --arg u "$(UPDATER_BASE_URL)/latest.json" '.plugins.updater.endpoints == [$$u]' desktop/src-tauri/tauri.conf.json >/dev/null 2>&1; then \
+	  echo "❌ tauri.conf.json plugins.updater endpoints must be exactly [\"$(UPDATER_BASE_URL)/latest.json\"] — the app would fetch updates from the wrong host"; exit 1; \
 	fi; \
 	echo "✅ release-check passed: TAG=$(TAG)"
 
 ## release: Full release pipeline — check, build all 10 assets, sign the
-##          updater artifacts, publish to Gitea, publish to the GitHub
-##          mirror. CI runs this on tag push: make release TAG=<v>.
+##          updater artifacts, publish to Gitea, upload to the shifu bucket,
+##          publish to the GitHub mirror (bridge). CI runs this on tag push:
+##          make release TAG=<v>.
 ##          Explicit sequential recipe of sub-make calls: the per-platform
 ##          targets (release-build-*, desktop-*) are the single source of
 ##          truth for the build commands — nothing is inlined here.
 ##          Command-line vars (TAG, PRUNE, CONTAINER_BUILDER, GITEA_URL,
 ##          OWNER, REPO, OUTPUT_DIR) propagate to the sub-makes via
-##          MAKEFLAGS; GITEA_TOKEN / GH_RELEASE_TOKEN / TAURI_SIGNING_* ride
-##          along in the environment.
+##          MAKEFLAGS; GITEA_TOKEN / GH_RELEASE_TOKEN / TAURI_SIGNING_* /
+##          SHIFU_S3_* ride along in the environment.
 ##          Order matters: never run with -j.
 release:
 	@echo "🚀 Release $(RELEASE_VERSION) — sequential by design, do not run with -j"
@@ -271,6 +279,7 @@ release:
 	$(MAKE) release-build-android
 	$(MAKE) desktop-updater
 	$(MAKE) release-publish TAG=$(TAG)
+	$(MAKE) release-publish-shifu TAG=$(TAG)
 	$(MAKE) release-publish-github TAG=$(TAG)
 
 ## release-bump: Bump to VERSION (X.Y.Z or X.Y.Z-<prerelease>, required) on a
@@ -484,6 +493,92 @@ release-publish:
 	trap - EXIT; \
 	echo "✅ Published $$v to $(GITEA_URL)/$(OWNER)/$(REPO)/releases/tag/$$v"
 
+## release-publish-shifu: Upload the 10 assets + SHA256SUMS to the shifu bucket
+##              (rclone copyto only, immutable under peakbot/<v>/), verify them
+##              over the public URL, then move the mutable latest.json pointer
+##              (stable tags only) and check the .healthcheck canary. Needs
+##              TAG, SHIFU_S3_ENDPOINT / SHIFU_S3_ACCESS_KEY / SHIFU_S3_SECRET_KEY
+##              (env only, never printed) and rclone, curl, sha256sum, cmp.
+##              Idempotent re-run; no deletes, no rollback.
+# No network until every precondition passed. The credentials are read by the
+# shell only (doubled dollars) so they never reach the recipe text, make -n
+# output or argv; rclone takes them from RCLONE_CONFIG_SHIFU_* env vars.
+# Order is load-bearing: version files, SHA256SUMS last in the directory,
+# public verification, and only then the pointer.
+release-publish-shifu:
+	@set -eu; \
+	v="$(TAG)"; \
+	if [ -z "$$v" ]; then \
+	  echo "❌ TAG is not set — pass TAG=<version> (expected: $(RELEASE_VERSION))"; exit 1; \
+	fi; \
+	if ! printf '%s' "$$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$$'; then \
+	  echo "❌ TAG '$$v' is not X.Y.Z[-pre]"; exit 1; \
+	fi; \
+	[ -n "$${SHIFU_S3_ENDPOINT:-}" ]   || { echo "❌ SHIFU_S3_ENDPOINT is empty — set the shifu S3 endpoint (Gitea variable SHIFU_S3_ENDPOINT)"; exit 1; }; \
+	[ -n "$${SHIFU_S3_ACCESS_KEY:-}" ] || { echo "❌ SHIFU_S3_ACCESS_KEY is empty — set the shifu S3 access key (Gitea secret SHIFU_S3_ACCESS_KEY)"; exit 1; }; \
+	[ -n "$${SHIFU_S3_SECRET_KEY:-}" ] || { echo "❌ SHIFU_S3_SECRET_KEY is empty — set the shifu S3 secret key (Gitea secret SHIFU_S3_SECRET_KEY)"; exit 1; }; \
+	command -v rclone >/dev/null    || { echo "❌ 'rclone' is required";    exit 1; }; \
+	command -v curl >/dev/null      || { echo "❌ 'curl' is required";      exit 1; }; \
+	command -v sha256sum >/dev/null || { echo "❌ 'sha256sum' is required"; exit 1; }; \
+	command -v cmp >/dev/null       || { echo "❌ 'cmp' is required";       exit 1; }; \
+	tmp=$$(mktemp -d); \
+	trap 'rm -rf "$$tmp"' EXIT; \
+	for n in $(RELEASE_ASSETS); do \
+	  case $$n in \
+	    peakbot-*) p="$(OUTPUT_DIR)/$$n" ;; \
+	    *) p="$(OUTPUT_DIR)/desktop/$$n" ;; \
+	  esac; \
+	  if [ ! -f "$$p" ]; then \
+	    echo "❌ Missing release asset: $$p"; exit 1; \
+	  fi; \
+	  (cd "$${p%/*}" && sha256sum "$$n") >> "$$tmp/SHA256SUMS"; \
+	done; \
+	export RCLONE_CONFIG_SHIFU_TYPE=s3 RCLONE_CONFIG_SHIFU_PROVIDER=Minio \
+	  RCLONE_CONFIG_SHIFU_ENDPOINT="$$SHIFU_S3_ENDPOINT" \
+	  RCLONE_CONFIG_SHIFU_ACCESS_KEY_ID="$$SHIFU_S3_ACCESS_KEY" \
+	  RCLONE_CONFIG_SHIFU_SECRET_ACCESS_KEY="$$SHIFU_S3_SECRET_KEY" \
+	  RCLONE_CONFIG_SHIFU_REGION=us-east-1 RCLONE_CONFIG_SHIFU_FORCE_PATH_STYLE=true \
+	  RCLONE_S3_NO_CHECK_BUCKET=true; \
+	dest="shifu:shifu/$(SHIFU_PREFIX)"; pub="$(UPDATER_BASE_URL)"; \
+	put_immutable() { rclone copyto --immutable --checksum --header-upload "Cache-Control: public, max-age=31536000, immutable" "$$1" "$$dest/$$v/$$2"; }; \
+	echo "🚀 Publishing $$v to $$pub/$$v/ ..."; \
+	for n in $(RELEASE_ASSETS); do \
+	  case $$n in \
+	    peakbot-*) p="$(OUTPUT_DIR)/$$n" ;; \
+	    *) p="$(OUTPUT_DIR)/desktop/$$n" ;; \
+	  esac; \
+	  echo "⬆️  $$n"; \
+	  put_immutable "$$p" "$$n"; \
+	done; \
+	echo "⬆️  SHA256SUMS"; \
+	put_immutable "$$tmp/SHA256SUMS" SHA256SUMS; \
+	curl -fsS -o "$$tmp/pub.sums" "$$pub/$$v/SHA256SUMS"; \
+	cmp -s "$$tmp/SHA256SUMS" "$$tmp/pub.sums" || { echo "❌ public $$v/SHA256SUMS mismatch — the edge serves different bytes than were uploaded"; exit 1; }; \
+	for n in $(RELEASE_ASSETS); do \
+	  case $$n in \
+	    peakbot-*) p="$(OUTPUT_DIR)/$$n" ;; \
+	    *) p="$(OUTPUT_DIR)/desktop/$$n" ;; \
+	  esac; \
+	  a=$$(curl -fsS --head -o /dev/null -w '%header{content-length}' "$$pub/$$v/$$n"); \
+	  b=$$(wc -c < "$$p" | tr -d ' '); \
+	  if [ "$$a" != "$$b" ]; then \
+	    echo "❌ $$n: public size $$a ≠ local $$b"; exit 1; \
+	  fi; \
+	done; \
+	case $$v in \
+	  *-*) echo "ℹ️  prerelease — $(SHIFU_PREFIX)/latest.json left unchanged" ;; \
+	  *) \
+	    rclone copyto --checksum --header-upload "Cache-Control: no-cache" --header-upload "Content-Type: application/json" \
+	      "$(OUTPUT_DIR)/desktop/latest.json" "$$dest/latest.json"; \
+	    curl -fsS -o "$$tmp/pub.latest" "$$pub/latest.json"; \
+	    cmp -s "$(OUTPUT_DIR)/desktop/latest.json" "$$tmp/pub.latest" || { echo "❌ public latest.json differs from local (edge cache?) — re-run make release-publish-shifu TAG=$$v (idempotent)"; exit 1; } ;; \
+	esac; \
+	[ "$$(curl -fsS "$(SHIFU_URL)/.healthcheck")" = "shifu-ok" ] || { echo "❌ .healthcheck canary missing/changed — STOP, see the shifu runbook §7"; exit 1; }; \
+	case $$v in \
+	  *-*) echo "✅ Published $$v to $$pub/$$v/" ;; \
+	  *) echo "✅ Published $$v to $$pub/$$v/ (latest.json → $$v)" ;; \
+	esac
+
 ## release-publish-github: Publish the same 10 assets to the public GitHub
 ##              mirror (the auto-updater's download host). Waits for the tag
 ##              to arrive (push-mirror lag: GH_TAG_WAIT_TRIES ×
@@ -622,10 +717,11 @@ help:
 	@echo "  make release-bump VERSION=0.2.0   # cut release/0.2.0 from origin/master, bump, promote notes, push — open a PR"
 	@echo "  make release-tag                  # after the PR merges: annotated tag from release-notes/<v>.md + push"
 	@echo "  make release TAG=0.2.0            # full pipeline: release-check, build all 10 assets, sign updater,"
-	@echo "                                    # publish to Gitea + the GitHub mirror"
+	@echo "                                    # publish to Gitea, the shifu bucket + the GitHub mirror (bridge)"
 	@echo "  make release TAG=0.2.0 PRUNE=1    # as above, pruning the container builder between platforms"
 	@echo "  make desktop-updater              # sign the 3 updater artifacts + build latest.json (needs signing key)"
-	@echo "  GITEA_TOKEN + GH_RELEASE_TOKEN    # required for the publish steps (env vars)"
+	@echo "  make release-publish-shifu TAG=0.2.0  # upload to the shifu bucket + verify (idempotent re-run)"
+	@echo "  GITEA_TOKEN + GH_RELEASE_TOKEN + SHIFU_S3_*  # required for the publish steps (env vars)"
 	@echo ""
 	@echo "Release notes: release-notes/<v>.md is required — Gitea/GitHub release body + git tag message (no fallback)."
 	@echo ""
@@ -634,6 +730,7 @@ help:
 	@echo "  GITEA_TOKEN        Gitea personal access token (required for release-publish)"
 	@echo "  GITEA_URL/OWNER/REPO  Auto-derived from origin remote — override if needed"
 	@echo "  GH_RELEASE_TOKEN   GitHub release token (required for release-publish-github, never printed)"
-	@echo "  GH_MIRROR_REPO     GitHub mirror owner/repo for latest.json + publishing (default: thepeak99/peakbot)"
+	@echo "  SHIFU_S3_ENDPOINT / SHIFU_S3_ACCESS_KEY / SHIFU_S3_SECRET_KEY  shifu bucket S3 endpoint + credentials (required for release-publish-shifu, never printed)"
+	@echo "  GH_MIRROR_REPO     GitHub mirror owner/repo, bridge only (release-publish-github; default: thepeak99/peakbot)"
 	@echo "  TAURI_SIGNING_PRIVATE_KEY(_PASSWORD)  Tauri updater signing key (required for desktop-updater)"
 	@echo "  PRUNE              1 = prune the container builder between platform builds in the release recipe"

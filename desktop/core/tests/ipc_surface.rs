@@ -32,9 +32,10 @@
 //!     - `app.security.capabilities == ["local-pages", "remote-web"]`
 //!       (an unlisted capability file is silently ignored — the new
 //!       file must be listed to be active)
-//!     - `plugins.updater.endpoints` == exactly the public GitHub
-//!       mirror's `latest.json`, `plugins.updater.pubkey` non-empty,
-//!       and `bundle.createUpdaterArtifacts` absent/false (local
+//!     - `plugins.updater.endpoints` == exactly the public shifu bucket's
+//!       `latest.json` (https://shifu.patchnotes.com/peakbot/latest.json),
+//!       `plugins.updater.pubkey` non-empty, and
+//!       `bundle.createUpdaterArtifacts` absent/false (local
 //!       builds must not need the signing key)
 //!
 //!   `desktop/ui/index.html` + `theme.js` (unchanged surface)
@@ -319,7 +320,7 @@ fn tauri_conf_lists_local_pages_and_remote_web() {
 }
 
 #[test]
-fn tauri_conf_updater_plugin_points_at_the_github_mirror() {
+fn tauri_conf_updater_plugin_points_at_shifu() {
     let conf = read_json("src-tauri/tauri.conf.json");
     let updater = conf
         .pointer("/plugins/updater")
@@ -333,8 +334,8 @@ fn tauri_conf_updater_plugin_points_at_the_github_mirror() {
     let got: Vec<&str> = endpoints.iter().filter_map(Value::as_str).collect();
     assert_eq!(
         got,
-        ["https://github.com/thepeak99/peakbot/releases/latest/download/latest.json"],
-        "exactly the public GitHub mirror's latest.json (the Gitea push-mirror has no release assets; no token in the app)"
+        ["https://shifu.patchnotes.com/peakbot/latest.json"],
+        "exactly the public shifu bucket's latest.json (no token in the app)"
     );
 
     let pubkey = updater.get("pubkey").and_then(Value::as_str).unwrap_or("");
