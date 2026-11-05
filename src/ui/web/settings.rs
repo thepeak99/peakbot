@@ -31,9 +31,10 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use url::Url;
 use uuid::Uuid;
 
 use crate::config::errors::{ConfigError, ConfigErrors, ConfigFileKind, PathSeg};
@@ -42,6 +43,7 @@ use crate::config::resolve::{Config, ParseCtx, Source, boot_only_diff};
 use crate::config::{BUILTIN_TOOL_NAMES, TAB_NAMES, resolve_token, save_config_at};
 use crate::session::SessionDeps;
 use crate::ui::web::registry::SessionRegistry;
+use crate::ui::web::tls;
 
 // ===========================================================================
 // Boot facts (spec §8.2 `boot` block, §6.9)
@@ -81,12 +83,130 @@ impl TokenSource {
     }
 }
 
-/// How this server was started — the `boot` block of `GET /api/settings`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// How this server was started — the `boot` block of `GET /api/settings`
+/// plus the facts `GET /api/pairing` needs (the effective token and the
+/// cert dir, design §8.4). Not `Copy` any more: the pairing fields own
+/// strings and paths.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BootWeb {
     pub bind: SocketAddr,
     pub token_source: TokenSource,
     pub tls: bool,
+    /// The effective web token (`None` = loopback-only, no token). `main`
+    /// guarantees a token exists before any non-loopback bind.
+    pub token: Option<String>,
+    /// The `--tls-name` extras, on top of the auto-discovered SANs.
+    pub extra_sans: Vec<String>,
+    /// The TLS cert dir (`None` = TLS off).
+    pub tls_dir: Option<PathBuf>,
+}
+
+/// `GET /api/pairing` wire (design §8.4, amending MP §4.4). Default serde
+/// external tagging: `{"Available":{"links":[…]}}` /
+/// `{"Unavailable":{"reason":"loopback_bind"|"no_tls"}}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum PairingWire {
+    /// A non-loopback bind with TLS: one entry link per phone-reachable
+    /// host, each carrying the effective token and the CA fingerprint.
+    /// Non-empty by construction (a non-loopback bind always has a
+    /// `primary_lan_host`).
+    Available { links: Vec<String> },
+    /// No phone-reachable link exists — `LoopbackBind` (checked before
+    /// `NoTls`) or `NoTls`.
+    Unavailable { reason: PairingUnavailable },
+}
+
+/// Why no pairing links exist (MP §4.4). Serialises snake_case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PairingUnavailable {
+    /// Loopback bind: nothing a phone on the network can reach, even with
+    /// TLS on.
+    LoopbackBind,
+    /// TLS off: there is no CA fingerprint to offer, so no link can be.
+    NoTls,
+}
+
+/// The pure pairing-link builder (design §8.4, MP §4.4): the server's
+/// entry links plus `&ca=sha256:<fp>`, where `<fp>` =
+/// [`tls::ca_fingerprint`] of `tls_dir`. `Some(dir)` ⇔ TLS on.
+///
+/// The order is locked: a loopback bind is `LoopbackBind` even with TLS
+/// on; a non-loopback bind without TLS is `NoTls`. Otherwise the first
+/// link is [`tls::primary_lan_host`] (the same host the startup banner
+/// advertises), then the `--tls-name` extras in the order given, then the
+/// other [`tls::local_sans`] hosts — all minus loopback names and
+/// deduped — so every link passes TLS name validation by construction.
+/// `&profile=<name>` is appended CLIENT-side (the panel dropdown), never
+/// here.
+pub fn pairing_links(
+    bind: SocketAddr,
+    extra_sans: &[String],
+    token: &str,
+    tls_dir: Option<&Path>,
+) -> PairingWire {
+    if bind.ip().is_loopback() {
+        return PairingWire::Unavailable {
+            reason: PairingUnavailable::LoopbackBind,
+        };
+    }
+    let Some(dir) = tls_dir else {
+        return PairingWire::Unavailable {
+            reason: PairingUnavailable::NoTls,
+        };
+    };
+    // The fingerprint already carries the `sha256:` prefix — never double
+    // it. A CA dir that can't be read offers no fingerprint, the same dead
+    // end as no TLS.
+    let Some(fp) = tls::ca_fingerprint(dir).ok() else {
+        return PairingWire::Unavailable {
+            reason: PairingUnavailable::NoTls,
+        };
+    };
+    let primary = tls::primary_lan_host(bind);
+    let mut hosts = vec![primary.clone()];
+    // The operator-supplied `--tls-name` extras follow the primary, in the
+    // order given — they are the intentional names — then the
+    // auto-discovered ones (mDNS, LAN IP), deduped and minus loopback.
+    for san in extra_sans {
+        if !is_loopback_name(san) && san != &primary && !hosts.contains(san) {
+            hosts.push(san.clone());
+        }
+    }
+    for san in tls::local_sans(bind, extra_sans) {
+        if is_loopback_name(&san) || hosts.contains(&san) {
+            continue;
+        }
+        hosts.push(san);
+    }
+    let links = hosts
+        .iter()
+        .map(|host| entry_link(host, token, &fp))
+        .collect();
+    PairingWire::Available { links }
+}
+
+/// A SAN that names loopback: the literal loopback names the leaf always
+/// carries, plus any loopback IP literal the operator added.
+fn is_loopback_name(name: &str) -> bool {
+    matches!(name, "localhost" | "127.0.0.1" | "::1")
+        || name.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// One entry link: `https://<host>/?token=<token>&ca=<fp>` — IPv6 hosts
+/// bracketed, built with [`url::Url`] (design §8.4). The query goes in via
+/// `set_query` so it stays verbatim: `query_pairs_mut` would form-encode
+/// the fingerprint's `:` to `%3A`, and the token is formatted the same
+/// (raw) way as [`WebUi::entry_url`] in `super`.
+fn entry_link(host: &str, token: &str, fp: &str) -> String {
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let mut url = Url::parse(&format!("https://{host}/")).expect("a well-formed host");
+    url.set_query(Some(&format!("token={token}&ca={fp}")));
+    url.to_string()
 }
 
 /// Boot-time facts `WebUi` threads into the settings router (spec §6.9):
@@ -672,6 +792,26 @@ async fn put_config(State(state): State<Arc<SettingsState>>, req: Request) -> Re
     }))
 }
 
+/// `GET /api/pairing` (design §8.4, MP §6.4): the phone-reachable entry
+/// links with the effective token and the CA fingerprint, as
+/// `PairingWire` JSON. Merged before the token layer like every settings
+/// route, so it is gated the same way. A `None` token means a loopback-only
+/// server (`main` guarantees a token before any non-loopback bind), which
+/// has no phone-reachable links.
+async fn get_pairing(State(state): State<Arc<SettingsState>>) -> Response {
+    if let Some(refused) = pin_refusal(&state) {
+        return refused;
+    }
+    let boot = &state.boot_web;
+    let wire = match &boot.token {
+        Some(token) => pairing_links(boot.bind, &boot.extra_sans, token, boot.tls_dir.as_deref()),
+        None => PairingWire::Unavailable {
+            reason: PairingUnavailable::LoopbackBind,
+        },
+    };
+    json_ok(&wire)
+}
+
 /// Unknown `/api/*` → 404 JSON envelope (T14 follow-up): never the SPA's
 /// 200 `index.html`. Also answers methods no `/api` route provides (e.g.
 /// `POST /api/config`), where axum would otherwise 405.
@@ -700,6 +840,10 @@ pub fn router(state: SettingsState) -> Router {
                 .post(api_not_found),
         )
         .route("/api/config/validate", post(validate_config))
+        // The pairing links (design §8.4): token-gated like every settings
+        // route (merged before the token layer by the caller), and
+        // registered before the catch-all so it is not swallowed.
+        .route("/api/pairing", get(get_pairing))
         // The /api/* catch-all: any other /api path (incl. /api/migrate —
         // there is no migrate endpoint) is a 404 JSON envelope.
         .route("/api/{*rest}", any(api_not_found))
@@ -853,6 +997,9 @@ mod tests {
                 bind: "127.0.0.1:7823".parse().unwrap(),
                 token_source: TokenSource::None,
                 tls: false,
+                token: None,
+                extra_sans: Vec::new(),
+                tls_dir: None,
             },
         };
         assert_eq!(repo_cwd(&state, None), PathBuf::from("/boot"));

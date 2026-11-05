@@ -200,8 +200,8 @@ pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Sessio
     // before the controller loop spawns. `resume` best-effort adopts a
     // persisted conversation; `ensure_boot_conversation` is idempotent, so it
     // mints a fresh one iff the resume didn't produce a current conversation
-    // (unknown id, disabled storage, or `None`). The fresh-mint path
-    // persists `session_cwd` and the selection.
+    // (unknown id, disabled storage, or `None`). The fresh-mint path only
+    // sets in-memory state; the first disk write is the first user message.
     if let Some(id) = resume {
         let _ = state_manager.load_conversation(id);
     }

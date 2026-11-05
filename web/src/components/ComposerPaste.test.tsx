@@ -578,7 +578,12 @@ describe("Composer paste → pending attachments (real useAttachments)", () => {
     expect(chipRemovers("image.png")).toHaveLength(1);
     expect(uploads).toHaveLength(1);
     expect(uploads[0].file).toBe(shot);
-    expect(uploadFileMock).toHaveBeenCalledWith("c1", shot, expect.any(Function));
+    expect(uploadFileMock).toHaveBeenCalledWith(
+      "c1",
+      shot,
+      expect.any(Function),
+      "",
+    );
   });
 
   it("pasting an image that is only in clipboardData.items renders a chip and uploads", async () => {

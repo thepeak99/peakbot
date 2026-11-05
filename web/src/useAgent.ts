@@ -11,6 +11,7 @@
 // land on the same session.
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { profileFromUrl, setConvoInUrl } from "./state";
 import type {
   AppState,
   ConversationSummary,
@@ -46,8 +47,11 @@ export interface AgentConnection {
    * id and reconnect the socket. Shares the live session if one is active,
    * else resumes it from disk — the same handshake as first load, so no
    * `/load` (which would clear background processes). `null` starts a new
-   * conversation (the server mints the session and replies `attached`). */
-  switchConvo: (id: string | null) => void;
+   * conversation (the server mints the session and replies `attached`).
+   * `profile` (re-)binds the socket to a catalogue profile — remote profiles
+   * route through the relay; `null` means local. `agent` rides the ONE
+   * attach of the fresh socket, so the new conversation starts on that pair. */
+  switchConvo: (id: string | null, profile?: string | null, agent?: string) => void;
 }
 
 function wsUrl(): string {
@@ -60,20 +64,6 @@ function wsUrl(): string {
  * a refresh, reopened same-URL tab, or shared link rejoins the same session. */
 function convoFromUrl(): string | null {
   return new URLSearchParams(window.location.search).get("convo");
-}
-
-/** Write `convo` into the address bar without a navigation (idempotent).
- * `null` removes the param, so the next attach starts a new conversation. */
-export function setConvoInUrl(convo: string | null): void {
-  const url = new URL(window.location.href);
-  if (convo === null) {
-    if (!url.searchParams.has("convo")) return;
-    url.searchParams.delete("convo");
-  } else {
-    if (url.searchParams.get("convo") === convo) return;
-    url.searchParams.set("convo", convo);
-  }
-  window.history.replaceState(null, "", url);
 }
 
 export function useAgent(): AgentConnection {
@@ -97,16 +87,25 @@ export function useAgent(): AgentConnection {
   // The conversation this client is bound to. Seeded from the URL (the only
   // binding), updated by `attached`/state, re-sent verbatim on reconnect.
   const convoRef = useRef<string | null>(convoFromUrl());
+  // The profile this socket attaches under (the routing key, design §6.4).
+  // Seeded from the URL, re-sent verbatim on EVERY reconnect — a retry is
+  // also remote (G7). `null` = local; the key is omitted from the frame.
+  const profileRef = useRef<string | null>(profileFromUrl());
+  // Rides exactly one attach (a switchConvo with an agent), then clears, so
+  // reconnects re-send only (convo, profile).
+  const attachAgentRef = useRef<string | null>(null);
   const [convo, setConvo] = useState<string | null>(convoRef.current);
   // Pending reconnect timer; shared so `switchConvo` can cancel it.
   const reconnectTimerRef = useRef<number | undefined>(undefined);
 
   // Single place that moves the binding: ref (for reconnects), state (for
-  // consumers) and the URL (refresh / bookmark / share).
-  const bindConvo = useCallback((id: string | null) => {
+  // consumers) and the URL (refresh / bookmark / share). `profile` is only
+  // written when given — server echoes move the convo, never the profile.
+  const bindConvo = useCallback((id: string | null, profile?: string | null) => {
     convoRef.current = id;
+    if (profile !== undefined) profileRef.current = profile;
     setConvo(id);
-    setConvoInUrl(id);
+    setConvoInUrl(id, profileRef.current);
   }, []);
 
   const send = useCallback((msg: InboundMessage) => {
@@ -144,7 +143,19 @@ export function useAgent(): AgentConnection {
         setError(null);
         backoffRef.current = 500;
         // First frame binds this socket to a session (or reconnects to it).
-        ws.send(JSON.stringify({ type: "attach", convo: convoRef.current }));
+        // `profile` is the routing key — omitted when unknown, never dropped
+        // once known (a reconnect after an error is also remote, G7).
+        const attach: { type: "attach"; convo: string | null; profile?: string; agent?: string } = {
+          type: "attach",
+          convo: convoRef.current,
+        };
+        if (profileRef.current !== null) attach.profile = profileRef.current;
+        const agent = attachAgentRef.current;
+        if (agent !== null) {
+          attach.agent = agent;
+          attachAgentRef.current = null;
+        }
+        ws.send(JSON.stringify(attach));
       };
 
       ws.onmessage = (ev) => {
@@ -224,10 +235,14 @@ export function useAgent(): AgentConnection {
   // resuming it from disk if not. A pending backoff reconnect is cancelled
   // and the old socket's handlers are detached first, so a switch can never
   // leave two sockets (or a stale `onclose` scheduling a third).
+  // `profile`/`agent` are the chip's reattach (design §6.4): same convo with
+  // a new profile still re-attaches, and the agent rides that one attach.
   const switchConvo = useCallback(
-    (id: string | null) => {
-      if (id === convoRef.current) return;
-      bindConvo(id);
+    (id: string | null, profile?: string | null, agent?: string) => {
+      const profileChanged = profile !== undefined && profile !== profileRef.current;
+      if (id === convoRef.current && !profileChanged && agent === undefined) return;
+      bindConvo(id, profile);
+      attachAgentRef.current = agent ?? null;
       backoffRef.current = 500;
       window.clearTimeout(reconnectTimerRef.current);
       const ws = wsRef.current;

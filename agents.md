@@ -625,6 +625,57 @@ A sub-agent's preamble (`build_sub_agent_preamble` in `src/pipeline/delegate_too
 
 Where it lives: `src/pipeline/{delegate_tool,handoff}.rs`, `build_sub_agent` in `src/providers/mod.rs`, `ToolEnv` in `src/tools/env.rs`, `MessageSource` + lane filter in `src/ui/app_state.rs` / `src/state/state_manager.rs`.
 
+## Remote profiles
+
+A profile entry with a `remote:` block points at ANOTHER PeakBot server. It is a normal tab next to the local profiles — one SPA, no webview navigation — and a socket attached to it is **relayed**: the local server opens one WebSocket to the remote and pumps frames, creating no session of its own.
+
+### Config shape
+
+```yaml
+profiles:
+  home-dev:
+    remote:
+      url: https://10.2.0.48:7823     # scheme://host[:port] only
+      token: pito                     # the REMOTE's web token (its `?token=…` link)
+      ca: sha256:3f9a…c1              # pin the remote's CA (64 hex) — or `ca: system`
+      profile: dev                    # REQUIRED: the profile ON THE REMOTE
+      # agent: team                   # optional: pin one agent of that profile
+    ui: { color: purple }
+```
+
+**Validation** (all in `Config::parse`):
+- **Global-only** — a `remote:` in a repo `.peakbot/config.yaml` is an error.
+- **Mutually exclusive with local fields** — a remote entry may carry only `remote` and `ui.color`; `agents`/`tools`/`mcps`/`fetch_url`/`env`/`memory`/`vector_db`/`ui.tabs` are errors naming the offending key.
+- `url` must be `https://` (plain `http://` is allowed **only for 127.0.0.1 / localhost**); a path, query, fragment or userinfo is an error (the token goes in `token`).
+- `ca` is required for https: `sha256:<64 hex>` (from the server's pairing link) or `system` for a publicly trusted certificate; it is forbidden on loopback http.
+- Names follow the usual rule — `.` and `..` are refused. The same `(url, profile)` pair may not be declared twice.
+
+### How it works
+
+- **The remote owns the conversation**: its session, history, sticky registry, reaper and kill. The local server persists nothing; a down remote gives a clear bounded error and a **local agent never answers a remote conversation**.
+- **The conversation list is merged** — local rows plus each remote's rows (fetched over token-gated `GET /api/conversations`, ≤ 2 s per remote; a down remote contributes none), tagged with the local profile name. Killing a remote row is routed to its server.
+- **Uploads and images** stream through the three allowlisted token-gated `/r/{profile}/…` routes; every root-relative image URL in remote state is re-rooted under `/r/<profile>/` so nothing auto-loads a local endpoint.
+- **Protocol versions must match exactly**: local and remote `ready.v` must both equal `PROTOCOL_VERSION` (`src/ui/wire.rs`) — older, newer, or missing is a hard error naming both versions (E-VERSION).
+- **Chaining is blocked** (a relay re-attaches with `relayed: true`; a remote-profile target is refused — E-CHAIN, which also makes loops impossible). **TUI/stdio refuse** remote profiles with a clear message — there is no web server there to relay through.
+
+### Security
+
+- The **local web token never leaves the local server** (contract-tested): every request the relay sends to the remote is built from the `RemoteProfile` alone, and the remote token travels as `Cookie: peakbot_token=…` — never in a URL, so it never reaches logs.
+- **CA pinning**: the remote's CA is fetched once (tokenless) and fingerprint-checked against `ca`; a mismatch is a hard E-TLS-PIN naming both fingerprints, and after that only that CA is a root. `ca: system` is an explicit opt-in. There is **no fallback** to system roots or plaintext.
+
+### Pairing
+
+- The TLS startup banner prints `🔑 CA fingerprint: sha256:…`; token-gated `GET /api/pairing` returns one `https://host:port/?token=…&ca=sha256:…` link per phone-reachable host (or `Unavailable` with `loopback_bind` / `no_tls`).
+- **Settings → General → "Connect a phone or another PeakBot"** lists the links (host labels only — the token URL appears only behind Show QR) with a profile dropdown that appends `&profile=<name>` client-side, plus Copy link.
+- **Settings → Profiles → "+ Add remote profile"** pastes such a link: the SPA splits it into `url`/`token`/`ca`/`profile` (the split never judges — `Config::parse` is the validator) and creates the entry named `<profile> on <host>`.
+- Remote changes are **reload-safe, next attach** (live-reload table: `profiles.* (remote) | next attach / next list refresh`).
+
+### Tab colour
+
+`ui.color` (one of red, orange, yellow, green, teal, blue, purple, pink) colours the tab accent, picker row and chip dot for local AND remote profiles; unset → a stable colour derived from the profile name (FNV-1a-32 % 8). The server resolves it into `ProfileInfo.color` — the SPA never derives a colour.
+
+Where it lives: `src/config/remote.rs` (parse), `src/ui/web/remote/{mod,relay,proxy}.rs` (client, relay, `/r/` proxy), `src/ui/web/conversations.rs` (merged list + kill), `web/src/settings/{profiles,connectPhone,pairingLink}` (Settings UI).
+
 ## CI (Gitea Actions)
 
 Two workflows on runner `shinpachi` (label `dind`):

@@ -64,12 +64,13 @@ export function activeTab(s: TabsState): ConvoTab {
 export function initialTabs(
   stored: TabsState | null,
   urlConvo: string | null,
+  urlProfile: string | null = null,
 ): TabsState {
   if (!stored) {
-    return { tabs: [freshTab(urlConvo)], active: 0 };
+    return { tabs: [freshTab(urlConvo, "", urlProfile)], active: 0 };
   }
   if (urlConvo === null) return stored;
-  return openConvo(stored, urlConvo);
+  return openConvo(stored, urlConvo, "", urlProfile);
 }
 
 export function newTab(s: TabsState): TabsState {
@@ -105,10 +106,15 @@ export function jumpTo(s: TabsState, n: number): TabsState {
   return activate(s, n - 1);
 }
 
-export function openConvo(s: TabsState, convo: string, title = ""): TabsState {
+export function openConvo(
+  s: TabsState,
+  convo: string,
+  title = "",
+  profile: string | null = null,
+): TabsState {
   const i = indexOfConvo(s, convo);
   if (i >= 0) return activate(s, i);
-  return { tabs: [...s.tabs, freshTab(convo, title)], active: s.tabs.length };
+  return { tabs: [...s.tabs, freshTab(convo, title, profile)], active: s.tabs.length };
 }
 
 /** The server says the active tab's socket is bound to `convo`; follow it. */

@@ -5,7 +5,7 @@
 //! Merged before the token layer in `WebUi::run`, so both are token-gated.
 
 use super::{KILL_RUNNING_MSG, WsState, registry::KillOutcome, registry::SessionRegistry};
-use crate::ui::wire::summaries_to_wire;
+use crate::ui::wire::{ConversationSummaryWire, summaries_to_wire};
 use axum::{
     Router,
     body::Body,
@@ -45,11 +45,7 @@ async fn kill(State(state): State<WsState>, Path(convo): Path<String>) -> Respon
 
 /// `{"items":[…]}` (+ `error`), built AFTER any kill so the rows reflect it.
 fn items_response(registry: &SessionRegistry, error: Option<&str>) -> Response {
-    let mut rows = registry.list_conversations();
-    // Storage order is unspecified (the in-memory store is a HashMap).
-    rows.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
-    let items = summaries_to_wire(rows, &registry.active_ids(), &registry.running_ids());
-    let mut body = serde_json::json!({ "items": items });
+    let mut body = serde_json::json!({ "items": local_rows(registry) });
     if let Some(e) = error {
         body["error"] = e.into();
     }
@@ -59,4 +55,13 @@ fn items_response(registry: &SessionRegistry, error: Option<&str>) -> Response {
         Body::from(body.to_string()),
     )
         .into_response()
+}
+
+/// This server's saved conversations, newest first, with the registry's
+/// live flags. Needs no session, so relay sockets can use it too.
+pub(crate) fn local_rows(registry: &SessionRegistry) -> Vec<ConversationSummaryWire> {
+    let mut rows = registry.list_conversations();
+    // Storage order is unspecified (the in-memory store is a HashMap).
+    rows.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
+    summaries_to_wire(rows, &registry.active_ids(), &registry.running_ids())
 }

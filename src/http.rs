@@ -10,28 +10,34 @@
 //! Android and, worse, has no timeouts — an upstream that accepts a request and
 //! never answers would wedge the turn until the process dies.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::config::HttpConfig;
 
-#[cfg(target_os = "android")]
-use std::sync::Arc;
-
-/// rustls config trusting the bundled Mozilla webpki roots (aws-lc-rs provider,
-/// already linked via reqwest's `rustls` feature).
-#[cfg(target_os = "android")]
-fn tls_config() -> rustls::ClientConfig {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    rustls::ClientConfig::builder_with_provider(Arc::new(
+/// The platform TLS policy as a rustls config (aws-lc-rs provider, already
+/// linked via reqwest's `rustls` feature): Android trusts the bundled Mozilla
+/// webpki roots, desktop the OS verifier. The remote-profile WS dial needs the
+/// config itself, so this is the one place the policy is built.
+pub fn system_tls_config() -> Result<rustls::ClientConfig, rustls::Error> {
+    let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::aws_lc_rs::default_provider(),
     ))
-    .with_safe_default_protocol_versions()
-    .expect("aws-lc-rs supports the default protocol versions")
-    .with_root_certificates(roots)
-    .with_no_client_auth()
+    .with_safe_default_protocol_versions()?;
+
+    #[cfg(target_os = "android")]
+    let builder = {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        builder.with_root_certificates(roots)
+    };
+    #[cfg(not(target_os = "android"))]
+    let builder = {
+        use rustls_platform_verifier::BuilderVerifierExt;
+        builder.with_platform_verifier()?
+    };
+
+    Ok(builder.with_no_client_auth())
 }
 
 /// reqwest builder with the platform TLS policy (Android: webpki roots; desktop:
@@ -39,7 +45,9 @@ fn tls_config() -> rustls::ClientConfig {
 /// (shorter) total timeout then `.build()`.
 pub fn client_builder() -> reqwest::ClientBuilder {
     #[cfg(target_os = "android")]
-    let base = reqwest::Client::builder().use_preconfigured_tls(tls_config());
+    let base = reqwest::Client::builder().tls_backend_preconfigured(
+        system_tls_config().expect("aws-lc-rs supports the default protocol versions"),
+    );
     #[cfg(not(target_os = "android"))]
     let base = reqwest::Client::builder();
 
@@ -85,7 +93,7 @@ mod tests {
     #[test]
     fn builds_client_without_panicking() {
         // On desktop this exercises the default reqwest path; on Android it
-        // exercises tls_config() (root loading + aws-lc-rs provider).
+        // exercises system_tls_config() (root loading + aws-lc-rs provider).
         let _ = client();
     }
 

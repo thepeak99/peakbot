@@ -66,8 +66,10 @@ export function ConversationsPicker({
   conversations: ConversationSummary[];
   hasTranscript: boolean;
   onOpen: () => void;
-  onLoad: (id: string) => void;
-  onKill: (id: string) => void;
+  // The row's profile rides along (null = local) so a remote row opens and
+  // dies on its own server (design §6.4).
+  onLoad: (id: string, profile: string | null) => void;
+  onKill: (id: string, profile: string | null) => void;
   dropUp?: boolean;
   // Kill-refusal message from the last list reply; null when none.
   error: string | null;
@@ -140,7 +142,7 @@ export function ConversationsPicker({
     ) {
       return;
     }
-    onLoad(c.id);
+    onLoad(c.id, c.profile ?? null);
   };
 
   const kill = (c: ConversationSummary) => {
@@ -149,7 +151,7 @@ export function ConversationsPicker({
         `Kill the live session for "${c.name}"? Anyone connected to it will be disconnected.`,
       )
     ) {
-      onKill(c.id);
+      onKill(c.id, c.profile ?? null);
     }
   };
 
@@ -258,9 +260,10 @@ export function ConversationsPicker({
             filtered.map(({ conversation: c, originalIndex }, fi) => {
               // The row's profile accent, resolved from the catalogue (design
               // T2); a row without a known profile shows no dot.
-              const rowColor = c.profile
-                ? catalog?.find((p) => p.name === c.profile)?.color
+              const rowProfile = c.profile
+                ? catalog?.find((p) => p.name === c.profile)
                 : undefined;
+              const rowColor = rowProfile?.color;
               return (
               <div
                 key={c.id}
@@ -304,6 +307,11 @@ export function ConversationsPicker({
                       >
                         {c.name}
                       </span>
+                      {rowProfile?.origin === "remote" && (
+                        <span className="shrink-0 rounded bg-zinc-800 px-1 text-[10px] text-zinc-400">
+                          remote
+                        </span>
+                      )}
                     </span>
                     <span className="text-[10px] text-zinc-500">
                       {c.message_count} msgs · {c.model}

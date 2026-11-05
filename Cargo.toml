@@ -23,7 +23,7 @@ base64 = "0.22"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-reqwest = { version = "0.13", features = ["rustls"], default-features = false }
+reqwest = { version = "0.13", features = ["rustls", "stream"], default-features = false }
 http = "1"
 chrono = "0.4"
 directories-next = "2"
@@ -89,6 +89,12 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
 axum-server = { version = "0.8", default-features = false, features = ["tls-rustls"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+# Remote profiles (src/ui/web/remote/): the WS dial is TCP → tokio-rustls →
+# `client_async`, so tungstenite needs only `handshake` plus the rustls
+# `MaybeTlsStream` arm (its bundled webpki roots are never used — we pass our
+# own config). Same feature set 0.28 already has in the lock: no new crate.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
+tokio-rustls = { version = "0.26", default-features = false }
 # Leaf validity window (src/ui/web/tls.rs `leaf_validity`): `time` is already
 # in the lock via rcgen/yasna — this only promotes the edge.
 time = "0.3"
@@ -141,6 +147,11 @@ libc = "0.2"
 [target.'cfg(target_os = "android")'.dependencies]
 webpki-roots = "1"
 
+# `http::system_tls_config()` hands the remote-profile WS dial the same OS
+# verifier reqwest uses on desktop. Already in the lock via reqwest.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+rustls-platform-verifier = "0.6"
+
 [dev-dependencies]
 tempfile = "3.27"
 insta = { version = "1.40", features = ["yaml", "serde", "filters"] }
@@ -159,8 +170,8 @@ tokio-util = { version = "0.7" }
 # notBefore/notAfter. Already in the lock via rcgen — this only adds a
 # dev-only dependency edge, no new crate.
 x509-parser = "0.18"
-# Remote-profiles T4 E2E: a real WebSocket client to drive `/ws` in
-# `src/ui/web/t4_tests.rs`. Same 0.29 axum already pulls — no new crate.
+# Remote-profiles T4 E2E: `connect_async` (default `connect` feature) drives
+# `/ws` in `src/ui/web/t4_tests.rs`; the lib dep above is handshake-only.
 tokio-tungstenite = "0.29"
 
 # No debuginfo for test builds: cold codegen of the large lib test binary

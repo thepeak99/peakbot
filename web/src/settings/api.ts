@@ -62,6 +62,11 @@ export function validateConfig(scope: Scope, text: string, convo?: string): Prom
   });
 }
 
+/** GET /api/pairing — the phone-reachable entry links (design §8.4). */
+export function getPairing(): Promise<unknown> {
+  return request<unknown>("/api/pairing");
+}
+
 /** PUT /api/config { scope, text, base_sha256, convo? } → 200 PutOk | 409 | 422. */
 export function putConfig(
   scope: Scope,

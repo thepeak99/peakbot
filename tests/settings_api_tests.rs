@@ -51,7 +51,7 @@
 //!    boot_cwd: PathBuf                   // repo-scope fallback cwd: <boot_cwd>/.peakbot/config.yaml
 //!    migrate_error: Option<String>       // boot auto-migration failure (AutoMigrateError Display), fixed at boot
 //!    boot_web: BootWeb
-//! 3. `peakbot::ui::web::settings::BootWeb { bind: SocketAddr, token_source: TokenSource, tls: bool }`
+//! 3. `peakbot::ui::web::settings::BootWeb { bind: SocketAddr, token_source: TokenSource, tls: bool, token: Option<String>, extra_sans: Vec<String>, tls_dir: Option<PathBuf> }`
 //!    and `TokenSource { Config, Env, Cli, None }`, serialising lowercase
 //!    ("config"|"env"|"cli"|"none") — §8.2 `boot` block.
 //! 4. `peakbot::ui::web::registry::SessionRegistry` made `pub` (module +
@@ -266,6 +266,9 @@ impl Sandbox {
                 bind: "127.0.0.1:7823".parse().expect("bind"),
                 token_source: TokenSource::Config,
                 tls: false,
+                token: None,
+                extra_sans: Vec::new(),
+                tls_dir: None,
             },
         };
         Self { xdg, cwd, state }

@@ -31,7 +31,8 @@ import {
 } from "./convoTabs";
 import { loadTabs, saveTabs } from "./tabsPersistence";
 import { tabShortcut } from "./tabShortcuts";
-import { setConvoInUrl, type AgentConnection } from "./useAgent";
+import { profileFromUrl, setConvoInUrl } from "./state";
+import type { AgentConnection } from "./useAgent";
 
 /** How often background tabs' running state is refreshed (only with >1 tab). */
 const POLL_MS = 4000;
@@ -51,8 +52,9 @@ function safeStorage(): Storage | null {
 export function bootDesktopTabs(): TabsState {
   const storage = safeStorage();
   const urlConvo = new URLSearchParams(window.location.search).get("convo");
-  const state = initialTabs(storage ? loadTabs(storage) : null, urlConvo);
-  setConvoInUrl(activeTab(state).convo);
+  const state = initialTabs(storage ? loadTabs(storage) : null, urlConvo, profileFromUrl());
+  const active = activeTab(state);
+  setConvoInUrl(active.convo, active.profile);
   return state;
 }
 
@@ -64,7 +66,8 @@ export interface ConvoTabsApi {
   activate(i: number): void;
   close(i: number): void;
   newTab(): void;
-  open(convo: string): void;
+  /** `profile` only matters for a convo with no tab yet (a picker row). */
+  open(convo: string, profile?: string | null): void;
 }
 
 /** `initial === null` (a browser) disables everything and returns `null`.
@@ -119,7 +122,8 @@ export function useConvoTabs(
         const left = stillOpen ? leave(st, from.convo, wasRunning) : st;
         return enter(left, to.convo);
       });
-      agentRef.current.switchConvo(to.convo);
+      // The tab's profile routes the attach (null = local, design §6.4).
+      agentRef.current.switchConvo(to.convo, to.profile);
     },
     [apply],
   );
@@ -220,7 +224,7 @@ export function useConvoTabs(
             activate: (i) => dispatch((s) => activate(s, i)),
             close: (i) => dispatch((s) => closeTab(s, i)),
             newTab: () => dispatch(newTab),
-            open: (c) => dispatch((s) => openConvo(s, c)),
+            open: (c, profile = null) => dispatch((s) => openConvo(s, c, "", profile)),
           }
         : null,
     [tabs, views, dispatch],

@@ -172,8 +172,7 @@ impl ImageLinks {
 /// to `f` (remote-URL skipping lives in `resolve`). A `None` answer leaves
 /// that span byte-identical, so we splice selectively into the original
 /// string instead of rebuilding the document from events.
-#[allow(dead_code)] // caller lands in the ImageLinks::rewrite follow-up task
-fn rewrite_markdown_images(
+pub(super) fn rewrite_markdown_images(
     src: &str,
     mut f: impl FnMut(&str) -> Option<String>,
 ) -> std::borrow::Cow<'_, str> {

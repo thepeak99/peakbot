@@ -752,6 +752,12 @@ export interface SelectionChipProps {
   /** Called with `Next conversation: …` / `Overrides reset for …`. */
   onToast?(message: string): void;
   dropUp?: boolean;
+  /** T9: a pick that crosses the local/remote boundary (`chipAction` →
+   *  "reattach") opens a fresh socket on (profile, agent) instead of sending
+   *  `select`. `agent` is omitted for the bare `selection-agent-remote` row
+   *  (a remote profile whose agents are unknown) — the remote resolves its
+   *  own agent. Optional so a chip without a socket owner just selects. */
+  onReattach?(profile: string, agent?: string): void;
 }
 // data-testids (the chip owns all of them):
 //   `selection-chip`        — the <button>. textContent =
@@ -777,11 +783,20 @@ export interface SelectionChipProps {
 //   `selection-profile-<name>` — one row per profile, catalog order (repo
 //                             first). 📁 on repo rows; row 0 caption `default`
 //                             (`pinned` under a pin). data-browsed="true" on
-//                             the BROWSED row. Click = BROWSE ONLY (nav → agent).
+//                             the BROWSED row. Click = browse (nav → agent);
+//                             a zero-agent remote profile also connects via
+//                             onReattach.
 //   `selection-agent-<name>` — rows of the BROWSED profile. Caption `N subagents`
 //                             (+ ` · default` on the first) or `single`.
 //                             Click = send(select(browsed, agent)) unless it is
 //                             already the bound pair; always nav → team.
+//   `selection-agent-remote` — the ONE row of a browsed REMOTE profile with
+//                             no known agents (the catalog emits `agents: []`):
+//                             label = the profile name, caption `remote —
+//                             agents on the server`. Click = reattach to the
+//                             profile WITHOUT an agent (no `select` frame);
+//                             always nav → team. Absent once the agents are
+//                             known (relay-filled).
 //   `selection-member-orchestrator` / `selection-member-sub-<name>` — Team rows;
 //                             each contains `selection-member-model`
 //                             (data-state="default"|"overridden"|"inherited";

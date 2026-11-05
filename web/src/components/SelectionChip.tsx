@@ -18,7 +18,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { boundAgentOf } from "../adapt";
-import { select } from "../state";
+import { chipAction, select } from "../state";
 import type { CatalogAgent } from "../types";
 import {
   EMPTY_TEAM,
@@ -65,6 +65,7 @@ export function SelectionChip({
   send,
   onToast,
   dropUp = false,
+  onReattach,
 }: SelectionChipProps) {
   const [open, setOpen] = useState(false);
   const [nav, setNav] = useState<Nav>({ pane: "profile" });
@@ -145,8 +146,15 @@ export function SelectionChip({
     setOpen(!open);
   };
 
-  // Profile click: browse only — nothing is selected, nothing is sent.
+  // Profile click: browse — nothing is selected, nothing is sent. Exception:
+  // a zero-agent remote profile is CONNECTED (onReattach without an agent)
+  // so the relay can fill the remote's real agents; the bare row stays the
+  // fallback until it does.
   const browse = (name: string) => {
+    const entry = catalog.find((p) => p.name === name);
+    if (entry && entry.origin === "remote" && entry.agents.length === 0 && onReattach && !locked) {
+      onReattach(name);
+    }
     setBrowsed(name);
     setNav({ pane: "agent" });
   };
@@ -155,8 +163,21 @@ export function SelectionChip({
   // clean), then drill into its Team. The popover stays open.
   const pickAgent = (agent: string) => {
     if (!(browsedProfile.name === selection.profile && agent === selection.agent)) {
-      send(select(browsedProfile.name, agent));
-      onToast?.(`Next conversation: ${browsedProfile.name} › ${agent}`);
+      const target = { profile: browsedProfile.name, agent, subagentModels: {} };
+      // Crossing local/remote needs a fresh socket: a `select` for a profile
+      // on the other server would be refused (design §6.3 #10).
+      if (onReattach && chipAction(selection, target, catalog) === "reattach") {
+        // The bare remote row (agent "") rides the attach WITHOUT an agent —
+        // the remote resolves its own (design §6.4); no `select` is sent.
+        onReattach(target.profile, agent || undefined);
+      } else {
+        send(select(target.profile, agent));
+      }
+      onToast?.(
+        agent
+          ? `Next conversation: ${browsedProfile.name} › ${agent}`
+          : `Next conversation: ${browsedProfile.name}`,
+      );
     }
     setNav({ pane: "team" });
   };

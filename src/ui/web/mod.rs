@@ -57,8 +57,7 @@ use crate::ui::Ui;
 use crate::ui::outbound::{OutboundRx, OutboundTx, outbound_channel};
 use crate::ui::ui_trait::builtin_commands;
 use crate::ui::wire::{
-    InboundMessage, ModelInfo, OutboundMessage, build_conversations_snapshot, build_dir_listing,
-    build_recent_dirs,
+    InboundMessage, ModelInfo, OutboundMessage, build_dir_listing, build_recent_dirs,
 };
 use crate::{StateManager, UiAction};
 use anyhow::Result;
@@ -74,7 +73,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures::{Sink, SinkExt, StreamExt};
-use registry::{KillOutcome, SessionRegistry};
+use registry::SessionRegistry;
 use rust_embed::RustEmbed;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -86,6 +85,7 @@ use uuid::Uuid;
 mod conversations;
 mod images;
 pub mod registry;
+mod remote;
 pub mod settings;
 pub mod system;
 #[cfg(test)]
@@ -322,6 +322,14 @@ impl Ui for WebUi {
                 bind: self.addr,
                 token_source: self.settings.token_source,
                 tls: self.tls,
+                // The `GET /api/pairing` facts (design §8.4): the effective
+                // token, the --tls-name extras and the cert dir. A
+                // `default_tls_dir` failure with TLS on (no usable home
+                // dir) means pairing reports no fingerprint to offer, and
+                // `serve_tls` still refuses to boot with the real error.
+                token: self.token.as_ref().map(|t| t.to_string()),
+                extra_sans: self.extra_sans.clone(),
+                tls_dir: self.tls.then(|| tls::default_tls_dir().ok()).flatten(),
             },
         };
         app = app.merge(settings::router(settings_state));
@@ -337,6 +345,11 @@ impl Ui for WebUi {
         if self.deps.is_some() {
             app = app.merge(conversations::router(self.ws_state.clone()));
         }
+
+        // The `/r/` proxy (remote-profiles §6.2): the three allowlisted
+        // routes plus a catch-all 404 for everything else under `/r/`.
+        // Before the token layer, so token-gated like `/api/uploads`.
+        app = app.merge(remote::proxy::router());
 
         // Gate every route behind the shared secret when one is configured.
         // Open by default (loopback); `main` guarantees a token exists before
@@ -700,20 +713,14 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
     // non-attach first frame attaches fresh and is then processed normally so
     // nothing is silently dropped. A socket that closes before any frame just
     // unwinds (writer drops on scope exit).
-    let (want, profile, agent, relayed, leftover) = match read_first_frame(&mut ws_stream).await {
+    let (convo, profile, agent, relayed, leftover) = match read_first_frame(&mut ws_stream).await {
         Some(text) => match serde_json::from_str::<InboundMessage>(&text) {
             Ok(InboundMessage::Attach {
                 convo,
                 profile,
                 agent,
                 relayed,
-            }) => (
-                convo.and_then(|s| Uuid::parse_str(&s).ok()),
-                profile,
-                agent,
-                relayed,
-                None,
-            ),
+            }) => (convo, profile, agent, relayed, None),
             _ => (None, None, None, false, Some(text)),
         },
         None => return,
@@ -727,24 +734,65 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
         .clone()
         .expect("ws_handler is mounted only with deps; the needs_setup guard replaces it");
 
+    // §5.11 (freshness): the remote decision — is L a remote profile *right
+    // now*, its target P and agent pin, and the relay's catalogue — comes
+    // from ONE fresh global-config parse, never the boot catalogue: a
+    // remote added or edited after boot must route on the NEXT attach.
+    // Only an attach naming a profile that is not LOCAL in the boot
+    // catalogue pays for the parse — a name has one kind per config, so a
+    // no-profile or boot-local attach can never be remote (local freshness
+    // is the session's own reload's job).
+    let (remote_profile, fresh_catalog) = match profile
+        .as_deref()
+        .filter(|p| !boot_has_local(registry.boot_catalog(), p))
+    {
+        Some(p) => match remote::fresh_attach(p) {
+            Ok(found) => found,
+            // E-CONFIG: exactly one locked error frame, then close. A
+            // broken global config disables remote attaches — it never
+            // falls back to a local session.
+            Err(e) => {
+                refuse(out_tx, writer_task, e.to_string()).await;
+                return;
+            }
+        },
+        None => (None, Vec::new()),
+    };
+
     // E-CHAIN (design §5.9): a relay may not reach through a remote profile.
     // Checked before `attach` so a refused chain never mints a session.
-    if relayed
-        && let Some(p) = profile.as_deref()
-        && registry.boot_catalog().remote(p).is_some()
-    {
+    if relayed && let Some(remote) = remote_profile.as_ref() {
         refuse(
             out_tx,
             writer_task,
             format!(
-                "profile '{p}' on this server is itself a remote profile — \
-                 chaining remote profiles isn't supported"
+                "profile '{}' on this server is itself a remote profile — \
+                 chaining remote profiles isn't supported",
+                remote.name
             ),
         )
         .await;
         return;
     }
 
+    // Remote(L) (design §5.1): relay and RETURN — no path from here reaches
+    // `registry.attach`, so a failed remote never falls back to a local session.
+    if let Some(remote) = remote_profile {
+        if let Some(pin) = registry.profile_pin() {
+            refuse(out_tx, writer_task, pinned_message(pin)).await;
+            return;
+        }
+        let view = remote::relay::LocalView {
+            name: remote.name.clone(),
+            target_profile: remote.target.profile.clone(),
+            target_agent: remote.target.agent.clone(),
+            catalog: fresh_catalog,
+        };
+        remote::relay::run(ws_stream, out_tx, writer_task, registry, view, convo, agent).await;
+        return;
+    }
+
+    let want = convo.and_then(|s| Uuid::parse_str(&s).ok());
     let registered = match registry.attach(want) {
         Ok(r) => r,
         Err(e) => {
@@ -892,17 +940,17 @@ fn ensure_selection(
         return Ok(());
     }
     let state = sm.get_state();
-    // The session's own (fresh, cwd-aware) catalogue; remote entries are
-    // filtered out of it, so a remote name reads as unknown here.
+    // The session's own (fresh, cwd-aware) catalogue. A remote name can't
+    // get here: attach routing (remote-profiles §5.11) relays it — or
+    // refuses with E-CONFIG — before `registry.attach` runs, and repo
+    // files never define remotes.
     let Some(info) = state.catalog.iter().find(|p| p.name == profile) else {
         return Err(format!("Unknown profile '{profile}'."));
     };
     if let Some(pin) = pin
         && pin != profile
     {
-        return Err(format!(
-            "This server is pinned to profile '{pin}' (--profile)."
-        ));
+        return Err(pinned_message(pin));
     }
     let cur = &state.selection;
     let agent = match agent {
@@ -925,6 +973,19 @@ fn ensure_selection(
         model: None,
     });
     Ok(())
+}
+
+/// E-PINNED (design §5.12).
+fn pinned_message(pin: &str) -> String {
+    format!("This server is pinned to profile '{pin}' (--profile).")
+}
+
+/// True when the boot catalogue has `name` as a LOCAL entry — the attach
+/// shapes that can never be remote, so the §5.11 fresh parse is skipped.
+fn boot_has_local(catalog: &crate::config::resolve::Catalog, name: &str) -> bool {
+    catalog
+        .entries()
+        .any(|e| matches!(e, crate::config::resolve::CatalogEntry::Local(l) if l.name == name))
 }
 
 /// Await the first text frame of a connection, skipping non-text control
@@ -983,35 +1044,34 @@ fn dispatch_inbound(
             })
             .is_ok(),
         Ok(InboundMessage::ListDir { path }) => out_tx.send(build_dir_listing(&path)).is_ok(),
+        // Spawned: the merged list fetches the remotes (≤ 2 s each, §5.6)
+        // and the reader loop must not block on it.
         Ok(InboundMessage::RequestConversations) => {
-            let items = build_conversations_snapshot(
-                state_manager,
-                &registry.active_ids(),
-                &registry.running_ids(),
-            );
-            out_tx
-                .send(OutboundMessage::ConversationsList { items, error: None })
-                .is_ok()
+            let registry = registry.clone();
+            let out_tx = out_tx.clone();
+            tokio::spawn(async move {
+                let items = remote::listing::merged_items(&registry).await;
+                let _ = out_tx.send(OutboundMessage::ConversationsList { items, error: None });
+            });
+            true
         }
         Ok(InboundMessage::RequestRecentDirs) => {
             let dirs = build_recent_dirs(state_manager);
             out_tx.send(OutboundMessage::RecentDirs { dirs }).is_ok()
         }
-        Ok(InboundMessage::KillSession { convo, .. }) => {
-            let Ok(id) = Uuid::parse_str(&convo) else {
-                return true;
-            };
-            let refused = registry.kill(id) == KillOutcome::Running;
-            // Active ids are read after the kill so the row reflects it.
-            let items = build_conversations_snapshot(
-                state_manager,
-                &registry.active_ids(),
-                &registry.running_ids(),
-            );
-            let error = refused.then(|| KILL_RUNNING_MSG.to_string());
-            out_tx
-                .send(OutboundMessage::ConversationsList { items, error })
-                .is_ok()
+        // Routed by `profile` (§5.6): a remote profile goes to its server,
+        // anything else is today's local kill. Spawned like the list.
+        Ok(InboundMessage::KillSession { convo, profile }) => {
+            let registry = registry.clone();
+            let out_tx = out_tx.clone();
+            tokio::spawn(async move {
+                if let Some((items, error)) =
+                    remote::listing::answer_kill(&registry, &convo, profile.as_deref()).await
+                {
+                    let _ = out_tx.send(OutboundMessage::ConversationsList { items, error });
+                }
+            });
+            true
         }
         // Re-attach mid-stream is a client bug; ignore rather than reset.
         Ok(InboundMessage::Attach { .. }) => true,

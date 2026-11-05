@@ -31,6 +31,7 @@ export function TopBar({
   conversationsError,
   send,
   onLoadConversation,
+  onReattach,
   notifyEnabled,
   notifyPermission,
   onToggleNotify,
@@ -59,7 +60,9 @@ export function TopBar({
   conversations: ConversationSummary[];
   conversationsError: string | null;
   send: (msg: InboundMessage) => void;
-  onLoadConversation: (id: string) => void;
+  onLoadConversation: (id: string, profile: string | null) => void;
+  /** Chip pick across local/remote: re-attach on (profile, agent). */
+  onReattach?(profile: string, agent?: string): void;
   notifyEnabled: boolean;
   notifyPermission: NotifyPermission;
   onToggleNotify: () => void;
@@ -109,6 +112,7 @@ export function TopBar({
           pinned={profilePinned}
           send={send}
           onToast={onToast}
+          onReattach={onReattach}
         />
         <ConversationsPicker
           conversations={conversations}
@@ -116,7 +120,9 @@ export function TopBar({
           hasTranscript={hasTranscript}
           onOpen={() => send({ type: "request_conversations" })}
           onLoad={onLoadConversation}
-          onKill={(id) => send({ type: "kill_session", convo: id })}
+          onKill={(id, profile) =>
+            send({ type: "kill_session", convo: id, ...(profile ? { profile } : {}) })
+          }
           catalog={catalog}
         />
 

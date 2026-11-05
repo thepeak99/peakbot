@@ -350,7 +350,7 @@ describe("ComposerSlot — ref.add", () => {
     await mount({ convo: "convo-1", live: makeLive(), handle });
     await add(handle, [f]);
     expect(uploadFileMock).toHaveBeenCalledTimes(1);
-    expect(uploadFileMock).toHaveBeenCalledWith("convo-1", f, expect.any(Function));
+    expect(uploadFileMock).toHaveBeenCalledWith("convo-1", f, expect.any(Function), "");
   });
 
   it("uploads each file separately, all under the same convo", async () => {
@@ -377,7 +377,7 @@ describe("ComposerSlot — ref.add", () => {
     await mount({ convo: "x", live: makeLive(), handle });
     await rerender({ convo: "y", live: makeLive(), handle });
     await add(handle, [pdf("late.pdf")]);
-    expect(uploadFileMock).toHaveBeenCalledWith("y", expect.any(File), expect.any(Function));
+    expect(uploadFileMock).toHaveBeenCalledWith("y", expect.any(File), expect.any(Function), "");
   });
 
   it("honours live.uploadLimits: a file over max_file_mb becomes an error chip and is never uploaded", async () => {
@@ -411,7 +411,7 @@ describe("ComposerSlot — ref.add", () => {
     await act(async () => {
       input!.dispatchEvent(new Event("change", { bubbles: true }));
     });
-    expect(uploadFileMock).toHaveBeenCalledWith("c-input", f, expect.any(Function));
+    expect(uploadFileMock).toHaveBeenCalledWith("c-input", f, expect.any(Function), "");
   });
 });
 

@@ -276,7 +276,7 @@ describe("ConversationsPicker — desktop vs browser (issue #373)", () => {
     });
 
     expect(confirmSpy, "the browser must keep the replace-confirm").toHaveBeenCalled();
-    expect(onLoad).toHaveBeenCalledWith("b2");
+    expect(onLoad).toHaveBeenCalledWith("b2", null);
   });
 
   // ── desktop: no +, no confirm, load opens a tab ────────────────────────
@@ -324,7 +324,7 @@ describe("ConversationsPicker — desktop vs browser (issue #373)", () => {
       confirmSpy,
       "desktop: no replace-confirm — loading opens a tab, nothing is replaced",
     ).not.toHaveBeenCalled();
-    expect(onLoad, "the picker must still hand the id to the tab store").toHaveBeenCalledWith("b2");
+    expect(onLoad, "the picker must still hand the id to the tab store").toHaveBeenCalledWith("b2", null);
   });
 
   it("desktop: loading without a transcript loads directly", async () => {
@@ -357,7 +357,7 @@ describe("ConversationsPicker — desktop vs browser (issue #373)", () => {
     });
 
     expect(confirmSpy).not.toHaveBeenCalled();
-    expect(onLoad).toHaveBeenCalledWith("b2");
+    expect(onLoad).toHaveBeenCalledWith("b2", null);
   });
 });
 

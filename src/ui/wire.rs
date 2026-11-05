@@ -124,7 +124,6 @@ pub(crate) enum InboundMessage {
         convo: String,
         /// Routing hint for a relay; the local path ignores it.
         #[serde(default)]
-        #[allow(dead_code)] // first reader is the T6 relay's kill routing
         profile: Option<String>,
     },
     Shutdown,
@@ -234,28 +233,29 @@ pub(crate) fn build_dir_listing(path: &str) -> OutboundMessage {
 }
 
 /// Trimmed subset of `ConversationSummary` for a dropdown picker
-/// (backend already sorts newest first).
+/// (backend already sorts newest first). Fields are `pub(crate)` so the
+/// T7 list merge can read `profile` to tag kept rows and rewrite it to L.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct ConversationSummaryWire {
     /// Fed back as `/load <id>`.
-    id: String,
-    name: String,
+    pub(crate) id: String,
+    pub(crate) name: String,
     /// ISO 8601 UTC.
-    updated_at: String,
-    message_count: usize,
-    model: String,
+    pub(crate) updated_at: String,
+    pub(crate) message_count: usize,
+    pub(crate) model: String,
     /// `true` when a live session is currently bound to this conversation
     /// (registry membership). Runtime-only, never persisted.
-    active: bool,
+    pub(crate) active: bool,
     /// `true` when that live session has an agent turn in flight. Always
     /// serialised (never omitted) so clients can rely on a bool; drives the
     /// spinner on background desktop tabs. Runtime-only, never persisted.
-    running: bool,
+    pub(crate) running: bool,
     /// The config profile this conversation is bound to (design T1, §6.1).
     /// `#[serde(default)]`: absent on old servers and on legacy
     /// profile-less conversations ⇒ `None`.
     #[serde(default)]
-    profile: Option<String>,
+    pub(crate) profile: Option<String>,
 }
 
 /// Outbound message envelopes to the client. Owning (no lifetime) so any

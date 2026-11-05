@@ -94,15 +94,21 @@ pub fn ca_cert_pem(tls_dir: &Path) -> Result<String> {
 /// `sha256:<hex>` of the CA certificate's DER — what a remote-profile `ca`
 /// pin compares against (shown in the banner so it can be copied).
 pub fn ca_fingerprint(tls_dir: &Path) -> Result<String> {
-    use sha2::{Digest, Sha256};
     let pem = ca_cert_pem(tls_dir)?;
     let der = CertificateDer::from_pem_slice(pem.as_bytes())
         .context("CA certificate PEM did not parse")?;
-    let hex: String = Sha256::digest(der.as_ref())
+    Ok(der_fingerprint(&der))
+}
+
+/// `sha256:<64 lower hex>` of a certificate's DER — shared with the remote
+/// client so the banner and the pin check can't disagree on the format.
+pub fn der_fingerprint(der: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let hex: String = Sha256::digest(der)
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    Ok(format!("sha256:{hex}"))
+    format!("sha256:{hex}")
 }
 
 /// A rustls server config presenting a freshly-minted leaf (signed by the CA)

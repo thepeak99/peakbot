@@ -34,16 +34,19 @@ const PARKED: ComposerLive = {
 
 export const ComposerSlot = memo(function ComposerSlot({
   convo,
+  base = "",
   live,
   ref,
 }: {
   convo: string | null;
+  /** `/r/<L>` proxy prefix of this tab's profile ("" = local); uploads use it. */
+  base?: string;
   /** `null` = inactive tab: parked and hidden. */
   live: ComposerLive | null;
   ref?: Ref<ComposerSlotHandle>;
 }) {
   const { uploadLimits, ...props } = live ?? PARKED;
-  const attachments = useAttachments(convo, uploadLimits);
+  const attachments = useAttachments(convo, uploadLimits, base);
   useImperativeHandle(ref, () => ({ add: attachments.add }), [attachments.add]);
   return <Composer {...props} hidden={live === null} attachments={attachments} />;
 });

@@ -43,6 +43,12 @@ impl RemoteToken {
     pub fn new(token: impl Into<String>) -> Self {
         Self(token.into())
     }
+
+    /// The raw value. Only `ui::web::remote::Client` reads it, to build the
+    /// `peakbot_token` cookie (design §7).
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
 }
 
 impl fmt::Debug for RemoteToken {

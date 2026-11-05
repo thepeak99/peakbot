@@ -36,11 +36,13 @@ interface Props {
    *  unrepresentable. */
   messages: WireChatMessage[];
   drawerOpen: boolean;
+  /** `/r/<L>` proxy prefix of the conversation's profile ("" = local). */
+  base?: string;
   /** React 19: `ref` is a plain prop, no `forwardRef` wrapper needed. */
   ref?: Ref<TranscriptHandle>;
 }
 
-export function Transcript({ messages, drawerOpen, ref }: Props) {
+export function Transcript({ messages, drawerOpen, base = "", ref }: Props) {
   // The hook counts the *filtered* messages, so "N new messages" is per-view.
   const { sectionRef, onScroll, pinned, unread, showTop, repin } =
     useTranscriptScroll(messages.length);
@@ -134,7 +136,7 @@ export function Transcript({ messages, drawerOpen, ref }: Props) {
               className="absolute left-0 top-0 w-full pb-3"
               style={{ transform: `translateY(${vi.start}px)` }}
             >
-              <Message message={adaptMessage(messages[vi.index])} />
+              <Message message={adaptMessage(messages[vi.index], base)} />
             </div>
           ))}
         </div>

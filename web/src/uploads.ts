@@ -20,11 +20,14 @@ function errorMessage(status: number, body: string): string {
   return `Upload failed (HTTP ${status})`;
 }
 
-/** `onProgress` receives the 0..1 fraction of the request body sent. */
+/** `onProgress` receives the 0..1 fraction of the request body sent. `base`
+ * is the pre-encoded `/r/<L>` proxy prefix of a remote conversation (from
+ * `apiBase`), used verbatim; "" = this server. */
 export function uploadFile(
   convo: string,
   file: File,
   onProgress: (fraction: number) => void,
+  base = "",
 ): UploadHandle {
   const xhr = new XMLHttpRequest();
   const done = new Promise<WireAttachment>((resolve, reject) => {
@@ -47,7 +50,7 @@ export function uploadFile(
   });
   xhr.open(
     "POST",
-    `/api/uploads?convo=${encodeURIComponent(convo)}&name=${encodeURIComponent(file.name)}`,
+    `${base}/api/uploads?convo=${encodeURIComponent(convo)}&name=${encodeURIComponent(file.name)}`,
   );
   xhr.setRequestHeader("Content-Type", "application/octet-stream");
   xhr.send(file);

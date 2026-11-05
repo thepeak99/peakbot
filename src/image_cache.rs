@@ -88,16 +88,23 @@ pub fn path_for(id: &str) -> Option<PathBuf> {
     path_for_in(&dir(), id)
 }
 
-fn path_for_in(dir: &Path, id: &str) -> Option<PathBuf> {
-    // Validate the id's grammar before ever touching the filesystem — an
-    // unvalidated id must never be joined onto `dir` (path-traversal).
-    let (hash, ext) = id.split_once('.')?;
+/// The id grammar, `^[0-9a-f]{64}\.(png|jpg|jpeg|gif|webp)$` — the single
+/// source of truth: `spill_in` mints it, `path_for_in` and the `/r/` proxy
+/// (design §5.5) check it. The proxy has no file to test, so the grammar
+/// stands alone here.
+pub fn valid_image_id(id: &str) -> bool {
+    let (hash, ext) = id.split_once('.').unwrap_or_default();
     let is_hex64 = hash.len() == 64
         && hash
             .bytes()
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
-    let is_known_ext = matches!(ext, "png" | "jpg" | "jpeg" | "gif" | "webp");
-    if !is_hex64 || !is_known_ext {
+    is_hex64 && matches!(ext, "png" | "jpg" | "jpeg" | "gif" | "webp")
+}
+
+fn path_for_in(dir: &Path, id: &str) -> Option<PathBuf> {
+    // Validate the id's grammar before ever touching the filesystem — an
+    // unvalidated id must never be joined onto `dir` (path-traversal defence).
+    if !valid_image_id(id) {
         return None;
     }
 

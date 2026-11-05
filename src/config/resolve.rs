@@ -537,7 +537,7 @@ impl Config {
                         );
                     }
                     // A repo profile can't replace a global remote definition.
-                    ProfileEntry::Local(def)
+                    ProfileEntry::Local(_)
                         if file
                             .profiles
                             .get(name)
@@ -577,6 +577,16 @@ impl Config {
                     }
                 }
                 ProfileEntry::Remote(rdef) => {
+                    // A remote name is a URL path segment (`/r/<name>/…`);
+                    // `.`/`..` would collapse in browsers and defeat the
+                    // `/r/` re-rooting (design §7), so they are a parse error.
+                    if matches!(name.as_str(), "." | "..") {
+                        global_sink.push(
+                            vec![key("profiles"), key(name)],
+                            format!("'{name}' isn't a valid remote profile name"),
+                        );
+                        continue;
+                    }
                     match remote::parse_remote(name, &rdef.remote, rdef.ui.color) {
                         Ok(remote_profile) => {
                             remotes.push((

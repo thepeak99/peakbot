@@ -32,6 +32,7 @@ import { FilesPanel } from "./components/FilesPanel";
 import { AgentsPanel } from "./components/AgentsPanel";
 import { Settings, useSettingsToggle } from "./settings/Settings";
 import { useAgent } from "./useAgent";
+import { apiBase } from "./state";
 import { useConvoTabs } from "./useConvoTabs";
 import type { TabsState } from "./convoTabs";
 import { useTaskNotifications } from "./useTaskNotifications";
@@ -112,7 +113,16 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
       ? (state?.conversation?.name ?? null)
       : null,
   );
+  // A picker row opens under ITS profile (null = local), so a remote row
+  // reattaches as a relay rather than a local session (design §6.4).
   const loadConversation = convoTabs ? convoTabs.open : switchConvo;
+  // The chip's local↔remote pick: the conversation is fresh (the chip locks
+  // after the first turn), so start a new one on that pair. `agent` is
+  // omitted for the bare remote row — the remote resolves its own.
+  const reattach = useCallback(
+    (profile: string, agent?: string) => switchConvo(null, profile, agent),
+    [switchConvo],
+  );
   const [drawerTab, setDrawerTab] = useState<string | null>(null);
   const drawerOpen = drawerTab !== null;
   // Settings is an in-app VIEW (not a route): this state lives here so the
@@ -128,6 +138,8 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   const catalog = state ? adaptCatalog(state) : [];
   const selection = state ? adaptSelection(state) : null;
   const boundAgent = boundAgentOf(catalog, selection);
+  // `/r/<L>` prefix for uploads and attachment URLs; derived, never stored.
+  const base = apiBase(selection?.profile ?? null, catalog);
   const [view, setView] = useState<ViewFilter>("global");
   // Called once here (not in TopBar) so App can filter with the same value
   // the button renders — two useState copies would desync (plan §6.1).
@@ -341,6 +353,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
         conversationsError={conversationsError}
         send={send}
         onLoadConversation={loadConversation}
+        onReattach={reattach}
         notifyEnabled={notify.enabled}
         notifyPermission={notify.permission}
         onToggleNotify={notify.toggle}
@@ -400,6 +413,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
               key={resetKey}
               messages={transcriptMessages}
               drawerOpen={drawerOpen}
+              base={base}
               ref={transcriptRef}
             />
           ) : (
@@ -420,6 +434,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
                 <ComposerSlot
                   key={t.id}
                   convo={t.convo}
+                  base={on ? base : apiBase(t.profile, catalog)}
                   live={on ? live : null}
                   ref={on ? activeSlot : undefined}
                 />
@@ -429,6 +444,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
             <ComposerSlot
               ref={activeSlot}
               convo={state?.conversation?.id ?? null}
+              base={base}
               live={live}
             />
           )}
@@ -446,6 +462,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
         recentDirs={recentDirs}
         send={send}
         onLoadConversation={loadConversation}
+        onReattach={reattach}
         catalog={catalog}
         selection={selection}
         selectionLocked={selectionLocked}
