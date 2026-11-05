@@ -14,7 +14,11 @@ use rig_core::one_or_many::OneOrMany;
 use rig_core::streaming::StreamingCompletionResponse;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 /// A recorded LLM request captured by MockCompletionModel.
 ///
@@ -39,6 +43,30 @@ pub struct MockCompletionModel {
     responses: Arc<Mutex<VecDeque<MockResponse>>>,
     recorded_requests: Arc<Mutex<Vec<RecordedRequest>>>,
     default_usage: RigUsage,
+    /// Armed once via [`Self::arm_hang`]: the next completion stays pending
+    /// until its future is dropped, flipping the flag (Stop-cancellation proof).
+    hang: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+}
+
+/// Never resolves: `poll` always returns `Pending`, and dropping the future
+/// flips the shared flag. Stop-cancellation tests arm it via
+/// [`MockCompletionModel::arm_hang`] to prove the caller dropped the
+/// in-flight summarize instead of awaiting it to completion.
+struct HangUntilDropped {
+    dropped: Arc<AtomicBool>,
+}
+
+impl Future for HangUntilDropped {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Poll::Pending
+    }
+}
+
+impl Drop for HangUntilDropped {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
 }
 
 impl MockCompletionModel {
@@ -50,7 +78,15 @@ impl MockCompletionModel {
             responses: Arc::new(Mutex::new(VecDeque::new())),
             recorded_requests: Arc::new(Mutex::new(Vec::new())),
             default_usage: RigUsage::default(),
+            hang: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Make the NEXT completion hang until its future is dropped, flipping
+    /// `dropped` on drop. The Stop tests assert on the flag: it can only be
+    /// true if the caller cancelled the in-flight call, not if it completed.
+    pub fn arm_hang(&self, dropped: Arc<AtomicBool>) {
+        *self.hang.lock().unwrap() = Some(dropped);
     }
 
     /// Queue a mock response.
@@ -150,6 +186,12 @@ impl CompletionModel for MockCompletionModel {
     ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
         // One scheduler tick so the event pump flushes the previous iteration's tool rows before this request's history is built.
         tokio::task::yield_now().await;
+        // Armed hang: pending forever; only a drop (cancellation) resolves it.
+        let armed = self.hang.lock().unwrap().take();
+        if let Some(dropped) = armed {
+            HangUntilDropped { dropped }.await;
+            unreachable!("the hang future resolves only when dropped");
+        }
         // Record the request for test inspection
         self.recorded_requests
             .lock()
