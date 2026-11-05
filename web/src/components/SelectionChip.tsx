@@ -160,11 +160,17 @@ export function SelectionChip({
       // Crossing local/remote needs a fresh socket: a `select` for a profile
       // on the other server would be refused (design §6.3 #10).
       if (onReattach && chipAction(selection, target, catalog) === "reattach") {
-        onReattach(target.profile, agent);
+        // The bare remote row (agent "") rides the attach WITHOUT an agent —
+        // the remote resolves its own (design §6.4); no `select` is sent.
+        onReattach(target.profile, agent || undefined);
       } else {
         send(select(target.profile, agent));
       }
-      onToast?.(`Next conversation: ${browsedProfile.name} › ${agent}`);
+      onToast?.(
+        agent
+          ? `Next conversation: ${browsedProfile.name} › ${agent}`
+          : `Next conversation: ${browsedProfile.name}`,
+      );
     }
     setNav({ pane: "team" });
   };

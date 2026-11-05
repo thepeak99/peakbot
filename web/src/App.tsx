@@ -117,9 +117,10 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   // reattaches as a relay rather than a local session (design §6.4).
   const loadConversation = convoTabs ? convoTabs.open : switchConvo;
   // The chip's local↔remote pick: the conversation is fresh (the chip locks
-  // after the first turn), so start a new one on that pair.
+  // after the first turn), so start a new one on that pair. `agent` is
+  // omitted for the bare remote row — the remote resolves its own.
   const reattach = useCallback(
-    (profile: string, agent: string) => switchConvo(null, profile, agent),
+    (profile: string, agent?: string) => switchConvo(null, profile, agent),
     [switchConvo],
   );
   const [drawerTab, setDrawerTab] = useState<string | null>(null);

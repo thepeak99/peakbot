@@ -537,7 +537,7 @@ impl Config {
                         );
                     }
                     // A repo profile can't replace a global remote definition.
-                    ProfileEntry::Local(def)
+                    ProfileEntry::Local(_)
                         if file
                             .profiles
                             .get(name)

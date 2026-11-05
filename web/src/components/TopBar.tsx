@@ -62,7 +62,7 @@ export function TopBar({
   send: (msg: InboundMessage) => void;
   onLoadConversation: (id: string, profile: string | null) => void;
   /** Chip pick across local/remote: re-attach on (profile, agent). */
-  onReattach?(profile: string, agent: string): void;
+  onReattach?(profile: string, agent?: string): void;
   notifyEnabled: boolean;
   notifyPermission: NotifyPermission;
   onToggleNotify: () => void;

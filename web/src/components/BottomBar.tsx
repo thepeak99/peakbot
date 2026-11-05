@@ -43,7 +43,7 @@ export function BottomBar({
   send: (msg: InboundMessage) => void;
   onLoadConversation: (id: string, profile: string | null) => void;
   /** Chip pick across local/remote: re-attach on (profile, agent). */
-  onReattach?(profile: string, agent: string): void;
+  onReattach?(profile: string, agent?: string): void;
   // T32 chat chip (optional — absent ⇒ no chip, as on older servers).
   catalog?: CatalogProfile[];
   selection?: Selection | null;

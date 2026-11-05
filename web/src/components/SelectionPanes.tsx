@@ -67,7 +67,10 @@ export function ProfilePane({
   );
 }
 
-/** Agent column rows of the browsed profile. Click = the binding pick. */
+/** Agent column rows of the browsed profile. Click = the binding pick.
+ * A remote profile with no known agents (the catalog emits `agents: []`)
+ * offers ONE bare row — the profile itself; the remote resolves its own
+ * agent (design §6.4). */
 export function AgentPane({
   profile,
   selection,
@@ -77,8 +80,29 @@ export function AgentPane({
   selection: Selection;
   onPick(agentName: string): void;
 }) {
+  // The bare row: only for a remote profile whose agents are unknown.
+  const bareRemote = profile.origin === "remote" && profile.agents.length === 0;
   return (
     <>
+      {bareRemote && (
+        <button
+          data-testid="selection-agent-remote"
+          type="button"
+          onClick={() => onPick("")}
+          className={ROW_CLS}
+        >
+          <span
+            className={
+              profile.name === selection.profile && selection.agent === ""
+                ? "font-medium text-emerald-400"
+                : "text-zinc-200"
+            }
+          >
+            {profile.name}
+          </span>
+          <span className="text-[10px] text-zinc-500">remote — agents on the server</span>
+        </button>
+      )}
       {profile.agents.map((a, i) => (
         <button
           key={a.name}
