@@ -22,6 +22,7 @@ This file is the working draft for the next release. When a version is tagged, t
 - **Remote profiles in the web UI.** Remote profiles are now selectable in the web UI.
   - They show next to your local profiles in the profile picker, marked `remote` and colour-coded.
   - Remote profiles are now selectable in the profile picker (the remote picks its agent).
+  - Clicking a remote profile in the picker connects it and lists the remote's real agents.
   - Each tab can be local or remote, side by side. Picking a profile on the other side of that line starts a new conversation on it.
   - The conversation list merges local and remote conversations into one list. Opening or killing a remote row goes to its own server.
   - Uploads and images are proxied through your local server.

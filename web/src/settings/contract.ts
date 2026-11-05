@@ -783,7 +783,9 @@ export interface SelectionChipProps {
 //   `selection-profile-<name>` — one row per profile, catalog order (repo
 //                             first). 📁 on repo rows; row 0 caption `default`
 //                             (`pinned` under a pin). data-browsed="true" on
-//                             the BROWSED row. Click = BROWSE ONLY (nav → agent).
+//                             the BROWSED row. Click = browse (nav → agent);
+//                             a zero-agent remote profile also connects via
+//                             onReattach.
 //   `selection-agent-<name>` — rows of the BROWSED profile. Caption `N subagents`
 //                             (+ ` · default` on the first) or `single`.
 //                             Click = send(select(browsed, agent)) unless it is

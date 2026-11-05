@@ -146,8 +146,15 @@ export function SelectionChip({
     setOpen(!open);
   };
 
-  // Profile click: browse only — nothing is selected, nothing is sent.
+  // Profile click: browse — nothing is selected, nothing is sent. Exception:
+  // a zero-agent remote profile is CONNECTED (onReattach without an agent)
+  // so the relay can fill the remote's real agents; the bare row stays the
+  // fallback until it does.
   const browse = (name: string) => {
+    const entry = catalog.find((p) => p.name === name);
+    if (entry && entry.origin === "remote" && entry.agents.length === 0 && onReattach && !locked) {
+      onReattach(name);
+    }
     setBrowsed(name);
     setNav({ pane: "agent" });
   };
