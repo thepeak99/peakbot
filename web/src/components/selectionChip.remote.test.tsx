@@ -21,6 +21,14 @@
 //   * a remote profile whose agents ARE known (relay-filled, §6.3
 //     `localize_state`) keeps its per-agent rows and shows no bare row.
 //
+// New contract (this revision): the relay fills the remote's real agents
+// only once the tab is ATTACHED to that remote — so browsing a zero-agent
+// remote profile must also CONNECT the tab: `browse()` calls
+// `onReattach(name)` WITHOUT an agent when the entry is `origin: "remote"`
+// with `agents: []` (and `onReattach` is provided, chip not locked), then
+// shows the Agent pane as a plain browse. The bare row stays the fallback
+// until the relay fills.
+//
 // The existing T9 chip tests (selectionChip.t9.test.tsx) stay green because
 // their fixture fabricates agents on the remote profile; this file uses
 // the REAL wire shape (`agents: []`).
@@ -173,8 +181,11 @@ describe("selection chip — a remote profile with zero local agents", () => {
     click(q("selection-agent-remote"));
 
     expect(send, "a reattach sends no select frame").not.toHaveBeenCalled();
-    expect(onReattach).toHaveBeenCalledTimes(1);
-    expect(onReattach).toHaveBeenCalledWith("bonsol-dev", undefined);
+    // New contract: the BROWSE already connected the tab (call 1, no
+    // agent); the bare-row pick is still allowed and reattaches again
+    // (call 2, also without an agent).
+    expect(onReattach).toHaveBeenCalledTimes(2);
+    expect(onReattach).toHaveBeenLastCalledWith("bonsol-dev", undefined);
   });
 
   it("browsing a zero-agent remote profile hides the local profile's agent rows", () => {
@@ -223,5 +234,82 @@ describe("selection chip — a remote profile with known agents (relay-filled)",
 
     expect(has("selection-agent-ops")).toBe(true);
     expect(has("selection-agent-remote"), "no bare row once the agents are known").toBe(false);
+  });
+});
+
+// ─── new contract: browsing a zero-agent remote CONNECTS it ─────────────
+//
+// The relay delivers the remote's real agents only once the tab is
+// attached to that remote. Browsing a remote profile whose agents are
+// unknown therefore reattaches WITHOUT an agent, then shows the Agent
+// pane as a plain browse; the bare row stays the fallback until the
+// relay fills.
+
+describe("selection chip — browsing a zero-agent remote profile connects it", () => {
+  it("browsing a zero-agent remote profile connects it (onReattach without agent)", () => {
+    const { send, onReattach } = mountChip();
+    openChip();
+    click(q("selection-profile-bonsol-dev"));
+
+    expect(onReattach, "browsing connects the tab to the remote").toHaveBeenCalledTimes(1);
+    expect(onReattach.mock.calls[0][0]).toBe("bonsol-dev");
+    // No agent: robust to the implementation passing a single argument
+    // or an explicit `undefined` as the second.
+    expect(onReattach.mock.calls[0][1]).toBeUndefined();
+    expect(send, "connecting is not a select frame").not.toHaveBeenCalled();
+    expect(has("selection-popover"), "the popover stays open").toBe(true);
+    expect(q("selection-popover").getAttribute("data-pane"), "and shows the Agent pane").toBe("agent");
+  });
+
+  it("the bare remote row stays as the fallback until the relay fills agents", () => {
+    mountChip();
+    openChip();
+    click(q("selection-profile-bonsol-dev"));
+
+    // The chip does not know the relay's agents yet: the same single
+    // bare row as before the connect.
+    expect(agentRows()).toEqual(["selection-agent-remote"]);
+  });
+});
+
+// ─── guard: browsing never connects a profile that is not a zero-agent remote ──
+
+describe("selection chip — browsing never connects other profiles", () => {
+  it("browsing a relay-filled remote profile does not reconnect", () => {
+    const filled: CatalogProfile[] = [
+      ...CATALOG,
+      {
+        name: "home-dev",
+        origin: "remote",
+        overridesGlobal: false,
+        agents: [{ name: "ops", model: "sonnet", subagents: [] }],
+        color: "pink",
+      },
+    ];
+    const { onReattach } = mountChip({ catalog: filled });
+    openChip();
+    click(q("selection-profile-home-dev"));
+
+    expect(onReattach, "known agents: the tab is already connected").not.toHaveBeenCalled();
+  });
+
+  it("browsing a local profile never reattaches", () => {
+    const { onReattach } = mountChip();
+    openChip();
+    click(q("selection-profile-dev"));
+
+    expect(onReattach, "local profiles need no attach").not.toHaveBeenCalled();
+  });
+});
+
+// ─── guard: a locked chip never connects ────────────────────────────────
+
+describe("selection chip — a locked chip never connects", () => {
+  it("a locked chip never connects", () => {
+    const { onReattach } = mountChip({ locked: true });
+    openChip(); // a locked chip does not open
+
+    expect(has("selection-popover"), "the popover never opens while locked").toBe(false);
+    expect(onReattach).not.toHaveBeenCalled();
   });
 });
