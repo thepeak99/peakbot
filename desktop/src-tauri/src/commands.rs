@@ -1,8 +1,8 @@
 //! The IPC commands (DESIGN §5.4): `status`, `act` and `theme_get` for
 //! the bundled status page. The remote PeakBot web UI (loopback :7823
 //! only, `capabilities/remote-web.json`) may invoke exactly `theme_set`,
-//! `update_status` and `update_install` — never `status`, `act` (it
-//! carries `quit`) or `theme_get`.
+//! `update_status`, `update_install` and `clipboard_image_png` — never
+//! `status`, `act` (it carries `quit`) or `theme_get`.
 
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -84,4 +84,26 @@ pub fn update_install(app: AppHandle) -> Result<(), String> {
         return Err("updates unsupported".into());
     };
     tx.0.send(update::Event::Install).map_err(|e| e.to_string())
+}
+
+/// The clipboard image as PNG bytes for the web UI's Linux paste fallback:
+/// WebKitGTK ≤ 2.50 never exposes clipboard images to DOM paste events
+/// (WebKit Bug 218519). Empty body = no image. Sync on purpose: Tauri runs
+/// sync commands on the main thread — the GTK thread, the only one where
+/// `wait_for_image` (a nested main loop) is legal.
+#[tauri::command]
+pub fn clipboard_image_png() -> Result<tauri::ipc::Response, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let clipboard = gtk::Clipboard::get(&gtk::gdk::SELECTION_CLIPBOARD);
+        let Some(image) = clipboard.wait_for_image() else {
+            return Ok(tauri::ipc::Response::new(Vec::new()));
+        };
+        let png = image
+            .save_to_bufferv("png", &[])
+            .map_err(|e| e.to_string())?;
+        peakbot_desktop_core::clipboard::checked_png(png).map(tauri::ipc::Response::new)
+    }
+    #[cfg(not(target_os = "linux"))]
+    Err("clipboard_image_png is Linux-only".into())
 }

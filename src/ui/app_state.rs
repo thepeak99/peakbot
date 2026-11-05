@@ -57,6 +57,17 @@ pub struct AppState {
     #[serde(default)]
     pub is_running: bool,
 
+    /// `true` while a slash command (or a model/cwd/selection switch) runs.
+    /// Distinct from `is_running` on purpose: a command sets `is_running`
+    /// WITHOUT adding a user row, so the trailing turn is already finished —
+    /// focus mode must not read that as a live turn (it would hide the last
+    /// answer, e.g. during `/compact`). The frontend derives
+    /// `turnInFlight = is_running && !command_running`. `#[serde(default)]`
+    /// so old wire snapshots parse (and read as a plain turn, the
+    /// pre-field behaviour).
+    #[serde(default)]
+    pub command_running: bool,
+
     /// A graceful (first-press) Stop is pending: the in-flight tool call
     /// finishes, then the turn ends. Cleared by `set_running`.
     #[serde(default)]
@@ -218,7 +229,7 @@ impl Serialize for AppState {
         // stored copy can never drift from the pin. `run_started_at` stays
         // off the wire (`Instant` is not `Serialize`). Keep this list in
         // sync with the struct above.
-        let mut ser = serializer.serialize_struct("AppState", 26)?;
+        let mut ser = serializer.serialize_struct("AppState", 27)?;
         ser.serialize_field("chat", &self.chat)?;
         ser.serialize_field("todo", &self.todo)?;
         ser.serialize_field("input", &self.input)?;
@@ -227,6 +238,7 @@ impl Serialize for AppState {
         ser.serialize_field("conversation", &self.conversation)?;
         ser.serialize_field("preferences", &self.preferences)?;
         ser.serialize_field("is_running", &self.is_running)?;
+        ser.serialize_field("command_running", &self.command_running)?;
         ser.serialize_field("stop_pending", &self.stop_pending)?;
         ser.serialize_field("is_loading", &self.is_loading)?;
         ser.serialize_field("welcome", &self.welcome)?;

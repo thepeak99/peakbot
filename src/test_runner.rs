@@ -235,7 +235,7 @@ impl TestRunner {
                 Ok(response) => {
                     // Append the assistant response. The user message was
                     // appended at the top of this fn — see invariant above.
-                    self.state_manager.commit_reply(&response);
+                    self.state_manager.add_assistant_message(response.clone());
                     self.state_manager.set_running(false);
                     return ProcessResult::Success(response);
                 }
@@ -285,7 +285,7 @@ impl TestRunner {
                         self.process_session_hook_events();
                         match result {
                             Ok(response) => {
-                                self.state_manager.commit_reply(&response);
+                                self.state_manager.add_assistant_message(response.clone());
                                 self.state_manager.set_running(false);
                                 return ProcessResult::Success(response);
                             }
@@ -320,6 +320,9 @@ impl TestRunner {
     fn process_session_hook_events(&self) {
         let hook_stats = self.session_hook.get_stats();
         self.state_manager.reset_stats();
+        // The replayed requests are live for the (just reset) session —
+        // stamp them with the SM's current generation so they move the gate.
+        let generation = self.state_manager.compaction_generation();
         let pricing = crate::hooks::ModelPricing::default();
         for req in hook_stats.all_requests() {
             let cost = (req.input_tokens as f64 * pricing.input_per_token)
@@ -329,6 +332,7 @@ impl TestRunner {
                 req.input_tokens,
                 req.output_tokens,
                 cost,
+                generation,
             );
         }
     }

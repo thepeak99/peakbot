@@ -10,8 +10,9 @@ export function isDesktop(): boolean {
 
 // ── desktop IPC seam ─────────────────────────────────────────────────────
 // The desktop app grants this page (on its default loopback backend only)
-// three Tauri commands (desktop/src-tauri/capabilities/remote-web.json):
-// `theme_set`, `update_status`, `update_install`. Everything goes through
+// four Tauri commands (desktop/src-tauri/capabilities/remote-web.json):
+// `theme_set`, `update_status`, `update_install`, `clipboard_image_png`.
+// Everything goes through
 // `globalThis.__TAURI__.core.invoke`; ANY rejection — including no IPC at
 // all (a non-default address, an older desktop app) — means "the desktop
 // option is unavailable here".
@@ -45,3 +46,16 @@ export const getUpdateStatus = (): Promise<UpdateStatus> =>
 
 export const installUpdate = (): Promise<void> =>
   invoke("update_install").then(() => undefined);
+
+// ── clipboard image (Linux desktop paste fallback) ──────────────────────
+// WebKitGTK ≤ 2.50 never exposes a clipboard image to DOM paste events
+// (WebKit Bug 218519), so the app reads it: `clipboard_image_png` returns PNG
+// bytes, 0 bytes = no image. Tauri delivers raw bytes as an ArrayBuffer, or as
+// a number[] when its custom-protocol IPC is blocked — Uint8Array takes both.
+export const readClipboardImage = (): Promise<File | null> =>
+  invoke("clipboard_image_png").then((raw) => {
+    const bytes = new Uint8Array(raw as ArrayBuffer | number[]);
+    return bytes.length === 0
+      ? null
+      : new File([bytes], "pasted-image.png", { type: "image/png" });
+  });

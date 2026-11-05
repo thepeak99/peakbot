@@ -47,8 +47,8 @@
 # Environment:
 #   CONTAINER_BUILDER  podman (default) or docker
 #   PRUNE=1            run '<builder> builder prune -af' between builds (CI disk)
-#   GH_MIRROR_REPO     GitHub mirror owner/repo for latest.json URLs
-#                      (default: thepeak99/peakbot)
+#   UPDATER_BASE_URL   public updater base URL (set by make desktop-updater;
+#                      required for 'updater')
 
 set -eu
 
@@ -197,6 +197,8 @@ build_updater() {
         || { echo "❌ missing desktop/src-tauri/tauri.conf.json (pubkey source)" >&2; exit 1; }
     [ -f "release-notes/$VERSION.md" ] \
         || { echo "❌ missing release notes: release-notes/$VERSION.md" >&2; exit 1; }
+    [ -n "${UPDATER_BASE_URL:-}" ] \
+        || { echo "❌ UPDATER_BASE_URL is empty — run via 'make desktop-updater'" >&2; exit 1; }
     [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ] \
         || { echo "❌ TAURI_SIGNING_PRIVATE_KEY is empty — export the Tauri signing private key" >&2; exit 1; }
     [ -n "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" ] \
@@ -215,7 +217,7 @@ build_updater() {
     printf '%s' "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" > "$pwfile"
     "$CONTAINER_BUILDER" build \
         --build-arg VERSION="$VERSION" \
-        --build-arg GH_MIRROR_REPO="${GH_MIRROR_REPO:-thepeak99/peakbot}" \
+        --build-arg UPDATER_BASE_URL="$UPDATER_BASE_URL" \
         --build-arg NOTES="release-notes/$VERSION.md" \
         --secret id=tauri_key,src="$keyfile" \
         --secret id=tauri_key_pw,src="$pwfile" \

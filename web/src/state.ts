@@ -178,6 +178,13 @@ export interface AppState {
   context: WireContext;
   conversation: WireConversationMeta | null;
   is_running: boolean;
+  /** A slash command (the Command arm, and the SwitchModel/ChangeCwd/Select
+   * arms that also set_running) is executing — WITHOUT a user turn in
+   * flight. True while e.g. /compact runs, false after. Optional: old
+   * snapshots parse (absent → false). The App computes
+   * `turnInFlight = is_running && !command_running` for focus mode —
+   * `is_running` alone must NOT hide a finished answer during a command. */
+  command_running?: boolean;
   is_loading: boolean;
   /** Two-stage stop: a graceful (first-press) Stop is pending — the in-flight
    * tool call finishes, then the turn ends. Drives the Composer's Stop

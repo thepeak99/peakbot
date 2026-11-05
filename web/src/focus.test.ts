@@ -1,8 +1,6 @@
-// Tests for the Focus-mode core rule (plan-focus-mode.md §4) — written
-// FIRST, expected to be RED until `web/src/focus.ts` and
-// `web/src/useFocusMode.ts` exist. Both imports below resolve to
-// not-yet-created modules, so this whole file fails at collection for the
-// right reason (missing feature), not for a setup bug.
+// Tests for the Focus-mode core rule (plan-focus-mode.md §4) — pure TS, no
+// DOM: `focusView` (web/src/focus.ts) and `readFocusPref`
+// (web/src/useFocusMode.ts).
 //
 // The contract under test:
 //
@@ -370,6 +368,16 @@ describe("focusView blank answer rows", () => {
     expectVisible(view, m1);
     expect(view.activity).toBeNull();
   });
+
+  it("V-4: a finished turn keeps the narration row (the only agent row), hides the tool rows", () => {
+    const m1 = u("q");
+    const narration = a("narration");
+    const t1 = tc("bash");
+    const r1 = tr("bash");
+    const view = focusView([m1, narration, t1, r1], false);
+    expectVisible(view, m1, narration);
+    expect(view.activity).toBeNull();
+  });
 });
 
 // ─── regression: the orchestrator's reply to [bg output] is UNTAGGED ──────
@@ -464,5 +472,37 @@ describe("readFocusPref", () => {
     expect(readFocusPref("")).toBe(true);
     // Case-sensitive per the contract: raw !== "off".
     expect(readFocusPref("OFF")).toBe(true);
+  });
+});
+
+// ─── command in flight: the trailing turn is FINISHED, not running ────────
+// While a slash command runs (e.g. /compact) the backend sets is_running=true
+// WITHOUT adding a user row — the trailing turn already finished. The App
+// must pass `turnInFlight = isRunning && !commandRunning` to focusView
+// (locked design: new wire field AppState.command_running). These cases pin
+// both sides of that contract at the focusView level: with the flag the App
+// will pass during a command (running=false) the finished answer is visible;
+// with a plain running=true it is still hidden (existing cases 5-8
+// behaviour, locked).
+
+describe("focusView — finished turn with a command in flight (locked design)", () => {
+  it("isRunning=false (what the App passes while command_running) shows the finished answer", () => {
+    const m1 = u("q");
+    const m2 = tc("bash");
+    const m3 = tr("bash");
+    const m4 = a("the answer");
+    const view = focusView([m1, m2, m3, m4], false);
+    expectVisible(view, m1, m4);
+    expect(view.activity).toBeNull();
+  });
+
+  it("a plain focusView(msgs, true) still hides the finished answer (locked)", () => {
+    const m1 = u("q");
+    const m2 = tc("bash");
+    const m3 = tr("bash");
+    const m4 = a("the answer");
+    const view = focusView([m1, m2, m3, m4], true);
+    expectVisible(view, m1);
+    expect(view.activity).toBe(m4);
   });
 });

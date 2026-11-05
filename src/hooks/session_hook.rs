@@ -103,6 +103,11 @@ pub struct SessionStats {
     /// `/stats`, and the compaction loop-guard has to zero this without lying
     /// to the user about what the orchestrator's last request cost.
     last_orchestrator_input_tokens: Option<u64>,
+    /// Bumped by every wholesale invalidation of the gate reading
+    /// (`clear_last_input_tokens`, `reset`, `restore`). A usage event stamped
+    /// with an OLDER generation is a pre-compaction (or pre-reset) reading:
+    /// it still books tokens/cost honestly, but must not move the gate.
+    compaction_generation: u64,
 }
 
 impl SessionStats {
@@ -117,7 +122,13 @@ impl SessionStats {
     /// request's token usage is tracked. This mirrors rig's per-request usage reporting.
     /// API call count and total cost accumulate across all requests. The lane's
     /// bucket accumulates everything, tokens included.
-    pub fn add_request(&mut self, lane: &str, input: u64, output: u64, cost: f64) {
+    ///
+    /// `generation` is the compaction generation live when this request's
+    /// response was seen (the hook stamps it at that instant). Only a reading
+    /// from the CURRENT generation may move the orchestrator gate — a usage
+    /// event for a pre-compaction request must not resurrect the meter the
+    /// compaction just cleared.
+    pub fn add_request(&mut self, lane: &str, input: u64, output: u64, cost: f64, generation: u64) {
         self.total_input_tokens = input;
         self.total_output_tokens = output;
         self.total_api_calls += 1;
@@ -134,9 +145,17 @@ impl SessionStats {
         bucket.api_calls += 1;
         bucket.cost += cost;
 
-        if lane == crate::ui::app_state::ORCHESTRATOR_LANE {
+        if lane == crate::ui::app_state::ORCHESTRATOR_LANE
+            && generation >= self.compaction_generation
+        {
             self.last_orchestrator_input_tokens = Some(input);
         }
+    }
+
+    /// The compaction generation this stats object currently accepts —
+    /// the stamp a live request must carry to move the orchestrator gate.
+    pub fn compaction_generation(&self) -> u64 {
+        self.compaction_generation
     }
 
     /// Per-lane breakdown, sorted with `"orchestrator"` first then roles
@@ -177,6 +196,11 @@ impl SessionStats {
     }
 
     /// Reset all statistics
+    ///
+    /// Also clears the orchestrator gate reading and bumps the generation:
+    /// a fresh conversation starts with no live reading, and any usage event
+    /// still in flight from the retired conversation is stamped with the old
+    /// generation, so it can't seed the new conversation's meter or gate.
     pub fn reset(&mut self) {
         self.total_input_tokens = 0;
         self.total_output_tokens = 0;
@@ -184,6 +208,8 @@ impl SessionStats {
         self.total_cost = 0.0;
         self.requests.clear();
         self.lanes.clear();
+        self.last_orchestrator_input_tokens = None;
+        self.compaction_generation += 1;
     }
 
     /// Restore stats from a persisted snapshot (e.g. after `/load`).
@@ -210,6 +236,9 @@ impl SessionStats {
         }
         // /load must not blind the gate — seed it with the persisted input count.
         self.last_orchestrator_input_tokens = Some(input);
+        // Wholesale replacement: any usage event still in flight from the
+        // previous conversation is stamped with the old generation.
+        self.compaction_generation += 1;
     }
 
     /// Replace the per-lane breakdown wholesale (e.g. after `/load`). The flat
@@ -274,7 +303,7 @@ impl SessionStats {
     }
 
     /// Reset the "live context size" signal to 0 *without* touching cumulative
-    /// `total_*` bookkeeping or the API-call counter.
+    /// `total_cost` / `total_api_calls` or the per-lane buckets.
     ///
     /// Called from `StateManager::apply_compaction` so the next
     /// `last_input_tokens()` reads `Some(0)`, which makes
@@ -286,19 +315,29 @@ impl SessionStats {
     /// (Bug #2/#3) and the regression pin
     /// `force_compact_makes_needs_compaction_return_false`.
     ///
+    /// Also zeroes `total_input_tokens` — the LAST-request value (not the
+    /// cumulative sum), which `persist_current` writes and `restore` re-seeds
+    /// the gate from on `/load`. Left stale, it would resurrect the
+    /// pre-compaction meter on reload. And bumps the generation so a usage
+    /// event for a pre-compaction request, processed late, books its tokens
+    /// and cost but cannot move the gate.
+    ///
     /// Implementation: pushes a synthetic zero-token entry rather than
     /// popping/clearing real history. Symmetric with the seed trick in
     /// `restore()`: same one-extra-Vec-entry cost, no behaviour difference
-    /// for `total_input_tokens` / `total_cost` / `total_api_calls` because
-    /// none of those increment via direct `requests.push`.
+    /// for `total_cost` / `total_api_calls` because none of those increment
+    /// via direct `requests.push`.
     pub fn clear_last_input_tokens(&mut self) {
         self.requests.push(RequestStats {
             input_tokens: 0,
             output_tokens: 0,
             cost: 0.0,
         });
+        // The persisted fallback for the gate — zero it with the live reading.
+        self.total_input_tokens = 0;
         // Loop guard, same reason: the gate must not re-fire post-compaction.
         self.last_orchestrator_input_tokens = None;
+        self.compaction_generation += 1;
     }
 }
 
@@ -572,9 +611,11 @@ mod tests {
 
     /// `clear_last_input_tokens` makes `last_input_tokens()` return Some(0)
     /// so `ContextManager::needs_compaction` skips its token-based branch
-    /// and falls through to the message-count fallback. Cumulative
-    /// `total_*` fields and `total_api_calls` MUST be untouched —
-    /// `/stats` stays honest across compactions.
+    /// and falls through to the message-count fallback. The CUMULATIVE
+    /// bookkeeping (`total_cost`, `total_api_calls`, per-lane buckets) MUST
+    /// be untouched — `/stats` stays honest across compactions. The
+    /// LAST-request `total_input_tokens` value IS zeroed (it is the persisted
+    /// fallback for the gate, not a cumulative sum).
     ///
     /// Pinned by the in-loop compaction plan: the previous attempt
     /// (`compactfuck.md`) infinite-looped because nothing reset the stale
@@ -583,8 +624,20 @@ mod tests {
     #[test]
     fn clear_last_input_tokens_zeroes_last_without_touching_cumulative() {
         let mut stats = SessionStats::new();
-        stats.add_request("orchestrator", 500, 200, 0.05);
-        stats.add_request("orchestrator", 800, 300, 0.08);
+        stats.add_request(
+            "orchestrator",
+            500,
+            200,
+            0.05,
+            stats.compaction_generation(),
+        );
+        stats.add_request(
+            "orchestrator",
+            800,
+            300,
+            0.08,
+            stats.compaction_generation(),
+        );
 
         // Sanity: pre-clear, last_input_tokens reflects the most recent request.
         assert_eq!(stats.last_input_tokens(), Some(800));
@@ -631,15 +684,41 @@ mod tests {
         );
     }
 
+    /// `reset` must clear the orchestrator gate reading. `/new` and `/reset`
+    /// funnel through `StateManager::reset_stats` → `SessionStats::reset`,
+    /// and a stale `last_orchestrator_input_tokens` is exactly how the
+    /// "Orchestrator context" meter survives a reset (and how
+    /// `needs_compaction()` would fire on a brand-new conversation) —
+    /// meter-and-focus ticket, Bug C.
+    #[test]
+    fn reset_clears_last_orchestrator_input_tokens() {
+        let mut stats = SessionStats::new();
+        stats.add_request("orchestrator", 600, 50, 0.05, stats.compaction_generation());
+        assert_eq!(
+            stats.last_orchestrator_input_tokens(),
+            Some(600),
+            "precondition: the gate reads the last orchestrator request"
+        );
+
+        stats.reset();
+
+        assert!(
+            stats.last_orchestrator_input_tokens().is_none(),
+            "reset must clear last_orchestrator_input_tokens (got {:?}) — a stale \
+             reading keeps the context meter alive across /new and /reset",
+            stats.last_orchestrator_input_tokens()
+        );
+    }
+
     /// Per-lane aggregation keeps a bucket per lane while the flat
     /// grand total still accumulates across all lanes. Two lanes → two
     /// buckets, orchestrator sorted first.
     #[test]
     fn add_request_buckets_stats_per_lane() {
         let mut stats = SessionStats::new();
-        stats.add_request("orchestrator", 100, 20, 0.01);
-        stats.add_request("reviewer", 200, 40, 0.02);
-        stats.add_request("reviewer", 300, 60, 0.03);
+        stats.add_request("orchestrator", 100, 20, 0.01, stats.compaction_generation());
+        stats.add_request("reviewer", 200, 40, 0.02, stats.compaction_generation());
+        stats.add_request("reviewer", 300, 60, 0.03, stats.compaction_generation());
 
         // Flat grand total accumulates across lanes.
         assert_eq!(stats.total_api_calls, 3);
@@ -675,8 +754,8 @@ mod tests {
             },
         )]);
 
-        stats.add_request("junior", 2_000, 100, 0.02);
-        stats.add_request("junior", 3_000, 150, 0.03);
+        stats.add_request("junior", 2_000, 100, 0.02, stats.compaction_generation());
+        stats.add_request("junior", 3_000, 150, 0.03, stats.compaction_generation());
 
         let (_, junior) = stats
             .lanes_sorted()
@@ -964,10 +1043,11 @@ mod tests {
             "no usage reported yet must not trip the gate"
         );
 
+        let stamp = stats.lock().unwrap().compaction_generation();
         stats
             .lock()
             .unwrap()
-            .add_request("reviewer", 1_001, 10, 0.0);
+            .add_request("reviewer", 1_001, 10, 0.0, stamp);
         let over =
             rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_completion_call(
                 &hook,
@@ -990,10 +1070,11 @@ mod tests {
     #[tokio::test]
     async fn orchestrator_hook_has_no_sub_agent_gate() {
         let stats = Arc::new(Mutex::new(SessionStats::new()));
+        let stamp = stats.lock().unwrap().compaction_generation();
         stats
             .lock()
             .unwrap()
-            .add_request("orchestrator", 999_999, 10, 0.0);
+            .add_request("orchestrator", 999_999, 10, 0.0, stamp);
         let hook = SessionHook::with_context_tracking(None, stats);
 
         let prompt = user_msg("next");
@@ -1552,7 +1633,13 @@ mod tests {
             sm.add_user_message(format!("u{i}"));
             sm.add_assistant_message(format!("a{i}"));
         }
-        sm.add_request(&MessageSource::Human, 1_000, 100, 0.0);
+        sm.add_request(
+            &MessageSource::Human,
+            1_000,
+            100,
+            0.0,
+            sm.compaction_generation(),
+        );
         assert!(sm.needs_compaction(), "fixture: compaction would fire");
         sm.set_running(true);
 
@@ -1765,24 +1852,20 @@ mod tests {
         );
     }
 
-    // ── Orchestrator reply: staged prose (ticket #294) ────────────────────
+    // ── Orchestrator reply: the hook writes the prose row (ticket #294) ───
     //
-    // Written FIRST against the locked design. `AssistantParts` gains
-    // `has_tool_call` (set in the ToolCall match arm of
-    // `extract_content_from_response`), and `on_completion_response` stages
-    // `parts.text` on the wired StateManager for orchestrator-lane responses
-    // that carried a tool call. Sub-agent hooks never stage.
-    //
-    // RED state: `parts.has_tool_call` and `sm.commit_reply` do not exist
-    // yet — this test fails to COMPILE on exactly those names (the intended
-    // RED). Staging is observed through the public commit seam
-    // (`commit_reply("")` flushes whatever was staged).
+    // Written FIRST against the locked design. `on_completion_response`
+    // writes ONE Agent row, via `StateManager::add_assistant_message`, for an
+    // orchestrator-lane response that carried a tool call: the response's
+    // `parts.text` byte-identical, stamped with the response it just opened.
+    // A text-only response writes nothing (the turn loop owns the final row).
+    // Sub-agent hooks carry no StateManager and never write.
 
     /// H-1 — a response carrying [Text "A", ToolCall] sets `has_tool_call`
-    /// and stages "A" on the orchestrator's StateManager; a [Text "A"]-only
-    /// response sets it false and stages nothing.
+    /// and the hook writes exactly one Agent row "A" stamped with the open
+    /// response's id; a [Text "A"]-only response writes no row.
     #[tokio::test]
-    async fn orchestrator_hook_stages_prose_only_when_the_response_carried_a_tool_call() {
+    async fn orchestrator_hook_writes_the_prose_row_only_when_the_response_carried_a_tool_call() {
         use crate::state::StateManager;
         use crate::ui::app_state::MessageRole;
 
@@ -1806,8 +1889,8 @@ mod tests {
             "a text-only response must not set has_tool_call"
         );
 
-        // (b) on_completion_response stages the prose for (a), observable
-        //     through the commit seam: flush → ONE agent row "A".
+        // (b) on_completion_response writes the row for (a): exactly one
+        //     Agent row "A", stamped with the response the hook opened.
         let sm = StateManager::new_arc();
         let (hook, _rx) = SessionHook::with_channel();
         let hook = hook.with_state_manager(&sm);
@@ -1828,10 +1911,6 @@ mod tests {
             )
             .await;
         assert_eq!(action, HookAction::Continue);
-        assert!(
-            sm.commit_reply(""),
-            "the staged prose must be in the staging buffer"
-        );
         let state = sm.get_state();
         let agent_rows: Vec<&crate::ui::app_state::ChatMessage> = state
             .chat
@@ -1839,11 +1918,25 @@ mod tests {
             .iter()
             .filter(|m| m.role == MessageRole::Agent)
             .collect();
-        assert_eq!(agent_rows.len(), 1, "exactly one row from the flush");
+        assert_eq!(
+            agent_rows.len(),
+            1,
+            "the hook writes exactly one row; transcript={:?}",
+            state.chat.messages
+        );
         assert_eq!(agent_rows[0].content, "A");
+        assert!(
+            agent_rows[0].response_id.is_some(),
+            "the row is stamped with the response the hook opened"
+        );
+        assert_eq!(
+            agent_rows[0].response_id,
+            sm.current_response_id(),
+            "the row's response_id is the open response's id"
+        );
 
-        // (c) (b)-shape: the text-only response stages NOTHING — a flush
-        //     commits nothing and no row is pushed.
+        // (c) the text-only response writes NO row — the turn loop owns the
+        //     final reply's row.
         let sm = StateManager::new_arc();
         let (hook, _rx) = SessionHook::with_channel();
         let hook = hook.with_state_manager(&sm);
@@ -1865,12 +1958,123 @@ mod tests {
             .await;
         assert_eq!(action, HookAction::Continue);
         assert!(
-            !sm.commit_reply(""),
-            "a text-only response must stage nothing"
+            sm.get_state().chat.messages.is_empty(),
+            "a text-only response must write no row"
         );
+    }
+
+    /// H-2 — the row is the response text BYTE-IDENTICAL: no trim, and a
+    /// tool-call response whose text is blank writes no row at all.
+    #[tokio::test]
+    async fn orchestrator_hook_row_is_byte_identical_and_blank_prose_writes_no_row() {
+        use crate::state::StateManager;
+        use crate::ui::app_state::MessageRole;
+
+        async fn on_response(hook: &SessionHook, choice: OneOrMany<AssistantContent>) {
+            let response = CompletionResponse {
+                choice,
+                usage: rig_core::completion::Usage::default(),
+                raw_response: crate::mock::completion_model::MockModelResponse {
+                    content: String::new(),
+                    is_tool_call: true,
+                },
+                message_id: None,
+            };
+            let action =
+                rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_completion_response(
+                    hook,
+                    &user_msg("next"),
+                    &response,
+                )
+                .await;
+            assert_eq!(action, HookAction::Continue);
+        }
+
+        // Surrounding whitespace survives: no trim.
+        let sm = StateManager::new_arc();
+        let (hook, _rx) = SessionHook::with_channel();
+        let hook = hook.with_state_manager(&sm);
+        let choice = OneOrMany::many([
+            AssistantContent::text("  padded\n\n"),
+            AssistantContent::tool_call("1", "todo", serde_json::json!({})),
+        ])
+        .unwrap();
+        on_response(&hook, choice).await;
+        let rows: Vec<String> = sm
+            .get_state()
+            .chat
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Agent)
+            .map(|m| m.content.clone())
+            .collect();
+        assert_eq!(rows, vec!["  padded\n\n".to_string()], "byte-identical");
+
+        // Blank prose + a tool call: no row (never a blank Agent row).
+        let sm = StateManager::new_arc();
+        let (hook, _rx) = SessionHook::with_channel();
+        let hook = hook.with_state_manager(&sm);
+        let choice = OneOrMany::many([
+            AssistantContent::text("   "),
+            AssistantContent::tool_call("1", "todo", serde_json::json!({})),
+        ])
+        .unwrap();
+        on_response(&hook, choice).await;
         assert!(
             sm.get_state().chat.messages.is_empty(),
-            "no row may be pushed"
+            "blank prose must write no row"
+        );
+    }
+
+    /// N10 — a response that will produce NO row (blank text, no tool call)
+    /// must not leave its thinking staged: the NEXT row appended
+    /// (`add_assistant_message("x")`) carries no thinking blocks. (I5 —
+    /// thinking is staged only for responses that produce a row.)
+    #[tokio::test]
+    async fn rowless_response_does_not_leak_its_thinking_into_the_next_row() {
+        use crate::state::StateManager;
+
+        let sm = StateManager::new_arc();
+        let (hook, _rx) = SessionHook::with_channel();
+        let hook = hook.with_state_manager(&sm).with_preserve_reasoning(true);
+
+        // Blank text, no tool call, WITH a thinking block.
+        let choice = OneOrMany::many([
+            AssistantContent::Reasoning(
+                rig_core::completion::message::Reasoning::new_with_signature(
+                    "private thoughts",
+                    Some("sig-1".to_string()),
+                ),
+            ),
+            AssistantContent::text(""),
+        ])
+        .unwrap();
+        let response = CompletionResponse {
+            choice,
+            usage: rig_core::completion::Usage::default(),
+            raw_response: crate::mock::completion_model::MockModelResponse {
+                content: String::new(),
+                is_tool_call: false,
+            },
+            message_id: None,
+        };
+        let action =
+            rig_core::agent::PromptHook::<crate::mock::MockCompletionModel>::on_completion_response(
+                &hook,
+                &user_msg("next"),
+                &response,
+            )
+            .await;
+        assert_eq!(action, HookAction::Continue);
+
+        sm.add_assistant_message("x".to_string());
+        let state = sm.get_state();
+        let last = state.chat.messages.last().expect("the row exists");
+        assert_eq!(last.content, "x");
+        assert!(
+            last.thinking.is_empty(),
+            "a row-less response's thinking must not attach to a later row; got {:?}",
+            last.thinking
         );
     }
 
@@ -2407,15 +2611,24 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
         }
 
         // Update the session stats with this request's usage
-        // This is critical for ContextManager to track actual token counts
-        if let Ok(mut stats) = self.stats.lock() {
-            stats.add_request(
-                self.source.lane_label(),
-                input_tokens,
-                usage.output_tokens,
-                0.0, // Cost is calculated externally
-            );
-        }
+        // This is critical for ContextManager to track actual token counts.
+        // The stamp is read here, at response time: it is the freshness fact
+        // for the gate, and the same value rides the event so the UI task's
+        // write of this same response is judged against the same generation.
+        let generation = match self.stats.lock() {
+            Ok(mut stats) => {
+                let generation = stats.compaction_generation();
+                stats.add_request(
+                    self.source.lane_label(),
+                    input_tokens,
+                    usage.output_tokens,
+                    0.0, // Cost is calculated externally
+                    generation,
+                );
+                generation
+            }
+            Err(_) => 0,
+        };
 
         // Extract content and reasoning from response using rig's API.
         let parts = extract_content_from_response(&response.choice);
@@ -2437,25 +2650,32 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
         // text-turn thinking. The gate is the lane predicate — sub-agent hooks
         // carry no StateManager, so the lane check is what excludes them.
         //
-        // Note there is deliberately no `!thinking.is_empty()` condition: a
-        // response that emitted no thinking still ends the previous response's
-        // group, and rows appended after it must NOT inherit the previous
-        // response's blocks.
+        // Blocks are staged only for a response that produces a transcript
+        // row — it speaks, or it carries a tool call (whose row the hook
+        // writes right below). A row-less response stages nothing, so its
+        // blocks cannot leak onto the next row; the call itself still runs,
+        // because a response without thinking must close the previous
+        // response's group.
         if self.source.is_orchestrator_lane()
             && let Some(weak) = self.state_manager.as_ref()
             && let Some(sm) = weak.upgrade()
         {
-            sm.begin_response(thinking.clone());
-            // Staged inline (not via the event task) so it happens-before rig
-            // returns. A tool-call response is never rig's final one, so staged
-            // prose and the returned text never overlap.
+            let speaks = !parts.text.trim().is_empty();
+            sm.begin_response(if speaks || parts.has_tool_call {
+                thinking.clone()
+            } else {
+                Vec::new()
+            });
+            // Inline (not via the event task) so the row lands before rig
+            // returns and precedes this response's ToolCall rows. A blank
+            // text writes no row — never a blank Agent row.
             if parts.has_tool_call {
-                sm.stage_prose(parts.text.clone());
+                sm.add_assistant_message(parts.text.clone());
             }
         }
 
         if let Some(ref sender) = self.event_sender {
-            // Emit event with per-request token counts; cost is computed in CostHandler.
+            // Emit event with per-request token counts; no cost model, so cost rides at 0.0.
             let event = AgentEvent::CompletionResponse {
                 content: parts.text,
                 reasoning: parts.reasoning,
@@ -2464,7 +2684,8 @@ impl<M: CompletionModel> PromptHook<M> for SessionHook {
                     input_tokens,
                     output_tokens: usage.output_tokens,
                     total_tokens: input_tokens + usage.output_tokens,
-                    cost: 0.0, // Cost = 0 here, calculated by CostHandler
+                    cost: 0.0, // no cost model in live events
+                    generation,
                 },
                 timestamp: Utc::now(),
             };

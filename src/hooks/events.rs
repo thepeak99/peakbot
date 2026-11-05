@@ -34,18 +34,28 @@ pub struct TokenUsage {
     pub output_tokens: u64,
     /// Total tokens (input + output)
     pub total_tokens: u64,
-    /// Estimated cost in USD (calculated by CostHandler, not the hook)
+    /// Estimated cost in USD — 0.0 on live events (no cost model); only
+    /// persisted event logs may carry a value
     pub cost: f64,
+    /// Compaction generation live when the hook saw this response. The
+    /// event can land in the UI task AFTER a compaction cleared the
+    /// orchestrator gate; the stats compare this stamp against their own
+    /// generation and refuse to let a stale reading move the gate.
+    /// `#[serde(default)]` so pre-stamp event logs load as generation 0.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 impl TokenUsage {
-    /// Create a new TokenUsage from raw token counts (cost defaults to 0.0)
+    /// Create a new TokenUsage from raw token counts (cost defaults to 0.0,
+    /// generation to 0 — a log-replay usage, not a live response)
     pub fn from_raw(input: u64, output: u64) -> Self {
         Self {
             input_tokens: input,
             output_tokens: output,
             total_tokens: input + output,
-            cost: 0.0, // Cost = 0 here, calculated by CostHandler
+            cost: 0.0, // no cost model in live usage
+            generation: 0,
         }
     }
 }

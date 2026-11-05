@@ -1797,9 +1797,7 @@ impl AgentRunner {
                     }
 
                     QueueMessage::Command(cmd) => {
-                        if let Some(ref sm) = state_manager {
-                            sm.set_running(true);
-                        }
+                        Self::mark_command_running(&state_manager, true);
                         // The conversation *before* the command. `/load` swaps it;
                         // an unchanged id after means there is nothing to re-bind.
                         let conversation_before = state_manager
@@ -1835,9 +1833,7 @@ impl AgentRunner {
                             )
                             .await;
                         }
-                        if let Some(ref sm) = state_manager {
-                            sm.set_running(false);
-                        }
+                        Self::mark_command_running(&state_manager, false);
                         completion_tx.send(CompletionResult::CommandDone).ok();
                     }
 
@@ -1858,9 +1854,7 @@ impl AgentRunner {
                         // re-reads config first (picking up newly-added
                         // aliases) and re-resolves, emitting a clean error if
                         // the alias vanished under a reload.
-                        if let Some(ref sm) = state_manager {
-                            sm.set_running(true);
-                        }
+                        Self::mark_command_running(&state_manager, true);
                         let outcome = Self::handle_switch_model(
                             &alias,
                             &mut agent,
@@ -1872,8 +1866,8 @@ impl AgentRunner {
                         .await;
                         if let Some(ref sm) = state_manager {
                             sm.decrement_pending_input();
-                            sm.set_running(false);
                         }
+                        Self::mark_command_running(&state_manager, false);
                         match outcome {
                             Ok(()) => {
                                 completion_tx.send(CompletionResult::CommandDone).ok();
@@ -1893,9 +1887,7 @@ impl AgentRunner {
                         // agent on the *current* model, then reset the
                         // conversation like /new. The View already validated
                         // the path; we re-validate defensively.
-                        if let Some(ref sm) = state_manager {
-                            sm.set_running(true);
-                        }
+                        Self::mark_command_running(&state_manager, true);
                         let outcome = Self::handle_change_cwd(
                             &path,
                             &mut agent,
@@ -1907,8 +1899,8 @@ impl AgentRunner {
                         .await;
                         if let Some(ref sm) = state_manager {
                             sm.decrement_pending_input();
-                            sm.set_running(false);
                         }
+                        Self::mark_command_running(&state_manager, false);
                         if let Err(msg) = outcome
                             && let Some(ref sm) = state_manager
                         {
@@ -1918,9 +1910,7 @@ impl AgentRunner {
                     }
 
                     QueueMessage::Select(request) => {
-                        if let Some(ref sm) = state_manager {
-                            sm.set_running(true);
-                        }
+                        Self::mark_command_running(&state_manager, true);
                         Self::handle_select(
                             request,
                             &mut agent,
@@ -1932,8 +1922,8 @@ impl AgentRunner {
                         .await;
                         if let Some(ref sm) = state_manager {
                             sm.decrement_pending_input();
-                            sm.set_running(false);
                         }
+                        Self::mark_command_running(&state_manager, false);
                         completion_tx.send(CompletionResult::CommandDone).ok();
                     }
                 }
@@ -1947,6 +1937,7 @@ impl AgentRunner {
                 if let Some(ref sm) = state_manager {
                     sm.close_interrupted_tool_call();
                     sm.set_running(false);
+                    sm.set_command_running(false);
                     sm.add_system_message(format!("⚠ internal error: {what} — turn aborted"));
                 }
                 completion_tx.send(CompletionResult::Error).ok();
@@ -2656,18 +2647,37 @@ impl AgentRunner {
         }
     }
 
+    /// One seam for the command-running flag pair so the two flags can't
+    /// desync. `command_running` leads on entry and trails on exit: no
+    /// broadcast frame may ever carry `is_running=true` with
+    /// `command_running=false` for a command, or focus mode reads it as a
+    /// live turn and hides the last answer (the /compact bug).
+    fn mark_command_running(state_manager: &Option<Arc<StateManager>>, on: bool) {
+        if let Some(sm) = state_manager {
+            if on {
+                sm.set_command_running(true);
+                sm.set_running(true);
+            } else {
+                sm.set_running(false);
+                sm.set_command_running(false);
+            }
+        }
+    }
+
     /// Process a `SourcedEvent` and update StateManager accordingly.
     ///
     /// This is the Controller's responsibility — it decides how domain events
     /// affect the UI state. The Model (StateManager) is passive and only holds data.
     ///
-    /// The event carries the lane that produced it (`source`). Cost/token
-    /// roll-up is **lane-agnostic** — a sub-agent's usage counts toward the
-    /// parent `/stats` exactly like the orchestrator's (the #1 research fix:
-    /// a delegation's cost must never be silent). The lane *is* honoured when
-    /// stamping the resulting transcript ChatMessage, so the renderer can
-    /// label a sub-agent's turns and `get_agent_history` can filter them out
-    /// of the orchestrator's wire context.
+    /// The event carries the lane that produced it (`source`). Sub-agent
+    /// completions book into the shared `/stats` here — their hooks keep
+    /// private stats, so this is the lane's only shared booking, and a
+    /// delegation's cost must never be silent. Orchestrator-lane completions
+    /// are already booked inline by the hook; the event only syncs the UI.
+    /// The lane *is* honoured when stamping the resulting transcript
+    /// ChatMessage, so the renderer can label a sub-agent's turns and
+    /// `get_agent_history` can filter them out of the orchestrator's wire
+    /// context.
     pub(crate) fn process_event_for_ui(
         state_manager: &Option<Arc<StateManager>>,
         sourced: SourcedEvent,
@@ -2686,19 +2696,36 @@ impl AgentRunner {
                 thinking,
                 ..
             } => {
-                // Roll tokens/cost into session stats, keyed by lane: the
-                // parent `/stats` sees sub-agent cost too, and can break it
-                // down per role.
-                sm.add_request(&source, usage.input_tokens, usage.output_tokens, usage.cost);
+                if source.is_orchestrator_lane() {
+                    // The hook already booked this response inline on the shared
+                    // stats (it is the sole CompletionResponse emitter — re-booking
+                    // here double-counts /stats); the inline write skips AppState,
+                    // so the event only syncs the UI.
+                    sm.sync_stats_to_ui();
+                } else {
+                    // Sub-agent hooks keep private stats, so this is the lane's
+                    // only booking into the shared `/stats`. `usage.generation` is
+                    // the stamp the hook read at response time — a pre-compaction
+                    // event landing late books tokens/cost but cannot move the
+                    // orchestrator meter (see `SessionStats::add_request`).
+                    sm.add_request(
+                        &source,
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        usage.cost,
+                        usage.generation,
+                    );
+                }
 
                 // Surface a **sub-agent's** prose on its own lane. The
-                // orchestrator's prose is staged by the hook and committed once
-                // per turn by `commit_reply`, so adding it here too would
-                // double it — hence the orchestrator-lane guard. A
-                // sub-agent's final answer legitimately appears twice in the
-                // transcript: once here on its `🧩 role` lane (it *said* it) and
-                // once as the orchestrator's `delegate` ToolResult (it *received*
-                // it) — distinct lanes, not a duplicate bug.
+                // orchestrator's rows are owned elsewhere — the hook writes
+                // them for tool-call-carrying responses, the turn loop writes
+                // the final reply — so adding them here would double them;
+                // hence the orchestrator-lane guard. A sub-agent's final
+                // answer legitimately appears twice in the transcript: once
+                // here on its `🧩 role` lane (it *said* it) and once as the
+                // orchestrator's `delegate` ToolResult (it *received* it) —
+                // distinct lanes, not a duplicate bug.
                 if !thinking.is_empty() && !source.is_orchestrator_lane() {
                     // Sub-agent emitted thinking — carry blocks onto its lane
                     // so the rebuilt orchestrator wire never sees them
@@ -2742,8 +2769,8 @@ impl AgentRunner {
         }
     }
 
-    /// Internal process_message — takes the already-built current-turn `Message`
-    /// (text or multimodal) and history from `StateManager`, runs the agent,
+    /// The turn loop: takes the already-built current-turn `Message` (text
+    /// or multimodal) and history from `StateManager`, runs the agent,
     /// writes the response back to state. Retries on transient errors.
     ///
     /// **In-loop compaction (`mid-compaction.md`).** When the wired
@@ -2755,23 +2782,6 @@ impl AgentRunner {
     /// against infinite terminate-restart cycles is in
     /// `apply_compaction` — see that fn's doc and `SessionStats::clear_last_input_tokens`.
     async fn process_message_internal(
-        current_turn: rig_core::completion::message::Message,
-        state_manager: &Option<Arc<StateManager>>,
-        agent: &Arc<DynAgent>,
-        config: &Config,
-    ) -> CompletionResult {
-        let result = Self::run_turn(current_turn, state_manager, agent, config).await;
-        // Flushes prose staged this turn on exits that never reach a final
-        // reply (Stop, Error); a no-op after a successful commit.
-        if let Some(sm) = state_manager.as_ref() {
-            sm.commit_reply("");
-        }
-        result
-    }
-
-    /// The retry / compaction / empty-reply-nudge loop behind
-    /// [`Self::process_message_internal`].
-    async fn run_turn(
         mut current_turn: rig_core::completion::message::Message,
         state_manager: &Option<Arc<StateManager>>,
         agent: &Arc<DynAgent>,
@@ -2835,9 +2845,10 @@ impl AgentRunner {
                     let Some(sm) = state_manager.as_ref() else {
                         return CompletionResult::Success;
                     };
-                    // One row per turn (staged prose + final text), persisted by
-                    // StateManager.
-                    if sm.commit_reply(&response) {
+                    // The final reply is its own row (blank → no-op); the
+                    // tool-call responses' rows already landed from the hook.
+                    sm.add_assistant_message(response);
+                    if sm.turn_has_reply() {
                         sm.set_final_broadcast(true);
                         // Fire-and-forget: upgrade the provisional title
                         // after the first reply
@@ -2849,7 +2860,7 @@ impl AgentRunner {
                         sm.set_final_broadcast(true);
                         return CompletionResult::Success;
                     }
-                    // Blank reply with nothing staged: ask once more. The nudge
+                    // Blank reply with no prose row: ask once more. The nudge
                     // rides the wire only, so the transcript never shows it.
                     nudged = true;
                     tracing::warn!(target: "peakbot", "empty final reply; nudging the model once");
@@ -6938,6 +6949,7 @@ headers:
                         output_tokens: 50,
                         total_tokens: 150,
                         cost: 0.02,
+                        generation: 0,
                     },
                     timestamp: chrono::Utc::now(),
                 },
@@ -7053,6 +7065,7 @@ headers:
                         output_tokens: 8,
                         total_tokens: 18,
                         cost: 0.0,
+                        generation: 0,
                     },
                     timestamp: chrono::Utc::now(),
                 },
@@ -7073,9 +7086,19 @@ headers:
     }
 
     /// The orchestrator's own `CompletionResponse` text must NOT be added by
-    /// the event path — it already enters via `prompt_with_history`'s return
-    /// value (`add_assistant_message`). Adding it here too would double it.
-    /// Only stats move for an orchestrator-lane completion.
+    /// the event path — that row is owned elsewhere: the hook writes it for
+    /// tool-call-carrying responses, and the turn loop writes the final reply
+    /// (`add_assistant_message`). Adding it here too would double it.
+    ///
+    /// And NO stats move for an orchestrator-lane completion: the hook
+    /// already booked this response inline on the shared stats (the single
+    /// booking — see `orchestrator_completion_event_does_not_double_book`),
+    /// so the event path is UI-sync-only for the orchestrator lane.
+    ///
+    /// NOTE (TDD): the old expectation (`total_api_calls == 1` — the event
+    /// path re-books the hook's response) pinned W2 of the /stats
+    /// double-count. It now expects 0 bookings from the event path, per the
+    /// locked fix. RED until the fix lands.
     #[test]
     fn orchestrator_completion_prose_is_not_double_added() {
         use crate::hooks::events::{AgentEvent, SourcedEvent, TokenUsage};
@@ -7098,6 +7121,7 @@ headers:
                         output_tokens: 3,
                         total_tokens: 8,
                         cost: 0.0,
+                        generation: 0,
                     },
                     timestamp: chrono::Utc::now(),
                 },
@@ -7108,8 +7132,302 @@ headers:
             before, after,
             "orchestrator completion must not add a transcript message (the return-value path owns that)"
         );
-        // ...but stats still moved.
-        assert_eq!(sm.get_stats().total_api_calls, 1);
+        // ...and the event path books NOTHING for the orchestrator lane —
+        // the hook's inline booking is the single source of truth.
+        assert_eq!(
+            sm.get_stats().total_api_calls,
+            0,
+            "an orchestrator-lane CompletionResponse must not book stats on the \
+             event path (the hook already booked it inline) — got {}",
+            sm.get_stats().total_api_calls
+        );
+    }
+
+    // ─── /stats double-count regression (orchestrator lane) ─────────────────
+    //
+    // In production every orchestrator-lane LLM response is booked TWICE into
+    // the shared SessionStats:
+    //   W1 (inline): `SessionHook::on_completion_response` books on the
+    //       shared stats — orchestrator hooks are built with
+    //       `with_context_tracking(…, state_manager.stats_arc())`
+    //       (providers/mod.rs) — then emits `AgentEvent::CompletionResponse`.
+    //   W2 (event task): `AgentRunner::process_event_for_ui` calls
+    //       `sm.add_request` for EVERY CompletionResponse, booking again.
+    // The locked fix makes W2 UI-sync-only for the orchestrator lane
+    // (`!source.is_orchestrator_lane()` around the `sm.add_request`).
+    // Sub-agent hooks book into PRIVATE stats (`SessionHook::new(sink)`), so
+    // for sub-agents W2 is the ONLY booking into the shared stats — it must
+    // stay. TestRunner/TestHarness are deliberately NOT used here: they
+    // replay hook stats and never run W2, so they hide the bug.
+    /// One orchestrator response = one booking. W1 is replayed exactly as the
+    /// hook does it (shared stats, cost 0.0), then the matching
+    /// CompletionResponse event goes through the event path. The event path
+    /// must not move any stats for the orchestrator lane — today it re-books
+    /// (2 calls, 200/20 tokens, the event's cost added on top).
+    #[test]
+    fn orchestrator_completion_event_does_not_double_book() {
+        use crate::hooks::events::{AgentEvent, SourcedEvent, TokenUsage};
+
+        let sm = Arc::new(StateManager::new());
+        let sm_opt: Option<Arc<StateManager>> = Some(sm.clone());
+        let generation = sm.compaction_generation();
+
+        // W1 — the hook's inline booking on the SHARED stats, exactly as
+        // `on_completion_response` does it (cost 0.0 there: "cost is
+        // calculated externally", so the event carries the cost).
+        sm.stats_arc()
+            .lock()
+            .unwrap()
+            .add_request("orchestrator", 100, 10, 0.0, generation);
+
+        // W2 — the event task then sees the hook's CompletionResponse.
+        AgentRunner::process_event_for_ui(
+            &sm_opt,
+            SourcedEvent {
+                source: MessageSource::Human,
+                event: AgentEvent::CompletionResponse {
+                    content: "Done.".to_string(),
+                    reasoning: None,
+                    thinking: vec![],
+                    usage: TokenUsage {
+                        input_tokens: 100,
+                        output_tokens: 10,
+                        total_tokens: 110,
+                        cost: 0.05,
+                        generation,
+                    },
+                    timestamp: chrono::Utc::now(),
+                },
+            },
+        );
+
+        let stats = sm.get_stats();
+        assert_eq!(
+            stats.total_api_calls, 1,
+            "one orchestrator response books exactly one API call — the event \
+             path must not re-book what the hook already booked"
+        );
+        let lane = stats
+            .lanes_sorted()
+            .into_iter()
+            .find(|(name, _)| name == "orchestrator")
+            .map(|(_, lane)| lane)
+            .expect("the orchestrator lane exists");
+        assert_eq!(lane.api_calls, 1, "orchestrator lane: 1 call, not 2");
+        assert_eq!(
+            lane.input_tokens, 100,
+            "orchestrator lane: 100 input tokens, not 200"
+        );
+        assert_eq!(
+            lane.output_tokens, 10,
+            "orchestrator lane: 10 output tokens, not 20"
+        );
+        assert!(
+            (stats.total_cost - 0.0).abs() < f64::EPSILON,
+            "cost is booked once (the hook's booking) — the event path must \
+             not add the event's cost on top (got {})",
+            stats.total_cost
+        );
+    }
+
+    /// A sub-agent's CompletionResponse is booked EXACTLY once — by the event
+    /// path, because the sub-agent hook books into private stats (no W1 on
+    /// the shared stats). GREEN today; must stay green after the fix (the
+    /// orchestrator-lane guard must not catch sub-agent lanes).
+    #[test]
+    fn sub_agent_completion_event_is_booked_once() {
+        use crate::hooks::events::{AgentEvent, SourcedEvent, TokenUsage};
+
+        let sm = Arc::new(StateManager::new());
+        let sm_opt: Option<Arc<StateManager>> = Some(sm.clone());
+        let generation = sm.compaction_generation();
+
+        // No W1 on the shared stats: the sub-agent hook books into PRIVATE
+        // stats (`SessionHook::new(sink)` — no `with_context_tracking`), so
+        // the event path is the ONLY booking into the shared stats. It must
+        // stay, exactly once.
+        AgentRunner::process_event_for_ui(
+            &sm_opt,
+            SourcedEvent {
+                source: MessageSource::SubAgent {
+                    role: "reviewer".to_string(),
+                },
+                event: AgentEvent::CompletionResponse {
+                    content: "Looks good.".to_string(),
+                    reasoning: None,
+                    thinking: vec![],
+                    usage: TokenUsage {
+                        input_tokens: 50,
+                        output_tokens: 7,
+                        total_tokens: 57,
+                        cost: 0.01,
+                        generation,
+                    },
+                    timestamp: chrono::Utc::now(),
+                },
+            },
+        );
+
+        let stats = sm.get_stats();
+        assert_eq!(
+            stats.total_api_calls, 1,
+            "a sub-agent completion books exactly one API call"
+        );
+        let lane = stats
+            .lanes_sorted()
+            .into_iter()
+            .find(|(name, _)| name == "reviewer")
+            .map(|(_, lane)| lane)
+            .expect("the reviewer lane exists");
+        assert_eq!(lane.api_calls, 1, "reviewer lane: 1 call");
+        assert_eq!(lane.input_tokens, 50, "reviewer lane: 50 input tokens");
+        assert_eq!(lane.output_tokens, 7, "reviewer lane: 7 output tokens");
+        assert!(
+            (stats.total_cost - 0.01).abs() < f64::EPSILON,
+            "the sub-agent's cost is booked once (got {})",
+            stats.total_cost
+        );
+    }
+
+    /// The orchestrator event must keep the UI in sync with the shared stats
+    /// even once it stops booking: the hook's inline write goes straight to
+    /// the stats Arc (no UI sync), so the event path is the only thing that
+    /// pushes the stats into the UI state for this response. GREEN today
+    /// (W2 books and syncs), and meaningful after the fix — drop the sync
+    /// and the UI stalls on the pre-event values.
+    #[test]
+    fn orchestrator_completion_event_still_syncs_ui() {
+        use crate::hooks::events::{AgentEvent, SourcedEvent, TokenUsage};
+
+        let sm = Arc::new(StateManager::new());
+        let sm_opt: Option<Arc<StateManager>> = Some(sm.clone());
+        let generation = sm.compaction_generation();
+
+        // The hook books directly on the stats Arc — that write does NOT
+        // reach the UI state (only `StateManager::add_request` →
+        // `sync_stats_to_ui` does). The UI is stale right after W1.
+        sm.stats_arc()
+            .lock()
+            .unwrap()
+            .add_request("orchestrator", 100, 10, 0.0, generation);
+        assert_eq!(
+            sm.get_state().stats.total_api_calls,
+            0,
+            "precondition: the hook's inline booking is not visible to the UI"
+        );
+
+        // The orchestrator's CompletionResponse event must leave the UI
+        // mirroring the shared stats — whatever the fix does to the booking.
+        AgentRunner::process_event_for_ui(
+            &sm_opt,
+            SourcedEvent {
+                source: MessageSource::Human,
+                event: AgentEvent::CompletionResponse {
+                    content: "Done.".to_string(),
+                    reasoning: None,
+                    thinking: vec![],
+                    usage: TokenUsage {
+                        input_tokens: 100,
+                        output_tokens: 10,
+                        total_tokens: 110,
+                        cost: 0.05,
+                        generation,
+                    },
+                    timestamp: chrono::Utc::now(),
+                },
+            },
+        );
+
+        let ui = sm.get_state().stats;
+        let stats = sm.get_stats();
+        assert_eq!(
+            ui.total_api_calls, stats.total_api_calls,
+            "UI api_calls must mirror the stats after the orchestrator event"
+        );
+        assert_eq!(
+            ui.total_input_tokens, stats.total_input_tokens,
+            "UI input tokens must mirror the stats after the orchestrator event"
+        );
+        assert_eq!(
+            ui.total_output_tokens, stats.total_output_tokens,
+            "UI output tokens must mirror the stats after the orchestrator event"
+        );
+        assert!(
+            (ui.total_cost - stats.total_cost).abs() < f64::EPSILON,
+            "UI cost must mirror the stats after the orchestrator event"
+        );
+    }
+
+    /// End-to-end: one REAL mock orchestrator response through the REAL hook
+    /// (W1, inline on the shared stats — `create_mock_agent` builds the hook
+    /// with `with_context_tracking(…, stats_arc())`) and the REAL event pump
+    /// (W2, `process_event_for_ui`). Exactly one call may reach the shared
+    /// stats. No TestRunner/TestHarness — they replay hook stats and never
+    /// run W2, so they hide the bug.
+    #[cfg(feature = "mock")]
+    #[tokio::test]
+    async fn one_orchestrator_response_counts_once_end_to_end() {
+        let sm = Arc::new(StateManager::new());
+        let (agent, _info, mut events, _hook, model) =
+            crate::providers::create_mock_agent("test prompt", 4, sm.clone())
+                .expect("the mock agent builds");
+        model.add_response(crate::mock::MockResponse::text_with_usage(
+            "Done.",
+            crate::mock::Usage {
+                input_tokens: 100,
+                output_tokens: 10,
+            },
+        ));
+
+        // One REAL orchestrator response through the REAL hook: W1 books
+        // inline on the shared stats during the prompt.
+        let reply = agent
+            .prompt("hello")
+            .await
+            .expect("the mock turn completes");
+        assert_eq!(reply, "Done.");
+
+        // ... and through the REAL event pump. The channel is unbounded and
+        // the hook sends inline, so every event is already queued when the
+        // prompt returns — drain it synchronously (no spawned-pump race) and
+        // feed it exactly as the runner would.
+        let sm_opt: Option<Arc<StateManager>> = Some(sm.clone());
+        let mut completions = 0;
+        while let Ok(sourced) = events.try_recv() {
+            if matches!(
+                sourced.event,
+                crate::hooks::AgentEvent::CompletionResponse { .. }
+            ) {
+                completions += 1;
+            }
+            AgentRunner::process_event_for_ui(&sm_opt, sourced);
+        }
+        assert_eq!(
+            completions, 1,
+            "the hook emitted exactly one CompletionResponse"
+        );
+
+        let stats = sm.get_stats();
+        assert_eq!(
+            stats.total_api_calls, 1,
+            "one orchestrator response counts once end-to-end — hook booking \
+             (W1) and event path (W2) must not both book"
+        );
+        let lane = stats
+            .lanes_sorted()
+            .into_iter()
+            .find(|(name, _)| name == "orchestrator")
+            .map(|(_, lane)| lane)
+            .expect("the orchestrator lane exists");
+        assert_eq!(lane.api_calls, 1, "orchestrator lane: 1 call, not 2");
+        assert_eq!(
+            lane.input_tokens, 100,
+            "orchestrator lane: 100 input tokens, not 200"
+        );
+        assert_eq!(
+            lane.output_tokens, 10,
+            "orchestrator lane: 10 output tokens, not 20"
+        );
     }
 
     /// T4 — stop message rendering. Pure-function test, no fixtures.
@@ -7268,34 +7586,33 @@ headers:
     }
 
     // =========================================================================
-    // ─── orchestrator reply: staged prose + empty-reply nudge (ticket #294) ───
+    // ─── orchestrator prose: faithful rows, no merge (ticket #294 rework) ───
     //
-    // Written FIRST against the locked design (TDD — production code absent):
-    //   1. `AssistantParts` gains `has_tool_call`; the orchestrator hook
-    //      stages `parts.text` via `StateManager::stage_prose` for every
-    //      response that carried a tool call (sub-agent hooks never stage).
-    //   2. `StateManager::commit_reply(final_text) -> bool` merges the staged
-    //      chunks + the final text into ONE assistant row — blank-dropped,
-    //      deduped by trimmed text (first occurrence wins), joined with
-    //      `"\n\n"`; a single chunk stays byte-identical. False when nothing
-    //      remains (no row, open-response thinking cleared).
-    //   3. `process_message_internal` calls `commit_reply(&response)` in the
-    //      Ok arm; a false commit nudges ONCE with the NON-persisted
-    //      `crate::EMPTY_REPLY_NUDGE` user message, and a second false commit
-    //      warns with `crate::EMPTY_REPLY_WARNING`. The wrapper flushes staged
-    //      prose on every exit (`commit_reply("")`), so Stop/Error still keep
-    //      the prose.
-    //
-    // RED state: `stage_prose` / `commit_reply` / `EMPTY_REPLY_NUDGE` /
-    // `EMPTY_REPLY_WARNING` do not exist yet, so the suite fails to COMPILE on
-    // exactly those names — the intended RED. (T4 is a pure no-regression
-    // guard: once the suite compiles it is green on old AND new behaviour.)
+    // Written FIRST against the locked design (TDD — the merge is still in
+    // place, so the new expectations are RED on the old behaviour):
+    //   * The orchestrator hook writes ONE Agent row per tool-call-carrying
+    //     response — the response's `parts.text` byte-identical (never
+    //     blank) — via `StateManager::add_assistant_message`. The row
+    //     precedes that response's ToolCall rows and carries the open
+    //     response's id + thinking blocks.
+    //   * The turn loop's Ok arm calls `add_assistant_message(response)`
+    //     (blank → no-op), then `turn_has_reply()`: a reply row exists →
+    //     Success; none and not yet nudged → nudge ONCE with the
+    //     NON-persisted `crate::EMPTY_REPLY_NUDGE`; none and already nudged
+    //     → `crate::EMPTY_REPLY_WARNING`. The nudge fires only when the
+    //     final is blank AND the turn has no prose row.
+    //   * `turn_prose` / `stage_prose` / `commit_reply` are GONE — no join,
+    //     no dedupe, no flush wrapper.
+    //   * The wire groups rows by `response_id`: one Assistant message per
+    //     response ([Reasoning…, Text, ToolCall…]), one User per ToolResult;
+    //     rows without an id keep the legacy one-message-per-row shape.
     //
     // Pattern: `stop_mid_tool_persists_interrupted_result` — create_mock_agent,
     // event pump, `process_message_internal`. `fu(x)` below is
     // `MockResponse::tool_call_with_follow_up("todo", …, x)`: one response
-    // carrying a tool call AND the prose `x` (the dropped-prose shape of
-    // ticket #294).
+    // carrying a tool call AND the prose `x` — the shape whose prose the old
+    // pipeline merged into the final reply (and replayed back into the
+    // model's own history).
 
     /// One `todo` tool call plus the prose `follow_up` in the SAME response —
     /// the exact wire shape that used to lose `follow_up` on the orchestrator
@@ -7311,8 +7628,8 @@ headers:
 
     /// Boot conversation + one user turn + mock agent + event pump + the
     /// turn task. `responses` are queued in order. The pump writes the
-    /// ToolCall/ToolResult rows (the assistant row itself is written
-    /// synchronously by the commit seam, so no assertion here races it).
+    /// ToolCall/ToolResult rows; the Agent rows are written by the hook
+    /// (tool-call responses) and the turn loop (the final reply).
     #[cfg(feature = "mock")]
     fn staged_reply_fixture(
         responses: Vec<crate::mock::MockResponse>,
@@ -7369,12 +7686,15 @@ headers:
             .collect()
     }
 
-    /// T1 — prose in a tool-call response is NOT dropped: it is staged and
-    /// committed into the final reply, which lands as exactly ONE orchestrator
-    /// agent row, `"\n\n"`-joined with the closing text.
+    /// T1 — prose in a tool-call response lands as its OWN row: the
+    /// orchestrator Agent rows are ["ANSWER", "🙏 amen"] in order (each
+    /// byte-identical to its response text), the "ANSWER" row precedes the
+    /// ToolCall row, and the wire carries ONE Assistant message with Text
+    /// "ANSWER" + the ToolCall. "ANSWER" appears once; two requests (no
+    /// nudge).
     #[cfg(feature = "mock")]
     #[tokio::test(flavor = "multi_thread")]
-    async fn t1_tool_call_prose_is_staged_into_the_final_reply() {
+    async fn t1_tool_call_prose_lands_as_its_own_row() {
         let (sm, model, turn) = staged_reply_fixture(vec![
             fu("ANSWER"),
             crate::mock::MockResponse::text("🙏 amen"),
@@ -7389,28 +7709,78 @@ headers:
         let msgs = sm.get_state().chat.messages;
         let rows = agent_rows_after_user(&msgs);
         assert_eq!(
-            rows.len(),
+            rows.iter().map(|r| r.content.as_str()).collect::<Vec<_>>(),
+            vec!["ANSWER", "🙏 amen"],
+            "the tool-call prose and the final reply are two separate rows, \
+             in order, byte-identical; transcript={msgs:?}"
+        );
+
+        // The prose row precedes the ToolCall row of its response.
+        let user_idx = msgs
+            .iter()
+            .position(|m| m.role == crate::ui::app_state::MessageRole::User)
+            .expect("the user message is in the transcript");
+        let prose_idx = msgs[user_idx..]
+            .iter()
+            .position(|m| {
+                m.role == crate::ui::app_state::MessageRole::Agent && m.content == "ANSWER"
+            })
+            .expect("the ANSWER row exists");
+        let tc_idx = msgs
+            .iter()
+            .position(|m| m.role == crate::ui::app_state::MessageRole::ToolCall)
+            .expect("the ToolCall row exists");
+        assert!(
+            user_idx + prose_idx < tc_idx,
+            "the prose row must precede the ToolCall row; transcript={msgs:?}"
+        );
+
+        // The wire: ONE Assistant message carrying Text "ANSWER" and the
+        // ToolCall — never a merged "ANSWER\n\n🙏 amen" text.
+        let history = sm.get_agent_history();
+        let answer_msgs: Vec<&rig_core::completion::message::Message> = history
+            .iter()
+            .filter(|m| {
+                matches!(
+                m,
+                rig_core::completion::message::Message::Assistant { content, .. }
+                    if content.iter().any(|c| matches!(
+                        c,
+                        rig_core::completion::message::AssistantContent::Text(t)
+                            if t.text == "ANSWER"
+                    )))
+            })
+            .collect();
+        assert_eq!(
+            answer_msgs.len(),
             1,
-            "exactly one orchestrator agent row after the user msg; transcript={msgs:?}"
+            "exactly one Assistant message carries the ANSWER text; history={history:?}"
+        );
+        assert!(
+            matches!(
+                answer_msgs[0],
+                rig_core::completion::message::Message::Assistant { content, .. }
+                    if content.iter().any(|c| matches!(
+                        c,
+                        rig_core::completion::message::AssistantContent::ToolCall(tc)
+                            if tc.function.name == "todo"
+                    ))
+            ),
+            "the ANSWER message must also carry the ToolCall; history={history:?}"
         );
         assert_eq!(
-            rows[0].content, "ANSWER\n\n🙏 amen",
-            "staged tool-call prose + closing text, joined with a blank line"
-        );
-        // The wire context carries "ANSWER" exactly once (inside the merged row).
-        assert_eq!(
-            count_occurrences(&sm.get_agent_history(), "ANSWER"),
+            count_occurrences(&history, "ANSWER"),
             1,
             "ANSWER must occur once in get_agent_history()"
         );
         assert_eq!(model.request_count(), 2, "no nudge on a non-empty final");
     }
 
-    /// T2 — a final reply duplicating the staged prose collapses to ONE row.
-    /// Dedup is by trimmed text, first occurrence wins.
+    /// T2 — repeated prose stays repeated: there is NO dedup — the rows are
+    /// ["X", "X"], both byte-identical.
     #[cfg(feature = "mock")]
     #[tokio::test(flavor = "multi_thread")]
-    async fn t2_duplicate_final_reply_collapses_to_one_row() {
+    async fn t2_repeated_prose_persists_both_rows() {
         let (sm, _model, turn) =
             staged_reply_fixture(vec![fu("X"), crate::mock::MockResponse::text("X")]);
 
@@ -7422,15 +7792,18 @@ headers:
 
         let msgs = sm.get_state().chat.messages;
         let rows = agent_rows_after_user(&msgs);
-        assert_eq!(rows.len(), 1, "one row; transcript={msgs:?}");
-        assert_eq!(rows[0].content, "X", "dedup keeps the first occurrence");
+        assert_eq!(
+            rows.iter().map(|r| r.content.as_str()).collect::<Vec<_>>(),
+            vec!["X", "X"],
+            "no dedup — both rows are persisted; transcript={msgs:?}"
+        );
     }
 
-    /// T3 — multiple staged chunks join in order with blank lines; a
-    /// duplicated chunk collapses to its first occurrence.
+    /// T3 — multiple prose responses keep every row, in order: ["A", "B",
+    /// "C"] — no joining.
     #[cfg(feature = "mock")]
     #[tokio::test(flavor = "multi_thread")]
-    async fn t3_multiple_staged_chunks_join_with_blank_lines() {
+    async fn t3_multiple_prose_responses_keep_every_row() {
         let (sm, _model, turn) =
             staged_reply_fixture(vec![fu("A"), fu("B"), crate::mock::MockResponse::text("C")]);
 
@@ -7442,13 +7815,17 @@ headers:
 
         let msgs = sm.get_state().chat.messages;
         let rows = agent_rows_after_user(&msgs);
-        assert_eq!(rows.len(), 1, "one row; transcript={msgs:?}");
-        assert_eq!(rows[0].content, "A\n\nB\n\nC");
+        assert_eq!(
+            rows.iter().map(|r| r.content.as_str()).collect::<Vec<_>>(),
+            vec!["A", "B", "C"],
+            "every response's prose is its own row, in order; transcript={msgs:?}"
+        );
     }
 
+    /// T3 — duplicated prose is NOT collapsed: the rows are ["A", "A", "C"].
     #[cfg(feature = "mock")]
     #[tokio::test(flavor = "multi_thread")]
-    async fn t3_duplicate_staged_chunk_collapses() {
+    async fn t3_repeated_prose_keeps_every_row() {
         let (sm, _model, turn) =
             staged_reply_fixture(vec![fu("A"), fu("A"), crate::mock::MockResponse::text("C")]);
 
@@ -7460,8 +7837,11 @@ headers:
 
         let msgs = sm.get_state().chat.messages;
         let rows = agent_rows_after_user(&msgs);
-        assert_eq!(rows.len(), 1, "one row; transcript={msgs:?}");
-        assert_eq!(rows[0].content, "A\n\nC", "the duplicate chunk is dropped");
+        assert_eq!(
+            rows.iter().map(|r| r.content.as_str()).collect::<Vec<_>>(),
+            vec!["A", "A", "C"],
+            "no dedup — the duplicate row is kept; transcript={msgs:?}"
+        );
     }
 
     /// T4 — the common path must not move: a plain text reply is persisted
@@ -7489,12 +7869,12 @@ headers:
         );
     }
 
-    /// T5 — an empty final reply after staged prose commits the staged prose
-    /// (the reply is NOT empty once staged), so NO nudge fires: exactly two
-    /// requests, one row with the staged text.
+    /// T5 — an empty final reply after a prose row: the turn succeeds on the
+    /// hook's row — one row "ANSWER", no blank row, exactly two requests (no
+    /// nudge: the turn HAS a reply).
     #[cfg(feature = "mock")]
     #[tokio::test(flavor = "multi_thread")]
-    async fn t5_empty_final_after_staged_prose_commits_without_nudge() {
+    async fn t5_empty_final_after_prose_row_succeeds_without_nudge() {
         let (sm, model, turn) =
             staged_reply_fixture(vec![fu("ANSWER"), crate::mock::MockResponse::text("")]);
 
@@ -7506,12 +7886,20 @@ headers:
 
         let msgs = sm.get_state().chat.messages;
         let rows = agent_rows_after_user(&msgs);
-        assert_eq!(rows.len(), 1, "one row; transcript={msgs:?}");
-        assert_eq!(rows[0].content, "ANSWER");
+        assert_eq!(
+            rows.iter().map(|r| r.content.as_str()).collect::<Vec<_>>(),
+            vec!["ANSWER"],
+            "the hook's prose row is the turn's only row; transcript={msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| m.content.trim().is_empty()
+                && m.role == crate::ui::app_state::MessageRole::Agent),
+            "no blank agent row may be persisted; transcript={msgs:?}"
+        );
         assert_eq!(
             model.request_count(),
             2,
-            "the staged prose made the reply non-empty — no nudge"
+            "the prose row made the turn a reply — no nudge"
         );
     }
 
@@ -7711,13 +8099,14 @@ headers:
         );
     }
 
-    /// T9 — Stop mid-tool: the staged prose of the interrupted response is
-    /// flushed by the wrapper's `commit_reply("")` on the Stopped exit — the
-    /// agent row "PARTIAL" lands after the INTERRUPTED tool result, and the
-    /// staging buffer is empty afterwards.
+    /// T9 — Stop mid-tool: the interrupted response's prose lands as an
+    /// Agent row BEFORE its ToolCall row; the INTERRUPTED result answers the
+    /// call; the stop System row is last, and NO agent row follows the
+    /// result. The next wire replay is Asst[Text "PARTIAL", TC bash] ·
+    /// User[TR].
     #[cfg(feature = "mock")]
     #[tokio::test(flavor = "multi_thread")]
-    async fn t9_stop_mid_tool_flushes_staged_prose_as_final_row() {
+    async fn t9_stop_mid_tool_keeps_the_prose_row_before_the_call() {
         use crate::ui::app_state::MessageRole;
 
         let storage: Arc<dyn crate::storage::ConversationStorage> =
@@ -7729,7 +8118,7 @@ headers:
         let (agent, _info, mut events, _hook, model) =
             crate::providers::create_mock_agent("test prompt", 4, sm.clone())
                 .expect("mock agent builds");
-        // A real in-flight tool (30s sleep) carrying the staged prose.
+        // A real in-flight tool (30s sleep) carrying the prose.
         model.add_response(crate::mock::MockResponse::tool_call_with_follow_up(
             "bash",
             serde_json::json!({ "command": "sleep 30" }),
@@ -7762,7 +8151,10 @@ headers:
                     && tail.role == MessageRole::ToolCall
                     && tail.tool_name.as_deref() == Some("bash")
                 {
-                    return tail.call_id.clone();
+                    return tail
+                        .call_id
+                        .clone()
+                        .expect("the ToolCall row carries its id");
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
@@ -7782,11 +8174,29 @@ headers:
             "a cancelled turn must report Stopped"
         );
 
+        // The agent loop's drain arm posts the stop row once the turn
+        // reports Stopped — this fixture runs the turn directly, so post it
+        // here exactly as the drain arm would.
+        sm.add_system_message("Agent stopped by user".to_string());
+
         let msgs = sm.get_state().chat.messages;
-        // The INTERRUPTED result is answered for the in-flight call…
+        // The prose row exists and precedes its ToolCall row…
+        let prose_idx = msgs
+            .iter()
+            .position(|m| m.role == MessageRole::Agent && m.content == "PARTIAL")
+            .expect("the prose row exists; transcript={msgs:?}");
+        let tc_idx = msgs
+            .iter()
+            .position(|m| m.role == MessageRole::ToolCall && m.call_id == Some(call_id.clone()))
+            .expect("the bash ToolCall row exists");
+        assert!(
+            prose_idx < tc_idx,
+            "the prose row must precede its ToolCall row; transcript={msgs:?}"
+        );
+        // …and the INTERRUPTED result answers the in-flight call.
         let interrupted_idx = msgs
             .iter()
-            .rposition(|m| m.role == MessageRole::ToolResult && m.call_id == call_id)
+            .rposition(|m| m.role == MessageRole::ToolResult && m.call_id == Some(call_id.clone()))
             .expect("the INTERRUPTED result row exists");
         let interrupted = &msgs[interrupted_idx];
         assert!(
@@ -7796,42 +8206,62 @@ headers:
                 .unwrap_or_default()
                 .starts_with("INTERRUPTED")
         );
-        // …and the staged prose lands as the final agent row, after it.
-        let rows: Vec<&crate::ui::app_state::ChatMessage> = msgs
-            .iter()
-            .skip(interrupted_idx + 1)
-            .filter(|m| m.role == MessageRole::Agent && m.source.is_orchestrator_lane())
-            .collect();
-        assert_eq!(
-            rows.len(),
-            1,
-            "exactly one agent row after the INTERRUPTED result; transcript={msgs:?}"
-        );
-        assert_eq!(
-            rows[0].content, "PARTIAL",
-            "the staged prose is the flushed final row"
-        );
-        // Staging is empty afterwards: another flush commits nothing.
-        let before = msgs.len();
+        // No agent row after the result; the stop System row is last.
         assert!(
-            !sm.commit_reply(""),
-            "staging must be empty after the flush"
+            !msgs[interrupted_idx + 1..]
+                .iter()
+                .any(|m| m.role == MessageRole::Agent && m.source.is_orchestrator_lane()),
+            "no agent row may follow the INTERRUPTED result; transcript={msgs:?}"
         );
         assert_eq!(
-            sm.get_state().chat.messages.len(),
-            before,
-            "no further row may appear"
+            msgs.last().map(|m| m.role),
+            Some(MessageRole::System),
+            "the stop row is the last row; transcript={msgs:?}"
+        );
+
+        // The next wire replay: User go · Asst[Text "PARTIAL", TC bash] ·
+        // User[TR].
+        let history = sm.get_agent_history();
+        let tail_msgs = &history[history.len().saturating_sub(2)..];
+        assert!(
+            matches!(
+                tail_msgs.first(),
+                Some(rig_core::completion::message::Message::Assistant { content, .. })
+                    if content.iter().any(|c| matches!(
+                        c,
+                        rig_core::completion::message::AssistantContent::Text(t)
+                            if t.text == "PARTIAL"
+                    ))
+                        && content.iter().any(|c| matches!(
+                            c,
+                            rig_core::completion::message::AssistantContent::ToolCall(tc)
+                                if tc.function.name == "bash"
+                        ))
+            ),
+            "the PARTIAL message must carry Text + the bash ToolCall; history={history:?}"
+        );
+        assert!(
+            matches!(
+                tail_msgs.last(),
+                Some(rig_core::completion::message::Message::User { content })
+                    if content.iter().any(|c| matches!(
+                        c,
+                        rig_core::completion::message::UserContent::ToolResult(tr)
+                            if tr.id == call_id
+                    ))
+            ),
+            "the wire tail must be the INTERRUPTED ToolResult; history={history:?}"
         );
 
         pump.abort();
     }
 
-    /// T10 — a non-transient LLM error after staged prose: the turn reports
-    /// Error with its ❌ system message, and the staged prose is still
-    /// persisted as the agent row (the wrapper's flush-on-exit).
+    /// T10 — a non-transient LLM error after a prose row: the turn reports
+    /// Error with its ❌ system message LAST, and the prose row "A" sits
+    /// before the ToolCall row (where the response put it).
     #[cfg(feature = "mock")]
     #[tokio::test(flavor = "multi_thread")]
-    async fn t10_hard_error_flushes_staged_prose_and_keeps_error_row() {
+    async fn t10_hard_error_keeps_the_prose_row_and_the_error_row() {
         let (sm, _model, turn) = staged_reply_fixture(vec![
             fu("A"),
             crate::mock::MockResponse::error("authentication failed"),
@@ -7848,26 +8278,44 @@ headers:
 
         let msgs = sm.get_state().chat.messages;
         let rows = agent_rows_after_user(&msgs);
-        assert_eq!(rows.len(), 1, "one row; transcript={msgs:?}");
         assert_eq!(
-            rows[0].content, "A",
-            "the staged prose survives the error exit"
+            rows.iter().map(|r| r.content.as_str()).collect::<Vec<_>>(),
+            vec!["A"],
+            "the prose row survives the error exit; transcript={msgs:?}"
         );
+        // "A" before the ToolCall…
+        let user_idx = msgs
+            .iter()
+            .position(|m| m.role == crate::ui::app_state::MessageRole::User)
+            .expect("the user message is in the transcript");
+        let prose_idx = msgs[user_idx..]
+            .iter()
+            .position(|m| m.role == crate::ui::app_state::MessageRole::Agent && m.content == "A")
+            .expect("the prose row exists");
+        let tc_idx = msgs
+            .iter()
+            .position(|m| m.role == crate::ui::app_state::MessageRole::ToolCall)
+            .expect("the ToolCall row exists");
         assert!(
-            msgs.iter().any(|m| {
+            user_idx + prose_idx < tc_idx,
+            "the prose row must precede its ToolCall row; transcript={msgs:?}"
+        );
+        // …and the ❌ failure row is the last row.
+        assert!(
+            msgs.last().is_some_and(|m| {
                 m.role == crate::ui::app_state::MessageRole::System && m.content.starts_with('❌')
             }),
-            "the ❌ failure message must be present; transcript={msgs:?}"
+            "the ❌ failure message must be the last row; transcript={msgs:?}"
         );
     }
 
-    /// T11 — persistence: after the T1 shape (staged prose + closing text),
-    /// reloading the conversation from storage yields "ANSWER" exactly ONCE in
-    /// the messages and exactly ONCE in the rebuilt wire history — the merged
-    /// row round-trips, and nothing duplicates.
+    /// T11 — persistence: after the T1 shape (prose row + final row),
+    /// `get_agent_history()` is IDENTICAL before and after reload, and
+    /// "ANSWER" occurs exactly once — the faithful rows (with their
+    /// `response_id`s) round-trip, and nothing duplicates.
     #[cfg(feature = "mock")]
     #[tokio::test(flavor = "multi_thread")]
-    async fn t11_merged_reply_survives_reload_without_duplicating() {
+    async fn t11_faithful_rows_survive_reload_without_duplicating() {
         use crate::storage::{ConversationStorage, InMemoryStorage};
 
         let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::new());
@@ -7904,6 +8352,8 @@ headers:
             .expect("no panic");
         assert!(matches!(result, CompletionResult::Success));
 
+        let before = sm.get_agent_history();
+
         // Reload from storage into the SAME StateManager.
         let id = sm
             .get_current_conversation_id()
@@ -7911,18 +8361,16 @@ headers:
         sm.load_conversation(id).expect("conversation reloads");
 
         let msgs = sm.get_state().chat.messages;
-        let containing: Vec<&crate::ui::app_state::ChatMessage> = msgs
-            .iter()
-            .filter(|m| m.content.contains("ANSWER"))
-            .collect();
+        let rows = agent_rows_after_user(&msgs);
         assert_eq!(
-            containing.len(),
-            1,
-            "ANSWER must live in exactly one reloaded message; messages={msgs:?}"
+            rows.iter().map(|r| r.content.as_str()).collect::<Vec<_>>(),
+            vec!["ANSWER", "🙏 amen"],
+            "both rows survive the reload; messages={msgs:?}"
         );
         assert_eq!(
-            containing[0].content, "ANSWER\n\n🙏 amen",
-            "the merged row round-trips byte-identical"
+            sm.get_agent_history(),
+            before,
+            "the wire history must be identical before and after reload"
         );
         assert_eq!(
             count_occurrences(&sm.get_agent_history(), "ANSWER"),
@@ -7936,7 +8384,121 @@ headers:
     // T12 — no-regression pin (pre-existing, must stay UNCHANGED):
     // `orchestrator_completion_prose_is_not_double_added` (above) — an
     // orchestrator `CompletionResponse` event adds NO transcript row; the
-    // commit path owns that row.
+    // hook (tool-call responses) and the turn loop (the final reply) own
+    // that row.
+
+    /// N9 — two consecutive turns: turn 1 is `fu("A")` + `text("B")` (a
+    /// prose row and a final row), turn 2 is `text("C")`. The THIRD request's
+    /// history carries ONE Assistant message with Text "A" + the ToolCall and
+    /// a separate Asst[Text "B"] — no message anywhere contains the merged
+    /// "A\n\nB".
+    #[cfg(feature = "mock")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn n9_next_turn_history_replays_separate_rows_not_the_merge() {
+        let (sm, _model, turn) =
+            staged_reply_fixture(vec![fu("A"), crate::mock::MockResponse::text("B")]);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), turn)
+            .await
+            .expect("turn 1 finishes")
+            .expect("no panic");
+        assert!(matches!(result, CompletionResult::Success));
+
+        // Turn 2: a fresh user message, a fresh mock agent whose model
+        // answers "C" — its FIRST request is the third LLM request overall.
+        sm.add_user_message("again".to_string());
+        let current_turn = sm
+            .build_current_turn_message()
+            .expect("the second user turn was dispatched");
+        let (agent, _info, mut events, _hook, model2) =
+            crate::providers::create_mock_agent("test prompt", 4, sm.clone())
+                .expect("mock agent builds");
+        model2.add_response(crate::mock::MockResponse::text("C"));
+        let sm_opt_pump = Some(sm.clone());
+        let pump = tokio::spawn(async move {
+            while let Some(ev) = events.recv().await {
+                AgentRunner::process_event_for_ui(&sm_opt_pump, ev);
+            }
+        });
+        sm.set_running(true);
+        let agent = Arc::new(agent);
+        let config = test_config();
+        let sm_opt = Some(sm.clone());
+        let turn2 = tokio::spawn(async move {
+            AgentRunner::process_message_internal(current_turn, &sm_opt, &agent, &config).await
+        });
+        let result2 = tokio::time::timeout(std::time::Duration::from_secs(15), turn2)
+            .await
+            .expect("turn 2 finishes")
+            .expect("no panic");
+        assert!(matches!(result2, CompletionResult::Success));
+
+        let requests = model2.get_recorded_requests();
+        assert_eq!(requests.len(), 1, "turn 2 makes exactly one request");
+        let payload = &requests[0].chat_history;
+
+        // Exactly ONE Assistant message carries Text "A" — and it also
+        // carries the ToolCall.
+        let a_msgs: Vec<&rig_core::completion::message::Message> = payload
+            .iter()
+            .filter(|m| {
+                matches!(
+                m,
+                rig_core::completion::message::Message::Assistant { content, .. }
+                    if content.iter().any(|c| matches!(
+                        c,
+                        rig_core::completion::message::AssistantContent::Text(t)
+                            if t.text == "A"
+                    )))
+            })
+            .collect();
+        assert_eq!(
+            a_msgs.len(),
+            1,
+            "exactly one Assistant message carries Text A; payload={payload:?}"
+        );
+        assert!(
+            matches!(
+                a_msgs[0],
+                rig_core::completion::message::Message::Assistant { content, .. }
+                    if content.iter().any(|c| matches!(
+                        c,
+                        rig_core::completion::message::AssistantContent::ToolCall(_tc)
+                    ))
+            ),
+            "the Text A message must also carry the ToolCall; payload={payload:?}"
+        );
+        // A separate Assistant message is exactly [Text "B"].
+        let b_msgs: Vec<&rig_core::completion::message::Message> = payload
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m,
+                    rig_core::completion::message::Message::Assistant { content, .. }
+                        if content.len() == 1
+                            && matches!(
+                                content.first_ref(),
+                                rig_core::completion::message::AssistantContent::Text(t)
+                                    if t.text == "B"
+                            )
+                )
+            })
+            .collect();
+        assert_eq!(
+            b_msgs.len(),
+            1,
+            "exactly one Assistant message is [Text B]; payload={payload:?}"
+        );
+        // No message anywhere contains the merged shape.
+        assert!(
+            !payload
+                .iter()
+                .any(|m| message_texts(m).iter().any(|t| t.contains("A\n\nB"))),
+            "no message may contain the merged 'A\\n\\nB'; payload={payload:?}"
+        );
+
+        pump.abort();
+    }
 
     /// c — teardown mid-tool: when the action channel closes with a turn in
     /// flight, `run_loop` must abort the agent task and answer the in-flight

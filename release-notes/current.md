@@ -4,7 +4,7 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ## Changes
 
-### Features
+### Fixes
 
 - **Per-profile tab colour.** Each profile now has a colour. Set it with `ui.color` (one of red, orange, yellow, green, teal, blue, purple, pink). If unset, a stable colour is derived from the profile name.
 - Conversation tabs show a coloured top accent. The selection chip and conversation picker rows show a colour dot.
@@ -28,3 +28,5 @@ This file is the working draft for the next release. When a version is tagged, t
   - The protocol versions must match exactly; a mismatch is refused with an error naming both versions.
   - The TUI and stdio refuse remote profiles.
 - **Remote profiles in Settings.** The Profiles pane lists remote entries with a `remote` badge and their tab colour, and edits them (URL, masked token, CA pin, target profile, optional agent pin, tab colour) — with a `ca` required hint when the pin is empty. "+ Add remote profile" pastes a pairing link and creates the entry named `<profile> on <host>`. Settings → General gains a "Connect a phone or another PeakBot" panel: the pairing links (host labels only, the token URL behind Show QR), a profile dropdown, and Copy link.
+- Desktop (Linux): pasting an image (Ctrl+V) into the chat box now attaches it. The bundled WebKitGTK did not pass clipboard images to the page, so the app now reads the image from the clipboard itself. Text paste, the 📎 button, drag-and-drop and macOS/Windows/browser behaviour are unchanged.
+- `/stats` no longer double-counts API calls and per-agent token totals for the main agent.

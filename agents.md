@@ -276,13 +276,15 @@ apply "on next /new" vs "restart required" (the server computes the boot-only
 list — the client keeps none). The gear is hidden when the active profile's
 `ui.tabs` filters out the `settings` tab, and the whole settings API is refused
 under a `--profile` pin. In the desktop app the web UI additionally gets
-**exactly three loopback-only IPC commands** (`theme_set`, `update_status`,
-`update_install`) granted to the `:7823` backend by the `remote-web` capability
-(`desktop/src-tauri/capabilities/remote-web.json`) — `theme_set` reports the web
-theme so the desktop's bundled pages follow it, and `update_status` /
-`update_install` drive the in-app **Update available** banner (slim bar under
-the top bar; polls `update_status` every 30 s; click = download, install,
-restart; dismissible until the version changes) — nothing else reaches the web
+**exactly four loopback-only IPC commands** (`theme_set`, `update_status`,
+`update_install`, `clipboard_image_png`) granted to the `:7823` backend by the
+`remote-web` capability (`desktop/src-tauri/capabilities/remote-web.json`) —
+`theme_set` reports the web theme so the desktop's bundled pages follow it,
+`update_status` / `update_install` drive the in-app **Update available** banner
+(slim bar under the top bar; polls `update_status` every 30 s; click =
+download, install, restart; dismissible until the version changes), and
+`clipboard_image_png` returns the clipboard image as PNG for the Linux paste
+fallback (WebKitGTK ≤ 2.50, WebKit Bug 218519) — nothing else reaches the web
 origin. The web-server settings live in Settings → General.
 
 **First run**: with no global config (or a failed migration) the chat is
@@ -456,13 +458,13 @@ All four end `FROM scratch` with `--output type=local,dest=./output`. **Gotcha:*
 
 ### Release pipeline
 
-Fully CI-driven: `release-bump` branch → PR green → merged → `make release-tag` on up-to-date master (HEAD == origin/master) pushes the annotated tag → the push triggers `.gitea/workflows/release.yml` (runner `dind`, Alpine host driving the host docker daemon — no job container, 180-min timeout, secret `RELEASE_TOKEN` → env `GITEA_TOKEN`) which runs:
+Fully CI-driven: `release-bump` branch → PR green → merged → `make release-tag` on up-to-date master (HEAD == origin/master) pushes the annotated tag → the push triggers `.gitea/workflows/release.yml` (runner `dind`, Alpine host driving the host docker daemon — no job container, 300-min timeout, secret `RELEASE_TOKEN` → env `GITEA_TOKEN`) which runs:
 
 ```bash
 make release TAG=0.3.0 PRUNE=1 CONTAINER_BUILDER=docker GITEA_URL=… OWNER=ai-bots REPO=peakbot
 ```
 
-`make release` = `release-check` (TAG == Cargo version == desktop version, `release-notes/<TAG>.md` exists, `tauri.conf.json` updater endpoints point at the GitHub mirror) → per platform: `release-build-<p>` → `desktop-<p>` → prune, for linux, macos, windows → `release-build-android` → `desktop-updater` → `release-publish` → `release-publish-github`. Sequential by design — never run with `-j`.
+`make release` = `release-check` (TAG == Cargo version == desktop version, `release-notes/<TAG>.md` exists, `tauri.conf.json` updater endpoints are exactly `[UPDATER_BASE_URL/latest.json]`) → per platform: `release-build-<p>` → `desktop-<p>` → prune, for linux, macos, windows → `release-build-android` → `desktop-updater` → `release-publish` → `release-publish-shifu` → `release-publish-github` (bridge). Sequential by design — never run with `-j`.
 
 Ten release assets: server `peakbot-<v>-{linux-amd64, windows-amd64.exe, macos-universal2, android-arm64}`; desktop `PeakBot-Desktop-<v>-{linux-x86_64.AppImage, macos-universal.zip, macos-universal.app.tar.gz, windows-x86_64-portable.exe, windows-x86_64-setup.exe}`; plus `latest.json` (the updater manifest).
 
@@ -470,11 +472,13 @@ Ten release assets: server `peakbot-<v>-{linux-amd64, windows-amd64.exe, macos-u
 
 `release-publish` (Gitea) asserts all 10 assets exist **before** any API call, then creates a DRAFT release, uploads all 10, and publishes; tags with a `-` (RCs) are marked **prerelease**; any failure deletes the draft, so a release is complete or absent, never partial.
 
-`release-publish-github` then publishes the same 10 assets to the public mirror `thepeak99/peakbot` — the auto-updater's download host — with `GH_RELEASE_TOKEN` (Gitea secret): it waits for the tag to arrive via the push-mirror, is idempotent (an existing complete release is a no-op), uploads into a DRAFT, and publishes with `make_latest` **true for stable tags only** — RCs are prerelease and never `latest`.
+`release-publish-shifu` then uploads the same 10 assets plus a `SHA256SUMS` to the public **shifu** bucket (MinIO, anonymous read at `https://shifu.patchnotes.com`) under `peakbot/<v>/` — **rclone `copyto` only, no deletes, no rollback**, version files `--immutable`, verified over the public URL *before* the mutable `peakbot/latest.json` pointer moves (stable tags only; RCs leave it unchanged). The endpoint/credentials ride along as `SHIFU_S3_ENDPOINT` (a Gitea **variable**, not a secret) and the `SHIFU_S3_ACCESS_KEY` / `SHIFU_S3_SECRET_KEY` secrets; they are never Make-expanded and never printed. A re-run with identical bytes is a no-op; with changed bytes it fails on `immutable file modified` before the pointer moves.
 
-**Recovery (Gitea published, GitHub failed):** re-run `make release-publish-github TAG=<v>` with the assets still in `output/` (idempotent), or use the human's local, uncommitted `scripts/sync-github-mirror.sh` (`DRY_RUN=1` first, then a real run). Afterwards verify `GET https://api.github.com/repos/thepeak99/peakbot/releases/latest`.
+`release-publish-github` (the 0.26.2 **bridge**) then publishes the same 10 assets to the public mirror `thepeak99/peakbot` with `GH_RELEASE_TOKEN` (Gitea secret) — idempotent (an existing complete release is a no-op), uploads into a DRAFT, and publishes with `make_latest` **true for stable tags only** — RCs are prerelease and never `latest`. The Gitea→GitHub push-mirror was **deleted**: the tag does NOT arrive on GitHub by itself. A human pushes it **right after** `make release-tag`: `git push github 0.26.2` — `release-publish-github` then polls for the tag to appear (up to GH_TAG_WAIT_TRIES × GH_TAG_WAIT_SECS). The bridge is removed in a later PR, after which GitHub goes private and `GH_RELEASE_TOKEN` is deleted.
 
-Release body + tag message = `release-notes/<v>.md` (read via `jq --rawfile` — any Markdown is safe). No `NOTES=` override, no fallback. Local re-run of the CI job: `make release TAG=X.Y.Z GITEA_TOKEN=…` (if the tag already went out, delete it locally + from origin first). Host needs: git, cargo, podman/docker, curl, jq, awk.
+**Recovery (shifu failed):** re-run `make release-publish-shifu TAG=<v>` with the assets still in `output/` (idempotent; a stale public `latest.json` fails loudly and is re-uploaded). **Recovery (Gitea published, GitHub failed):** re-run `make release-publish-github TAG=<v>` (idempotent), pushing the tag to GitHub first if it never arrived. Afterwards verify `GET https://api.github.com/repos/thepeak99/peakbot/releases/latest`.
+
+Release body + tag message = `release-notes/<v>.md` (read via `jq --rawfile` — any Markdown is safe). No `NOTES=` override, no fallback. Local re-run of the CI job: `make release TAG=X.Y.Z GITEA_TOKEN=…` (if the tag already went out, delete it locally + from origin first). Host needs: git, cargo, podman/docker, curl, jq, awk, rclone, sha256sum.
 
 ## Vision (image input)
 
@@ -597,11 +601,11 @@ The load-bearing guarantee: sub-agent turns are filtered out of the agent's wire
 
 Delegation tokens/cost roll into the parent `/stats` lane-agnostically (exception: Ollama sub-agents are hookless — untracked).
 
-Orchestrator reply: rig returns only the last response's text, so prose from responses that also carried tool calls is staged by the hook (`StateManager::stage_prose`) and committed with the final text as one row (`commit_reply`) at the end of the turn (also on Stop/Error). An empty final reply is re-requested once with a wire-only nudge, then a `⚠` system row is shown.
+Orchestrator reply: each orchestrator response becomes at most one Agent row — the hook writes the row for a response that carried tool calls (that response's own prose, byte-identical), the turn loop writes the final reply (a blank final writes nothing). The wire replays rows grouped by `response_id`: one Assistant message per response, one User per tool result; System rows never reach the model. An empty final reply succeeds when the turn already has a prose row, else it is re-requested once with a wire-only nudge, then a `⚠` system row is shown.
 
 ### Context meter
 
-The Session tab context meter is sourced from the **main agent's lane** only (sub-agent turns do not move it). This is the same signal the compaction gate reads. Labelled "Orchestrator context" with a tooltip explaining the distinction. With no subagents, behaviour is identical to a single agent.
+The Session tab context meter is sourced from the **main agent's lane** only (sub-agent turns do not move it). This is the same signal the compaction gate reads. Labelled "Orchestrator context" with a tooltip explaining the distinction. With no subagents, behaviour is identical to a single agent. Compaction, `/new` and `/reset` zero the reading, and a usage event stamped with an older compaction generation (`SessionStats::compaction_generation`) is booked but cannot move it. While a slash command runs, `AppState.command_running` is true alongside `is_running`; web focus mode keys off `is_running && !command_running`.
 
 ### Prompt recipes
 
@@ -677,7 +681,7 @@ Where it lives: `src/config/remote.rs` (parse), `src/ui/web/remote/{mod,relay,pr
 Two workflows on runner `shinpachi` (label `dind`):
 
 - **`ci.yml`** — `rust:1.95` container. Job `ci` = release contract tests (`sh tests/release.sh`, hermetic — Makefile targets + `release.yml`) → Node 22 frontend gate (`web/`: `npm ci` + lint/typecheck/test/build) → `cargo fmt --all -- --check` → `cargo clippy --all-targets --locked -- -D warnings` → `cargo test --workspace --locked`. Job `desktop` = the full desktop workspace (`--manifest-path desktop/Cargo.toml --workspace`) with the same fmt/clippy/test trio — after apt-installing the Tauri webkit deps (same set as `Dockerfile.desktop-linux`) and `touch`ing a placeholder sidecar binary (tauri-build requires `bundle.externalBin` to exist) — plus the Windows portable-exe static tests (`desktop/scripts/test-build-desktop-windows.sh`) and the auto-updater + macOS tarball contract tests (`desktop/scripts/test-updater-manifest.sh`, `desktop/scripts/test-assemble-app-tarball.sh`, after apt-installing `jq` + `zip`). No node/web build there: `desktop/ui` is committed static files.
-- **`release.yml`** — on tag push (`push: tags: ['*']`), on the `dind` runner (Alpine host driving the host docker daemon, no job container, `timeout-minutes: 180`, secret `RELEASE_TOKEN` → env `GITEA_TOKEN`): pure-git checkout, tool check, then `make release TAG=$GITHUB_REF_NAME PRUNE=1 CONTAINER_BUILDER=docker GITEA_URL=… OWNER=… REPO=…`.
+- **`release.yml`** — on tag push (`push: tags: ['*']`), on the `dind` runner (Alpine host driving the host docker daemon, no job container, `timeout-minutes: 300`, secret `RELEASE_TOKEN` → env `GITEA_TOKEN`): pure-git checkout, tool check (incl. `rclone`, `apk add --no-cache rclone` before it), then `make release TAG=$GITHUB_REF_NAME PRUNE=1 CONTAINER_BUILDER=docker GITEA_URL=… OWNER=… REPO=…`.
 
 (Reproduce `ci` locally with exactly those commands; autofix with `cargo fmt --all` + `cargo clippy --fix --allow-dirty [--tests]`.)
 
