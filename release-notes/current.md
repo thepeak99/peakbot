@@ -6,6 +6,7 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ### Fixes
 
+- Stop now interrupts memory.md compaction and in-conversation context compaction: a double Stop press drops the in-flight summarization and ends the turn as Stopped, leaving memory.md and the history untouched. A cancelled memory compaction retries on the next message.
 - **Per-profile tab colour.** Each profile now has a colour. Set it with `ui.color` (one of red, orange, yellow, green, teal, blue, purple, pink). If unset, a stable colour is derived from the profile name.
 - Conversation tabs show a coloured top accent. The selection chip and conversation picker rows show a colour dot.
 - Conversation list entries now carry their profile. The conversation index is rebuilt once on upgrade.

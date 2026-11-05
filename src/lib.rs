@@ -1725,10 +1725,21 @@ impl AgentRunner {
                             .map(|ctx| &ctx.bound.profile.memory)
                             .filter(|memory| memory.enabled)
                             .map(|memory| memory.threshold_bytes);
-                        if !memory_compaction_done && let Some(threshold) = memory_threshold {
-                            memory_compaction_done = true;
-                            if let Some(sm) = state_manager.as_ref() {
-                                Self::maybe_compact_memory(sm, threshold).await;
+                        if !memory_compaction_done
+                            && let Some(threshold) = memory_threshold
+                            && let Some(sm) = state_manager.as_ref()
+                        {
+                            // Stop interrupts the summarize like the prompt: on
+                            // cancel the future is dropped (memory.md
+                            // untouched) and the latch stays clear, so the next
+                            // user message retries.
+                            let cancel = sm.turn_cancel_token();
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => {}
+                                _ = Self::maybe_compact_memory(sm, threshold) => {
+                                    memory_compaction_done = true;
+                                }
                             }
                         }
 
@@ -2887,7 +2898,13 @@ impl AgentRunner {
                     };
 
                     sm.set_status(Some("Compacting context...".to_string()));
-                    let compacted = sm.force_compact().await;
+                    // Stop interrupts the summarize like the prompt: on cancel
+                    // the turn ends as Stopped and the history is untouched.
+                    let compacted = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return CompletionResult::Stopped,
+                        r = sm.force_compact() => r,
+                    };
                     sm.set_status(None);
 
                     let Some(result) = compacted else {
@@ -9778,6 +9795,424 @@ headers:
                     .all(|m| m.role != MessageRole::ToolResult),
                 "the graceful arm must not synthesise INTERRUPTED results"
             );
+        }
+    }
+
+    // ── Stop × compaction (defects A/B) ─────────────────────────────────────
+    //
+    // Stop must interrupt both compaction paths: the lazy `memory.md`
+    // compaction on the first user message (defect A) and the in-loop
+    // context compaction behind `Terminate("compact")` (defect B). Today
+    // neither is selected against the per-turn cancellation token, so a
+    // double Stop press leaves both summarizes running to completion.
+    // The hanging mock (`MockCompletionModel::arm_hang`) makes the defect
+    // observable: the turn can only end as Stopped if the summarize
+    // future is dropped, which flips the hang's drop flag.
+
+    #[cfg(feature = "mock")]
+    mod compaction_stop {
+        use super::*;
+        use crate::config::resolve::{ParseCtx, Source};
+        use crate::mock::MockResponse;
+        use crate::ui::app_state::MessageRole;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        /// Profile with memory compaction armed at a tiny threshold, so the
+        /// first user message triggers the lazy `memory.md` compaction.
+        const MEMORY_TEST_YAML: &str = r#"
+providers:
+  - name: openrouter
+    type: openrouter
+    api_key: sk-test
+    models:
+      - { name: anthropic/claude-3.7-sonnet, alias: sonnet }
+general:
+  context:
+    enabled: false
+profiles:
+  dev:
+    memory:
+      enabled: true
+      threshold_bytes: 100
+    agents:
+      team:
+        model: sonnet
+"#;
+
+        /// >100 bytes, so the 100-byte profile threshold fires.
+        const OVERSIZED_MEMORY: &str = "# PeakBot Memory\n\n## Episodic\n\n- a filler entry deliberately long enough to exceed the 100 byte compaction threshold of the test profile\n";
+
+        struct Rig {
+            main_model: crate::mock::MockCompletionModel,
+            tx: mpsc::UnboundedSender<UiAction>,
+            h: tokio::task::JoinHandle<()>,
+        }
+
+        /// Full mock runner WITH a rebuild context: `agent_loop` reads the
+        /// memory threshold from the bound profile, so the lazy compaction
+        /// path under test is the production one.
+        fn spawn_runner(sm: &Arc<StateManager>, responses: Vec<MockResponse>) -> Rig {
+            let model = crate::mock::MockCompletionModel::new();
+            for response in responses {
+                model.add_response(response);
+            }
+            let (ev_tx, events) = tokio::sync::mpsc::unbounded_channel();
+            let hook = SessionHook::with_context_tracking(Some(ev_tx), sm.stats_arc())
+                .with_state_manager(sm)
+                .with_wire_label("mock".to_string(), "mock-model".to_string());
+            let agent = rig_core::agent::AgentBuilder::new(model.clone())
+                .preamble("test prompt")
+                .max_tokens(1024)
+                .default_max_turns(4)
+                .hook(hook.clone())
+                .build();
+
+            let info = ProviderInfo {
+                name: "mock".to_string(),
+                model: "mock-model".to_string(),
+                supports_vision: false,
+                preserve_reasoning: true,
+                display_reasoning: false,
+            };
+            let config = Arc::new(
+                Config::parse(
+                    Source {
+                        path: std::path::Path::new("/global/config.yaml"),
+                        text: MEMORY_TEST_YAML,
+                    },
+                    None,
+                    &ParseCtx { known_skills: &[] },
+                )
+                .expect("fixture config must parse"),
+            );
+            let bound = config
+                .catalog
+                .start_bound(None)
+                .expect("the default bound resolves");
+            let ctx = RebuildContext {
+                config: Arc::clone(&config),
+                bound,
+                mcp_handles: Arc::new(Vec::new()),
+                shell_kind: None,
+                skills: SkillRegistry::default(),
+                todo_tool: None,
+                profile_pin: None,
+            };
+            let resolved = mock_resolved_model();
+            let mut runner = AgentRunner::new(
+                DynAgent::Mock(agent),
+                config,
+                info,
+                SkillRegistry::default(),
+                Some(events),
+                Some(sm.clone()),
+                Arc::new(hook),
+                &resolved,
+            )
+            .expect("runner builds");
+            runner = runner.with_rebuild_context(ctx);
+
+            let (tx, rx) = mpsc::unbounded_channel::<UiAction>();
+            let h = tokio::spawn(async move { runner.run_loop(rx).await });
+            Rig {
+                main_model: model,
+                tx,
+                h,
+            }
+        }
+
+        /// Wait (≤10s) for the live status banner to read exactly `what` —
+        /// the banner the compaction arms set right before the summarize.
+        async fn wait_status(sm: &Arc<StateManager>, what: &str) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if sm.get_state().status_message.as_deref() == Some(what) {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("status '{what}' must go live within 10s"));
+        }
+
+        fn stop_message_present(sm: &Arc<StateManager>) -> bool {
+            sm.get_state().chat.messages.iter().any(|m| {
+                m.role == MessageRole::System && m.content.starts_with("Agent stopped by user")
+            })
+        }
+
+        /// Wait (≤`secs`) for the turn to end as Stopped: `is_running` clear
+        /// and the stop system message posted.
+        async fn wait_stopped(sm: &Arc<StateManager>, secs: u64) {
+            tokio::time::timeout(Duration::from_secs(secs), async {
+                loop {
+                    if !sm.is_running() && stop_message_present(sm) {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the turn must end as Stopped (is_running clear + stop message) \
+                     within {secs}s of the double Stop press"
+                )
+            });
+        }
+
+        /// Two presses through the production Stop path: the first is
+        /// graceful, the second immediate (cancels the per-turn token).
+        fn double_press(rig: &Rig) {
+            rig.tx
+                .send(UiAction::RequestStop)
+                .expect("the action channel is open");
+            rig.tx
+                .send(UiAction::RequestStop)
+                .expect("the action channel is open");
+        }
+
+        fn send(rig: &Rig, text: &str) {
+            rig.tx
+                .send(UiAction::SendMessage {
+                    text: text.to_string(),
+                    attachments: vec![],
+                })
+                .expect("the action channel is open");
+        }
+
+        /// Clean teardown: close the action channel and let `run_loop` exit.
+        async fn shutdown(rig: Rig) {
+            drop(rig.tx);
+            tokio::time::timeout(Duration::from_secs(10), rig.h)
+                .await
+                .expect("run_loop must finish within 10s of the action channel closing")
+                .expect("the run_loop task must not panic");
+        }
+
+        /// Session with a tempdir cwd holding an oversized `memory.md` and a
+        /// HANGING compaction model installed as the title model.
+        fn hung_memory_session() -> (
+            Arc<StateManager>,
+            std::path::PathBuf,
+            tempfile::TempDir,
+            Arc<AtomicBool>,
+        ) {
+            let tmp = tempfile::tempdir().unwrap();
+            let memory_path = tmp.path().join("memory.md");
+            std::fs::write(&memory_path, OVERSIZED_MEMORY).unwrap();
+
+            let storage: Arc<dyn crate::storage::ConversationStorage> =
+                Arc::new(crate::storage::InMemoryStorage::new());
+            let sm = StateManager::new_arc_with_storage(storage);
+            sm.set_session_cwd(tmp.path().to_path_buf());
+            sm.ensure_boot_conversation(tmp.path(), "mock-model");
+
+            let (compaction_model, compaction_mock) =
+                crate::providers::create_mock_compaction_model();
+            let summarize_dropped = Arc::new(AtomicBool::new(false));
+            compaction_mock.arm_hang(summarize_dropped.clone());
+            sm.init_title_model(Arc::new(compaction_model));
+
+            (sm, memory_path, tmp, summarize_dropped)
+        }
+
+        /// Defect A: Stop must interrupt the lazy memory compaction. The
+        /// summarize hangs; only dropping its future (the cancel select) can
+        /// end the turn. Today the bare await runs the hang to completion,
+        /// so the 5s bound on `wait_stopped` fails.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn stop_during_memory_compaction_ends_stopped_and_keeps_file_byte_identical() {
+            let (sm, memory_path, _tmp, summarize_dropped) = hung_memory_session();
+
+            let rig = spawn_runner(&sm, vec![MockResponse::text("answer")]);
+            send(&rig, "hi");
+
+            // Compaction in flight: the banner is set right before the
+            // (hanging) summarize, so it proves we are inside the defect.
+            wait_status(&sm, "Compacting memory.md...").await;
+            double_press(&rig);
+
+            wait_stopped(&sm, 5).await;
+
+            assert!(
+                summarize_dropped.load(Ordering::SeqCst),
+                "the in-flight summarize future must be dropped on Stop"
+            );
+            assert_eq!(
+                std::fs::read(&memory_path).unwrap(),
+                OVERSIZED_MEMORY.as_bytes(),
+                "memory.md must be byte-identical after a cancelled compaction"
+            );
+            assert_eq!(
+                rig.main_model.request_count(),
+                0,
+                "a stopped turn must not reach the model"
+            );
+
+            shutdown(rig).await;
+        }
+
+        /// The cancel must not consume the latch: after a Stop-killed
+        /// compaction, the NEXT user message compacts `memory.md` again.
+        /// (Today unreachable — the first turn never ends — so this fails on
+        /// the same 5s bound as defect A.)
+        #[tokio::test(flavor = "multi_thread")]
+        async fn memory_compaction_retries_on_next_message_after_cancelled_turn() {
+            let (sm, memory_path, _tmp, _summarize_dropped) = hung_memory_session();
+
+            let rig = spawn_runner(
+                &sm,
+                vec![MockResponse::text("answer"), MockResponse::text("answer2")],
+            );
+            send(&rig, "hi");
+            wait_status(&sm, "Compacting memory.md...").await;
+            double_press(&rig);
+            wait_stopped(&sm, 5).await;
+
+            // Swap in a live model: the re-armed latch must compact now.
+            // Three identical responses: the compaction call plus the
+            // fire-and-forget title upgrades the second turn may fire.
+            let (model2, mock2) = crate::providers::create_mock_compaction_model();
+            for _ in 0..3 {
+                mock2.add_response(MockResponse::text("COMPACTED"));
+            }
+            sm.init_title_model(Arc::new(model2));
+
+            send(&rig, "again");
+
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if std::fs::read(&memory_path).unwrap() == b"COMPACTED" && !sm.is_running() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("compaction must run on the next user message after a cancelled turn");
+
+            shutdown(rig).await;
+        }
+
+        /// Defect B: Stop must interrupt the in-loop context compaction.
+        /// 16 seeded messages push the hook's count fallback past the gate
+        /// (keep_recent 5 → >15), so the first `on_completion_call`
+        /// terminates with "compact" and `force_compact` hangs in the
+        /// (hanging) summarize before any model call.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn stop_during_context_compaction_ends_stopped_and_keeps_history() {
+            let tmp = tempfile::tempdir().unwrap();
+            let storage: Arc<dyn crate::storage::ConversationStorage> =
+                Arc::new(crate::storage::InMemoryStorage::new());
+            let sm = StateManager::new_arc_with_storage(storage);
+            // A session cwd with NO memory.md: this test is about context
+            // compaction, and the memory gate must stay out of the way.
+            sm.set_session_cwd(tmp.path().to_path_buf());
+            sm.ensure_boot_conversation(tmp.path(), "mock-model");
+
+            for i in 0..8 {
+                sm.add_user_message(format!("user line {i}"));
+                sm.add_assistant_message(format!("agent line {i}"));
+            }
+
+            let (compaction_model, compaction_mock) =
+                crate::providers::create_mock_compaction_model();
+            let summarize_dropped = Arc::new(AtomicBool::new(false));
+            compaction_mock.arm_hang(summarize_dropped.clone());
+            let cfg = crate::config::ContextConfig {
+                enabled: true,
+                threshold: 0.8,
+                keep_recent: 5,
+                compaction_model: None,
+            };
+            let cm = crate::context_manager::ContextManager::new(
+                cfg,
+                1000,
+                Some(Arc::new(compaction_model)),
+            );
+
+            let rig = spawn_runner(&sm, vec![]);
+            // AgentRunner::new re-stamps the SM's ContextManager from the
+            // (compaction-off) test config — re-apply the armed one.
+            sm.init_context_manager(cm);
+
+            send(&rig, "go");
+
+            // The compact arm sets this banner right before force_compact.
+            wait_status(&sm, "Compacting context...").await;
+            double_press(&rig);
+
+            wait_stopped(&sm, 5).await;
+
+            assert!(
+                summarize_dropped.load(Ordering::SeqCst),
+                "the in-flight context summarize must be dropped on Stop"
+            );
+            let msgs = sm.get_state().chat.messages;
+            assert!(
+                !msgs.iter().any(|m| m.role == MessageRole::Summary),
+                "history must not be replaced by a summary after a cancelled compaction"
+            );
+            assert_eq!(
+                rig.main_model.request_count(),
+                0,
+                "a stopped turn must not reach the model"
+            );
+
+            shutdown(rig).await;
+        }
+
+        /// Sanity (green today): an UNcancelled memory compaction still runs
+        /// to completion and rewrites `memory.md` in place, then the turn
+        /// proceeds to the model.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn memory_compaction_completes_when_uncancelled() {
+            let tmp = tempfile::tempdir().unwrap();
+            let memory_path = tmp.path().join("memory.md");
+            std::fs::write(&memory_path, OVERSIZED_MEMORY).unwrap();
+
+            let storage: Arc<dyn crate::storage::ConversationStorage> =
+                Arc::new(crate::storage::InMemoryStorage::new());
+            let sm = StateManager::new_arc_with_storage(storage);
+            sm.set_session_cwd(tmp.path().to_path_buf());
+            sm.ensure_boot_conversation(tmp.path(), "mock-model");
+
+            let (compaction_model, compaction_mock) =
+                crate::providers::create_mock_compaction_model();
+            compaction_mock.add_response(MockResponse::text("COMPACTED"));
+            sm.init_title_model(Arc::new(compaction_model));
+
+            let rig = spawn_runner(&sm, vec![MockResponse::text("answer")]);
+            send(&rig, "hi");
+
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if std::fs::read(&memory_path).unwrap() == b"COMPACTED" && !sm.is_running() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the uncancelled compaction must rewrite memory.md and finish the turn");
+
+            let msgs = sm.get_state().chat.messages;
+            assert!(
+                msgs.iter()
+                    .any(|m| m.role == MessageRole::Agent && m.content.contains("answer")),
+                "the turn must complete after the compaction"
+            );
+            assert!(
+                msgs.iter()
+                    .any(|m| m.role == MessageRole::System
+                        && m.content.contains("memory.md compacted")),
+                "the compaction must be surfaced as a system message"
+            );
+
+            shutdown(rig).await;
         }
     }
 }
