@@ -413,6 +413,7 @@ make release-bump VERSION=0.3.0
 make release-tag
 #   annotated tag 0.3.0, message = release-notes/0.3.0.md, pushed — the tag
 #   push triggers .gitea/workflows/release.yml
+# final step: the one Discord announcement (@everyone embed card) — "Release announcement (mandatory)" below
 ```
 
 The notes file is **required** — `release-check` fails the run when `release-notes/<v>.md` is missing. There is no `Release <v>` fallback.
@@ -477,6 +478,44 @@ Ten release assets: server `peakbot-<v>-{linux-amd64, windows-amd64.exe, macos-u
 `release-publish-github` (the 0.26.2 **bridge**) then publishes the same 10 assets to the public mirror `thepeak99/peakbot` with `GH_RELEASE_TOKEN` (Gitea secret) — idempotent (an existing complete release is a no-op), uploads into a DRAFT, and publishes with `make_latest` **true for stable tags only** — RCs are prerelease and never `latest`. The Gitea→GitHub push-mirror was **deleted**: the tag does NOT arrive on GitHub by itself. A human pushes it **right after** `make release-tag`: `git push github 0.26.2` — `release-publish-github` then polls for the tag to appear (up to GH_TAG_WAIT_TRIES × GH_TAG_WAIT_SECS). The bridge is removed in a later PR, after which GitHub goes private and `GH_RELEASE_TOKEN` is deleted.
 
 **Recovery (shifu failed):** re-run `make release-publish-shifu TAG=<v>` with the assets still in `output/` (idempotent; a stale public `latest.json` fails loudly and is re-uploaded). **Recovery (Gitea published, GitHub failed):** re-run `make release-publish-github TAG=<v>` (idempotent), pushing the tag to GitHub first if it never arrived. Afterwards verify `GET https://api.github.com/repos/thepeak99/peakbot/releases/latest`.
+
+### Release announcement (mandatory)
+
+Every release — stable **and** RC — gets exactly ONE Discord post, the final step of the release, only after the release is verified:
+
+- Gitea release `<v>` has all 10 assets (the list above).
+- `https://shifu.patchnotes.com/peakbot/<v>/SHA256SUMS` returns 200.
+- Stable tags: `GET https://api.github.com/repos/thepeak99/peakbot/releases/latest` has `tag_name` == `<v>`.
+
+Never announce an unverified or partial release. If any check fails, do not post — report to the human instead.
+
+POST the payload below to the Discord webhook in `DISCORD_WEBHOOK_AI` with `?wait=true`. Success = HTTP 200 plus a message id — report the id back. Always ping @everyone: `content` is exactly `@everyone` and `allowed_mentions` is `{"parse": ["everyone"]}`. A mention inside an embed does NOT ping.
+
+```json
+{
+  "content": "@everyone",
+  "allowed_mentions": { "parse": ["everyone"] },
+  "embeds": [{
+    "title": "🚀 PeakBot <v> is out!",
+    "url": "https://github.com/thepeak99/peakbot/releases/tag/<v>",
+    "color": 3066993,
+    "description": "<one or two sentences: the headline change, user-facing>",
+    "fields": [
+      { "name": "✨ What's new", "value": "• <item>\n• <item>" },
+      { "name": "🐛 Fixes", "value": "• <item>" },
+      { "name": "📦 Downloads", "value": "**Desktop:** [Linux](https://shifu.patchnotes.com/peakbot/<v>/PeakBot-Desktop-<v>-linux-x86_64.AppImage) · [macOS](https://shifu.patchnotes.com/peakbot/<v>/PeakBot-Desktop-<v>-macos-universal.zip) · [Windows](https://shifu.patchnotes.com/peakbot/<v>/PeakBot-Desktop-<v>-windows-x86_64-setup.exe)\n**Server:** [Linux](https://shifu.patchnotes.com/peakbot/<v>/peakbot-<v>-linux-amd64) · [macOS](https://shifu.patchnotes.com/peakbot/<v>/peakbot-<v>-macos-universal2) · [Windows](https://shifu.patchnotes.com/peakbot/<v>/peakbot-<v>-windows-amd64.exe) · [Android](https://shifu.patchnotes.com/peakbot/<v>/peakbot-<v>-android-arm64)" },
+      { "name": "🔄 Updating", "value": "Desktop updates itself via the in-app banner. Server: download the new binary." }
+    ],
+    "footer": { "text": "PeakBot <v> · full notes on the release page" },
+    "timestamp": "<ISO-8601 UTC time of posting>"
+  }]
+}
+```
+
+- Content comes from `release-notes/<v>.md`, rewritten for users (no PR numbers, no internal jargon).
+- "What's new": at most 6 bullets. Omit the Fixes field when there are no fixes.
+- RC tags: title `🧪 PeakBot <v> release candidate`, color `15105570` (orange), and the Updating field notes it is a prerelease (the desktop updater does not offer RCs).
+- Discord limits: field value ≤ 1024 chars, description ≤ 4096, whole embed ≤ 6000.
 
 Release body + tag message = `release-notes/<v>.md` (read via `jq --rawfile` — any Markdown is safe). No `NOTES=` override, no fallback. Local re-run of the CI job: `make release TAG=X.Y.Z GITEA_TOKEN=…` (if the tag already went out, delete it locally + from origin first). Host needs: git, cargo, podman/docker, curl, jq, awk, rclone, sha256sum.
 
