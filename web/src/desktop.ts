@@ -22,6 +22,24 @@ export function isDesktop(): boolean {
   return shell() === "desktop";
 }
 
+// ── edition signal (L7) ───────────────────────────────────────────────────
+// What THIS server can do: `boot.edition` on `GET /api/settings`.
+// `"full"` (host build) is the default until the first boot read; a read
+// WITHOUT the field (old servers) resets it back to `"full"`. `getSettings()`
+// (settings/api.ts) is the single read point — Boot, Settings and the
+// wizard all go through it.
+export type Edition = "full" | "local";
+
+let bootEdition: Edition = "full";
+
+export function edition(): Edition {
+  return bootEdition;
+}
+
+export function setBootEdition(e: Edition | undefined): void {
+  bootEdition = e ?? "full";
+}
+
 // ── desktop IPC seam ─────────────────────────────────────────────────────
 // The desktop app grants this page (on its default loopback backend only)
 // four Tauri commands (desktop/src-tauri/capabilities/remote-web.json):

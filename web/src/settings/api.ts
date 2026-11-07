@@ -3,6 +3,7 @@
 // rejects with `ApiError` (403 pin/tenant, 409 stale, 422 validation
 // envelope, 400/500).
 
+import { setBootEdition } from "../desktop";
 import type { ConfigErr, ConfigText, PutOk, Scope, SettingsMeta, ValidateRes } from "./types";
 
 /** The parsed error body of a non-2xx response. */
@@ -37,11 +38,16 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T;
 }
 
-/** GET /api/settings (…?convo=<uuid> when given). */
+/** GET /api/settings (…?convo=<uuid> when given). Every successful read
+ *  updates the edition seam (desktop.ts) — the single read point for
+ *  Boot, Settings and the wizard (L7). */
 export function getSettings(convo?: string): Promise<SettingsMeta> {
   return request<SettingsMeta>(
     convo ? `/api/settings?convo=${encodeURIComponent(convo)}` : "/api/settings",
-  );
+  ).then((meta) => {
+    setBootEdition(meta.edition);
+    return meta;
+  });
 }
 
 /** GET /api/config?scope=…&convo=… */

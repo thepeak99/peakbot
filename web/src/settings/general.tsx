@@ -12,7 +12,7 @@
 import { useEffect, useState } from "react";
 import { getPairing } from "./api";
 import { useSettingsCtx } from "./context";
-import { shell } from "../desktop";
+import { edition, shell } from "../desktop";
 import { get, type Doc } from "./yamlDoc";
 import { errAt } from "./paths";
 import { ConnectPhonePane, decodePairing, type Pairing } from "./connectPhone";
@@ -127,6 +127,9 @@ export function GeneralPane() {
   // read-only (🔒); the repo file may only contain `profiles:`.
   const readOnly = scope === "repo";
   const paneDoc = readOnly ? globalDoc : doc;
+  // L7: the Local edition (phone build) runs loopback-only by construction —
+  // the "Web server" card has nothing to offer there.
+  const local = edition() === "local";
 
   const g = (rest: Seg[]) => get(paneDoc, ["general", ...rest]);
   const web = asRecord(g(["web"]));
@@ -204,7 +207,9 @@ export function GeneralPane() {
       )}
 
       <fieldset disabled={readOnly || undefined} className="m-0 min-w-0 space-y-4 border-0 p-0">
-        {/* 1. Web server (RESTART REQUIRED) */}
+        {/* 1. Web server (RESTART REQUIRED) — L7: absent in the local
+            edition (the phone build is loopback-only by construction). */}
+        {!local && (
         <div className={CARD}>
           <div className={CARD_HEAD}>
             <h3 className={CARD_H3}>Web server</h3>
@@ -359,6 +364,7 @@ export function GeneralPane() {
             </div>
           </div>
         </div>
+        )}
 
         {/* 3. Search (SearXNG; presence = on; no restart badge) */}
         <div className={CARD}>

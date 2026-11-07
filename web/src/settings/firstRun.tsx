@@ -171,6 +171,12 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
   const [putOk, setPutOk] = useState<PutOk | null>(null);
 
   const phase = deriveSetupPhase(meta, global.exists);
+  // L7 (driven by the meta prop Boot passes from the same boot read): the
+  // local edition (phone build) skips the "Web access" step — the server is
+  // loopback-only by construction — and the PATH fact (the binary runs from
+  // the APK; PATH has no meaning there).
+  const local = meta.edition === "local";
+  const steps = local ? STEPS.filter((s) => s.name !== "web") : STEPS;
 
   // Esc closes the wizard (Boot shows the setup strip underneath).
   useEffect(() => {
@@ -317,7 +323,7 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
     );
   }
 
-  const idx = STEPS.findIndex((s) => s.name === step);
+  const idx = steps.findIndex((s) => s.name === step);
   const pType = answers.provider.type;
 
   return (
@@ -337,7 +343,7 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
         data-testid="firstrun-stepper"
         className="flex flex-wrap items-center gap-1.5 border-b border-zinc-800 bg-zinc-900/40 px-4 py-1.5 sm:hidden"
       >
-        {STEPS.map((s, i) => {
+        {steps.map((s, i) => {
           const isHere = s.name === step;
           const isVisited = visited.has(s.name);
           const stepOk =
@@ -375,7 +381,7 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
             sm breakpoint (F3, ≤ 412 CSS px on phones). */}
         <nav className="hidden w-56 shrink-0 overflow-y-auto border-r border-zinc-800 p-4 sm:block">
           <div className="mb-2 text-[10px] uppercase tracking-wide text-zinc-600">Setup</div>
-          {STEPS.map((s, i) => {
+          {steps.map((s, i) => {
             const isHere = s.name === step;
             const isVisited = visited.has(s.name);
             const stepOk =
@@ -443,8 +449,14 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
                   <div>Config · {meta.global_path}</div>
                   <div>Data dir · {meta.facts.data_dir}</div>
                   <div>Version · {meta.facts.version}</div>
-                  {pathFact(meta.facts.install) !== null && (
-                    <div data-testid="firstrun-fact-path">PATH · {pathFact(meta.facts.install)}</div>
+                  {/* L7: the local edition omits the PATH fact (APK build —
+                      PATH has no meaning on the phone); the full edition
+                      keeps the line, reading "unknown" when the install
+                      probe is absent. */}
+                  {!local && (
+                    <div data-testid="firstrun-fact-path">
+                      PATH · {pathFact(meta.facts.install) ?? "unknown"}
+                    </div>
                   )}
                 </div>
                 <button
@@ -801,7 +813,7 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
               data-testid="firstrun-back"
               type="button"
               disabled={idx === 0}
-              onClick={() => goTo(STEPS[idx - 1].name)}
+              onClick={() => goTo(steps[idx - 1].name)}
               className={FOOTER_BTN}
             >
               Back
@@ -815,7 +827,7 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
                 data-testid="firstrun-next"
                 type="button"
                 disabled={stepErrors.length > 0}
-                onClick={() => goTo(STEPS[idx + 1].name)}
+                onClick={() => goTo(steps[idx + 1].name)}
                 className={FOOTER_BTN + " border-emerald-800 bg-emerald-900/40 text-emerald-200 hover:bg-emerald-900/70"}
               >
                 Next

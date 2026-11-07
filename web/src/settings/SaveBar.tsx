@@ -9,10 +9,13 @@
 // conditional wrapper), so React reconciliation keeps the same DOM node.
 //
 // Restart banner: bottom banner after a save with restart_required.
-// "Restart now" ONLY in the desktop app (the caller navigates to
-// "peakbot-desktop:restart"); a browser shows "Restart PeakBot to apply."
+// "Restart now" in the desktop app (the caller navigates to
+// "peakbot-desktop:restart"); in the MOBILE shell with a Local-edition
+// server it is an anchor to `peakbot-mobile:restart` (the shell restarts
+// the Local core); a browser shows "Restart PeakBot to apply."
 
 import { useEffect, useRef } from "react";
+import { edition, shell } from "../desktop";
 import type { Scope } from "./types";
 
 const VALIDATE_DEBOUNCE_MS = 400;
@@ -165,6 +168,16 @@ export function RestartBanner({ keys, desktop, onLater, onRestartNow }: RestartB
         >
           Restart now
         </button>
+      ) : shell() === "mobile" && edition() === "local" ? (
+        // L7: the mobile shell restarts the Local core when it sees this
+        // navigation — the only SPA→shell restart message.
+        <a
+          data-testid="restart-banner-restart"
+          href="peakbot-mobile:restart"
+          className="ml-auto cursor-pointer rounded bg-amber-600 px-3 py-1 font-medium text-black hover:bg-amber-500"
+        >
+          Restart now
+        </a>
       ) : (
         <span className="ml-auto text-amber-400/80">Restart PeakBot to apply.</span>
       )}

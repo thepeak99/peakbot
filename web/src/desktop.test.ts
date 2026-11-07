@@ -321,19 +321,22 @@ describe("clipboard image IPC seam", () => {
 // ── module surface (close-to-tray removal + auto-update) ─────────────────
 // The Desktop pane is gone: `DesktopView`, `getDesktopSettings` and
 // `toggleDesktopBackground` are no longer exported. The seam carries
-// exactly six exports: the shell detection pair (F1), the theme command,
-// the two update commands, and the clipboard-image read.
+// exactly eight exports: the shell detection pair (F1), the edition pair
+// (L7), the theme command, the two update commands, and the
+// clipboard-image read.
 //
 // RED today: `shell` is not exported yet (F1).
 
 describe("module surface", () => {
-  it("exports exactly isDesktop, shell, setDesktopTheme, getUpdateStatus, installUpdate, readClipboardImage", async () => {
+  it("exports exactly isDesktop, shell, edition, setBootEdition, setDesktopTheme, getUpdateStatus, installUpdate, readClipboardImage", async () => {
     const mod = (await import("./desktop")) as Record<string, unknown>;
     expect(Object.keys(mod).sort()).toEqual([
+      "edition",
       "getUpdateStatus",
       "installUpdate",
       "isDesktop",
       "readClipboardImage",
+      "setBootEdition",
       "setDesktopTheme",
       "shell",
     ]);

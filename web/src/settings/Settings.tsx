@@ -15,7 +15,7 @@
 // banner / 422 error panel / 200 toast + restart banner.
 
 import { useCallback, useEffect, useReducer, useState } from "react";
-import { isDesktop, shell } from "../desktop";
+import { edition, isDesktop, shell } from "../desktop";
 import { ApiError, getConfig, getSettings, putConfig, validateConfig } from "./api";
 import { createStore } from "./store";
 import { get, parse, set, stringify } from "./yamlDoc";
@@ -106,6 +106,13 @@ const SECTIONS: Record<Section, { label: string; desc: string }> = {
 const REPO_BANNER =
   "The repo file may only contain profiles:. Repo profiles are listed first and the first one is the default for conversations started here. A repo profile with the same name as a global one replaces it entirely (no merge).";
 
+// L7 (mobile plan §2.5): the Local edition (phone build) offers none of
+// these sections — no MCP servers, no in-SPA profile management (the shell
+// owns the profile list), no machine facts, no raw file editing. The nav and
+// the collapsed section select drop them; the default active section
+// ("profiles") is hidden, so it falls back to the first visible one.
+const HIDDEN_LOCAL_SECTIONS: readonly Section[] = ["mcps", "profiles", "system", "raw"];
+
 /** A config map value (profiles / agents) as a plain record. */
 function asMap(v: unknown): Record<string, unknown> {
   return v !== null && typeof v === "object" && !Array.isArray(v)
@@ -154,6 +161,9 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
   // (peakbot-mobile:profiles), not an SPA route — Settings exposes it as a
   // row; desktop/browser keep today's in-app Profiles section only.
   const mobile = shell() === "mobile";
+  // L7: what THIS server can do (boot.edition, set by getSettings on every
+  // successful read). The local edition hides the machine-side sections.
+  const local = edition() === "local";
 
   // ── Loading ──────────────────────────────────────────────────────────
   useEffect(() => {
@@ -374,6 +384,11 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
   const st = store.state();
   const dirty = store.isDirty(scope);
   const validateRes = st.validate;
+  // L7: the section actually shown. In the local edition a hidden section
+  // (the default "profiles" among them) is never offered, so the view falls
+  // back to the first visible one.
+  const activeSection: Section =
+    local && HIDDEN_LOCAL_SECTIONS.includes(active) ? "providers" : active;
   // Raw pane text (contract): rawText ?? (dirty ? stringify(draft) : savedText).
   const rawShown = st.rawText ?? (dirty ? stringify(st.draftDoc) : st.savedText);
   const allErrors: ConfigErr[] = validateRes && "errors" in validateRes ? validateRes.errors : [];
@@ -383,14 +398,14 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
     allErrors.filter((e) => e.file === scope).map((e) => route(e.path).section),
   );
   const paneErrors = allErrors.filter(
-    (e) => e.file === scope && route(e.path).section === active,
+    (e) => e.file === scope && route(e.path).section === activeSection,
   );
   const profilesMap = asMap(get(st.draftDoc, ["profiles"]));
   const profileCount = Object.keys(profilesMap).length;
   // Master-detail: the open profile/agent must still exist in the CURRENT
   // scope's draft (a deleted/renamed one falls back to the list).
   const openProfile =
-    active === "profiles" && profileSel.profile !== null && profileSel.profile in profilesMap
+    activeSection === "profiles" && profileSel.profile !== null && profileSel.profile in profilesMap
       ? profileSel.profile
       : null;
   const openProfileAgents =
@@ -437,7 +452,7 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
   // errors without a profile name, profile page = that profile's own,
   // agent page = that agent's).
   const listedErrors =
-    active !== "profiles"
+    activeSection !== "profiles"
       ? paneErrors
       : paneErrors.filter((e) => {
           const t = route(e.path);
@@ -480,6 +495,16 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
     },
     { group: "ADVANCED", items: [{ id: "raw", label: "Raw YAML" }] },
   ];
+  // L7: the local edition drops its hidden sections from the nav (groups that
+  // lose all items disappear with them).
+  const visibleGroups = local
+    ? navGroups
+        .map((g) => ({
+          ...g,
+          items: g.items.filter((i) => !HIDDEN_LOCAL_SECTIONS.includes(i.id)),
+        }))
+        .filter((g) => g.items.length > 0)
+    : navGroups;
 
   function navButton(item: { id: Section; label: string; dot?: "amber" | "blue"; lockedInRepo?: boolean }) {
     const locked = scope === "repo" && item.lockedInRepo;
@@ -521,7 +546,7 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
     );
   }
 
-  const allItems = navGroups.flatMap((g) => g.items);
+  const allItems = visibleGroups.flatMap((g) => g.items);
 
   return (
     <div className="fixed inset-0 z-40 flex flex-col bg-zinc-950 text-zinc-100">
@@ -582,7 +607,7 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
       {/* Body: left nav (desktop) + pane */}
       <div className="flex min-h-0 flex-1">
         <nav className="hidden w-56 shrink-0 space-y-4 overflow-auto border-r border-zinc-800 p-3 min-[801px]:block">
-          {navGroups.map((g) => (
+          {visibleGroups.map((g) => (
             <div key={g.group}>
               <div className="px-2 pb-1 text-[10px] font-semibold tracking-wider text-zinc-600">
                 {g.group}
@@ -659,9 +684,9 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
           {/* Mobile: the nav collapses into a select under the head */}
           <select
             value={
-              active === "profiles"
+              activeSection === "profiles"
                 ? `profiles${openProfile ? `|${openProfile}` : ""}${openAgent ? `|${openAgent}` : ""}`
-                : active
+                : activeSection
             }
             onChange={(e) => {
               const v = e.target.value;
@@ -684,10 +709,10 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
                 {scope === "repo" && item.lockedInRepo ? " 🔒" : ""}
               </option>
             ))}
-            {active === "profiles" && openProfile && (
+            {activeSection === "profiles" && openProfile && (
               <option value={`profiles|${openProfile}`}>Profiles › {openProfile}</option>
             )}
-            {active === "profiles" && openProfile && openAgent && (
+            {activeSection === "profiles" && openProfile && openAgent && (
               <option value={`profiles|${openProfile}|${openAgent}`}>
                 Profiles › {openProfile} › {openAgent}
               </option>
@@ -695,7 +720,7 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
           </select>
 
           {/* Breadcrumbs (spec §9.0: Profiles › <profile> › <agent>) */}
-          {active === "profiles" && (
+          {activeSection === "profiles" && (
             <div className="mb-2">
               <Crumbs
                 testid="profiles-crumbs"
@@ -710,8 +735,8 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
 
           {/* Section head */}
           <div className="mb-4 flex items-baseline gap-3">
-            <h2 className="text-base font-semibold">{SECTIONS[active].label}</h2>
-            {active === "profiles" && profileCount > 0 && (
+            <h2 className="text-base font-semibold">{SECTIONS[activeSection].label}</h2>
+            {activeSection === "profiles" && profileCount > 0 && (
               <span className="rounded-full border border-zinc-700 px-2 py-0.5 text-[10px] text-zinc-400">
                 {profileCount}
               </span>
@@ -719,7 +744,7 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
           </div>
 
           {/* Comment-loss banner (spec §9.0): above every FORM pane. */}
-          {st.rewriteWarning && active !== "raw" && active !== "system" && (
+          {st.rewriteWarning && activeSection !== "raw" && activeSection !== "system" && (
             <div
               data-testid="rewrite-banner"
               className="mb-4 max-w-2xl rounded border border-amber-800/60 bg-amber-950/40 px-3 py-2 text-xs text-amber-300"
@@ -732,11 +757,11 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
               master-detail (T27/T27b/T28) and General (T29) are the real
               content; the remaining sections keep a neutral empty state
               until their M5 tasks land. */}
-          {active === "providers" ? (
+          {activeSection === "providers" ? (
             <ProvidersPane />
-          ) : active === "mcps" ? (
+          ) : activeSection === "mcps" ? (
             <McpsPane />
-          ) : active === "profiles" ? (
+          ) : activeSection === "profiles" ? (
             openProfile && openAgent ? (
               <AgentPage profile={openProfile} agent={openAgent} />
             ) : openProfile ? (
@@ -755,9 +780,9 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
                 onOpenProfile={(n) => setProfileSel({ profile: n, agent: null })}
               />
             )
-          ) : active === "general" ? (
+          ) : activeSection === "general" ? (
             <GeneralPane />
-          ) : active === "system" ? (
+          ) : activeSection === "system" ? (
             <SystemPane />
           ) : (
             <RawPane
@@ -772,11 +797,11 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
           {/* Validation errors for sections without a full set of red fields
               are listed here; the providers/mcp panes render their own. In
               Profiles only the errors owned by the open page are listed. */}
-          {listedErrors.length > 0 && active !== "providers" && active !== "mcps" && (
+          {listedErrors.length > 0 && activeSection !== "providers" && activeSection !== "mcps" && (
             <ul className="mt-4 max-w-2xl space-y-2">
               {listedErrors.map((e, i) => {
                 const pathKey = dotPath(e.path);
-                const flashing = flash?.section === active && flash.pathKey === pathKey;
+                const flashing = flash?.section === activeSection && flash.pathKey === pathKey;
                 return (
                   <li
                     key={`${pathKey}-${i}`}

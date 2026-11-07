@@ -25,6 +25,10 @@ export interface SettingsMeta {
   builtin_persona: string;
   mcp_status: { name: string; state: "connected" | "failed" | "disabled" }[];
   boot: { bind: string; token_source: "config" | "env" | "cli" | "none"; tls: boolean };
+  /** What THIS server can do: `"full"` (host build) or `"local"` (phone
+   *  build — no MCP/profile/system panes, images-only uploads). Optional:
+   *  old servers omit it ⇒ the SPA treats it as `"full"`. */
+  edition?: "full" | "local";
   facts: {
     os: string;
     arch: string;

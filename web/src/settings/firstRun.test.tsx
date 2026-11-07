@@ -542,10 +542,11 @@ describe("FirstRun — Welcome (spec §9.13 step 1)", () => {
     });
     expect(text("firstrun-fact-path")).toBe("PATH · not on PATH — install target missing");
 
-    // No install info → the line is omitted (the fixture meta uses null).
+    // No install info (the fixture meta uses null): L7 keeps the line in
+    // the full edition — it reads "unknown" instead of being omitted.
     unmountFirstRun();
     mountFirstRun();
-    expect(has("firstrun-fact-path")).toBe(false);
+    expect(text("firstrun-fact-path")).toBe("PATH · unknown");
   });
 
   it("start_fresh_goes_to_the_provider_step", () => {

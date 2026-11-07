@@ -8,6 +8,7 @@ import type { CatalogProfile, Selection } from "../types";
 import { CwdPicker } from "./CwdPicker";
 import { ConversationsPicker } from "./ConversationsPicker";
 import { SelectionChip } from "./SelectionChip";
+import { edition } from "../desktop";
 
 // Bottom status bar — mobile-only (hidden on lg+). Houses the selection chip
 // (profile, agent and team-model setup), conversations picker, and cwd picker
@@ -88,7 +89,9 @@ export function BottomBar({
         catalog={catalog}
       />
 
-      {cwd && (
+      {/* L7: the local edition (phone build) has no cwd of its own to
+          pick — the shell owns the working directory. */}
+      {cwd && edition() !== "local" && (
         <CwdPicker
           cwd={cwd}
           hasTranscript={hasTranscript}

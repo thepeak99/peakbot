@@ -12,6 +12,7 @@ import { NotifyToggle } from "./NotifyToggle";
 import { FocusToggle } from "./FocusToggle";
 import { ThemeToggle } from "./ThemeToggle";
 import type { NotifyPermission } from "../useTaskNotifications";
+import { edition } from "../desktop";
 
 // Top status bar. Sessions trio (conversations + model + cwd) live here on
 // lg+ and migrate to the BottomBar on smaller screens. Right side carries the
@@ -128,7 +129,9 @@ export function TopBar({
           catalog={catalog}
         />
 
-        {cwd && (
+        {/* L7: the local edition (phone build) has no cwd of its own to
+            pick — the shell owns the working directory. */}
+        {cwd && edition() !== "local" && (
           <CwdPicker
             cwd={cwd}
             hasTranscript={hasTranscript}
