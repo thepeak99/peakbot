@@ -372,6 +372,8 @@ cargo test
 make build-linux    # output/peakbot-linux-amd64
 make build-windows  # output/peakbot-windows-amd64.exe
 make build-macos    # output/peakbot-macos-universal2
+make mobile-android # PeakBot Mobile for Android (built from mobile/)
+make mobile-ios     # PeakBot Mobile for iOS (built from mobile/, Mac)
 ```
 
 ---

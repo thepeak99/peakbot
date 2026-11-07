@@ -4,11 +4,17 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ## Changes
 
-- **Mobile app scaffold (M1).** New `mobile/` Tauri 2 app crate (`peakbot-mobile`, identifier `sh.shifu.mobile`) for Android + iOS: bundled Profiles page shell, `peakbot` linked `--no-default-features` (the Local edition), Android project committed with the locked toolchain pins (AGP 9.3.1 / Gradle 9.6.1 / Kotlin 2.2.10, SDK 37, minSdk 24) and a network-security config that trusts system + user CAs and allows cleartext only for the in-phone core on `127.0.0.1`. The crate joins the root Cargo workspace (one `Cargo.lock`), and `make release-bump` / `check-version.sh` now keep the mobile versions in lockstep with the root. No user-facing change yet — the app ships with the later mobile releases.
-
-- **Mobile app shell glue (M5).** The `peakbot-mobile` app now wires its navigation guard and the Profiles page commands (`profiles_get`, `profile_add`, `profile_rename`, `profile_remove`, `local_consent_set`, `profile_open`). Only the bundled page can call them; server pages get no IPC and no opener. Links that leave a server (`target=_blank`, `window.open`, `mailto:`) open in the system browser and the app stays put. A profile always opens from Rust, so Android Back returns to the Profiles page and a second Back exits. `peakbot-mobile:profiles` returns to the Profiles page from any server page, including a 401 page. Removing a profile clears the webview's browsing data and, on Android, its cookies, so the server's token leaves the cookie jar. Profiles live in the app's `files` dir (`profiles.json`). There is still no user-facing release: the real Profiles page lands in M6.
-
-- **PeakBot on this phone: the Local core runs (L8).** Opening Local from the Profiles page now starts the in-app PeakBot core. It listens on `127.0.0.1:47823` only, or on a free port if that one is taken. Each start gets a new 32-hex token from the OS random generator, and no command hands it to the Profiles page: the app opens the URL itself. The core's config lives under the app's `files/config` and its data under `files/core`. On a Local page, "Restart now" (`peakbot-mobile:restart`) restarts the core on the same port with a new token and reloads it. The same link on a server page does nothing. When the app comes back to the foreground, a listener the OS took away is served again. If the core can't start, the Profiles page shows "Couldn't start PeakBot on this phone: …". Debug app builds now include the web UI, as release builds already did.
+- **PeakBot Mobile for Android and iOS** (built in `mobile/`). A Tauri 2 shell
+  (app id `sh.shifu.mobile`, name PeakBot) whose only native screen is the Profiles
+  page. It offers **Remote** profiles — pair a PeakBot server by pasting its
+  pairing link or scanning its QR (HTTPS only: the server needs `tls: true`,
+  `bind: 0.0.0.0:7823`, a web token, and its CA installed on the phone) — and an
+  **On this phone** Local profile (a PeakBot core with no code execution:
+  fetch/search, todo, think, image-only attachments, your own API key, a first-use
+  consent notice; config and data stay on the phone and are excluded from
+  backups). Core changes this release: `fetch_url` gains a `headers` argument;
+  provider `base_url` values with a trailing slash are now tolerated; and the web
+  SPA gains a `window.peakbotShell` marker (desktop / mobile / plain browser).
 
 ### Fixes
 
