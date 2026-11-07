@@ -6,6 +6,10 @@ mod link;
 mod local;
 mod nav;
 mod profiles;
+// iOS glue (IOS-2): the edge-swipe back gesture + the data root's backup
+// exclusion. Compiled for the iOS target only.
+#[cfg(target_os = "ios")]
+mod ios;
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -46,6 +50,9 @@ impl AppDirs {
         // the data root is `Context.filesDir` under it (R14).
         #[cfg(target_os = "android")]
         let data = path.app_data_dir()?.join("files");
+        // iOS (§2.6): the data root is app_data_dir() itself
+        // (`…/Library/Application Support/sh.shifu.mobile`) and the cache
+        // app_cache_dir() — nothing under `…/peakbot`.
         #[cfg(not(target_os = "android"))]
         let data = path.app_data_dir()?;
         Ok(AppDirs {
@@ -405,11 +412,20 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     app.manage(Store { path, profiles });
 
     let handle = app.handle().clone();
-    WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+    let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
         .background_color(BACKGROUND)
         .initialization_script(INIT_SCRIPT)
         .on_navigation(move |url| on_navigation(&handle, url))
         .build()?;
+    // IOS-2: `D` excludes itself from iCloud backups, and the WKWebView gets
+    // the edge-swipe back gesture (off by default; no Tauri option — I-D10).
+    #[cfg(target_os = "ios")]
+    {
+        ios::exclude_data_root_from_backup(&dirs.data);
+        ios::enable_back_gestures(&window);
+    }
+    #[cfg(not(target_os = "ios"))]
+    let _ = window;
     Ok(())
 }
 

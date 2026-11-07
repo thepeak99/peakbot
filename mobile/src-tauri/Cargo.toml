@@ -37,3 +37,11 @@ rust-embed = { version = "8", features = ["debug-embed"] }
 # QR pairing (plan §2.9: CAMERA via the barcode plugin) — mobile targets only.
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
 tauri-plugin-barcode-scanner = "2"
+
+# IOS-2 (I-D10): the WKWebView edge-swipe back gesture + the
+# NSURLIsExcludedFromBackupKey resource value on the data root — the raw
+# Objective-C bridge, iOS only. wry already pulls both crates for iOS; the
+# extra `NSError` feature unlocks NSURL::setResourceValue:forKey:error:.
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSError"] }
