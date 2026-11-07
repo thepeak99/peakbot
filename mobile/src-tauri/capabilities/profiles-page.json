@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/mobile-schema.json",
+  "identifier": "profiles-page",
+  "description": "Bundled Profiles page only — no remote key: the server origin gets no IPC.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

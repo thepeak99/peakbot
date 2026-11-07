@@ -60,7 +60,10 @@ jobs:
         run: |
           cargo fmt --all -- --check
           cargo clippy --all-targets --locked -- -D warnings
-          cargo test --workspace --locked
+          # No `--workspace`: default-members is the root crate (the mobile
+          # crate joins the workspace, plan D8) — the ci job never needs
+          # webkit, and the mobile crate is checked in the `desktop` job.
+          cargo test --locked
       # Local edition: the core without the `host` feature, as phones embed
       # it. The canary test exists only in that build, so anything but
       # `1 passed` means `host` leaked back in through a dependency edge.

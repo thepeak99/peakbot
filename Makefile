@@ -247,8 +247,8 @@ export PRUNE
 PRUNE_STEP = if [ "$${PRUNE}" = "1" ]; then $(CONTAINER_BUILDER) builder prune -af; fi
 
 ## release-check: Verify TAG is set and equals the Cargo.toml version, desktop
-##                version is in sync, release-notes/<TAG>.md exists, and the
-##                tauri.conf.json updater endpoints are exactly the shifu
+##                + mobile versions are in sync, release-notes/<TAG>.md exists, and
+##                the tauri.conf.json updater endpoints are exactly the shifu
 ##                UPDATER_BASE_URL/latest.json
 release-check:
 	@set -eu; \
@@ -327,8 +327,12 @@ release-bump:
 	awk -v v="$$v" '/^\[package\]/{p=1} p && /^version[[:space:]]*=/ && !done {sub(/"[^"]*"/, "\"" v "\""); done=1} {print}' Cargo.toml > Cargo.toml.tmp && mv Cargo.toml.tmp Cargo.toml; \
 	echo "🖥️  Bumping desktop/Cargo.toml to $$v..."; \
 	awk -v v="$$v" '/^\[workspace.package\]/{p=1} p && /^version[[:space:]]*=/ && !done {sub(/"[^"]*"/, "\"" v "\""); done=1} {print}' desktop/Cargo.toml > desktop/Cargo.toml.tmp && mv desktop/Cargo.toml.tmp desktop/Cargo.toml; \
+	echo "📱 Bumping mobile/src-tauri/Cargo.toml + tauri.conf.json to $$v..."; \
+	awk -v v="$$v" '/^\[package\]/{p=1} p && /^version[[:space:]]*=/ && !done {sub(/"[^"]*"/, "\"" v "\""); done=1} {print}' mobile/src-tauri/Cargo.toml > mobile/src-tauri/Cargo.toml.tmp && mv mobile/src-tauri/Cargo.toml.tmp mobile/src-tauri/Cargo.toml; \
+	jq --arg v "$$v" '.version = $$v' mobile/src-tauri/tauri.conf.json > mobile/src-tauri/tauri.conf.json.tmp && mv mobile/src-tauri/tauri.conf.json.tmp mobile/src-tauri/tauri.conf.json; \
 	echo "🔒 Updating Cargo.lock..."; \
 	cargo update -p peakbot --precise "$$v" >/dev/null 2>&1 || cargo update -p peakbot >/dev/null; \
+	cargo update -p peakbot-mobile --precise "$$v" >/dev/null 2>&1 || cargo update -p peakbot-mobile >/dev/null; \
 	cargo update --workspace --manifest-path desktop/Cargo.toml >/dev/null 2>&1; \
 	if [ ! -f release-notes/current.md ]; then \
 	  echo "❌ release-notes/current.md not found"; exit 1; \
@@ -338,7 +342,7 @@ release-bump:
 	  # Prerelease (RC): snapshot the notes; the draft keeps accumulating for stable. \
 	  echo "📄 Snapshotting release notes (prerelease): release-notes/$$v.md ← release-notes/current.md"; \
 	  awk '/^## /{f=1} f' release-notes/current.md > release-notes/$$v.md; \
-	  git add Cargo.toml Cargo.lock desktop/Cargo.toml desktop/Cargo.lock release-notes/$$v.md; \
+	  git add Cargo.toml Cargo.lock desktop/Cargo.toml desktop/Cargo.lock mobile/src-tauri/Cargo.toml mobile/src-tauri/tauri.conf.json release-notes/$$v.md; \
 	  ;; \
 	*) \
 	  # Stable: promote — the draft becomes the versioned file, a fresh draft starts. \
@@ -347,7 +351,7 @@ release-bump:
 	  awk '/^## /{exit} {print}' release-notes/current.md > release-notes/current.md.tmp; \
 	  printf '## Changes\n' >> release-notes/current.md.tmp; \
 	  mv release-notes/current.md.tmp release-notes/current.md; \
-	  git add Cargo.toml Cargo.lock desktop/Cargo.toml desktop/Cargo.lock release-notes/$$v.md release-notes/current.md; \
+	  git add Cargo.toml Cargo.lock desktop/Cargo.toml desktop/Cargo.lock mobile/src-tauri/Cargo.toml mobile/src-tauri/tauri.conf.json release-notes/$$v.md release-notes/current.md; \
 	  ;; \
 	esac; \
 	git commit -m "chore: release $$v" -m "Co-authored by PeakBot!"; \

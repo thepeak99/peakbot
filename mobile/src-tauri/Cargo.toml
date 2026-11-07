@@ -1,0 +1,30 @@
+# PeakBot Mobile — the Tauri 2 shell (plan §2.2). Member of the root
+# workspace: one Cargo.lock (D8), `--locked` everywhere.
+[package]
+name = "peakbot-mobile"
+version = "0.27.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "peakbot_mobile_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.7", features = [] }
+
+[dependencies]
+tauri = { version = "2.12.4", features = [] }
+tauri-plugin-opener = "2.7"
+tauri-plugin-log = "2.10"
+# THE pairing-link parser + Profiles store + nav guard (M2–M4, L8).
+url = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The Local core: the root crate compiled without `host` (plan §2.7). One app,
+# one artifact — no `local` feature.
+peakbot = { path = "../..", default-features = false }
+
+# QR pairing (plan §2.9: CAMERA via the barcode plugin) — mobile targets only.
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+tauri-plugin-barcode-scanner = "2"

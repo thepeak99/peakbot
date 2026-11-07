@@ -1,10 +1,12 @@
 #!/bin/sh
 #
-# check-version.sh — verify that the desktop workspace version matches the
-# root peakbot version. Per DESIGN.md §5.7 / P0.3:
+# check-version.sh — verify that the desktop workspace version and the mobile
+# app version match the root peakbot version. Per DESIGN.md §5.7 / P0.3:
 #   desktop/Cargo.toml [workspace.package].version == root Cargo.toml [package].version
+#   mobile/src-tauri/Cargo.toml [package].version == root Cargo.toml [package].version
+#   mobile/src-tauri/tauri.conf.json "version" == root Cargo.toml [package].version
 #
-# Exit 0 when they match; exit 1 with a message on stderr when they differ
+# Exit 0 when they all match; exit 1 with a message on stderr when they differ
 # (or a version cannot be read).
 #
 # This script lives at <root>/desktop/scripts/. It resolves the repo root
@@ -35,6 +37,8 @@ version_of() {
 
 root_ver=$(version_of "package" "$root/Cargo.toml")
 desk_ver=$(version_of "workspace.package" "$root/desktop/Cargo.toml")
+mob_cargo_ver=$(version_of "package" "$root/mobile/src-tauri/Cargo.toml")
+mob_conf_ver=$(jq -r '.version' "$root/mobile/src-tauri/tauri.conf.json" 2>/dev/null)
 
 if [ -z "$root_ver" ]; then
     echo "check-version.sh: could not read version from root Cargo.toml ($root/Cargo.toml)" >&2
@@ -44,11 +48,27 @@ if [ -z "$desk_ver" ]; then
     echo "check-version.sh: could not read version from desktop/Cargo.toml [workspace.package] ($root/desktop/Cargo.toml)" >&2
     exit 1
 fi
+if [ -z "$mob_cargo_ver" ]; then
+    echo "check-version.sh: could not read version from mobile/src-tauri/Cargo.toml ($root/mobile/src-tauri/Cargo.toml)" >&2
+    exit 1
+fi
+if [ -z "$mob_conf_ver" ] || [ "$mob_conf_ver" = "null" ]; then
+    echo "check-version.sh: could not read version from mobile/src-tauri/tauri.conf.json ($root/mobile/src-tauri/tauri.conf.json)" >&2
+    exit 1
+fi
 
 if [ "$root_ver" != "$desk_ver" ]; then
     echo "check-version.sh: version mismatch — root Cargo.toml is $root_ver, desktop/Cargo.toml is $desk_ver" >&2
     exit 1
 fi
+if [ "$root_ver" != "$mob_cargo_ver" ]; then
+    echo "check-version.sh: version mismatch — root Cargo.toml is $root_ver, mobile/src-tauri/Cargo.toml is $mob_cargo_ver" >&2
+    exit 1
+fi
+if [ "$root_ver" != "$mob_conf_ver" ]; then
+    echo "check-version.sh: version mismatch — root Cargo.toml is $root_ver, mobile/src-tauri/tauri.conf.json is $mob_conf_ver" >&2
+    exit 1
+fi
 
-echo "check-version.sh: OK (root=$root_ver desktop=$desk_ver)"
+echo "check-version.sh: OK (root=$root_ver desktop=$desk_ver mobile=$mob_cargo_ver/$mob_conf_ver)"
 exit 0

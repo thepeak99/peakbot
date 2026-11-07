@@ -1,3 +1,12 @@
+# One workspace, one lock (mobile plan D8): `mobile/src-tauri` joins here so
+# the Local APK builds exactly the dependency set root CI tests.
+# `default-members = ["."]` keeps plain `cargo build/test/clippy` (and root CI)
+# on the root crate only — the mobile crate is always addressed with `-p`.
+# `desktop/` stays its own workspace (desktop and mobile bump Tauri independently).
+[workspace]
+members = [".", "mobile/src-tauri"]
+default-members = ["."]
+
 [package]
 name = "peakbot"
 version = "0.27.0"

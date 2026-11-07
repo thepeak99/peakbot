@@ -1,0 +1,12 @@
+# Pinned for the mobile builds: Xcode's "Build Rust Code" phase does not pass
+# RUSTUP_TOOLCHAIN through, and rustup reads this file from cargo's cwd.
+# Android: arm64 for release; x86_64 only for dev emulator APKs (no armv7/i686).
+[toolchain]
+channel = "1.95.0"
+targets = [
+  "aarch64-linux-android",
+  "x86_64-linux-android",
+  "aarch64-apple-ios",
+  "aarch64-apple-ios-sim",
+  "x86_64-apple-ios",
+]
