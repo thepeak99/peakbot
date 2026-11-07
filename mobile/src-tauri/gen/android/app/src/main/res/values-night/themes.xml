@@ -6,6 +6,7 @@
              matching the page; 15+ is edge-to-edge and transparent. -->
         <item name="android:windowLightStatusBar">false</item>
         <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:windowBackground">#FF09090B</item>
         <item name="android:statusBarColor">#FF09090B</item>
         <item name="android:navigationBarColor">#FF09090B</item>
     </style>
