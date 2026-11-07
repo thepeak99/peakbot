@@ -1515,8 +1515,10 @@ default hook, so it must call `shutdown()` (sidecar stop) +
   label from `core::update::menu_label` (`Check for updates…` /
   `Checking for updates…` / `Update available — v{v}` /
   `Downloading v{v}…` / `Installing v{v}…` / `Update to v{v} failed —
-  retry`), kept in sync across all stored menu copies; click sends
-  `Event::Click` to the updater thread.
+  retry`), kept in sync across all stored menu copies; click sends a manual
+  `Event::Check` to the updater thread (check-only — installs happen only
+  from the banner's **Restart to update**; a manual check that finds an
+  update shows an "Update available" dialog).
 
 **Signing (post-build, `make desktop-updater`).** `createUpdaterArtifacts`
 stays OFF. `Dockerfile.desktop-updater` (pinned `@tauri-apps/cli@2.12.3`,

@@ -152,6 +152,12 @@ impl UpdateSys for TauriUpdateSys {
             Dialog::InstallFailed(e) => {
                 ("Update failed".to_string(), format!("Update failed: {e}"))
             }
+            Dialog::UpdateAvailable(v) => (
+                "Update available".to_string(),
+                format!(
+                    "PeakBot v{v} is available. Use the update banner in the PeakBot window to install it."
+                ),
+            ),
         };
         // Fire-and-forget: `show` dispatches to the main thread and
         // returns immediately, so this thread never blocks on the

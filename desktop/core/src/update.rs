@@ -72,7 +72,7 @@ pub enum State {
 
 /// One input to the state machine. `CheckDone`/`Installing`/
 /// `InstallOutcome` are fed back by the loop after a `RunCheck`/
-/// `RunInstall` effect; `Click`/`Install` come from the tray/banner.
+/// `RunInstall` effect; `Install` comes from the banner (`Click` is legacy).
 pub enum Event {
     Check { manual: bool },
     Click,
@@ -97,6 +97,7 @@ pub enum Dialog {
     UpToDate,
     CheckFailed(String),
     InstallFailed(String),
+    UpdateAvailable(Version),
 }
 
 /// What the loop must do after a `step` (run inline on the loop
@@ -140,8 +141,13 @@ pub fn step(s: &State, e: Event) -> (State, Effect) {
                 Effect::None,
             )
         }
-        (State::Checking { .. }, Event::CheckDone(Ok(Some(v)))) => {
-            (State::Available(v), Effect::None)
+        (State::Checking { manual, .. }, Event::CheckDone(Ok(Some(v)))) => {
+            let effect = if *manual {
+                Effect::Notify(Dialog::UpdateAvailable(v.clone()))
+            } else {
+                Effect::None
+            };
+            (State::Available(v), effect)
         }
         (State::Checking { manual, .. }, Event::CheckDone(Ok(None))) => {
             let effect = if *manual {
@@ -170,8 +176,8 @@ pub fn step(s: &State, e: Event) -> (State, Effect) {
             },
             Effect::RunCheck,
         ),
-        // Click = the tray item; Install = the web banner button. Both
-        // start the same download+install on Available/Failed.
+        // Installs come from the web banner's Install; the menu only sends
+        // Check, so Click is not sent by the app.
         (State::Available(v) | State::Failed(v), Event::Click | Event::Install) => {
             (State::Downloading(v.clone()), Effect::RunInstall)
         }
@@ -509,6 +515,81 @@ mod tests {
             },
             Event::CheckDone(Ok(Some(v.clone()))),
             (State::Available(v.clone()), Effect::None),
+        );
+    }
+
+    // Manual check finds an update — the tray/app-menu item is
+    // CHECK-ONLY, so the result must be announced (the dialog is the
+    // only feedback for a menu click) but never installed. Needs the
+    // new `Dialog::UpdateAvailable(Version)` variant: RED = compile
+    // error until it exists.
+    #[test]
+    fn step_check_done_found_update_notifies_when_manual_and_no_known_version() {
+        let v = "0.25.0".to_string();
+        assert_step(
+            &State::Checking {
+                manual: true,
+                known: None,
+            },
+            Event::CheckDone(Ok(Some(v.clone()))),
+            (
+                State::Available(v.clone()),
+                Effect::Notify(Dialog::UpdateAvailable(v.clone())),
+            ),
+        );
+    }
+
+    #[test]
+    fn step_check_done_found_update_notifies_when_manual_and_older_version_known() {
+        let older = "0.24.0".to_string();
+        let newer = "0.25.0".to_string();
+        assert_step(
+            &State::Checking {
+                manual: true,
+                known: Some(older),
+            },
+            Event::CheckDone(Ok(Some(newer.clone()))),
+            (
+                State::Available(newer.clone()),
+                Effect::Notify(Dialog::UpdateAvailable(newer.clone())),
+            ),
+        );
+    }
+
+    #[test]
+    fn step_check_done_found_update_never_installs_even_when_manual() {
+        // A menu-initiated check must not chain into a download.
+        let (state, effect) = step(
+            &State::Checking {
+                manual: true,
+                known: None,
+            },
+            Event::CheckDone(Ok(Some("0.25.0".to_string()))),
+        );
+        assert_eq!(state, State::Available("0.25.0".to_string()));
+        assert_ne!(effect, Effect::RunInstall, "check-only: no install effect");
+    }
+
+    #[test]
+    fn step_check_done_found_update_stays_silent_when_not_manual() {
+        // Startup / 24h periodic checks: the banner carries the news.
+        let older = "0.24.0".to_string();
+        let newer = "0.25.0".to_string();
+        assert_step(
+            &State::Checking {
+                manual: false,
+                known: None,
+            },
+            Event::CheckDone(Ok(Some(newer.clone()))),
+            (State::Available(newer.clone()), Effect::None),
+        );
+        assert_step(
+            &State::Checking {
+                manual: false,
+                known: Some(older),
+            },
+            Event::CheckDone(Ok(Some(newer.clone()))),
+            (State::Available(newer), Effect::None),
         );
     }
 
@@ -1144,6 +1225,45 @@ mod tests {
             st.renders.last(),
             Some(&State::Idle),
             "Gone (replaced) → back to Idle"
+        );
+        drop(tx);
+        done.recv_timeout(Duration::from_secs(5))
+            .expect("the loop exits");
+    }
+
+    #[test]
+    fn run_loop_manual_check_that_finds_an_update_notifies_once_and_never_installs() {
+        // Startup check: nothing new (silent). Then the menu item's
+        // manual check finds 0.25.0.
+        let (tx, done, st) = spawn_loop(make_fake(Ok(None), InstallOutcome::Gone));
+        wait_for("the startup check", || st.lock().unwrap().checks == 1);
+        st.lock()
+            .unwrap()
+            .script
+            .push_back(Ok(Some("0.25.0".to_string())));
+        tx.send(Event::Check { manual: true })
+            .expect("the loop is alive");
+        wait_for("the UpdateAvailable notification", || {
+            st.lock().unwrap().notifications == vec![Dialog::UpdateAvailable("0.25.0".to_string())]
+        });
+        // Let several ticks pass: a buggy auto-install or a duplicate
+        // notification would show up.
+        std::thread::sleep(Duration::from_millis(150));
+        let st = st.lock().unwrap();
+        assert_eq!(st.checks, 2, "startup + exactly one manual check");
+        assert_eq!(
+            st.notifications,
+            vec![Dialog::UpdateAvailable("0.25.0".to_string())],
+            "exactly one UpdateAvailable notification"
+        );
+        assert_eq!(
+            st.install_calls, 0,
+            "a manual check is check-only: it must never install"
+        );
+        assert_eq!(
+            st.renders.last(),
+            Some(&State::Available("0.25.0".to_string())),
+            "the banner state is Available, waiting for the web banner's Install"
         );
         drop(tx);
         done.recv_timeout(Duration::from_secs(5))

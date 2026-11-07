@@ -30,8 +30,9 @@ fn status_item(app: &AppHandle) -> tauri::Result<MenuItem<Wry>> {
     MenuItem::with_id(app, "status", "PeakBot", false, None::<&str>)
 }
 
-/// The `update` item (initial label per `core::update::menu_label(Idle)`;
-/// the updater thread rewrites it on every state change).
+/// The `update` item: check-only (click = manual check; installs come from
+/// the web banner). Initial label per `core::update::menu_label(Idle)`; the
+/// updater thread rewrites it on every state change.
 fn update_item(app: &AppHandle) -> tauri::Result<MenuItem<Wry>> {
     MenuItem::with_id(app, "update", "Check for updates…", true, None::<&str>)
 }
@@ -165,7 +166,7 @@ pub fn handle_menu_event(app: &AppHandle, id: &str) {
         "update" => {
             // `UpdateTx` is managed only on updatable builds.
             if let Some(tx) = app.try_state::<UpdateTx>() {
-                let _ = tx.0.send(update::Event::Click);
+                let _ = tx.0.send(update::Event::Check { manual: true });
             }
         }
         "logs" => {
