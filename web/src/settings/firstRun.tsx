@@ -28,7 +28,7 @@ import type { ConfigText, PutOk, SettingsMeta } from "./types";
 
 /** The generated global config for a fresh setup (spec §9.13 example).
  * PURE: same answers in, same bytes out; the input is never mutated. */
-export function buildFirstRunYaml(a: FirstRunAnswers): string {
+export function buildFirstRunYaml(a: FirstRunAnswers, opts: { local?: boolean } = {}): string {
   const p = a.provider;
   const provider: Record<string, unknown> = { name: p.name, type: p.type };
   const apiKey = (p.api_key ?? "").trim();
@@ -53,20 +53,23 @@ export function buildFirstRunYaml(a: FirstRunAnswers): string {
     main.subagents = { helper: { prompt: "Take focused sub-tasks and report back." } };
   }
 
-  // Local never writes a token, even a leftover one; LAN always does.
-  const web: Record<string, unknown> = {
-    bind: a.web.access === "lan" ? "0.0.0.0:7823" : "127.0.0.1:7823",
-  };
-  if (a.web.access === "lan" && (a.web.token ?? "").trim() !== "") {
-    web.token = a.web.token;
-  }
-
-  const doc = {
+  const doc: Record<string, unknown> = {
     providers: [provider],
     mcps: [] as unknown[],
     profiles: { default: { agents: { main } } },
-    general: { web },
   };
+  // The Local (phone) core picks its own loopback port and token and never
+  // reads `general.web`, so the Local edition writes no `general` block.
+  if (!opts.local) {
+    // Local access never writes a token, even a leftover one; LAN always does.
+    const web: Record<string, unknown> = {
+      bind: a.web.access === "lan" ? "0.0.0.0:7823" : "127.0.0.1:7823",
+    };
+    if (a.web.access === "lan" && (a.web.token ?? "").trim() !== "") {
+      web.token = a.web.token;
+    }
+    doc.general = { web };
+  }
   return stringify(doc);
 }
 
@@ -251,7 +254,7 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
   // Review preview: the EXACT text that will be PUT, with the secrets
   // (API key AND the LAN web token) masked VISUALLY only (the real values
   // are what get sent).
-  const yamlText = useMemo(() => buildFirstRunYaml(effective), [effective]);
+  const yamlText = useMemo(() => buildFirstRunYaml(effective, { local }), [effective, local]);
   const maskedYaml = useMemo(() => {
     let t = yamlText;
     for (const secret of [answers.provider.api_key, answers.web.token]) {

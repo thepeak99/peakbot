@@ -358,6 +358,11 @@ describe("buildFirstRunYaml (spec §9.13 generated YAML)", () => {
     expect(doc.general.web).toEqual({ bind: "127.0.0.1:7823" });
   });
 
+  it("local_edition_writes_no_general_block", () => {
+    const doc = parseYaml(buildFirstRunYaml(ANSWERS, { local: true })) as Record<string, unknown>;
+    expect(Object.keys(doc)).toEqual(["providers", "mcps", "profiles"]);
+  });
+
   it("openrouter_omits_base_url_even_when_given", () => {
     const a = clone(ANSWERS);
     a.provider.base_url = "https://openrouter.ai/api/v1";

@@ -384,6 +384,24 @@ describe("first-run wizard per edition", () => {
     expect(q("firstrun-yaml")!.textContent).not.toContain("persona");
   });
 
+  it("local: the written config carries no general.web block (the Local core never reads it)", () => {
+    setBootEdition("local");
+    mountWizard(meta({ needs_setup: true, boot: LOCAL_BOOT }));
+    walkToAgentStep();
+    press(q("firstrun-next"));
+    const yaml = q("firstrun-yaml")!.textContent!;
+    expect(yaml).not.toContain("general");
+    expect(yaml).not.toContain("7823");
+  });
+
+  it("full: the written config keeps the general.web bind block", () => {
+    mountWizard(meta({ needs_setup: true, boot: FULL_BOOT }));
+    walkToAgentStep();
+    press(q("firstrun-next")); // agent → web
+    press(q("firstrun-next")); // web → review
+    expect(q("firstrun-yaml")!.textContent).toContain("bind: 127.0.0.1:7823");
+  });
+
   it("full: the agent step keeps the persona picker (unchanged)", () => {
     mountWizard(meta({ needs_setup: true, boot: FULL_BOOT }));
     walkToAgentStep();
