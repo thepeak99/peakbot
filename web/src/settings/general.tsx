@@ -12,6 +12,7 @@
 import { useEffect, useState } from "react";
 import { getPairing } from "./api";
 import { useSettingsCtx } from "./context";
+import { shell } from "../desktop";
 import { get, type Doc } from "./yamlDoc";
 import { errAt } from "./paths";
 import { ConnectPhonePane, decodePairing, type Pairing } from "./connectPhone";
@@ -644,8 +645,11 @@ export function GeneralPane() {
         </div>
       </fieldset>
 
-      {/* 9. Pairing (design §8.4) — machine-wide facts, outside the fieldset */}
-      {pairing !== null && (
+      {/* 9. Pairing (design §8.4) — machine-wide facts, outside the fieldset.
+          F2: absent in the mobile shell — the phone IS the pairing target,
+          so the panel would tell it to pair with itself (Facts are still
+          fetched; only the render is gated). */}
+      {pairing !== null && shell() !== "mobile" && (
         <ConnectPhonePane pairing={pairing} profiles={localProfiles} />
       )}
     </div>

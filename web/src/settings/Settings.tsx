@@ -15,7 +15,7 @@
 // banner / 422 error panel / 200 toast + restart banner.
 
 import { useCallback, useEffect, useReducer, useState } from "react";
-import { isDesktop } from "../desktop";
+import { isDesktop, shell } from "../desktop";
 import { ApiError, getConfig, getSettings, putConfig, validateConfig } from "./api";
 import { createStore } from "./store";
 import { get, parse, set, stringify } from "./yamlDoc";
@@ -150,6 +150,10 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
   const [flash, setFlash] = useState<{ section: Section; pathKey: string } | null>(null);
 
   const desktop = isDesktop();
+  // F2: the mobile shell's profile list is a shell page
+  // (peakbot-mobile:profiles), not an SPA route — Settings exposes it as a
+  // row; desktop/browser keep today's in-app Profiles section only.
+  const mobile = shell() === "mobile";
 
   // ── Loading ──────────────────────────────────────────────────────────
   useEffect(() => {
@@ -638,6 +642,20 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
           }}
         >
         <main className="min-w-0 flex-1 overflow-auto p-4 sm:p-6">
+          {/* F2: the mobile shell manages profiles in its own page
+              (peakbot-mobile:profiles sentinel, classified by the nav guard);
+              the SPA has no in-page equivalent, so it offers the shell's
+              row instead of (and never alongside) a browser open. */}
+          {mobile && (
+            <a
+              href="peakbot-mobile:profiles"
+              className="flex cursor-pointer items-center gap-2 rounded border border-zinc-800 bg-zinc-900/40 px-3 py-2 text-xs text-zinc-200 hover:bg-zinc-900 hover:text-zinc-300"
+              title="Profile list is managed by the mobile shell"
+            >
+              Switch profile
+            </a>
+          )}
+
           {/* Mobile: the nav collapses into a select under the head */}
           <select
             value={
