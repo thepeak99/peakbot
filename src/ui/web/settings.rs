@@ -355,8 +355,8 @@ fn facts() -> JsonValue {
     let exe_path: Option<String> = std::env::current_exe()
         .ok()
         .map(|p| p.to_string_lossy().into_owned());
-    let data_dir = dirs::data_dir()
-        .map(|p| p.join("peakbot").to_string_lossy().into_owned())
+    let data_dir = crate::paths::app_data_dir()
+        .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
     let install = install_info(&exe_path);
     json!({

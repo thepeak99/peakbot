@@ -445,14 +445,11 @@ impl Default for ConversationConfig {
 
 impl ConversationConfig {
     /// `storage_dir`, else `<data_local_dir>/peakbot/conversations` (the
-    /// 0.23 default, unchanged).
+    /// 0.23 default, unchanged; `<data>/conversations` under embedder roots).
     pub fn storage_dir_or_default(&self) -> PathBuf {
-        self.storage_dir.clone().unwrap_or_else(|| {
-            dirs::data_local_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("peakbot")
-                .join("conversations")
-        })
+        self.storage_dir
+            .clone()
+            .unwrap_or_else(crate::paths::conversations_dir)
     }
 }
 

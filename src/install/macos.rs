@@ -81,7 +81,7 @@ fn log_path(exe: &Path) -> PathBuf {
         .map(Path::to_path_buf)
         // Network/`/var/root` homes are not under /Users; fall back to the
         // live home, then to the binary's own directory.
-        .or_else(dirs::home_dir)
+        .or_else(crate::paths::home_dir)
         .or_else(|| exe.parent().map(Path::to_path_buf))
         .unwrap_or_default();
     home.join("Library")
@@ -161,7 +161,7 @@ fn unescape_xml(s: &str) -> String {
 }
 
 fn plist_path() -> Result<PathBuf, InstallError> {
-    let home = dirs::home_dir().ok_or_else(|| {
+    let home = crate::paths::home_dir().ok_or_else(|| {
         InstallError::Io(std::io::Error::other(
             "cannot resolve a home directory for the LaunchAgent plist",
         ))

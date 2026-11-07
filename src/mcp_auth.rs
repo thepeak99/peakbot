@@ -8,7 +8,7 @@
 //! ## Flow
 //!
 //! 1. Build a `FilesystemCredentialStore` at
-//!    `dirs::cache_dir()/peakbot/mcp-auth/<server-name>.json`.
+//!    `<cache dir>/peakbot/mcp-auth/<server-name>.json` (see `crate::paths`).
 //! 2. Attach it to a fresh `AuthorizationManager`; call
 //!    `initialize_from_store`. **Cache hit → return immediately.** rmcp's
 //!    `get_access_token` will silently refresh expired access tokens using
@@ -22,8 +22,8 @@
 //!
 //! ## Cache file
 //!
-//! - **Path:** `dirs::cache_dir()/peakbot/mcp-auth/<server-name>.json`.
-//!   No silent fallback — if `dirs::cache_dir()` returns `None` we error.
+//! - **Path:** `<cache dir>/peakbot/mcp-auth/<server-name>.json` (see `crate::paths`).
+//!   No silent fallback — if there is no cache dir we error.
 //! - **Permissions:** `0o600` on Unix (set on save, enforced on load —
 //!   any group/world bits set rejects with a remediation message).
 //!
@@ -66,21 +66,21 @@ pub struct AuthCallback {
 /// Filesystem-backed credential store for OAuth tokens.
 ///
 /// Persists [`StoredCredentials`] as JSON to
-/// `dirs::cache_dir()/peakbot/mcp-auth/<server-name>.json` with mode
-/// `0o600` on Unix.
+/// `<cache dir>/peakbot/mcp-auth/<server-name>.json` with mode `0o600` on
+/// Unix.
 #[derive(Debug)]
 pub struct FilesystemCredentialStore {
     path: PathBuf,
 }
 
 impl FilesystemCredentialStore {
-    /// Build a store rooted at `dirs::cache_dir()` for the given server name.
+    /// Build a store rooted at the cache dir for the given server name.
     ///
     /// Returns `None` if the platform doesn't expose a cache directory
     /// (rare — basically only odd embedded targets). The caller surfaces
     /// this as [`AuthorizationError::NoCacheDir`].
     pub fn for_server(server_name: &str) -> Option<Self> {
-        let cache_dir = dirs::cache_dir()?.join("peakbot").join("mcp-auth");
+        let cache_dir = crate::paths::mcp_auth_dir()?;
         Some(Self {
             path: cache_dir.join(format!("{server_name}.json")),
         })
@@ -518,7 +518,7 @@ pub enum AuthorizationError {
     #[error("OAuth: {0}")]
     Rmcp(#[from] AuthError),
 
-    /// Platform doesn't expose a cache directory (`dirs::cache_dir()`
+    /// Platform doesn't expose a cache directory (`paths::mcp_auth_dir()`
     /// returned `None`). Should be extremely rare on real desktops.
     #[error(
         "OAuth: cannot locate a cache directory on this platform. \

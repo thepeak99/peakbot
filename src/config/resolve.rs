@@ -1347,7 +1347,7 @@ fn expand_home(raw: &str) -> Option<PathBuf> {
     } else {
         raw.strip_prefix("~/")?
     };
-    dirs::home_dir().map(|home| home.join(rest))
+    crate::paths::home_dir().map(|home| home.join(rest))
 }
 
 fn profile_info(p: &ResolvedProfile) -> ProfileInfo {

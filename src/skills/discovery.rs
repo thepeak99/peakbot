@@ -173,9 +173,9 @@ impl SkillRegistry {
 pub fn get_default_skills_dirs(session_cwd: &Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
 
-    // 1. Global skills directory: ~/.agents/skills
-    if let Some(home) = dirs::home_dir() {
-        let global_skills = home.join(".agents").join("skills");
+    // 1. Global skills directory: ~/.agents/skills (`<data>/skills` under
+    //    embedder roots, where there is no home).
+    if let Some(global_skills) = crate::paths::global_skills_dir() {
         dirs.push(global_skills);
     }
 

@@ -30,7 +30,6 @@ pub use resolve::{
 };
 
 use anyhow::Context;
-use directories_next::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -922,7 +921,7 @@ fn default_backoff_factor() -> f64 {
 /// Public because `get_config_file_path` (and the auto-migration, which
 /// locates the legacy `web-token` file next to `config.yaml`) need it.
 pub fn get_config_dir() -> Option<std::path::PathBuf> {
-    ProjectDirs::from("com", "peakbot", "peakbot").map(|dirs| dirs.config_dir().to_path_buf())
+    crate::paths::config_dir()
 }
 
 /// Get the platform-specific config file path.

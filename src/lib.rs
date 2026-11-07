@@ -23,6 +23,7 @@ mod mcp_auth;
 mod memory_compaction;
 #[cfg(feature = "mock")]
 pub mod mock;
+pub mod paths;
 pub mod pipeline;
 mod providers;
 pub mod pty_runner;
@@ -10783,8 +10784,9 @@ fn local_edition_canary() {
 
 // ─── dirs guard (mobile plan §2.6, task L2) ──────────────────────────────
 //
-// `src/paths.rs` is the ONLY module that may call `dirs::` / use
-// `ProjectDirs` — Android has no HOME and the `paths::Roots` seam must be
+// `src/paths.rs` is the ONLY module that may call the platform-dir
+// helpers (the `dirs` crate and the `directories` crate's project-dirs
+// type) — Android has no HOME and the `paths::Roots` seam must be
 // the single place platform roots are read. Text scan of every
 // `src/**/*.rs` file: any other file containing the strings fails. The
 // needles are built with `concat!` so this file itself never contains them.
@@ -10798,10 +10800,10 @@ fn walk_rs_files(path: &std::path::Path, visit: &mut dyn FnMut(&std::path::Path,
         let p = entry.path();
         if p.is_dir() {
             walk_rs_files(&p, visit);
-        } else if p.extension().is_some_and(|e| e == "rs") {
-            if let Ok(text) = std::fs::read_to_string(&p) {
-                visit(&p, &text);
-            }
+        } else if p.extension().is_some_and(|e| e == "rs")
+            && let Ok(text) = std::fs::read_to_string(&p)
+        {
+            visit(&p, &text);
         }
     }
 }
@@ -10831,7 +10833,8 @@ fn dirs_calls_appear_only_in_paths_module() {
     walk_rs_files(&src, &mut visit);
     assert!(
         offenders.is_empty(),
-        "dirs::/ProjectDirs calls outside src/paths.rs:\n{}",
+        "{} calls outside src/paths.rs:\n{}",
+        concat!("dirs", "::/", "Project", "Dirs"),
         offenders.join("\n")
     );
 }
