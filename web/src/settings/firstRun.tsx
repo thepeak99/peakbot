@@ -16,7 +16,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { stringify } from "yaml";
-import { isDesktop } from "../desktop";
+import { isDesktop, shell } from "../desktop";
 import { putConfig } from "./api";
 import { generateToken } from "./general";
 import { NEUTRAL_PERSONA, TERSE_PERSONA } from "./agent";
@@ -174,8 +174,10 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
   // L7 (driven by the meta prop Boot passes from the same boot read): the
   // local edition (phone build) skips the "Web access" step — the server is
   // loopback-only by construction — and the PATH fact (the binary runs from
-  // the APK; PATH has no meaning there).
-  const local = meta.edition === "local";
+  // the APK; PATH has no meaning there). The edition lives in the `boot`
+  // block on the wire.
+  const local = meta.boot?.edition === "local";
+  const isMobileShell = shell() === "mobile";
   const steps = local ? STEPS.filter((s) => s.name !== "web") : STEPS;
 
   // Esc closes the wizard (Boot shows the setup strip underneath).
@@ -297,6 +299,21 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
               </p>
             )}
             <p className="text-sm text-zinc-300">Restart PeakBot to start chatting.</p>
+            {/* Mobile + Local: without this the screen is a dead end — the
+                shell (not the user) restarts the in-process core. The anchor
+                navigates `peakbot-mobile:restart`, which the nav guard
+                classifies RestartLocal (gated to the Local page). */}
+            {isMobileShell && local && (
+              <div>
+                <a
+                  data-testid="firstrun-restart-now"
+                  href="peakbot-mobile:restart"
+                  className="inline-block cursor-pointer rounded-md bg-emerald-700 px-4 py-1.5 text-sm font-medium text-white hover:bg-emerald-600"
+                >
+                  Restart now
+                </a>
+              </div>
+            )}
             <div className="space-y-1 font-mono text-[11px] text-zinc-500">
               <div>Config: {global.path}</div>
               {finished && putOk.backup !== null && (
@@ -638,6 +655,12 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
                     ))}
                   </select>
                 </Field>
+                {/* The persona picker is full-edition only: Local has its
+                    own built-in persona (L1), so the Code Crusader /
+                    engineer / reviewer choices don't apply there. The
+                    default answer (persona: null) writes no `persona` key —
+                    which on Local IS the Local built-in persona. */}
+                {!local && (
                 <div>
                   <span className="mb-1 block text-[11px] text-zinc-400">Persona</span>
                   <div className="flex flex-wrap gap-1.5">
@@ -680,6 +703,7 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
                     never drifts into your file.
                   </span>
                 </div>
+                )}
                 <div
                   data-testid="fr-agent-subagents"
                   className="flex items-start justify-between gap-3"

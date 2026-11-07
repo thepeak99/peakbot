@@ -152,6 +152,50 @@ async fn settings_reports_the_edition_in_normal_mode() {
     );
 }
 
+/// Cross-side pin (L7): the web suite
+/// (`web/src/settings/editionGating.test.tsx`) feeds `getSettings()` the
+/// `boot` block of the shared fixture `fixtures/settings_boot_local.json`.
+/// The live response's `boot` key set must equal the fixture's, so a server
+/// that moves/renames a boot key (e.g. `edition` to top-level) breaks both
+/// sides at once — the L7 bug where the web read a top-level `edition` the
+/// server never sent.
+#[tokio::test]
+async fn boot_block_shape_matches_the_shared_fixture() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/settings_boot_local.json"))
+            .expect("the shared fixture must be valid JSON");
+    // The fixture itself is the locked shape: `edition` in the `boot`
+    // block, never top-level.
+    assert!(
+        fixture.get("edition").is_none(),
+        "the fixture must not carry a top-level edition: {fixture}"
+    );
+    assert_eq!(fixture["boot"]["edition"], "local", "fixture: {fixture}");
+
+    let addr = spawn_settings(state(None)).await;
+    let v = get_settings(addr).await;
+    let mut live: Vec<&str> = v["boot"]
+        .as_object()
+        .expect("the live boot block must be an object")
+        .keys()
+        .map(|k| k.as_str())
+        .collect();
+    let mut fixture_keys: Vec<&str> = fixture["boot"]
+        .as_object()
+        .expect("the fixture boot block must be an object")
+        .keys()
+        .map(|k| k.as_str())
+        .collect();
+    live.sort_unstable();
+    fixture_keys.sort_unstable();
+    assert_eq!(
+        live, fixture_keys,
+        "the live boot block's keys must match the shared fixture — the web \
+         suite reads its shape from there; live boot = {}",
+        v["boot"]
+    );
+}
+
 // ═══ Local upload: images only (QL7) ═════════════════════════════════════
 
 #[cfg(not(feature = "host"))]

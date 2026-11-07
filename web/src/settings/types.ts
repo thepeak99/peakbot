@@ -24,11 +24,18 @@ export interface SettingsMeta {
   skills: string[];
   builtin_persona: string;
   mcp_status: { name: string; state: "connected" | "failed" | "disabled" }[];
-  boot: { bind: string; token_source: "config" | "env" | "cli" | "none"; tls: boolean };
-  /** What THIS server can do: `"full"` (host build) or `"local"` (phone
-   *  build — no MCP/profile/system panes, images-only uploads). Optional:
-   *  old servers omit it ⇒ the SPA treats it as `"full"`. */
-  edition?: "full" | "local";
+  boot: {
+    /** What THIS server can do: `"full"` (host build) or `"local"` (phone
+     *  build — no MCP/profile/system panes, images-only uploads). Optional:
+     *  old servers omit it ⇒ the SPA treats it as `"full"`. Lives in the
+     *  `boot` block on the wire (pinned cross-side by
+     *  tests/fixtures/settings_boot_local.json via editionFixture.test.ts
+     *  and tests/edition_settings.rs). */
+    edition?: "full" | "local";
+    bind: string;
+    token_source: "config" | "env" | "cli" | "none";
+    tls: boolean;
+  };
   facts: {
     os: string;
     arch: string;

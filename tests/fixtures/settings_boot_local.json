@@ -1,0 +1,8 @@
+{
+  "boot": {
+    "edition": "local",
+    "bind": "127.0.0.1:47823",
+    "token_source": "none",
+    "tls": false
+  }
+}

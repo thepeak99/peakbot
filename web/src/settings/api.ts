@@ -45,7 +45,9 @@ export function getSettings(convo?: string): Promise<SettingsMeta> {
   return request<SettingsMeta>(
     convo ? `/api/settings?convo=${encodeURIComponent(convo)}` : "/api/settings",
   ).then((meta) => {
-    setBootEdition(meta.edition);
+    // The edition lives in the `boot` block on the wire (tests/
+    // edition_settings.rs pins the shape; old servers omit it ⇒ full).
+    setBootEdition(meta.boot?.edition);
     return meta;
   });
 }

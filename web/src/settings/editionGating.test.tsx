@@ -7,12 +7,11 @@
 //
 // **The locked contract (builder L7 implements exactly this):**
 //
-// 1. `web/src/settings/types.ts` — `SettingsMeta` gains
-//    `edition?: "full" | "local"` (OPTIONAL — old servers omit it).
-//    NOTE: until that field lands, `npm run typecheck` is RED on the
-//    `meta({ edition: … })` fixtures below (excess-property errors). That
-//    is the expected TDD state; vitest (esbuild, no typecheck) runs the
-//    file regardless.
+// 1. `web/src/settings/types.ts` — `SettingsMeta.boot` gains
+//    `edition?: "full" | "local"` (OPTIONAL — old servers omit it). The
+//    edition lives in the `boot` block on the wire, exactly as the server
+//    sends it (`src/ui/web/settings.rs`); the cross-side pin is
+//    `tests/fixtures/settings_boot_local.json`.
 //
 // 2. `web/src/desktop.ts` (the shell/edition-detection seam, beside
 //    `shell()`):
@@ -24,9 +23,9 @@
 //    `setBootEdition(undefined)` resets to `"full"` (missing ⇒ full).
 //
 // 3. Wiring: `getSettings()` in `web/src/settings/api.ts` calls
-//    `setBootEdition(meta.edition)` on every successful `/api/settings`
-//    read (the single read point — Boot, Settings and the wizard all go
-//    through it).
+//    `setBootEdition(meta.boot?.edition)` on every successful
+//    `/api/settings` read (the single read point — Boot, Settings and the
+//    wizard all go through it).
 //
 // 4. Gating when `edition() === "local"`:
 //    - Settings hides the MCP, Profiles, System and Raw YAML panes (nav
@@ -45,10 +44,8 @@
 // 5. `full` (and missing edition): everything unchanged — the `full`
 //    tests below are guards that must stay green before and after.
 //
-// RED today: `edition` / `setBootEdition` do not exist in ../desktop
-// (whole-file import failure → every test below fails), none of the
-// local-edition gating exists, and the typecheck is RED on the `edition`
-// field.
+// All GREEN: the `edition` / `setBootEdition` seam and every local-edition
+// gate above exist; the fixtures use the real server's wire shape.
 //
 // Harness: same style as ./mobileGating.test.tsx — plain createRoot/act +
 // raw DOM queries (no testing-library), marker globals set/deleted per
@@ -123,9 +120,15 @@ function setShell(marker: "desktop" | "mobile" | "browser") {
 
 const GLOBAL_PATH = "/home/u/.config/peakbot/config.yaml";
 
-// `meta({ edition: "local" })` does not typecheck until L4/L7 add
-// `edition?: "full" | "local"` to SettingsMeta — the expected typecheck
-// RED (see header). vitest runs the file regardless.
+// The REAL wire shape (src/ui/web/settings.rs `get_settings`): `edition`
+// lives in the `boot` block, never top-level. The cross-side pin is
+// editionFixture.test.ts (reads tests/fixtures/settings_boot_local.json,
+// which tests/edition_settings.rs also asserts against), so the two sides
+// can't drift again.
+const BASE_BOOT: SettingsMeta["boot"] = { bind: "127.0.0.1:7823", token_source: "none", tls: false };
+const LOCAL_BOOT: SettingsMeta["boot"] = { ...BASE_BOOT, edition: "local" };
+const FULL_BOOT: SettingsMeta["boot"] = { ...BASE_BOOT, edition: "full" };
+
 function meta(over: Partial<SettingsMeta> = {}): SettingsMeta {
   return {
     needs_setup: false,
@@ -140,7 +143,7 @@ function meta(over: Partial<SettingsMeta> = {}): SettingsMeta {
     skills: [],
     builtin_persona: "You are Code Crusader.",
     mcp_status: [],
-    boot: { bind: "127.0.0.1:7823", token_source: "none", tls: false },
+    boot: BASE_BOOT,
     facts: {
       os: "linux",
       arch: "amd64",
@@ -204,7 +207,7 @@ describe("edition() seam (L7)", () => {
   });
 
   it("a boot read with edition local updates edition()", async () => {
-    stubSettingsFetch(meta({ edition: "local" }));
+    stubSettingsFetch(meta({ boot: LOCAL_BOOT }));
     await getSettings();
     expect(edition()).toBe("local");
   });
@@ -224,7 +227,7 @@ const HIDDEN_LABELS = ["MCP servers", "Profiles", "System", "Raw YAML"];
 
 describe("Settings panes per edition", () => {
   it("local: hides the MCP, Profiles, System and Raw YAML panes", async () => {
-    stubSettingsFetch(meta({ edition: "local" }));
+    stubSettingsFetch(meta({ boot: LOCAL_BOOT }));
     mount(<Settings convo={null} onClose={() => {}} />);
     await flush();
 
@@ -250,10 +253,10 @@ describe("Settings panes per edition", () => {
   });
 
   it.each([
-    ["full", "full"],
+    ["full", FULL_BOOT],
     ["missing edition (old server)", undefined],
-  ] as const)("%s: shows all six panes (unchanged)", async (_label, ed) => {
-    stubSettingsFetch(ed === undefined ? meta() : meta({ edition: ed }));
+  ] as const)("%s: shows all six panes (unchanged)", async (_label, boot) => {
+    stubSettingsFetch(boot === undefined ? meta() : meta({ boot }));
     mount(<Settings convo={null} onClose={() => {}} />);
     await flush();
 
@@ -288,7 +291,7 @@ describe("General → Web section per edition", () => {
 
   it("local: hides the Web server section", async () => {
     setBootEdition("local");
-    mountPane(meta({ edition: "local" }));
+    mountPane(meta({ boot: LOCAL_BOOT }));
     await flush();
 
     expect(host.querySelector('[data-testid="general-access-local"]')).toBeNull();
@@ -297,7 +300,7 @@ describe("General → Web section per edition", () => {
   });
 
   it("full: keeps the Web server section (unchanged)", async () => {
-    mountPane(meta({ edition: "full" }));
+    mountPane(meta({ boot: FULL_BOOT }));
     await flush();
 
     expect(host.querySelector('[data-testid="general-access-local"]')).not.toBeNull();
@@ -314,7 +317,7 @@ describe("first-run wizard per edition", () => {
 
   it("local: has no web step", () => {
     setBootEdition("local");
-    mountWizard(meta({ needs_setup: true, edition: "local" }));
+    mountWizard(meta({ needs_setup: true, boot: LOCAL_BOOT }));
 
     expect(host.querySelector('[data-testid="firstrun-stepper-web"]')).toBeNull();
     for (const id of ["welcome", "provider", "agent", "review"]) {
@@ -324,16 +327,106 @@ describe("first-run wizard per edition", () => {
 
   it("local: has no PATH fact", () => {
     setBootEdition("local");
-    mountWizard(meta({ needs_setup: true, edition: "local" }));
+    mountWizard(meta({ needs_setup: true, boot: LOCAL_BOOT }));
 
     expect(host.querySelector('[data-testid="firstrun-fact-path"]')).toBeNull();
   });
 
   it("full: keeps the web step and the PATH fact (unchanged)", () => {
-    mountWizard(meta({ needs_setup: true, edition: "full" }));
+    mountWizard(meta({ needs_setup: true, boot: FULL_BOOT }));
 
     expect(host.querySelector('[data-testid="firstrun-stepper-web"]')).not.toBeNull();
     expect(host.querySelector('[data-testid="firstrun-fact-path"]')).not.toBeNull();
+  });
+
+  // ── persona picker (fix 4): Local has its own built-in persona ──────────
+
+  const q = (id: string) => host.querySelector(`[data-testid="${id}"]`) as HTMLElement | null;
+  const press = (el: Element | null) => {
+    expect(el, "element to click must exist").not.toBeNull();
+    act(() => {
+      el!.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    });
+  };
+
+  /** Welcome → Provider (Ollama needs no key; one preset model) → Agent. */
+  function walkToAgentStep() {
+    press(q("firstrun-start-fresh"));
+    // Provider type select → ollama (no API key required).
+    const sel = q("fr-provider-type")!.querySelector("select") as HTMLSelectElement;
+    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")!.set!.call(sel, "ollama");
+    act(() => {
+      sel.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    press(q("fr-model-preset-0"));
+    press(q("firstrun-next"));
+    expect(q("firstrun-step-agent"), "must land on the agent step").not.toBeNull();
+  }
+
+  it("local: the agent step has no persona picker", () => {
+    setBootEdition("local");
+    mountWizard(meta({ needs_setup: true, boot: LOCAL_BOOT }));
+    walkToAgentStep();
+
+    for (const id of ["fr-persona-builtin", "fr-persona-neutral", "fr-persona-terse"]) {
+      expect(q(id), `${id} must be hidden on Local`).toBeNull();
+    }
+    expect(host.textContent).not.toContain("Code Crusader");
+    expect(q("fr-agent-model"), "the model choice stays").not.toBeNull();
+  });
+
+  it("local: the written config carries no persona key (the Local built-in persona applies)", () => {
+    setBootEdition("local");
+    mountWizard(meta({ needs_setup: true, boot: LOCAL_BOOT }));
+    walkToAgentStep();
+    press(q("firstrun-next")); // agent → review (no web step on Local)
+    expect(q("firstrun-step-review")).not.toBeNull();
+    expect(q("firstrun-yaml")!.textContent).not.toContain("persona");
+  });
+
+  it("full: the agent step keeps the persona picker (unchanged)", () => {
+    mountWizard(meta({ needs_setup: true, boot: FULL_BOOT }));
+    walkToAgentStep();
+
+    for (const id of ["fr-persona-builtin", "fr-persona-neutral", "fr-persona-terse"]) {
+      expect(q(id), `${id} must stay on full`).not.toBeNull();
+    }
+  });
+
+  // ── "Config written" screen (fix 2): the user must not be stuck ─────────
+
+  // needs_setup + the global file exists ⇒ the derived restart_pending
+  // screen, shown straight away (also what a reload after Finish shows).
+  const WRITTEN_GLOBAL: ConfigText = { ...MISSING_GLOBAL, exists: true, text: "x: 1", sha256: "abc" };
+
+  function mountWritten(m: SettingsMeta) {
+    mount(<FirstRun meta={m} global={WRITTEN_GLOBAL} onClose={() => {}} />);
+  }
+
+  it("mobile + local: the Config-written screen has Restart now → peakbot-mobile:restart", () => {
+    setShell("mobile");
+    setBootEdition("local");
+    mountWritten(meta({ needs_setup: true, boot: LOCAL_BOOT }));
+
+    expect(q("firstrun-restart"), "the Config-written screen").not.toBeNull();
+    const a = host.querySelector('a[data-testid="firstrun-restart-now"]');
+    expect(a, "the Local Config-written screen must offer Restart now").not.toBeNull();
+    expect(a?.getAttribute("href")).toBe("peakbot-mobile:restart");
+    expect(a?.textContent).toContain("Restart now");
+  });
+
+  it.each([
+    ["mobile + full", "mobile", FULL_BOOT],
+    ["browser + local", "browser", LOCAL_BOOT],
+    ["desktop + local", "desktop", LOCAL_BOOT],
+    ["browser + full", "browser", FULL_BOOT],
+  ] as const)("%s: no Restart now link on the Config-written screen (unchanged)", (_l, shellMarker, boot) => {
+    setShell(shellMarker);
+    setBootEdition(boot.edition);
+    mountWritten(meta({ needs_setup: true, boot }));
+
+    expect(q("firstrun-restart")).not.toBeNull();
+    expect(q("firstrun-restart-now")).toBeNull();
   });
 });
 
