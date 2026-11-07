@@ -485,3 +485,71 @@ fn main_rs_registers_exactly_the_manifest_commands() {
         "generate_handler! registers EXACTLY the seven AppManifest commands — a missing entry is a runtime 'command not found' that the JS seam swallows"
     );
 }
+
+/// The body of the `"update" =>` arm of `handle_menu_event` in
+/// `tray.rs`, with `//` line comments stripped (a comment saying
+/// "never Event::Click" must not trip the negative assertions) and
+/// all whitespace removed (so rustfmt line-wrapping can't matter).
+///
+/// A braced arm is cut at its matching `}`; a bare-expression arm at
+/// the first `,`.
+fn tray_update_arm_compact() -> String {
+    const ARM: &str = "\"update\" =>";
+    let tray = read("src-tauri/src/tray.rs");
+    let code: String = tray
+        .lines()
+        .map(|l| l.find("//").map_or(l, |i| &l[..i]))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let arm = code
+        .find(ARM)
+        .expect("tray.rs handle_menu_event has an `\"update\" =>` match arm");
+    let rest = code[arm + ARM.len()..].trim_start();
+    let body = if rest.starts_with('{') {
+        let mut depth = 0usize;
+        let mut end = None;
+        for (i, c) in rest.char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        &rest[..end.expect("the `\"update\"` arm's braces are balanced")]
+    } else {
+        &rest[..rest
+            .find(',')
+            .expect("the `\"update\"` arm ends with a comma")]
+    };
+    body.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+#[test]
+fn menu_update_item_sends_a_manual_check() {
+    let arm = tray_update_arm_compact();
+    assert!(
+        arm.contains("Event::Check{manual:true}"),
+        "the \"Check for updates…\" menu item must send `update::Event::Check {{ manual: true }}` \
+         (check-only; the manual flag makes the result notify); arm was: {arm}"
+    );
+}
+
+#[test]
+fn menu_update_item_never_sends_click_or_install() {
+    let arm = tray_update_arm_compact();
+    assert!(
+        !arm.contains("Event::Click"),
+        "the menu item is CHECK-ONLY: `Event::Click` on Available/Failed downloads, installs and \
+         restarts the app — installs belong to the web banner (`update_install`); arm was: {arm}"
+    );
+    assert!(
+        !arm.contains("Event::Install"),
+        "the menu item must never send `Event::Install` (banner-only); arm was: {arm}"
+    );
+}
