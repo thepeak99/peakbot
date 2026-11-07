@@ -38,6 +38,7 @@ apk=${1:-}
 
 script_dir=$(cd "$(dirname "$0")" >/dev/null 2>&1 && pwd)
 mobile_root=$(cd "$script_dir/.." >/dev/null 2>&1 && pwd)
+root=$(cd "$script_dir/../.." >/dev/null 2>&1 && pwd)
 conf="$mobile_root/src-tauri/tauri.conf.json"
 [ -f "$conf" ] || { echo "❌ smoke: missing $conf" >&2; exit 1; }
 VERSION=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$conf" | head -n 1)
@@ -153,16 +154,61 @@ else
     echo "ℹ️  smoke: debug build — the 40 MB release size cap does not apply (debug is never released)"
 fi
 
-# ── L10 hook (Phase 3, plan §4.3 test 6) ────────────────────────────────
-# The L10 symbol check — llvm-nm -D / strings on the unstripped
-# libpeakbot-mobile.so: no portable_pty, TokioChildProcess, BashTool,
-# ratatui — is implemented in Phase 3 as the body of this function. No
-# stub logic here: it stays a no-op until L10 fills it in and uncomments
-# the call below.
+# ── L10 (Phase 3, plan §4.3 test 6): host-only symbol leak check ─────────
+# The unstripped mobile lib must not link host-only code (the shell/PTY,
+# BashTool, the ratatui TUI). Rust internals are mostly not exported as
+# dynamic symbols, so `llvm-nm -D` alone isn't enough — we also scan
+# `strings`, where type names and panic paths survive. Either scan catching
+# one of the four names fails the build. The NDK's llvm is not on PATH by
+# default, so its prebuilt bin is prepended and `llvm-nm -D` is the exact
+# tool the APK was linked with.
 run_l10_symbol_check() {
-    : # L10 (Phase 3): symbol scan of the unstripped .so
+    # Optional second arg: an explicit binary to scan (used to prove the
+    # check can catch a leak). When absent, locate the unstripped mobile lib.
+    so="${2:-}"
+
+    # NDK's llvm prebuilt bin (toolchains/llvm/prebuilt/linux-x86_64/bin),
+    # not on PATH by default; prepend it so `llvm-nm -D` resolves to the
+    # linker tool the APK was actually built with.
+    if [ -n "${NDK_HOME:-}" ] \
+        && [ -x "${NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" ]; then
+        export PATH="${NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
+    fi
+    command -v llvm-nm >/dev/null 2>&1 \
+        || fail "L10: llvm-nm not found (NDK llvm toolchain missing?)"
+
+    # Locate the unstripped lib the APK links (when not given explicitly). The
+    # debug build is unstripped (release is stripped by
+    # CARGO_PROFILE_RELEASE_STRIP=true). Prefer the cargo target tree; fall
+    # back to a find over the build dirs.
+    if [ -z "$so" ]; then
+        for base in "$root/target" "${CARGO_TARGET_DIR:-$root/target}" "$root/mobile/src-tauri/target"; do
+            for profile in debug release; do
+                [ -f "$base/aarch64-linux-android/$profile/libpeakbot_mobile_lib.so" ] \
+                    && so="$base/aarch64-linux-android/$profile/libpeakbot_mobile_lib.so"
+                [ -n "$so" ] && break
+            done
+            [ -n "$so" ] && break
+        done
+        [ -n "$so" ] || so=$(find "$root" -type f -name 'libpeakbot_mobile_lib.so' 2>/dev/null | head -n 1)
+    fi
+    [ -n "$so" ] || fail "L10: no libpeakbot_mobile_lib.so to symbol-check (build incomplete?)"
+
+    # Checked names (host-only code that must not be in the mobile build).
+    bad=""
+    for sym in portable_pty TokioChildProcess BashTool ratatui; do
+        if llvm-nm -D "$so" 2>/dev/null | grep -Fq -- "$sym" \
+            || strings "$so" 2>/dev/null | grep -Fq -- "$sym"; then
+            bad="$sym"
+            break
+        fi
+    done
+    if [ -n "$bad" ]; then
+        fail "L10: host-only symbol '$bad' found in $so — host code leaked into the mobile build"
+    fi
+    ok "L10: no host-only symbols (portable_pty, TokioChildProcess, BashTool, ratatui) in $so"
 }
-# run_l10_symbol_check "$apk" "$mobile_root"   # ← wired in by L10
+run_l10_symbol_check "$apk"
 
 echo "✅ smoke: all checks passed — $apk ($kind)"
 exit 0
