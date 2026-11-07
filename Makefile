@@ -152,7 +152,7 @@ MOBILE_ANDROID_TARGET_VOL  := peakbot-mobile-android-target
 
 ## mobile-android: Build the PeakBot Mobile Android APK (M7). Runs
 ##                 mobile/scripts/build-android.sh INSIDE the toolchain
-##                 container (worktree at /w): web/dist (if absent) →
+##                 container (worktree at /w): web/dist (always rebuilt) →
 ##                 npm ci → `npm run tauri -- android build --apk
 ##                 --target aarch64 --ci -- --locked` → smoke (M8).
 ##                 Release signing: ANDROID_KEYSTORE_B64 +

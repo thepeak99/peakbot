@@ -43,13 +43,12 @@ VERSION=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
     || { echo "❌ could not read version from mobile/src-tauri/tauri.conf.json" >&2; exit 1; }
 echo "📱 PeakBot Mobile $VERSION (Android arm64)"
 
-# 1. The Local core embeds the SPA from web/dist — build it if absent
-#    (the `make web` equivalent; restore the tracked .gitkeep Vite wipes).
-if [ ! -f "$root/web/dist/index.html" ]; then
-    echo "🕸️  web/dist missing — building the SPA (make web equivalent)..."
-    (cd "$root/web" && npm ci --no-audit --no-fund && npm run build)
-    touch "$root/web/dist/.gitkeep"
-fi
+# 1. The Local core embeds the SPA from web/dist, so it must match web/src:
+#    ALWAYS build it (a "build if absent" check silently shipped a stale SPA).
+#    This is the `make web` equivalent; restore the tracked .gitkeep Vite wipes.
+echo "🕸️  building the SPA (make web equivalent)..."
+(cd "$root/web" && npm ci --no-audit --no-fund && npm run build)
+touch "$root/web/dist/.gitkeep"
 
 # 2. D6: the CLI is a devDependency in mobile/package.json — always go
 #    through `npm run tauri --`, never a global tauri.
