@@ -1,0 +1,470 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		09EDDD2907A15909B7400EA4 /* assets in Resources */ = {isa = PBXBuildFile; fileRef = A69497BA17AA7C9B2EC09619 /* assets */; };
+		14DB94ECD903C6DA654A3202 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = A1E8E67DB20ABB94CD7CC98E /* LaunchScreen.storyboard */; };
+		67C4E01B2F8715120E2EACBB /* MetalKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BFE8F65EB0CBC5530192CB77 /* MetalKit.framework */; };
+		9D0CC8D4D21A5E4B4BC3527D /* main.mm in Sources */ = {isa = PBXBuildFile; fileRef = DC5610CC867A355843CCD16B /* main.mm */; };
+		BBF82DAEC7563F28C2206A5B /* libapp.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 16D5C16E3DA30396D955E97E /* libapp.a */; };
+		BFE1F784FBDF94E6B471EC45 /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 339236822C7A4E394D22C236 /* UIKit.framework */; };
+		C3AAF4AAE7186633C1E5B2D6 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 4B17348D50E7D3E2D93A7413 /* Assets.xcassets */; };
+		CD6A2361668E6CFA1493B359 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 726C950A5B1F815FD848410B /* CoreGraphics.framework */; };
+		D7A0612922C79FBF5AEBA83E /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 51656C006BF3F6C15D2A13D1 /* QuartzCore.framework */; };
+		DA39A7CCD62D9A6DCFDDA25C /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3DC71436A3FB33826B974218 /* WebKit.framework */; };
+		E63961BB92C30FAACA201902 /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D1FFC82EA4763C985BCB3150 /* Security.framework */; };
+		F4F1CECD88D9DB0E261A2A86 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = CC988C045137A8AF116AA779 /* Metal.framework */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		03E100122D3F09D5691A1F80 /* lib.rs */ = {isa = PBXFileReference; path = lib.rs; sourceTree = "<group>"; };
+		16D5C16E3DA30396D955E97E /* libapp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libapp.a; sourceTree = "<group>"; };
+		1F55ED30134AD314AF0F8FF3 /* peakbot-mobile_iOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "peakbot-mobile_iOS.entitlements"; sourceTree = "<group>"; };
+		25EB5E705665793E66E405AD /* nav.rs */ = {isa = PBXFileReference; path = nav.rs; sourceTree = "<group>"; };
+		339236822C7A4E394D22C236 /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
+		3B87542A2AD7F09605117914 /* bindings.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = bindings.h; sourceTree = "<group>"; };
+		3DC71436A3FB33826B974218 /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
+		4B17348D50E7D3E2D93A7413 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		51656C006BF3F6C15D2A13D1 /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
+		5CC1D1FEBC9CDFFAF47639D4 /* link.rs */ = {isa = PBXFileReference; path = link.rs; sourceTree = "<group>"; };
+		6B7BE45375AD19A274374173 /* local.rs */ = {isa = PBXFileReference; path = local.rs; sourceTree = "<group>"; };
+		6C759A7008CA4BA1AAF23934 /* main.rs */ = {isa = PBXFileReference; path = main.rs; sourceTree = "<group>"; };
+		726C950A5B1F815FD848410B /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
+		A1E8E67DB20ABB94CD7CC98E /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
+		A69497BA17AA7C9B2EC09619 /* assets */ = {isa = PBXFileReference; lastKnownFileType = folder; path = assets; sourceTree = SOURCE_ROOT; };
+		BFE8F65EB0CBC5530192CB77 /* MetalKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalKit.framework; path = System/Library/Frameworks/MetalKit.framework; sourceTree = SDKROOT; };
+		CC988C045137A8AF116AA779 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
+		D1FFC82EA4763C985BCB3150 /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
+		DC5610CC867A355843CCD16B /* main.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = main.mm; sourceTree = "<group>"; };
+		F077D6AAEDFA57C07EC8C3A4 /* peakbot-mobile_iOS.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = "peakbot-mobile_iOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		F2FB31FD8C9FBCD3C6F81D58 /* profiles.rs */ = {isa = PBXFileReference; path = profiles.rs; sourceTree = "<group>"; };
+		FB152B59C8CD5E61051B29DE /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		D3AB468A64C5C113ADCA3484 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				BBF82DAEC7563F28C2206A5B /* libapp.a in Frameworks */,
+				CD6A2361668E6CFA1493B359 /* CoreGraphics.framework in Frameworks */,
+				F4F1CECD88D9DB0E261A2A86 /* Metal.framework in Frameworks */,
+				67C4E01B2F8715120E2EACBB /* MetalKit.framework in Frameworks */,
+				D7A0612922C79FBF5AEBA83E /* QuartzCore.framework in Frameworks */,
+				E63961BB92C30FAACA201902 /* Security.framework in Frameworks */,
+				BFE1F784FBDF94E6B471EC45 /* UIKit.framework in Frameworks */,
+				DA39A7CCD62D9A6DCFDDA25C /* WebKit.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		0F8E1F35456E57155A3A7558 /* peakbot-mobile */ = {
+			isa = PBXGroup;
+			children = (
+				DC5610CC867A355843CCD16B /* main.mm */,
+				553F3464EBA2A9E4A88472BF /* bindings */,
+			);
+			path = "peakbot-mobile";
+			sourceTree = "<group>";
+		};
+		27B1032A58A059AB7E5CF42C /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				726C950A5B1F815FD848410B /* CoreGraphics.framework */,
+				16D5C16E3DA30396D955E97E /* libapp.a */,
+				CC988C045137A8AF116AA779 /* Metal.framework */,
+				BFE8F65EB0CBC5530192CB77 /* MetalKit.framework */,
+				51656C006BF3F6C15D2A13D1 /* QuartzCore.framework */,
+				D1FFC82EA4763C985BCB3150 /* Security.framework */,
+				339236822C7A4E394D22C236 /* UIKit.framework */,
+				3DC71436A3FB33826B974218 /* WebKit.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		2F66DA80CFBBDDB44337DF71 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				F077D6AAEDFA57C07EC8C3A4 /* peakbot-mobile_iOS.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		38732194E73E8634BD8E2B0F /* peakbot-mobile_iOS */ = {
+			isa = PBXGroup;
+			children = (
+				FB152B59C8CD5E61051B29DE /* Info.plist */,
+				1F55ED30134AD314AF0F8FF3 /* peakbot-mobile_iOS.entitlements */,
+			);
+			path = "peakbot-mobile_iOS";
+			sourceTree = "<group>";
+		};
+		3E9DF5A7F2B5CCF34A7B5F55 /* src */ = {
+			isa = PBXGroup;
+			children = (
+				03E100122D3F09D5691A1F80 /* lib.rs */,
+				5CC1D1FEBC9CDFFAF47639D4 /* link.rs */,
+				6B7BE45375AD19A274374173 /* local.rs */,
+				6C759A7008CA4BA1AAF23934 /* main.rs */,
+				25EB5E705665793E66E405AD /* nav.rs */,
+				F2FB31FD8C9FBCD3C6F81D58 /* profiles.rs */,
+			);
+			name = src;
+			path = ../../src;
+			sourceTree = "<group>";
+		};
+		553F3464EBA2A9E4A88472BF /* bindings */ = {
+			isa = PBXGroup;
+			children = (
+				3B87542A2AD7F09605117914 /* bindings.h */,
+			);
+			path = bindings;
+			sourceTree = "<group>";
+		};
+		626E7DAA6A0DF60C889E8F4F /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				0F8E1F35456E57155A3A7558 /* peakbot-mobile */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+		EA25212438CE85B6B394CC03 = {
+			isa = PBXGroup;
+			children = (
+				A69497BA17AA7C9B2EC09619 /* assets */,
+				4B17348D50E7D3E2D93A7413 /* Assets.xcassets */,
+				A1E8E67DB20ABB94CD7CC98E /* LaunchScreen.storyboard */,
+				F4A974660901B3DA5019824A /* Externals */,
+				38732194E73E8634BD8E2B0F /* peakbot-mobile_iOS */,
+				626E7DAA6A0DF60C889E8F4F /* Sources */,
+				3E9DF5A7F2B5CCF34A7B5F55 /* src */,
+				27B1032A58A059AB7E5CF42C /* Frameworks */,
+				2F66DA80CFBBDDB44337DF71 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		F4A974660901B3DA5019824A /* Externals */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			path = Externals;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		D80E2E44D700AF8F08406834 /* peakbot-mobile_iOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 1B19AB3DED0B2F41492C51F9 /* Build configuration list for PBXNativeTarget "peakbot-mobile_iOS" */;
+			buildPhases = (
+				5516E77AA3280051EA6B6A70 /* Build Rust Code */,
+				536B92868DA77FC61E9A04E6 /* Sources */,
+				D3B297D7CE4D3C94841FD200 /* Resources */,
+				D3AB468A64C5C113ADCA3484 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = "peakbot-mobile_iOS";
+			packageProductDependencies = (
+			);
+			productName = "peakbot-mobile_iOS";
+			productReference = F077D6AAEDFA57C07EC8C3A4 /* peakbot-mobile_iOS.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		C31F05A1CDDB1486E27889DF /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+				};
+			};
+			buildConfigurationList = E4E4A6399C4C972C29EF891E /* Build configuration list for PBXProject "peakbot-mobile" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = EA25212438CE85B6B394CC03;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 2F66DA80CFBBDDB44337DF71 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				D80E2E44D700AF8F08406834 /* peakbot-mobile_iOS */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		D3B297D7CE4D3C94841FD200 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				C3AAF4AAE7186633C1E5B2D6 /* Assets.xcassets in Resources */,
+				14DB94ECD903C6DA654A3202 /* LaunchScreen.storyboard in Resources */,
+				09EDDD2907A15909B7400EA4 /* assets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		5516E77AA3280051EA6B6A70 /* Build Rust Code */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build Rust Code";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(SRCROOT)/Externals/x86_64/${CONFIGURATION}/libapp.a",
+				"$(SRCROOT)/Externals/arm64/${CONFIGURATION}/libapp.a",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "npm run -- tauri ios xcode-script -v --platform \"${PLATFORM_DISPLAY_NAME:?}\" --sdk-root \"${SDKROOT:?}\" --framework-search-paths \"${FRAMEWORK_SEARCH_PATHS:?}\" --header-search-paths \"${HEADER_SEARCH_PATHS:?}\" --gcc-preprocessor-definitions \"${GCC_PREPROCESSOR_DEFINITIONS:-}\" --configuration \"${CONFIGURATION:?}\" ${FORCE_COLOR} ${ARCHS:?}\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		536B92868DA77FC61E9A04E6 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				9D0CC8D4D21A5E4B4BC3527D /* main.mm in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		2A7C404C16E78CC73C79EFC4 /* release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+			};
+			name = release;
+		};
+		3478F0B6EEE655DF4B2BEFB5 /* release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
+				ARCHS = (
+					arm64,
+					x86_64,
+				);
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = "peakbot-mobile_iOS/peakbot-mobile_iOS.entitlements";
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				ENABLE_BITCODE = NO;
+				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\".\"",
+				);
+				INFOPLIST_FILE = "peakbot-mobile_iOS/Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"LIBRARY_SEARCH_PATHS[arch=arm64]" = "$(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
+				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = sh.shifu.mobile;
+				PRODUCT_NAME = "PeakBot";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALID_ARCHS = "arm64  x86_64";
+			};
+			name = release;
+		};
+		A4C90804605DAF79D83B8808 /* debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = debug;
+		};
+		F802A5B6322348872BE60BAA /* debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
+				ARCHS = (
+					arm64,
+					x86_64,
+				);
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = "peakbot-mobile_iOS/peakbot-mobile_iOS.entitlements";
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				ENABLE_BITCODE = NO;
+				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\".\"",
+				);
+				INFOPLIST_FILE = "peakbot-mobile_iOS/Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"LIBRARY_SEARCH_PATHS[arch=arm64]" = "$(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
+				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = sh.shifu.mobile;
+				PRODUCT_NAME = "PeakBot";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALID_ARCHS = "arm64  x86_64";
+			};
+			name = debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		1B19AB3DED0B2F41492C51F9 /* Build configuration list for PBXNativeTarget "peakbot-mobile_iOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F802A5B6322348872BE60BAA /* debug */,
+				3478F0B6EEE655DF4B2BEFB5 /* release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = debug;
+		};
+		E4E4A6399C4C972C29EF891E /* Build configuration list for PBXProject "peakbot-mobile" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A4C90804605DAF79D83B8808 /* debug */,
+				2A7C404C16E78CC73C79EFC4 /* release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = C31F05A1CDDB1486E27889DF /* Project object */;
+}
