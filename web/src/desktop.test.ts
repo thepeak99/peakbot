@@ -28,36 +28,6 @@ afterEach(() => {
   delete g.isTauri;
 });
 
-describe("isDesktop", () => {
-  it("returns true when window.isTauri is exactly true", () => {
-    g.isTauri = true;
-    expect(isDesktop()).toBe(true);
-  });
-
-  it("returns false in a browser (isTauri absent)", () => {
-    // No property set at all — the normal browser case.
-    expect(isDesktop()).toBe(false);
-  });
-
-  it("returns false when isTauri is false", () => {
-    g.isTauri = false;
-    expect(isDesktop()).toBe(false);
-  });
-
-  // The comparison must be strict `=== true`, not truthiness: any other
-  // value (a string, a number, an object) is not Tauri's signal.
-  it.each([
-    ["the string 'true'", "true"],
-    ["the number 1", 1],
-    ["an object", {}],
-    ["null", null],
-    ["undefined (explicit)", undefined],
-  ] as const)("returns false when isTauri is %s", (_label, value) => {
-    g.isTauri = value;
-    expect(isDesktop()).toBe(false);
-  });
-});
-
 // ── shell seam (mobile plan §2.5, task F1) ───────────────────────────────
 // `shell()` reads `window.peakbotShell` — the marker the shell's init
 // script injects: exactly "desktop" or "mobile". Anything else — missing,

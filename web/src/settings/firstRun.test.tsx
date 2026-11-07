@@ -118,7 +118,7 @@ afterEach(() => {
     root = undefined;
   }
   vi.unstubAllGlobals();
-  delete (globalThis as { isTauri?: unknown }).isTauri;
+  delete (globalThis as { peakbotShell?: unknown }).peakbotShell;
   window.history.replaceState(null, "", "/");
 });
 
@@ -807,7 +807,7 @@ describe("FirstRun — Review + Finish (spec §9.13 steps 5–6)", () => {
   });
 
   it("desktop_finish_navigates_restart_sentinel", async () => {
-    (globalThis as { isTauri?: unknown }).isTauri = true;
+    (globalThis as { peakbotShell?: unknown }).peakbotShell = "desktop";
     const calls = stubApi();
     // jsdom cannot navigate to a custom scheme: record the assignment.
     const loc = { href: "http://localhost/", pathname: "/", search: "" };

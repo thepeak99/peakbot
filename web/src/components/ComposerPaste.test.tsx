@@ -408,14 +408,14 @@ describe("Composer paste — Linux desktop clipboard fallback (WebKit Bug 218519
   const flush = () => act(async () => {});
 
   beforeEach(() => {
-    (globalThis as { isTauri?: unknown }).isTauri = true;
+    (globalThis as { peakbotShell?: unknown }).peakbotShell = "desktop";
     invoke = vi.fn(async () => new Uint8Array([1, 2, 3]).buffer);
     (globalThis as { __TAURI__?: unknown }).__TAURI__ = { core: { invoke } };
     uaSpy = vi.spyOn(navigator, "userAgent", "get").mockReturnValue(WEBKITGTK_UA);
   });
 
   afterEach(() => {
-    delete (globalThis as { isTauri?: unknown }).isTauri;
+    delete (globalThis as { peakbotShell?: unknown }).peakbotShell;
     delete (globalThis as { __TAURI__?: unknown }).__TAURI__;
     vi.restoreAllMocks();
   });
@@ -490,7 +490,7 @@ describe("Composer paste — Linux desktop clipboard fallback (WebKit Bug 218519
   });
 
   it("in a browser an empty paste never asks the app", async () => {
-    delete (globalThis as { isTauri?: unknown }).isTauri;
+    delete (globalThis as { peakbotShell?: unknown }).peakbotShell;
     const add = vi.fn();
     const ta = await mountComposer(add);
 

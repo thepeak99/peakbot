@@ -7,8 +7,8 @@
 //   export const POLL_MS = 30_000    // export the poll interval constant
 //
 // Behaviour under test (all IPC goes through the desktop.ts seam; this file
-// stubs `globalThis.__TAURI__.core.invoke` and `globalThis.isTauri`):
-//   - not desktop (`isTauri !== true`) → renders nothing, ZERO invoke calls,
+// stubs `globalThis.__TAURI__.core.invoke` and `globalThis.peakbotShell`):
+//   - not desktop (`peakbotShell !== "desktop"`) → renders nothing, ZERO invoke calls,
 //     even after 60s of fake time.
 //   - update_status → null → renders nothing (polling keeps running).
 //   - available → text "Update available — v{version}" (the dash is U+2014)
@@ -44,7 +44,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { POLL_MS, UpdateBanner } from "./UpdateBanner";
 
 type TauriGlobal = {
-  isTauri?: unknown;
+  peakbotShell?: unknown;
   __TAURI__?: { core?: { invoke?: unknown } };
 };
 const g = globalThis as TauriGlobal;
@@ -63,7 +63,7 @@ let root: Root | null = null;
 let invoke: ReturnType<typeof vi.fn>;
 
 interface MountOpts {
-  /** false → `isTauri` stays unset (browser); the IPC stub is still
+  /** false → `peakbotShell` stays unset (browser); the IPC stub is still
    *  installed so we can assert ZERO calls. Default: true. */
   desktop?: boolean;
   /** Queue of `update_status` results; the last entry repeats.
@@ -90,7 +90,7 @@ async function mountDesktop(opts: MountOpts = {}): Promise<HTMLDivElement> {
     }
     return undefined;
   });
-  if (opts.desktop !== false) g.isTauri = true;
+  if (opts.desktop !== false) g.peakbotShell = "desktop";
   g.__TAURI__ = { core: { invoke } };
 
   container = document.createElement("div");
@@ -110,7 +110,7 @@ afterEach(() => {
   container?.remove();
   container = null;
   delete g.__TAURI__;
-  delete g.isTauri;
+  delete g.peakbotShell;
   vi.useRealTimers();
 });
 

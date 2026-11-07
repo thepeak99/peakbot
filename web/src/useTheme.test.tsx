@@ -40,7 +40,7 @@ afterEach(() => {
   }
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
-  delete (globalThis as { isTauri?: unknown }).isTauri;
+  delete (globalThis as { peakbotShell?: unknown }).peakbotShell;
   delete (globalThis as { __TAURI__?: unknown }).__TAURI__;
   localStorage.clear();
 });
@@ -104,7 +104,7 @@ function Probe() {
 
 describe("useTheme desktop reporting", () => {
   it("reports the initial theme on mount and the new theme after toggle", async () => {
-    (globalThis as { isTauri?: unknown }).isTauri = true;
+    (globalThis as { peakbotShell?: unknown }).peakbotShell = "desktop";
     const invoke = stubInvoke();
     stubMatchMedia(false); // no stored theme, OS dark ⇒ initial "dark"
 
@@ -124,7 +124,7 @@ describe("useTheme desktop reporting", () => {
   });
 
   it("respects a stored theme before falling back to the OS preference", async () => {
-    (globalThis as { isTauri?: unknown }).isTauri = true;
+    (globalThis as { peakbotShell?: unknown }).peakbotShell = "desktop";
     const invoke = stubInvoke();
     stubMatchMedia(false); // OS dark — must LOSE to the stored light theme
     localStorage.setItem("peakbot-theme", "light");
@@ -153,7 +153,7 @@ describe("useTheme desktop reporting", () => {
 
   it("a rejecting theme_set stub raises no unhandled error", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
-    (globalThis as { isTauri?: unknown }).isTauri = true;
+    (globalThis as { peakbotShell?: unknown }).peakbotShell = "desktop";
     const invoke = vi.fn(async () => {
       throw new Error("ipc down");
     });

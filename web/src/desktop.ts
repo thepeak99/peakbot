@@ -1,11 +1,25 @@
 import type { Theme } from "./useTheme";
 
-// The single desktop-detection seam. Tauri sets `window.isTauri = true` itself
-// (main-frame init script, every origin), so a strict comparison is the whole
-// check — no UA sniffing, no `__TAURI__`, no IPC.
+// The single shell-detection seam. Both Tauri shells (desktop `window.rs`,
+// mobile `src-tauri/lib.rs`) inject `window.peakbotShell = "desktop" | "mobile"`
+// via a main-frame init script on every origin. Read with a strict comparison
+// — never `window.isTauri` (old shells set it without the marker), no UA
+// sniffing, no IPC. Missing or any other value is the fail-safe "browser" (SH1).
+declare global {
+  interface Window {
+    peakbotShell?: "desktop" | "mobile";
+  }
+}
+
+export type Shell = "desktop" | "mobile" | "browser";
+
+export function shell(): Shell {
+  const marker = (globalThis as { peakbotShell?: unknown }).peakbotShell;
+  return marker === "desktop" || marker === "mobile" ? marker : "browser";
+}
 
 export function isDesktop(): boolean {
-  return (globalThis as { isTauri?: unknown }).isTauri === true;
+  return shell() === "desktop";
 }
 
 // ── desktop IPC seam ─────────────────────────────────────────────────────
