@@ -329,11 +329,51 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
         </div>
         <span className="text-[11px] text-zinc-600">Esc to close</span>
       </header>
+      {/* F3 (S8): below the sm breakpoint the side rail collapses to a top
+          stepper so the wizard fits ≤ 412 CSS px (360/412 phone frames)
+          with "Next"/"Finish" always in the footer and no horizontal
+          overflow. */}
+      <div
+        data-testid="firstrun-stepper"
+        className="flex flex-wrap items-center gap-1.5 border-b border-zinc-800 bg-zinc-900/40 px-4 py-1.5 sm:hidden"
+      >
+        {STEPS.map((s, i) => {
+          const isHere = s.name === step;
+          const isVisited = visited.has(s.name);
+          const stepOk =
+            s.name === "provider" ? providerErrors.length === 0 :
+            s.name === "web" ? webErrors.length === 0 : true;
+          const dot = !isVisited
+            ? "border border-zinc-600"
+            : isHere
+              ? stepOk ? "bg-emerald-400" : "bg-red-400"
+              : stepOk ? "bg-emerald-600" : "bg-red-500";
+          return (
+            <button
+              key={s.name}
+              data-testid={`firstrun-stepper-${s.name}`}
+              type="button"
+              disabled={!isVisited}
+              onClick={() => goTo(s.name)}
+              className={`flex cursor-pointer items-center gap-1 rounded bg-zinc-900/60 px-2 py-0.5 text-[10px] text-zinc-300 transition-colors ${
+                isHere ? "bg-zinc-800 text-zinc-100" : "hover:bg-zinc-900"
+              } disabled:cursor-default disabled:opacity-40`}
+            >
+              <span
+                className={`h-1.5 w-1.5 shrink-0 rounded-full ${dot}`}
+                aria-hidden
+              />
+              {i + 1}. {s.title}
+            </button>
+          );
+        })}
+      </div>
 
       <div className="flex min-h-0 flex-1">
         {/* Left rail: numbered steps with status dots. Later steps are
-            disabled until visited. */}
-        <nav className="w-56 shrink-0 overflow-y-auto border-r border-zinc-800 p-4">
+            disabled until visited. Collapses to a top stepper below the
+            sm breakpoint (F3, ≤ 412 CSS px on phones). */}
+        <nav className="hidden w-56 shrink-0 overflow-y-auto border-r border-zinc-800 p-4 sm:block">
           <div className="mb-2 text-[10px] uppercase tracking-wide text-zinc-600">Setup</div>
           {STEPS.map((s, i) => {
             const isHere = s.name === step;
