@@ -85,7 +85,8 @@ const TOKEN: &str = "l3-contract-token";
 /// with text containing this marker.
 const MOCK_REPLY: &str = "MOCK_REPLY";
 
-type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 fn client() -> reqwest::Client {
     reqwest::Client::builder()
@@ -230,8 +231,7 @@ async fn local_core_contract() {
     // ── Scenario B: a valid mock config ⇒ a full chat turn over /ws ───────
     // Write the mock-provider config, re-boot, and drive a complete chat turn
     // (the S15/S16 regression: this used to 1006).
-    std::fs::write(config_root.join("config.yaml"), MOCK_CONFIG)
-        .expect("write mock config");
+    std::fs::write(config_root.join("config.yaml"), MOCK_CONFIG).expect("write mock config");
     let core = LocalCore::boot(TOKEN.to_string())
         .await
         .expect("boot with the mock config");

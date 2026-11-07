@@ -149,7 +149,8 @@ fn memory_section_present_iff_memory_enabled_and_file_create_registered() {
         );
 
         // The rule under test: section present iff enabled ∧ registered.
-        let prompt = build_agent_prompt(agent, &profile, &skills, None::<ShellKind>, Path::new(CWD));
+        let prompt =
+            build_agent_prompt(agent, &profile, &skills, None::<ShellKind>, Path::new(CWD));
         let present = prompt.contains(MEMORY_MARKER);
         assert_eq!(
             present,

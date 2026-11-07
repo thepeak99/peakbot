@@ -68,11 +68,14 @@
 use std::collections::HashMap;
 
 use peakbot::config::FetchUrlConfig;
-use peakbot::tools::fetch_url::{validate_headers, FetchUrlArgs, FetchUrlError, FetchUrlTool};
+use peakbot::tools::fetch_url::{FetchUrlArgs, FetchUrlError, FetchUrlTool, validate_headers};
 use rig_core::tool::Tool;
 
 fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-    pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
 }
 
 fn args(value: serde_json::Value) -> FetchUrlArgs {
@@ -101,15 +104,17 @@ fn validate_headers_empty_map_is_ok() {
 
 #[test]
 fn validate_headers_twenty_is_ok() {
-    let pairs: Vec<(String, String)> =
-        (0..20).map(|i| (format!("X-H{i:02}"), "v".to_string())).collect();
+    let pairs: Vec<(String, String)> = (0..20)
+        .map(|i| (format!("X-H{i:02}"), "v".to_string()))
+        .collect();
     assert_accepted(&pairs.into_iter().collect());
 }
 
 #[test]
 fn validate_headers_twenty_one_is_rejected_with_count_message() {
-    let pairs: Vec<(String, String)> =
-        (0..21).map(|i| (format!("X-H{i:02}"), "v".to_string())).collect();
+    let pairs: Vec<(String, String)> = (0..21)
+        .map(|i| (format!("X-H{i:02}"), "v".to_string()))
+        .collect();
     assert_rejected(
         &pairs.into_iter().collect(),
         "headers: at most 20 headers are allowed (got 21)",
@@ -185,8 +190,9 @@ fn validate_headers_forbidden_names_are_rejected_case_insensitively() {
 #[test]
 fn validate_headers_count_is_checked_before_per_header_rules() {
     // 21 headers, one of them forbidden → the COUNT error wins.
-    let mut pairs: Vec<(String, String)> =
-        (0..20).map(|i| (format!("X-H{i:02}"), "v".to_string())).collect();
+    let mut pairs: Vec<(String, String)> = (0..20)
+        .map(|i| (format!("X-H{i:02}"), "v".to_string()))
+        .collect();
     pairs.push(("Host".to_string(), "v".to_string()));
     assert_rejected(
         &pairs.into_iter().collect(),
@@ -242,13 +248,14 @@ async fn call_rejects_over_limit_headers_before_any_network_io() {
         headers.insert(format!("X-H{i:02}"), serde_json::json!("v"));
     }
     let err = tool
-        .call(args(serde_json::json!({ "url": "http://127.0.0.1:9/x", "headers": headers })))
+        .call(args(
+            serde_json::json!({ "url": "http://127.0.0.1:9/x", "headers": headers }),
+        ))
         .await
         .expect_err("21 headers must be refused before any request is sent");
     match err {
         FetchUrlError::InvalidArgs(msg) => assert_eq!(
-            msg,
-            "headers: at most 20 headers are allowed (got 21)",
+            msg, "headers: at most 20 headers are allowed (got 21)",
             "the tool-result text is the exact validation message"
         ),
         other => panic!("expected InvalidArgs, got: {other:?}"),
@@ -286,8 +293,7 @@ async fn call_rejects_oversized_header_value_before_any_network_io() {
         .expect_err("an 8193-byte value must be refused before any request");
     match err {
         FetchUrlError::InvalidArgs(msg) => assert_eq!(
-            msg,
-            "headers: header value for 'X-Big' is 8193 bytes; the limit is 8192",
+            msg, "headers: header value for 'X-Big' is 8193 bytes; the limit is 8192",
             "the tool-result text is the exact validation message"
         ),
         other => panic!("expected InvalidArgs, got: {other:?}"),
@@ -375,7 +381,8 @@ async fn loopback_once() -> (String, tokio::sync::oneshot::Receiver<(String, Str
 fn header_value(headers: &str, name: &str) -> Option<String> {
     headers.lines().find_map(|line| {
         let (n, v) = line.split_once(':')?;
-        n.trim().eq_ignore_ascii_case(name)
+        n.trim()
+            .eq_ignore_ascii_case(name)
             .then(|| v.trim().to_string())
     })
 }
@@ -474,13 +481,12 @@ async fn definition(allow_post: bool) -> rig_core::completion::ToolDefinition {
 }
 
 fn assert_headers_property(def: &rig_core::completion::ToolDefinition, allow_post: bool) {
-    let props = def
-        .parameters["properties"]
+    let props = def.parameters["properties"]
         .as_object()
         .unwrap_or_else(|| panic!("allow_post={allow_post}: missing properties object"));
-    let headers = props.get("headers").unwrap_or_else(|| {
-        panic!("allow_post={allow_post}: the `headers` parameter is missing")
-    });
+    let headers = props
+        .get("headers")
+        .unwrap_or_else(|| panic!("allow_post={allow_post}: the `headers` parameter is missing"));
     assert_eq!(headers["type"], "object", "headers is a JSON object");
     assert_eq!(
         headers["additionalProperties"],
@@ -531,10 +537,16 @@ async fn definition_json(allow_post: bool) -> serde_json::Value {
 
 #[tokio::test]
 async fn fetch_url_definition_snapshot_allow_post_true() {
-    insta::assert_json_snapshot!("fetch_url_definition_allow_post_true", definition_json(true).await);
+    insta::assert_json_snapshot!(
+        "fetch_url_definition_allow_post_true",
+        definition_json(true).await
+    );
 }
 
 #[tokio::test]
 async fn fetch_url_definition_snapshot_allow_post_false() {
-    insta::assert_json_snapshot!("fetch_url_definition_allow_post_false", definition_json(false).await);
+    insta::assert_json_snapshot!(
+        "fetch_url_definition_allow_post_false",
+        definition_json(false).await
+    );
 }
