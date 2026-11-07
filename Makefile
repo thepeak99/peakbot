@@ -2,6 +2,7 @@
         web dev \
         desktop-test desktop-test-windows desktop-fonttest desktop-dev desktop-linux desktop-macos desktop-windows desktop \
         desktop-updater \
+        mobile-android-image \
         release release-check release-bump release-tag \
         release-build-linux release-build-windows release-build-macos release-build-android \
         release-publish release-publish-shifu release-publish-github
@@ -123,6 +124,20 @@ $(OUTPUT_DIR)/$(ANDROID_BIN): Dockerfile.android
 	@chmod +x $(OUTPUT_DIR)/$(ANDROID_BIN)
 	@echo "✅ Built: $(OUTPUT_DIR)/$(ANDROID_BIN)"
 	@ls -lh $(OUTPUT_DIR)/$(ANDROID_BIN)
+
+## mobile-android-image: Build the PeakBot Mobile Android toolchain image
+##                       (Dockerfile.mobile-android, `toolchain` stage): JDK 17,
+##                       SDK platforms 36+37, build-tools 36.0.0, NDK r28c,
+##                       Rust 1.95 + both Android targets, cargo-ndk 4.1.2, Node 22.
+##                       The APK build stage (M7) is added on top of it.
+mobile-android-image:
+	@echo "📱 Building the PeakBot Mobile Android toolchain image..."
+	$(CONTAINER_BUILDER) build \
+		--target toolchain \
+		-t localhost/peakbot-mobile-android:toolchain \
+		-f Dockerfile.mobile-android \
+		.
+	@echo "✅ localhost/peakbot-mobile-android:toolchain"
 
 ## web: Build the web UI (web/dist/) — required for bare `peakbot` to serve the real SPA.
 ##        CI and Docker builds run the Node stage automatically; this is for local dev.
