@@ -130,3 +130,49 @@ jobs:
           apt-get install -y --no-install-recommends jq zip
           sh desktop/scripts/test-updater-manifest.sh
           sh desktop/scripts/test-assemble-app-tarball.sh
+
+  # Local edition on the real Android target: the `peakbot` lib without the
+  # `host` feature, cross-checked for arm64-v8a inside the mobile toolchain
+  # image (Dockerfile.mobile-android, `toolchain` stage).
+  #
+  # Runs on the Alpine host like release.yml — the `ci`/`desktop` jobs use a
+  # job-level `container:` (rust:1.95), which has no docker CLI or daemon
+  # access and cannot build/run containers. Here the host docker (the dind
+  # runner ships it) does both.
+  local-android:
+    name: local-android (NDK check of the Local edition)
+    runs-on: dind
+    timeout-minutes: 60
+
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout (no-node, pure git)
+        run: |
+          git init -q
+          git fetch --depth=1 \
+            "https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git" \
+            "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+      - name: Check required tools
+        run: |
+          for t in docker git; do
+            command -v "$t" >/dev/null || { echo "missing tool on runner: $t (add it to the runner image)"; exit 1; }
+          done
+      # BuildKit (docker 27 default) caches the image layers across runs; the
+      # `--mount=type=cache` in the Dockerfile keeps the cargo registry warm
+      # across image rebuilds.
+      - name: Build the toolchain image (BuildKit-cached)
+        run: docker build --target toolchain -t localhost/peakbot-mobile-android:toolchain .
+      # Named volumes keep the crate registry and the target dir warm between
+      # PRs (fresh per run otherwise); the worktree is bind-mounted, so no
+      # source is baked into the image.
+      - name: cargo ndk check (Local edition, arm64-v8a)
+        run: |
+          docker run --rm \
+            -v "$PWD":/work -w /work \
+            -v pbm-cargo-reg:/opt/cargo/registry \
+            -v pbm-cargo-target:/work/target \
+            localhost/peakbot-mobile-android:toolchain \
+            cargo ndk -t arm64-v8a check --locked -p peakbot --lib --no-default-features
