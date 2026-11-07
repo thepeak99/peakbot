@@ -72,7 +72,7 @@ pub enum State {
 
 /// One input to the state machine. `CheckDone`/`Installing`/
 /// `InstallOutcome` are fed back by the loop after a `RunCheck`/
-/// `RunInstall` effect; `Click`/`Install` come from the tray/banner.
+/// `RunInstall` effect; `Install` comes from the banner (`Click` is legacy).
 pub enum Event {
     Check { manual: bool },
     Click,
@@ -97,6 +97,7 @@ pub enum Dialog {
     UpToDate,
     CheckFailed(String),
     InstallFailed(String),
+    UpdateAvailable(Version),
 }
 
 /// What the loop must do after a `step` (run inline on the loop
@@ -140,8 +141,13 @@ pub fn step(s: &State, e: Event) -> (State, Effect) {
                 Effect::None,
             )
         }
-        (State::Checking { .. }, Event::CheckDone(Ok(Some(v)))) => {
-            (State::Available(v), Effect::None)
+        (State::Checking { manual, .. }, Event::CheckDone(Ok(Some(v)))) => {
+            let effect = if *manual {
+                Effect::Notify(Dialog::UpdateAvailable(v.clone()))
+            } else {
+                Effect::None
+            };
+            (State::Available(v), effect)
         }
         (State::Checking { manual, .. }, Event::CheckDone(Ok(None))) => {
             let effect = if *manual {
@@ -170,8 +176,8 @@ pub fn step(s: &State, e: Event) -> (State, Effect) {
             },
             Effect::RunCheck,
         ),
-        // Click = the tray item; Install = the web banner button. Both
-        // start the same download+install on Available/Failed.
+        // Installs come from the web banner's Install; the menu only sends
+        // Check, so Click is not sent by the app.
         (State::Available(v) | State::Failed(v), Event::Click | Event::Install) => {
             (State::Downloading(v.clone()), Effect::RunInstall)
         }
