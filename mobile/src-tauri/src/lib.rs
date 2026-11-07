@@ -14,6 +14,10 @@ pub fn run() {
         .expect("error while running PeakBot Mobile");
 }
 
+/// The single init script injected on every origin, both OSes (plan §2.3).
+/// Declares the mobile shell marker and shims `window.open` as a top-level
+/// navigation (I-D8) the nav guard can classify. Locked bytes — no trailing newline.
+pub const INIT_SCRIPT: &str = "Object.defineProperty(window,'peakbotShell',{value:'mobile'});\nwindow.open=function(u){if(u){location.href=new URL(String(u),location.href).href}return null};";
 // TESTER'S LOCK — Phase 2, lock 4 (RED until M4/M5 lands `INIT_SCRIPT`):
 // the init script is ONE const in lib.rs, injected on every origin, both
 // OSes (plan §2.3). The locked bytes are pinned below; M5 injects it via

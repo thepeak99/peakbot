@@ -44,6 +44,263 @@
 //! `last` ⇒ `Local`, dangling `last` parses as `Local`, the §2.3 example JSON
 //! round-trips, and persistence is tmp+rename (no temp litter).
 
+use serde::{Deserialize, Serialize};
+use serde::{
+    de::{self, Deserializer},
+    ser::{SerializeStruct, Serializer},
+};
+use std::fs::{self, File};
+use std::io::{self, Write};
+use std::path::Path;
+
+use crate::link::{LinkError, ServerLink};
+
+/// A stable, monotonically increasing, never-reused id for a remote profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RemoteId(pub u32);
+
+impl RemoteId {
+    pub fn new(id: u32) -> Self {
+        Self(id)
+    }
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// A remote's display name: trimmed, 1..=40 chars; defaults to `link.host_label()`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ProfileName(String);
+
+impl ProfileName {
+    /// Trim + validate; the default name is always a valid host label.
+    pub fn new(raw: &str) -> Result<Self, ProfileError> {
+        let trimmed = raw.trim();
+        let chars = trimmed.chars().count();
+        if !(1..=40).contains(&chars) {
+            return Err(ProfileError::BadName);
+        }
+        Ok(Self(trimmed.to_string()))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Errors from mutating the store.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ProfileError {
+    DuplicateServer,
+    BadName,
+    NoSuchProfile,
+    // Reserved for the "paste a raw link" path (M5); `add` always takes an
+    // already-validated `ServerLink`, so nothing here constructs it yet.
+    #[allow(dead_code)]
+    Link(LinkError),
+}
+
+/// Which profile is active: the Local edition, or a named remote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Active {
+    Local,
+    Remote(RemoteId),
+}
+
+impl Active {
+    pub fn is_local(&self) -> bool {
+        matches!(self, Active::Local)
+    }
+}
+
+impl Serialize for Active {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Active::Local => serializer.serialize_str("local"),
+            Active::Remote(id) => {
+                let mut s = serializer.serialize_struct("Remote", 1)?;
+                s.serialize_field("remote", &id.get())?;
+                s.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Active {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let v: serde_json::Value = serde_json::Value::deserialize(deserializer)?;
+        Ok(match v {
+            serde_json::Value::String(_) => Active::Local,
+            serde_json::Value::Object(m) => match m.get("remote").and_then(|n| n.as_u64()) {
+                Some(n) => Active::Remote(RemoteId::new(n as u32)),
+                None => Active::Local,
+            },
+            _ => Active::Local,
+        })
+    }
+}
+
+/// One paired remote server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Remote {
+    pub id: RemoteId,
+    pub name: ProfileName,
+    pub link: ServerLink,
+}
+
+impl Serialize for ServerLink {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.url().as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ServerLink {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw: String = String::deserialize(deserializer)?;
+        ServerLink::parse(&raw).map_err(de::Error::custom)
+    }
+}
+
+/// The store of paired remotes + active choice, persisted as `profiles.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Profiles {
+    pub remotes: Vec<Remote>,
+    pub last: Active,
+    pub next_id: u32,
+    pub local_consent: bool,
+}
+
+impl Profiles {
+    /// Load the store, or the empty default on missing/corrupt/bad-link input
+    /// (P2 dangling `last` also resolves to Local).
+    pub fn load(path: &Path) -> Profiles {
+        let raw = match fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(_) => return Self::default(),
+        };
+        let parsed: Profiles = match serde_json::from_str(&raw) {
+            Ok(p) => p,
+            Err(_) => return Self::default(),
+        };
+        let mut parsed = parsed;
+        if let Active::Remote(id) = parsed.last {
+            // dangling `last` id (no matching remote) → Local (P2).
+            if parsed.remotes.iter().find(|r| r.id == id).is_none() {
+                parsed.last = Active::Local;
+            }
+        }
+        parsed
+    }
+
+    /// Atomic tmp + rename in the target dir so a crash never leaves a half file
+    /// and no temp lingers.
+    pub fn save(&self, path: &Path) -> io::Result<()> {
+        let dir = path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "save: path has no parent dir")
+        })?;
+        let bytes = serde_json::to_string(self)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let base = path
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| "file".to_string());
+        let tmp = dir.join(format!(".{}.tmp", base));
+        {
+            let mut f = File::create(&tmp)?;
+            f.write_all(bytes.as_bytes())?;
+            f.flush()?;
+        }
+        fs::rename(&tmp, path)
+    }
+
+    pub fn remotes(&self) -> &[Remote] {
+        &self.remotes
+    }
+    pub fn last(&self) -> &Active {
+        &self.last
+    }
+    pub fn next_id(&self) -> u32 {
+        self.next_id
+    }
+    pub fn local_consent(&self) -> bool {
+        self.local_consent
+    }
+    pub fn get(&self, id: RemoteId) -> Option<&Remote> {
+        self.remotes.iter().find(|r| r.id == id)
+    }
+
+    /// Add a remote; P3 enforces one profile per origin, and the default name
+    /// is `host_label()`.
+    pub fn add(
+        &mut self,
+        link: ServerLink,
+        name: Option<ProfileName>,
+    ) -> Result<RemoteId, ProfileError> {
+        if self
+            .remotes
+            .iter()
+            .any(|r| r.link.origin() == link.origin())
+        {
+            return Err(ProfileError::DuplicateServer);
+        }
+        let name = match name {
+            Some(n) => n,
+            None => ProfileName::new(&link.host_label()).map_err(|_| ProfileError::BadName)?,
+        };
+        let id = RemoteId::new(self.next_id);
+        self.next_id += 1;
+        self.remotes.push(Remote { id, name, link });
+        Ok(id)
+    }
+
+    pub fn rename(&mut self, id: RemoteId, name: ProfileName) -> Result<(), ProfileError> {
+        if let Some(r) = self.remotes.iter_mut().find(|r| r.id == id) {
+            r.name = name;
+            Ok(())
+        } else {
+            Err(ProfileError::NoSuchProfile)
+        }
+    }
+
+    /// Drop a remote; if it was active, P2 falls back to Local.
+    pub fn remove(&mut self, id: RemoteId) -> Result<(), ProfileError> {
+        let pos = self
+            .remotes
+            .iter()
+            .position(|r| r.id == id)
+            .ok_or(ProfileError::NoSuchProfile)?;
+        if self.last == Active::Remote(id) {
+            self.last = Active::Local;
+        }
+        self.remotes.remove(pos);
+        Ok(())
+    }
+
+    pub fn set_last(&mut self, last: Active) {
+        self.last = last;
+    }
+    pub fn set_local_consent(&mut self, consent: bool) {
+        self.local_consent = consent;
+    }
+}
+
+impl Default for Profiles {
+    fn default() -> Self {
+        Self {
+            remotes: Vec::new(),
+            last: Active::Local,
+            next_id: 1,
+            local_consent: false,
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,7 +719,7 @@ mod tests {
         std::fs::write(
             &p,
             format!(
-                r#"{{"remotes":[{{"id":1,"name":"Home server","link":"https://nas.lan:7823/?token={EXAMPLE_TOKEN}"}}],\
+                r#"{{"remotes":[{{"id":1,"name":"Home server","link":"https://nas.lan:7823/?token={EXAMPLE_TOKEN}"}}],
                      "last":{{"remote":1}},"next_id":2,"local_consent":true}}"#
             ),
         )

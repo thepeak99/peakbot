@@ -28,6 +28,126 @@
 //! `NoHost` branch is a defensive invariant — its lock is the Display string,
 //! not a parse case.
 
+use std::fmt;
+use url::Url;
+
+/// The five user-facing rejections for a pairing link. `Display` wording is
+/// locked (v2 §5.4); these are what the UI surfaces verbatim.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum LinkError {
+    NotAUrl,
+    NotHttps,
+    NoHost,
+    NoToken,
+    HasCredentials,
+}
+
+impl std::error::Error for LinkError {}
+
+impl fmt::Display for LinkError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                LinkError::NotAUrl => "That isn't a link.",
+                LinkError::NotHttps =>
+                    "PeakBot Mobile only connects over HTTPS — start PeakBot with general.web.tls: true.",
+                LinkError::NoHost => "The link has no server address.",
+                LinkError::NoToken =>
+                    "The link has no access token — copy the full link PeakBot prints (…/?token=…).",
+                LinkError::HasCredentials => "Links with a username or password aren't supported.",
+            }
+        )
+    }
+}
+
+/// A validated PeakBot pairing link: `https://host[:port]/?token=…`.
+/// `parse` is the sole constructor; the token is only ever visible through
+/// `url()` (and the persisted profiles.json). `Debug`/`host_label()` drop it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ServerLink(url::Url);
+
+impl ServerLink {
+    /// Sanctioned token carrier — the normalized URL.
+    pub fn url(&self) -> &url::Url {
+        &self.0
+    }
+
+    /// What origins/cookie jars compare against.
+    pub fn origin(&self) -> url::Origin {
+        self.0.origin()
+    }
+
+    /// `host[:port]` (explicit port only); IPv6 stays bracketed. Never the token.
+    pub fn host_label(&self) -> String {
+        let host = self.0.host_str().expect("ServerLink always has a host");
+        match self.0.port() {
+            Some(p) => format!("{host}:{p}"),
+            None => host.to_string(),
+        }
+    }
+
+    /// Trim + apply the §2.3 rules in order: parse (NotAUrl) → scheme https
+    /// (NotHttps) → host (NoHost) → no userinfo (HasCredentials) → exactly one
+    /// non-empty `token` (NoToken), then normalize (path `/`, raw `token=…`,
+    /// no fragment, port kept).
+    pub fn parse(text: &str) -> Result<ServerLink, LinkError> {
+        let url = Url::parse(text.trim()).map_err(|_| LinkError::NotAUrl)?;
+
+        if url.scheme() != "https" {
+            return Err(LinkError::NotHttps);
+        }
+        if !url.has_host() {
+            return Err(LinkError::NoHost);
+        }
+        if !url.username().is_empty() {
+            return Err(LinkError::HasCredentials);
+        }
+        let raw_token = match extract_raw_token(url.query()) {
+            Some(t) => t,
+            None => return Err(LinkError::NoToken),
+        };
+
+        let mut normalized = url.clone();
+        normalized.set_path("/");
+        normalized.set_query(Some(&format!("token={raw_token}")));
+        normalized.set_fragment(None);
+        Ok(ServerLink(normalized))
+    }
+}
+
+/// The raw (percent-encoding preserved) value of the unique, non-empty `token`
+/// query param, or `None` if there isn't exactly one.
+fn extract_raw_token(query: Option<&str>) -> Option<String> {
+    let mut count = 0usize;
+    let mut token: Option<String> = None;
+    for part in query?.split('&') {
+        if let Some((key, value)) = part.split_once('=')
+            && key == "token"
+        {
+            count += 1;
+            token = Some(value.to_string());
+        }
+    }
+    if count != 1 {
+        return None;
+    }
+    let token = token?;
+    if token.is_empty() {
+        return None;
+    }
+    Some(token)
+}
+
+impl fmt::Debug for ServerLink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Origin only — never the token (secrecy P4).
+        let port = self.0.port().map(|p| format!(":{p}")).unwrap_or_default();
+        let host = self.0.host_str().unwrap_or("<no host>");
+        write!(f, "ServerLink({0}://{1}{2})", self.0.scheme(), host, port)
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -26,6 +26,70 @@
 //! `peakbot-mobile:profiles` (F2) and `web/src/desktop.test.ts` pins the
 //! `peakbotShell` marker values `"desktop"` / `"mobile"` (F1).
 
+use url::Url;
+
+/// What a webview navigation may do (plan §2.3). First match wins.
+#[derive(Debug, PartialEq)]
+pub enum Nav {
+    /// The page may display (app or known profile origin).
+    Allow,
+    /// Open in the system browser.
+    External,
+    /// Navigate to the mobile-only profiles screen.
+    Profiles,
+    /// Ask the app to restart the Local core (gate is in the handler, §2.4).
+    RestartLocal,
+    /// Refuse.
+    Block,
+}
+
+pub const PROFILES_SENTINEL: &str = "peakbot-mobile:profiles";
+pub const RESTART_SENTINEL: &str = "peakbot-mobile:restart";
+
+/// Origins the app may display: the Local loopback origin + paired remotes.
+/// Built per navigation so back/forward re-asks the guard (N1).
+#[derive(Debug, PartialEq, Eq)]
+pub struct Known<'a> {
+    pub local: Option<&'a url::Origin>,
+    pub remotes: &'a [url::Origin],
+}
+
+/// Classify a navigation (first match wins, §2.3 rule order).
+pub fn classify(url: Url, known: &Known<'_>) -> Nav {
+    // (1)+(2): peakbot-mobile:* — only the two sentinels are recognised; any
+    // other peakbot-* name is Block (it is not an open namespace).
+    if url.scheme() == "peakbot-mobile" {
+        return match url.path() {
+            "profiles" => Nav::Profiles,
+            "restart" => Nav::RestartLocal,
+            _ => Nav::Block,
+        };
+    }
+    // (3): the app's own origin (local assets + dev server).
+    if is_app_origin(&url) {
+        return Nav::Allow;
+    }
+    // (4): any known origin. The only way http: is allowed (the Local loopback).
+    let o = url.origin();
+    if known.local.is_some_and(|l| o == *l) || known.remotes.contains(&o) {
+        return Nav::Allow;
+    }
+    // (5): open externally.
+    if matches!(url.scheme(), "http" | "https" | "mailto" | "tel") {
+        return Nav::External;
+    }
+    // (6): intent:, file:, data:, javascript:, other — refuse.
+    Nav::Block
+}
+
+/// Whether the URL is the app's own webview origin (`tauri://localhost`,
+/// `http(s)://tauri.localhost`).
+fn is_app_origin(u: &Url) -> bool {
+    if u.scheme() == "tauri" {
+        return u.host_str() == Some("localhost");
+    }
+    matches!(u.scheme(), "http" | "https") && u.host_str() == Some("tauri.localhost")
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -52,9 +116,6 @@ mod tests {
     /// `a[href="peakbot-mobile:profiles"]` — read at compile time so this pin
     /// is deterministic.
     const WEB_MOBILE_GATING: &str = include_str!("../../../web/src/settings/mobileGating.test.tsx");
-    /// `web/src/desktop.test.ts` (F1) sets `window.peakbotShell` to exactly
-    /// `"desktop"` / `"mobile"`.
-    const WEB_DESKTOP_TEST: &str = include_str!("../../../web/src/desktop.test.ts");
 
     #[test]
     fn sentinel_consts_are_locked() {
