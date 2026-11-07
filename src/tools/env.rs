@@ -39,7 +39,12 @@ use crate::config::file::{Env, SearchConfig};
 use crate::config::resolve::{Config, Member, ResolvedAgent, ResolvedProfile, Subagent};
 use crate::config::{FetchUrlConfig, NameFilter, ResolvedModel, TimeoutsConfig};
 use crate::tools::ShellKind;
+#[cfg(feature = "host")]
 use crate::vector::VectorStore;
+
+/// The Local edition has no vector store: `ToolEnv.vector` is always `None`.
+#[cfg(not(feature = "host"))]
+pub enum VectorStore {}
 use crate::{McpServerHandle, mcp_tools_for_profile};
 
 /// The per-profile tool configuration, identical for the agent and its
@@ -75,6 +80,7 @@ impl ToolEnv {
     ) -> ToolEnv {
         // `open` only constructs the embeddings client; if it ever fails the
         // profile degrades to "no doc tools" instead of failing the build.
+        #[cfg(feature = "host")]
         let vector = match &p.vector {
             Some(spec) => match VectorStore::open(spec) {
                 Ok(store) => Some(store),
@@ -85,6 +91,9 @@ impl ToolEnv {
             },
             None => None,
         };
+        // The Local parse rejects `vector_db:`, so there is no store to open.
+        #[cfg(not(feature = "host"))]
+        let vector = None;
         ToolEnv {
             tools: p.tools.clone(),
             fetch_url: p.fetch_url.clone(),
@@ -135,16 +144,7 @@ impl McpSource {
         let groups = self
             .handles
             .iter()
-            .map(|h| {
-                (
-                    h.name().to_string(),
-                    h.tools()
-                        .iter()
-                        .cloned()
-                        .map(|t| Box::new(t) as Box<dyn ToolDyn>)
-                        .collect(),
-                )
-            })
+            .map(|h| (h.name().to_string(), h.tool_boxes()))
             .collect();
         mcp_tools_for_profile(groups, Some(&self.filter))
     }
@@ -170,7 +170,7 @@ impl McpSource {
                 .map(|h| {
                     (
                         h.name().to_string(),
-                        h.tools().iter().map(|t| t.name()).collect(),
+                        h.tool_boxes().iter().map(|t| t.name()).collect(),
                     )
                 })
                 .collect()
@@ -192,6 +192,7 @@ impl McpSource {
 ///
 /// `add_builtin_tools` constructs exactly this list — the single source of
 /// truth for both the real build and the name projections below.
+#[cfg(feature = "host")]
 pub(crate) fn builtin_tool_names(
     env: &ToolEnv,
     shell: Option<&ShellKind>,
@@ -227,6 +228,22 @@ pub(crate) fn builtin_tool_names(
     }
     if view_image {
         names.push("view_image");
+    }
+    names.retain(|name| env.tools.allows(name));
+    names
+}
+
+/// The Local edition's whole built-in set: no shell, file, doc or image tool
+/// exists in this build, whatever `shell` and `view_image` say.
+#[cfg(not(feature = "host"))]
+pub(crate) fn builtin_tool_names(
+    env: &ToolEnv,
+    _shell: Option<&ShellKind>,
+    _view_image: bool,
+) -> Vec<&'static str> {
+    let mut names = vec!["fetch_url", "fetch_page", "todo", "think"];
+    if env.search.is_some() {
+        names.push("web_search");
     }
     names.retain(|name| env.tools.allows(name));
     names

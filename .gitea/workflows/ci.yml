@@ -61,6 +61,16 @@ jobs:
           cargo fmt --all -- --check
           cargo clippy --all-targets --locked -- -D warnings
           cargo test --workspace --locked
+      # Local edition: the core without the `host` feature, as phones embed
+      # it. The canary test exists only in that build, so anything but
+      # `1 passed` means `host` leaked back in through a dependency edge.
+      - name: Rust checks (Local edition)
+        run: |
+          set -eu
+          cargo clippy --locked --lib --no-default-features -- -D warnings
+          cargo test --locked --lib --no-default-features
+          cargo test --locked --lib --no-default-features local_edition_canary -- --exact | tee /tmp/canary.log
+          grep -q 'test result: ok. 1 passed' /tmp/canary.log
 
   # Full desktop workspace (core + Tauri glue). The glue needs the webkit2gtk
   # system deps (same set as Dockerfile.desktop-linux); no node/web build —

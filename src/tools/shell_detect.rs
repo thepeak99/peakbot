@@ -359,6 +359,7 @@ mod tests {
 
     /// `name()` must stay in lockstep with the tool names so the model
     /// sees one shell under one name.
+    #[cfg(feature = "host")]
     #[test]
     fn shell_kind_name_matches_tool_names() {
         use super::super::{BashTool, PowerShellTool};

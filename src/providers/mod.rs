@@ -24,10 +24,13 @@ use crate::mock::MockCompletionModel;
 use crate::pipeline::SubAgentDeps;
 use crate::state::StateManager;
 use crate::tools::env::{ToolEnv, builtin_tool_names};
+#[cfg(feature = "host")]
 use crate::tools::{
-    BashTool, FetchPageTool, FetchUrlTool, FileCreateTool, FileInsertTool, FileReadTool,
-    FileStrReplaceTool, ListDirectoryTool, PdfReadTool, PowerShellTool, SearchTool, ShellBgTool,
-    ShellKind, ThinkTool, TodoTool, ViewImageTool,
+    BashTool, FileCreateTool, FileInsertTool, FileReadTool, FileStrReplaceTool, ListDirectoryTool,
+    PdfReadTool, PowerShellTool, ShellBgTool,
+};
+use crate::tools::{
+    FetchPageTool, FetchUrlTool, SearchTool, ShellKind, ThinkTool, TodoTool, ViewImageTool,
 };
 use anyhow::{Context, Result};
 use rig_core::agent::{Agent, AgentBuilder};
@@ -40,7 +43,6 @@ use rig_core::providers::ollama;
 use rig_core::providers::openai;
 use rig_core::providers::openrouter;
 use rig_core::tool::ToolDyn;
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -462,11 +464,16 @@ where
     // Path + shell tools resolve/spawn against the session cwd, owned by the
     // state manager (single source of truth). Without one (tests), fall back to
     // the process cwd — unchanged behaviour.
+    #[cfg(feature = "host")]
     let session_cwd: std::path::PathBuf = match state_manager.as_ref() {
         Some(sm) => sm.session_cwd(),
         None => std::env::current_dir().unwrap_or_default(),
     };
+    #[cfg(feature = "host")]
     let shell_env = shell_env(&bash_env);
+    // The Local edition plans no tool that touches the session cwd or a shell.
+    #[cfg(not(feature = "host"))]
+    let _ = (bash_env, state_manager, wire_bash_panel);
 
     // The delegate tool's outer TimeBudget must not expire while the
     // sub-agent is parked — it awaits the same session gate as the hook and
@@ -479,11 +486,17 @@ where
     let mut tools: Vec<Box<dyn ToolDyn>> = Vec::with_capacity(planned.len() + 1);
     for name in planned {
         let tool: Box<dyn ToolDyn> = match name {
+            #[cfg(feature = "host")]
             "file_create" => gate(Box::new(FileCreateTool::new(session_cwd.clone()))),
+            #[cfg(feature = "host")]
             "file_str_replace" => gate(Box::new(FileStrReplaceTool::new(session_cwd.clone()))),
+            #[cfg(feature = "host")]
             "file_insert" => gate(Box::new(FileInsertTool::new(session_cwd.clone()))),
+            #[cfg(feature = "host")]
             "file_read" => gate(Box::new(FileReadTool::new(session_cwd.clone()))),
+            #[cfg(feature = "host")]
             "pdf_read" => gate(Box::new(PdfReadTool::new(session_cwd.clone()))),
+            #[cfg(feature = "host")]
             "list_directory" => gate(Box::new(ListDirectoryTool::new(session_cwd.clone()))),
             "fetch_url" => gate(Box::new(FetchUrlTool::new(&tool_env.fetch_url))),
             "fetch_page" => gate(Box::new(FetchPageTool)),
@@ -497,11 +510,13 @@ where
             // The bg tool always spawns with the shell the model sees. No
             // state manager (test paths) ⇒ it still registers but answers
             // every call with the `NoStateManager` coach message.
+            #[cfg(feature = "host")]
             "bash_bg" | "powershell_bg" => gate(Box::new(ShellBgTool::new(
                 planned_shell(shell_kind).clone(),
                 state_manager.clone(),
                 shell_env.clone(),
             ))),
+            #[cfg(feature = "host")]
             "bash" => {
                 // Sub-agents (`wire_bash_panel = false`) skip the live panel
                 // so their shell output never bleeds into the main agent's
@@ -518,6 +533,7 @@ where
                     state_manager.clone(),
                 )))
             }
+            #[cfg(feature = "host")]
             "powershell" => gate(Box::new(
                 PowerShellTool::new(
                     planned_shell(shell_kind).executable().to_string(),
@@ -532,10 +548,12 @@ where
                     .expect("web_search is planned only when general.search is set");
                 gate(Box::new(SearchTool::new(search)))
             }
+            #[cfg(feature = "host")]
             "doc_index" => gate(Box::new(
                 crate::tools::DocIndexTool::new(planned_vector(tool_env).clone())
                     .with_session_cwd(session_cwd.clone()),
             )),
+            #[cfg(feature = "host")]
             "doc_search" => gate(Box::new(
                 crate::tools::DocSearchTool::new(planned_vector(tool_env).clone())
                     .with_session_cwd(session_cwd.clone()),
@@ -559,12 +577,14 @@ where
         .tools(prepare_mcp_tools(tool_env.mcp.tools(), &tool_env.timeouts))
 }
 
+#[cfg(feature = "host")]
 /// The shell a planned `bash`/`powershell`/bg tool runs on. The plan only
 /// names a shell tool when `shell_kind` is `Some`.
 fn planned_shell(shell_kind: Option<&ShellKind>) -> &ShellKind {
     shell_kind.expect("shell tools are planned only when a shell is detected")
 }
 
+#[cfg(feature = "host")]
 /// The store a planned `doc_*` tool uses. The plan only names them when the
 /// profile has a vector store.
 fn planned_vector(tool_env: &ToolEnv) -> &crate::vector::VectorStore {
@@ -574,9 +594,10 @@ fn planned_vector(tool_env: &ToolEnv) -> &crate::vector::VectorStore {
         .expect("doc tools are planned only when the profile has a vector store")
 }
 
+#[cfg(feature = "host")]
 /// The shell tools' env shape. An empty overlay is `None` — the shell then
 /// runs with the inherited process env, exactly as with no `env:` at all.
-fn shell_env(env: &Env) -> Option<HashMap<String, String>> {
+fn shell_env(env: &Env) -> Option<std::collections::HashMap<String, String>> {
     (!env.is_empty()).then(|| env.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
 }
 
@@ -597,6 +618,7 @@ fn anthropic_view_image_budget(c: &AnthropicConfig) -> Option<usize> {
     resolve_supports_vision(c.vision, "anthropic", &c.model).then_some(c.max_image_base64_bytes)
 }
 
+#[cfg(feature = "host")]
 /// Attach the live bash panel iff this agent owns one. The orchestrator wires
 /// its panel (`wire_panel = true`); sub-agents pass `false` so their shell
 /// output never bleeds into the orchestrator's panel. Either way the tool runs
@@ -1137,16 +1159,17 @@ pub fn create_mock_agent(
         .hook(hook.clone());
 
     // Add built-in tools (simplified for testing)
-    let bash_tool = BashTool::default();
     let todo = TodoTool::new(state_manager.clone());
 
-    let agent = agent_builder
+    #[cfg(feature = "host")]
+    let agent_builder = agent_builder
         .tool(FileCreateTool::default())
         .tool(FileStrReplaceTool::default())
         .tool(FileInsertTool::default())
         .tool(FileReadTool::default())
-        .tool(bash_tool)
-        .tool(ListDirectoryTool::default())
+        .tool(BashTool::default())
+        .tool(ListDirectoryTool::default());
+    let agent = agent_builder
         .tool(FetchUrlTool::default())
         .tool(FetchPageTool)
         .tool(ThinkTool)
@@ -1405,6 +1428,7 @@ mod tests {
     use serde_json::{Value, json};
     use std::time::Duration;
 
+    #[cfg(feature = "host")]
     #[test]
     fn wire_bash_tool_severs_sub_agent_panel() {
         // The orchestrator (`wire_panel = true`) drives the live bash
@@ -2155,6 +2179,7 @@ mod tests {
     /// `bash_bg` — the sweep's inverse. (The Bash host legitimately
     /// contains "bash", so this only checks the expected name is present.)
     #[cfg(feature = "mock")]
+    #[cfg(feature = "host")]
     #[tokio::test]
     async fn builtin_tool_definitions_register_bash_bg_under_bash() {
         let filter = crate::config::NameFilter::default();
@@ -2179,6 +2204,7 @@ mod tests {
     /// shell_kind`), so the "rest of the built-ins" assertion below needs
     /// a shell to have a `bash_bg` to keep.
     #[cfg(feature = "mock")]
+    #[cfg(feature = "host")]
     #[tokio::test]
     async fn tools_seam_honours_name_filter_enabled_only_and_disabled() {
         let bash = ShellKind::Bash {
@@ -2234,6 +2260,7 @@ mod tests {
     /// the shell tool, so a Windows box with no shell at all gets no
     /// shell surface, not a broken one).
     #[cfg(feature = "mock")]
+    #[cfg(feature = "host")]
     #[tokio::test]
     async fn builtin_shell_and_bg_tools_follow_shell_kind() {
         let filter = crate::config::NameFilter::default();
@@ -2307,6 +2334,7 @@ mod tests {
     /// names (human decision) — disabling one never disables the other,
     /// and each only addresses the tool its own shell registers.
     #[cfg(feature = "mock")]
+    #[cfg(feature = "host")]
     #[tokio::test]
     async fn powershell_bg_and_bash_bg_are_separately_disablable() {
         let ps = ShellKind::PowerShell {

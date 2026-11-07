@@ -38,26 +38,28 @@ pub(super) mod listing;
 pub(super) mod proxy;
 pub(super) mod relay;
 
-#[cfg(test)]
+// Every remote test drives a config `remote:` profile, which the Local
+// edition rejects at parse time — the relay is unreachable there.
+#[cfg(all(test, feature = "host"))]
 mod client_tests;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "host"))]
 mod relay_tests;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "host"))]
 mod test_support;
 
 // T7/T8 (merged list, kill routing, `/r/` proxy): shared fixture + tests.
-#[cfg(test)]
+#[cfg(all(test, feature = "host"))]
 mod t78_support;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "host"))]
 mod t7_tests;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "host"))]
 mod t8_tests;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "host"))]
 mod t9_tests;
 
 pub type WsStream = tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>;

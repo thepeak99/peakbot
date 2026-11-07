@@ -1081,6 +1081,7 @@ profiles:
     /// §5.10: a remote profile lists web-only in the TUI, in catalog order
     /// (before the locals when it is first in the file), and the
     /// `(default)` note stays on the first LOCAL line.
+    #[cfg(feature = "host")]
     #[test]
     fn render_profile_list_marks_remote_entries_web_only() {
         let yaml = "providers:\n  - name: patchnotes\n    type: openai\n    base_url: https://ai.patchnotes.com/v1\n    api_key: pn-test\n    models:\n      - { name: anthropic/claude-sonnet-4.5, alias: sonnet, max_tokens: 8192 }\nprofiles:\n  home-dev:\n    remote:\n      url: https://10.2.0.48:7823\n      token: pito\n      ca: sha256:3f9a0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab\n      profile: dev\n  dev:\n    agents:\n      team:\n        model: sonnet\n";
@@ -1610,7 +1611,8 @@ profiles:
 // profile, so these compile only once `config::remote` and the
 // `CatalogEntry` catalogue land.
 // ─────────────────────────────────────────────────────────────────────────────
-#[cfg(test)]
+// The Local edition has no `remote:` profiles to select.
+#[cfg(all(test, feature = "host"))]
 mod t3_remote_selection_tests {
     use std::path::Path;
 

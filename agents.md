@@ -75,6 +75,8 @@ All tools live in `src/tools/` and implement `rig::tool::Tool` (`NAME`, `Args`, 
 
 **The authoritative tool list is `BUILTIN_TOOL_NAMES` in `src/config/mod.rs`** — keep any table below in sync with it, never the other way round.
 
+**Editions.** The default `host` feature is everything that gives the agent hands: shell/PTY/bg, file + doc tools, MCP, the installer, the TUI and the CLI (`[[bin]]` and the TUI/shell/installer test targets require it). `--no-default-features` builds the **Local edition** — the core a phone embeds: built-ins are exactly `fetch_url`, `fetch_page`, `web_search`, `todo`, `think` (its own `BUILTIN_TOOL_NAMES`), its own persona/core prompt (`src/system_prompt_*_local.txt`), and `Config::parse` rejects host-only tools, `mcps:`, `vector_db:` and `remote:` profiles with a "not available in PeakBot on this phone" error. Gate host-only code with `#[cfg(feature = "host")]`; shared pure helpers live in `utils`. CI's canary `local_edition_canary` exists only in the Local build.
+
 Exactly **one shell + bg tool pair** is registered per detected shell: Bash hosts get `bash` + `bash_bg`, PowerShell hosts get `powershell` + `powershell_bg`, never both. `tools:` filter names are **per-shell** — `disabled: [bash_bg]` does NOT disable `powershell_bg` (they are separate names in `BUILTIN_TOOL_NAMES`).
 
 | Tool | File | Notes |
@@ -339,11 +341,14 @@ src/
 ├── skills/                 # skill discovery + SKILL.md parsing
 ├── vector/                 # VectorStore, embeddings client, parse/chunk
 ├── ui/                     # app_state, wire types; repl/ (ratatui), web/ (axum+WS+TLS), stdio/
-├── bg_processes.rs         # BgRegistry (background-process PTY processes)
+├── bg_processes.rs         # BgRegistry (background-process PTY processes; spawner host-only)
+├── line_buffer.rs          # PTY output ring + liveness (shared by bash and the bg registry)
+├── utils/                  # pure helpers shared across editions (paths, /cd resolve, elapsed time)
 ├── context_manager.rs      # compaction
 ├── conversation*.rs        # conversation data + persistence + titles
 ├── vision.rs               # [img:…] parsing, model vision detection
-├── system_prompt_*.txt     # persona / core / memory prompt pieces
+├── system_prompt_*.txt     # persona / core / memory prompt pieces (`*_local.txt`: Local edition)
+├── mcp_client.rs           # MCP server connections (host only)
 └── mcp_auth.rs             # MCP OAuth flow + token cache
 tests/                      # integration harness (MockCompletionModel, scenarios), repl_tests (insta)
 web/                        # SPA frontend (state.ts wire mirror, adapt.ts, components)
@@ -719,7 +724,7 @@ Where it lives: `src/config/remote.rs` (parse), `src/ui/web/remote/{mod,relay,pr
 
 Two workflows on runner `shinpachi` (label `dind`):
 
-- **`ci.yml`** — `rust:1.95` container. Job `ci` = release contract tests (`sh tests/release.sh`, hermetic — Makefile targets + `release.yml`) → Node 22 frontend gate (`web/`: `npm ci` + lint/typecheck/test/build) → `cargo fmt --all -- --check` → `cargo clippy --all-targets --locked -- -D warnings` → `cargo test --workspace --locked`. Job `desktop` = the full desktop workspace (`--manifest-path desktop/Cargo.toml --workspace`) with the same fmt/clippy/test trio — after apt-installing the Tauri webkit deps (same set as `Dockerfile.desktop-linux`) and `touch`ing a placeholder sidecar binary (tauri-build requires `bundle.externalBin` to exist) — plus the Windows portable-exe static tests (`desktop/scripts/test-build-desktop-windows.sh`) and the auto-updater + macOS tarball contract tests (`desktop/scripts/test-updater-manifest.sh`, `desktop/scripts/test-assemble-app-tarball.sh`, after apt-installing `jq` + `zip`). No node/web build there: `desktop/ui` is committed static files.
+- **`ci.yml`** — `rust:1.95` container. Job `ci` = release contract tests (`sh tests/release.sh`, hermetic — Makefile targets + `release.yml`) → Node 22 frontend gate (`web/`: `npm ci` + lint/typecheck/test/build) → `cargo fmt --all -- --check` → `cargo clippy --all-targets --locked -- -D warnings` → `cargo test --workspace --locked` → Local edition: `cargo clippy --locked --lib --no-default-features -- -D warnings`, `cargo test --locked --lib --no-default-features`, and the canary `cargo test --locked --lib --no-default-features local_edition_canary -- --exact` (must print `1 passed`). Job `desktop` = the full desktop workspace (`--manifest-path desktop/Cargo.toml --workspace`) with the same fmt/clippy/test trio — after apt-installing the Tauri webkit deps (same set as `Dockerfile.desktop-linux`) and `touch`ing a placeholder sidecar binary (tauri-build requires `bundle.externalBin` to exist) — plus the Windows portable-exe static tests (`desktop/scripts/test-build-desktop-windows.sh`) and the auto-updater + macOS tarball contract tests (`desktop/scripts/test-updater-manifest.sh`, `desktop/scripts/test-assemble-app-tarball.sh`, after apt-installing `jq` + `zip`). No node/web build there: `desktop/ui` is committed static files.
 - **`release.yml`** — on tag push (`push: tags: ['*']`), on the `dind` runner (Alpine host driving the host docker daemon, no job container, `timeout-minutes: 300`, secret `RELEASE_TOKEN` → env `GITEA_TOKEN`): pure-git checkout, tool check (incl. `rclone`, `apk add --no-cache rclone` before it), then `make release TAG=$GITHUB_REF_NAME PRUNE=1 CONTAINER_BUILDER=docker GITEA_URL=… OWNER=… REPO=…`.
 
 (Reproduce `ci` locally with exactly those commands; autofix with `cargo fmt --all` + `cargo clippy --fix --allow-dirty [--tests]`.)

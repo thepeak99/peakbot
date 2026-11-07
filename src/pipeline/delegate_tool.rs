@@ -2318,6 +2318,7 @@ profiles:
     }
 
     /// A 200 Responses-API completion carrying one `bash` tool call.
+    #[cfg(feature = "host")]
     fn ok_bash_call(command: &str) -> (u16, serde_json::Value) {
         (
             200,
@@ -2434,6 +2435,7 @@ profiles:
     }
 
     /// Lines appended to the counter file — the tool's execution count.
+    #[cfg(feature = "host")]
     fn counter_runs(counter: &std::path::Path) -> usize {
         std::fs::read_to_string(counter)
             .map(|c| c.lines().count())
@@ -2444,6 +2446,7 @@ profiles:
     /// the task: the retry replays the hook's last request snapshot — tool
     /// call + result included — so the tool must not run a second time and
     /// the replayed request must equal the failed one.
+    #[cfg(feature = "host")]
     #[tokio::test]
     async fn delegate_transient_error_resumes_from_snapshot() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2606,6 +2609,7 @@ profiles:
     /// The retry budget counts CONSECUTIVE failures without progress: a
     /// failure after a new tool round-trip resets the counter, so the total
     /// failures may exceed `max_retries` as long as no two are back-to-back.
+    #[cfg(feature = "host")]
     #[tokio::test]
     async fn delegate_retry_counter_resets_after_progress() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2685,6 +2689,7 @@ profiles:
     /// The companion guard: consecutive failures WITHOUT progress still
     /// exhaust the budget — `max_retries + 1` failures in a row end the
     /// delegation as a summarised INTERRUPTED handoff, exactly as today.
+    #[cfg(feature = "host")]
     #[tokio::test]
     async fn delegate_gives_up_after_consecutive_failures_without_progress() {
         let dir = tempfile::tempdir().expect("tempdir");

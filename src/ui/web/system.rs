@@ -40,6 +40,7 @@ pub enum InstallPath {
     Absent { hint: String },
 }
 
+#[cfg(feature = "host")]
 impl InstallPath {
     /// Pure translation from the install-core verdict to the wire form.
     /// Lives here so the conversion is exercised by the same in-module
@@ -110,6 +111,7 @@ impl SetupOpError {
     /// Convert any [`crate::install::InstallError`] to a `SetupOpError`
     /// per the §B table. The `Unsupported` variant is the only one that
     /// maps to 501; everything else lands at 500.
+    #[cfg(feature = "host")]
     pub fn from_install_error(e: &crate::install::InstallError) -> Self {
         use crate::install::InstallError;
         match e {
@@ -129,6 +131,7 @@ impl SetupOpError {
     /// invariant is the only reason this exists; PlanError's `Display`
     /// already names the rejected bind (§E.5), so we hand the message
     /// through verbatim.
+    #[cfg(feature = "host")]
     pub fn from_plan_error(e: &crate::install::PlanError) -> Self {
         Self::validation(e.to_string())
     }
@@ -187,6 +190,7 @@ impl ServiceFn {
 /// Production install adapter. Ignores the request body (plan §B
 /// `InstallRequest = Record<string, never>`), calls `install_binary`,
 /// and serialises the outcome to the §B `InstallResponse` shape.
+#[cfg(feature = "host")]
 pub fn install_op_adapter(_req: JsonValue) -> Result<JsonValue, SetupOpError> {
     let outcome =
         crate::install::install_binary().map_err(|e| SetupOpError::from_install_error(&e))?;
@@ -200,6 +204,7 @@ pub fn install_op_adapter(_req: JsonValue) -> Result<JsonValue, SetupOpError> {
 /// `general.web.token` from config.yaml at start (spec §8.4), so this
 /// adapter never touches a token *file* — the `<config_dir>/web-token`
 /// file was retired with the 0.24 layout.
+#[cfg(feature = "host")]
 pub fn service_op_adapter(req: JsonValue) -> Result<JsonValue, SetupOpError> {
     use crate::install::{ServiceOp, ServicePlan};
     let op = req
@@ -266,6 +271,7 @@ pub fn service_op_adapter(req: JsonValue) -> Result<JsonValue, SetupOpError> {
 /// §B `InstallResponse` JSON. `path` is the PATH verdict the install
 /// itself produced (recomputed from the post-install target so the
 /// response is self-describing — no need to look at `current_exe()`).
+#[cfg(feature = "host")]
 fn install_outcome_to_wire(o: &crate::install::InstallOutcome) -> JsonValue {
     use crate::install::InstallAction;
     let action = match o.action {
@@ -292,6 +298,7 @@ fn install_outcome_to_wire(o: &crate::install::InstallOutcome) -> JsonValue {
 
 /// Render a [`ServiceReport`](crate::install::ServiceReport) as the
 /// §B `ServiceResponse` JSON. Field-for-field match.
+#[cfg(feature = "host")]
 fn service_report_to_wire(r: &crate::install::ServiceReport) -> JsonValue {
     serde_json::json!({
         "manager": r.manager.as_wire(),

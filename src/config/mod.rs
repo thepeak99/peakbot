@@ -794,6 +794,7 @@ impl Default for MemoryConfig {
 /// are listed too — naming one that isn't currently registered is a harmless
 /// no-op, not an error. `delegate` is not here: it is on iff an agent has
 /// subagents, never filterable.
+#[cfg(feature = "host")]
 pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "bash",
     "bash_bg",
@@ -814,6 +815,11 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "view_image",
     "web_search",
 ];
+
+/// The Local edition's built-ins: no tool that touches the device's files
+/// or runs code exists in this build. Naming any other tool is a parse error.
+#[cfg(not(feature = "host"))]
+pub const BUILTIN_TOOL_NAMES: &[&str] = &["fetch_page", "fetch_url", "think", "todo", "web_search"];
 
 /// One name filter for every allow/deny list (`tools:`, `mcps:`, `skills:`,
 /// `ui.tabs:`). `enabled: false` allows nothing; a non-empty

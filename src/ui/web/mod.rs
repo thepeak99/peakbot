@@ -56,9 +56,9 @@ use crate::ui::AppState;
 use crate::ui::Ui;
 use crate::ui::outbound::{OutboundRx, OutboundTx, outbound_channel};
 use crate::ui::ui_trait::builtin_commands;
-use crate::ui::wire::{
-    InboundMessage, ModelInfo, OutboundMessage, build_dir_listing, build_recent_dirs,
-};
+#[cfg(feature = "host")]
+use crate::ui::wire::build_dir_listing;
+use crate::ui::wire::{InboundMessage, ModelInfo, OutboundMessage, build_recent_dirs};
 use crate::{StateManager, UiAction};
 use anyhow::Result;
 use axum::{
@@ -88,7 +88,8 @@ pub mod registry;
 mod remote;
 pub mod settings;
 pub mod system;
-#[cfg(test)]
+// Remote-profile E2E: the Local edition has no `remote:` profiles.
+#[cfg(all(test, feature = "host"))]
 mod t4_tests;
 pub mod tls;
 pub mod uploads;
@@ -259,7 +260,11 @@ impl WebUi {
         if local {
             // Detached because waiting on xdg-open can stall the runtime before
             // axum starts serving the already-bound port.
+            #[cfg(feature = "host")]
             let _ = open::that_detached(url);
+            // The Local edition's embedder owns the WebView: no browser to open.
+            #[cfg(not(feature = "host"))]
+            let _ = url;
         }
     }
 }
@@ -297,11 +302,15 @@ impl Ui for WebUi {
         // `/commands`. The seams point at the real install / service
         // dispatchers; tests inject their own fakes via `SystemState`,
         // production never sees `default_for_tests()`.
-        let system_state = system::SystemState {
-            install: system::InstallFn(system::install_op_adapter),
-            service: system::ServiceFn(system::service_op_adapter),
-        };
-        app = app.merge(system::router(system_state));
+        // The Local edition installs nothing, so it has no system routes.
+        #[cfg(feature = "host")]
+        {
+            let system_state = system::SystemState {
+                install: system::InstallFn(system::install_op_adapter),
+                service: system::ServiceFn(system::service_op_adapter),
+            };
+            app = app.merge(system::router(system_state));
+        }
 
         // The old `/api/setup*` surface is gone: tombstone 404s where the
         // SPA fallback would otherwise serve index.html.
@@ -1043,7 +1052,18 @@ fn dispatch_inbound(
                 model,
             })
             .is_ok(),
+        #[cfg(feature = "host")]
         Ok(InboundMessage::ListDir { path }) => out_tx.send(build_dir_listing(&path)).is_ok(),
+        // No folders to pick on a phone; the Local SPA hides the cwd picker.
+        #[cfg(not(feature = "host"))]
+        Ok(InboundMessage::ListDir { path }) => out_tx
+            .send(OutboundMessage::DirListing {
+                path,
+                parent: None,
+                entries: Vec::new(),
+                error: Some("browsing folders isn't available in PeakBot on this phone".into()),
+            })
+            .is_ok(),
         // Spawned: the merged list fetches the remotes (≤ 2 s each, §5.6)
         // and the reader loop must not block on it.
         Ok(InboundMessage::RequestConversations) => {

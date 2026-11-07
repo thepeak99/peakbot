@@ -50,10 +50,12 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use portable_pty::ChildKiller;
+#[cfg(feature = "host")]
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::pty_runner::{self, LineBuffer, PtyStatus, SpawnError, SpawnParams as PtySpawnParams};
+use crate::line_buffer::{LineBuffer, PtyStatus};
+#[cfg(feature = "host")]
+use crate::pty_runner::{self, SpawnError, SpawnParams as PtySpawnParams};
 use crate::tools::ShellKind;
 
 /// Default ring-buffer capacity when `capture_output_lines` is omitted.
@@ -116,16 +118,21 @@ pub struct BgProcess {
     /// Writer end of the PTY — used by `send_line`.
     writer: Box<dyn Write + Send>,
 
-    /// `ChildKiller` clone — calling `kill` kills the process group on
+    /// The PTY's `ChildKiller` clone — calling it kills the process group on
     /// Unix / terminates the process on Windows. Held separately from
     /// the child handle (which moved into the reader thread for `wait`)
     /// so we can signal even after the reader joins.
-    killer: Box<dyn ChildKiller + Send + Sync>,
+    killer: KillFn,
 
     /// Reader thread join handle. Always `Some` while the process is
     /// in the registry; taken out by `Drop` for the join.
     reader: Option<JoinHandle<()>>,
 }
+
+/// Kills one child. A closure rather than portable-pty's `ChildKiller`, so
+/// the registry has no PTY dependency and compiles in the Local edition
+/// (where only the spawner is missing and the registry stays empty).
+type KillFn = Box<dyn FnMut() -> std::io::Result<()> + Send + Sync>;
 
 /// Arguments for `BgRegistry::start`.
 pub struct StartParams {
@@ -191,6 +198,7 @@ pub enum BgError {
     },
 }
 
+#[cfg(feature = "host")]
 impl From<SpawnError> for BgError {
     fn from(e: SpawnError) -> Self {
         BgError::Spawn(e.to_string())
@@ -200,6 +208,8 @@ impl From<SpawnError> for BgError {
 /// The registry. Held as `Arc<Mutex<BgRegistry>>` on `StateManager`.
 pub struct BgRegistry {
     procs: HashMap<u32, BgProcess>,
+    // Only the spawner (host edition) hands out ids.
+    #[cfg_attr(not(feature = "host"), allow(dead_code))]
     next_id: u32,
 }
 
@@ -286,6 +296,7 @@ impl BgRegistry {
     /// (debounced at [`DEBOUNCE_MS`]) whenever fresh output lands so the
     /// agent loop can wake up and drain. The notification payload is
     /// intentionally empty — see `QueueMessage::BackgroundOutputReady`.
+    #[cfg(feature = "host")]
     pub fn start(
         &mut self,
         params: StartParams,
@@ -330,7 +341,10 @@ impl BgRegistry {
             exited_at: None,
             buffer: parts.buffer,
             writer: parts.writer,
-            killer: parts.killer,
+            killer: {
+                let mut killer = parts.killer;
+                Box::new(move || killer.kill())
+            },
             reader: parts.reader,
         };
 
@@ -359,7 +373,7 @@ impl BgRegistry {
         };
         // Kill the process group (Unix). Reader will see EOF and exit
         // on its own; we join it below.
-        let _ = proc.killer.kill();
+        let _ = (proc.killer)();
         let (exit_code, final_lines) = {
             let buf = proc.buffer.lock().expect("pty buffer mutex poisoned");
             let code = match &buf.status {
@@ -498,7 +512,7 @@ impl BgRegistry {
     }
 
     /// Process count accessor for tests.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "host"))]
     fn proc_count(&self) -> usize {
         self.procs.len()
     }
@@ -531,7 +545,7 @@ fn bg_status_from(proc: &BgProcess, buf: &LineBuffer) -> BgStatus {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "host"))]
 mod tests {
     use super::*;
     use crate::tools::ShellKind;
@@ -1046,17 +1060,7 @@ mod tests {
     }
 
     /// Dummy killer for tests that bypass real PTY spawning.
-    fn dummy_killer() -> Box<dyn ChildKiller + Send + Sync> {
-        #[derive(Debug)]
-        struct Dummy;
-        impl ChildKiller for Dummy {
-            fn kill(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-            fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
-                Box::new(Dummy)
-            }
-        }
-        Box::new(Dummy)
+    fn dummy_killer() -> KillFn {
+        Box::new(|| Ok(()))
     }
 }

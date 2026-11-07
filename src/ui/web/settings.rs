@@ -369,9 +369,22 @@ fn facts() -> JsonValue {
     })
 }
 
+/// The Local edition installs nothing: same shape, every slot absent.
+#[cfg(not(feature = "host"))]
+fn install_info(_exe_path: &Option<String>) -> JsonValue {
+    json!({
+        "target": "",
+        "state": "absent",
+        "path": super::system::InstallPath::Absent {
+            hint: "installing isn't available in PeakBot on this phone".to_string(),
+        },
+    })
+}
+
 /// The `facts.install` object — the 0.23 `build_install_info` shape
 /// (`target`, `state`, `path`) built from `install::install_target()` +
 /// `current_exe()` + `path_state` over the process PATH.
+#[cfg(feature = "host")]
 fn install_info(exe_path: &Option<String>) -> JsonValue {
     let target = crate::install::install_target();
     let target_display = target
@@ -443,7 +456,7 @@ async fn get_settings(
             .collect::<Vec<_>>(),
         "tab_names": TAB_NAMES.to_vec(),
         "skills": crate::load_default_skills(&cwd).0.names(),
-        "builtin_persona": include_str!("../../system_prompt_persona.txt"),
+        "builtin_persona": crate::SYSTEM_PROMPT_PERSONA,
         "mcp_status": mcp_status(state.deps.as_ref()),
         "boot": {
             "bind": state.boot_web.bind.to_string(),
@@ -924,6 +937,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "host")]
     #[test]
     fn mcp_status_is_derived_per_z3() {
         let deps = parse(

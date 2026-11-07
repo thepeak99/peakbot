@@ -24,7 +24,8 @@ pub mod wire;
 // added by the implementer of task 3; the test module is the TDD spec.
 mod outbound;
 
-// REPL UI
+// REPL UI (terminal; host edition only)
+#[cfg(feature = "host")]
 pub mod repl;
 
 // NDJSON stdio UI (`peakbot --stdio`)
@@ -38,6 +39,7 @@ pub use app_state::*;
 pub use ui_trait::*;
 
 // Re-export UI implementations
+#[cfg(feature = "host")]
 pub use repl::*;
 pub use stdio::StdioUi;
 pub use web::{DEFAULT_WEB_ADDR, WebUi};

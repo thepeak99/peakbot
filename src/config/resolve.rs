@@ -28,7 +28,13 @@ use super::{
     ModelRegistry, NameFilter, ProviderEntry, RegistryError, ResolvedModel, TAB_NAMES,
     get_config_file_path,
 };
-use crate::vector::normalize_lexical;
+use crate::utils::normalize_lexical;
+
+// The Local edition (no `host` feature) rejects at parse time what its
+// build lacks, so a config never silently loses a capability on the phone.
+const LOCAL_NO_MCPS: &str = "MCP servers are not available in PeakBot on this phone";
+const LOCAL_NO_VECTOR_DB: &str = "vector databases are not available in PeakBot on this phone";
+const LOCAL_NO_REMOTE: &str = "remote profiles are not available in PeakBot on this phone";
 
 /// L1 (§4.4). Public because reload quotes it for a legacy global.
 pub const L1_MESSAGE: &str = "config.yaml uses the pre-0.24 layout — restart PeakBot to migrate it automatically (the original is kept as config.yaml.pre-0.24)";
@@ -505,6 +511,9 @@ impl Config {
             .collect();
         let registry = build_registry(&file.providers, &declared, &mut global_sink);
         check_mcps(&file.mcps, &mut global_sink);
+        if !cfg!(feature = "host") && !file.mcps.is_empty() {
+            global_sink.push(vec![key("mcps")], LOCAL_NO_MCPS);
+        }
 
         let mut resolver = Resolver {
             registry: registry.as_ref(),
@@ -575,6 +584,9 @@ impl Config {
                     {
                         entries.push(CatalogEntry::Local(Arc::new(profile)));
                     }
+                }
+                ProfileEntry::Remote(_) if !cfg!(feature = "host") => {
+                    global_sink.push(vec![key("profiles"), key(name)], LOCAL_NO_REMOTE);
                 }
                 ProfileEntry::Remote(rdef) => {
                     // A remote name is a URL path segment (`/r/<name>/…`);
@@ -1008,9 +1020,14 @@ impl Resolver<'_> {
                 Some("'delegate' is not a filterable tool — it is on automatically when an agent has subagents".to_string())
             } else if BUILTIN_TOOL_NAMES.contains(&tool) {
                 None
-            } else {
+            } else if cfg!(feature = "host") {
                 Some(format!(
                     "unknown tool '{tool}'. Known tools: {}.",
+                    BUILTIN_TOOL_NAMES.join(", ")
+                ))
+            } else {
+                Some(format!(
+                    "`{tool}` isn't available in PeakBot on this phone. Available tools: {}.",
                     BUILTIN_TOOL_NAMES.join(", ")
                 ))
             }
@@ -1034,6 +1051,9 @@ impl Resolver<'_> {
             (!TAB_NAMES.contains(&tab))
                 .then(|| format!("unknown tab '{tab}'. Known tabs: {}.", TAB_NAMES.join(", ")))
         });
+        if !cfg!(feature = "host") && def.vector_db.is_some() {
+            sink.push(at(&base, &["vector_db"]), LOCAL_NO_VECTOR_DB);
+        }
         let vector = def
             .vector_db
             .as_ref()
@@ -2360,7 +2380,8 @@ profiles:
 // RP1–RP8 and CE1. They must fail to compile until `config::remote` and
 // the `CatalogEntry` catalogue land.
 // ─────────────────────────────────────────────────────────────────────────────
-#[cfg(test)]
+// The Local edition rejects every `remote:` profile (see `local_parse`).
+#[cfg(all(test, feature = "host"))]
 mod t3_remote_profile_tests {
     use std::path::Path;
 
