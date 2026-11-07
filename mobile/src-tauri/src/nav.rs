@@ -21,6 +21,12 @@ pub enum Nav {
 pub const PROFILES_SENTINEL: &str = "peakbot-mobile:profiles";
 pub const RESTART_SENTINEL: &str = "peakbot-mobile:restart";
 
+/// The server's CA download. The Profiles page's [Install certificate…]
+/// opens it in the system browser (plan §2.1) — it lives on the known
+/// remote origin, so the origin rule would display it in the webview,
+/// where a certificate can't be installed.
+pub const CA_PATH: &str = "/peakbot-ca.crt";
+
 /// Origins the app may display: the Local loopback origin + paired remotes.
 /// Built per navigation so back/forward re-asks the guard (N1).
 #[derive(Debug, PartialEq, Eq)]
@@ -42,8 +48,14 @@ pub fn classify(url: &Url, known: &Known<'_>) -> Nav {
     if is_app_origin(url) {
         return Nav::Allow;
     }
-    // (4): any known origin. The only way http: is allowed (the Local loopback).
+    // (4a): the CA download on a known profile origin goes to the system
+    // browser (plan §2.1) — the webview can't install a certificate.
     let o = url.origin();
+    if url.path() == CA_PATH && (known.local.is_some_and(|l| o == *l) || known.remotes.contains(&o))
+    {
+        return Nav::External;
+    }
+    // (4): any known origin. The only way http: is allowed (the Local loopback).
     if known.local.is_some_and(|l| o == *l) || known.remotes.contains(&o) {
         return Nav::Allow;
     }
@@ -155,6 +167,54 @@ mod tests {
         assert_eq!(
             classify(
                 &u("https://nas.lan:7823/conversations"),
+                &known(None, &remotes)
+            ),
+            Nav::Allow
+        );
+    }
+
+    // ── rule 4a: the CA download goes to the system browser ─────────────
+
+    #[test]
+    fn ca_path_on_known_remote_is_external() {
+        let remotes = [origin("https://nas.lan:7823")];
+        assert_eq!(
+            classify(
+                &u("https://nas.lan:7823/peakbot-ca.crt"),
+                &known(None, &remotes)
+            ),
+            Nav::External
+        );
+    }
+
+    #[test]
+    fn ca_path_on_known_local_is_external() {
+        let local = origin("http://127.0.0.1:47823");
+        assert_eq!(
+            classify(
+                &u("http://127.0.0.1:47823/peakbot-ca.crt"),
+                &known(Some(&local), &[])
+            ),
+            Nav::External
+        );
+    }
+
+    #[test]
+    fn ca_path_on_unknown_origin_is_external() {
+        // Falls through to rule (5) — external either way.
+        assert_eq!(
+            classify(&u("https://x.example/peakbot-ca.crt"), &none()),
+            Nav::External
+        );
+    }
+
+    #[test]
+    fn ca_path_suffix_on_other_paths_stays_allow() {
+        // The carve-out is the exact path, not a suffix.
+        let remotes = [origin("https://nas.lan:7823")];
+        assert_eq!(
+            classify(
+                &u("https://nas.lan:7823/settings/peakbot-ca.crt"),
                 &known(None, &remotes)
             ),
             Nav::Allow

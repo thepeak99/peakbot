@@ -341,6 +341,12 @@ pub fn run() {
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(log::LevelFilter::Info)
+                // Logcat (Android) / stdout (dev) only — the default LogDir
+                // target would also write a log file outside the app's data
+                // root. Nothing on this phone is written outside it.
+                .targets([tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::Stdout,
+                )])
                 .build(),
         )
         // D1: the default click handler turns `<a target=_blank>` into an
