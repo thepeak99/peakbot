@@ -24,6 +24,15 @@ serde_json = "1"
 # The Local core: the root crate compiled without `host` (plan §2.7). One app,
 # one artifact — no `local` feature.
 peakbot = { path = "../..", default-features = false }
+# local.rs: the core's loopback listener + readiness probe (Tauri's runtime is
+# tokio), the per-launch token from the OS RNG, and boot's error type. All
+# already in the lock via the core.
+tokio = { version = "1", features = ["net", "io-util", "time", "sync"] }
+getrandom = "0.4"
+anyhow = "1"
+# The core reads `web/dist` from disk in debug builds; a phone has no such
+# path, so the app embeds the SPA in every profile (feature unification).
+rust-embed = { version = "8", features = ["debug-embed"] }
 
 # QR pairing (plan §2.9: CAMERA via the barcode plugin) — mobile targets only.
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]

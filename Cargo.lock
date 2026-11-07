@@ -4575,7 +4575,10 @@ dependencies = [
 name = "peakbot-mobile"
 version = "0.27.0"
 dependencies = [
+ "anyhow",
+ "getrandom 0.4.2",
  "peakbot",
+ "rust-embed",
  "serde",
  "serde_json",
  "tauri",
@@ -4583,6 +4586,7 @@ dependencies = [
  "tauri-plugin-barcode-scanner",
  "tauri-plugin-log",
  "tauri-plugin-opener",
+ "tokio",
  "url",
 ]
 

@@ -1,6 +1,7 @@
 //! PeakBot Mobile — the Tauri glue (plan §2.2): plugins, the main window, the
 //! nav guard wiring and the Profiles page commands. Decisions live in the pure
-//! modules (`link`, `profiles`, `nav`); this file only wires them to Tauri.
+//! modules (`link`, `profiles`, `nav`) and the Local core's lifecycle in
+//! `local`; this file only wires them to Tauri.
 mod link;
 mod local;
 mod nav;
@@ -11,11 +12,14 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use tauri::webview::Color;
-use tauri::{AppHandle, Manager, State, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{
+    AppHandle, Manager, RunEvent, State, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+};
 use tauri_plugin_log::log;
 use tauri_plugin_opener::OpenerExt;
 
 use link::ServerLink;
+use local::{Local, should_restart};
 use nav::{Known, Nav};
 use profiles::{Active, ProfileError, ProfileName, Profiles, Remote, RemoteId};
 
@@ -28,8 +32,8 @@ pub const INIT_SCRIPT: &str = "Object.defineProperty(window,'peakbotShell',{valu
 /// the same colour so no white band shows behind either.
 const BACKGROUND: Color = Color(9, 9, 11, 255);
 
-/// The app's two storage roots (plan §2.6): `data` holds `profiles.json` and,
-/// from L8, the Local core's config/data; `cache` its cache.
+/// The app's two storage roots (plan §2.6): `data` holds `profiles.json` and
+/// the Local core's config/data; `cache` its cache.
 struct AppDirs {
     data: PathBuf,
     cache: PathBuf,
@@ -50,7 +54,7 @@ impl AppDirs {
         })
     }
 
-    /// The Local core's roots; L8 hands these to `peakbot::paths::init_roots`.
+    /// The Local core's roots (`peakbot::paths::init_roots`).
     fn core_roots(&self) -> peakbot::paths::Roots {
         peakbot::paths::Roots {
             config: self.data.join("config"),
@@ -103,11 +107,11 @@ struct LocalView {
 }
 
 impl ProfilesView {
-    fn of(p: &Profiles) -> ProfilesView {
+    fn of(p: &Profiles, local_running: bool) -> ProfilesView {
         ProfilesView {
             local: LocalView {
                 consented: p.local_consent(),
-                running: false, // L8: whether the Local core is up.
+                running: local_running,
             },
             remotes: p.remotes().iter().map(RemoteView::of).collect(),
             last: *p.last(),
@@ -143,8 +147,8 @@ enum Target {
 }
 
 #[tauri::command]
-fn profiles_get(store: State<'_, Store>) -> ProfilesView {
-    store.read(ProfilesView::of)
+fn profiles_get(store: State<'_, Store>, local: State<'_, Local>) -> ProfilesView {
+    store.read(|p| ProfilesView::of(p, local.is_running()))
 }
 
 #[tauri::command]
@@ -235,22 +239,32 @@ fn local_consent_set(store: State<'_, Store>) -> Result<(), String> {
 async fn profile_open(
     window: WebviewWindow,
     store: State<'_, Store>,
+    local: State<'_, Local>,
     target: Target,
 ) -> Result<(), String> {
-    let id = match target {
-        Target::Local => return Err("PeakBot on this phone isn't available yet.".into()),
-        Target::Remote(id) => RemoteId::new(id),
+    let url = match target {
+        Target::Local => {
+            let url = local.ensure().await?;
+            store.mutate(|p| {
+                p.set_last(Active::Local);
+                Ok(())
+            })?;
+            url
+        }
+        Target::Remote(id) => {
+            let id = RemoteId::new(id);
+            store.mutate(|p| {
+                let url = p
+                    .get(id)
+                    .ok_or(ProfileError::NoSuchProfile)?
+                    .link
+                    .url()
+                    .clone();
+                p.set_last(Active::Remote(id));
+                Ok(url)
+            })?
+        }
     };
-    let url = store.mutate(|p| {
-        let url = p
-            .get(id)
-            .ok_or(ProfileError::NoSuchProfile)?
-            .link
-            .url()
-            .clone();
-        p.set_last(Active::Remote(id));
-        Ok(url)
-    })?;
     window.navigate(url).map_err(|e| e.to_string())
 }
 
@@ -271,8 +285,9 @@ fn on_navigation(app: &AppHandle, url: &Url) -> bool {
     let remotes: Vec<url::Origin> = app
         .state::<Store>()
         .read(|p| p.remotes().iter().map(|r| r.link.origin()).collect());
+    let local = app.state::<Local>().origin();
     let known = Known {
-        local: None, // L8: the running core's loopback origin.
+        local: local.as_ref(),
         remotes: &remotes,
     };
     let nav = nav::classify(url, &known);
@@ -298,11 +313,57 @@ fn on_navigation(app: &AppHandle, url: &Url) -> bool {
                 }
             });
         }
-        // L8: restart the Local core, gated on the current page being Local (§2.4).
-        Nav::RestartLocal => {}
+        Nav::RestartLocal => {
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move { restart_local(&app).await });
+        }
         Nav::Block => {}
     }
     false
+}
+
+/// §2.4: only the Local page may restart the phone's core — a Remote page
+/// sending the sentinel does nothing. A failed restart lands on the Profiles
+/// page, where opening Local again shows the error.
+async fn restart_local(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let local = app.state::<Local>();
+    let current = match window.url() {
+        Ok(url) => url,
+        Err(e) => return log::warn!("restart: no current url: {e}"),
+    };
+    if !should_restart(&current, local.origin().as_ref()) {
+        return log::info!(
+            "restart ignored: {} is not the Local page",
+            without_query(&current)
+        );
+    }
+    let next = match local.restart().await {
+        Ok(url) => url,
+        Err(e) => {
+            log::warn!("{e}");
+            app_index_url()
+        }
+    };
+    if let Err(e) = window.navigate(next) {
+        log::warn!("navigate after restart: {e}");
+    }
+}
+
+/// §2.9: back in the foreground, re-serve the Local core if its listener
+/// was reclaimed; if that moved the port, follow it from the Local page.
+async fn resume_local(app: &AppHandle) {
+    let Some((old, url)) = app.state::<Local>().resume().await else {
+        return;
+    };
+    if let Some(window) = app.get_webview_window("main")
+        && window.url().is_ok_and(|u| u.origin() == old)
+        && let Err(e) = window.navigate(url)
+    {
+        log::warn!("navigate after re-serve: {e}");
+    }
 }
 
 /// For logs: a profile URL's query carries its token.
@@ -316,6 +377,9 @@ fn without_query(url: &Url) -> String {
 fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let dirs = AppDirs::resolve(app.handle())?;
     std::fs::create_dir_all(&dirs.data)?;
+    // Boot-only and before any core call: the core resolves every path from here.
+    peakbot::paths::init_roots(dirs.core_roots());
+    app.manage(Local::default());
     log::info!(
         "data root {}, cache root {}, core roots {:?}",
         dirs.data.display(),
@@ -369,8 +433,14 @@ pub fn run() {
             profile_open
         ])
         .setup(setup)
-        .run(tauri::generate_context!())
-        .expect("error while running PeakBot Mobile");
+        .build(tauri::generate_context!())
+        .expect("error while building PeakBot Mobile")
+        .run(|app, event| {
+            if let RunEvent::Resumed = event {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move { resume_local(&app).await });
+            }
+        });
 }
 
 #[cfg(test)]
@@ -391,7 +461,7 @@ mod glue_tests {
         let mut p = Profiles::default();
         let id = p.add(ServerLink::parse(LINK).unwrap(), None).unwrap();
         p.set_last(Active::Remote(id));
-        let json = serde_json::to_string(&ProfilesView::of(&p)).unwrap();
+        let json = serde_json::to_string(&ProfilesView::of(&p, false)).unwrap();
         assert_eq!(
             json,
             r#"{"local":{"consented":false,"running":false},"remotes":[{"id":1,"name":"nas.lan:7823","host_label":"nas.lan:7823","origin":"https://nas.lan:7823"}],"last":{"remote":1}}"#
