@@ -20,7 +20,8 @@ pub const MAIN_LABEL: &str = "main";
 /// the mobile init-script's `peakbotShell` definition with `"desktop"` in place of
 /// `"mobile"` (mobile plan §2.3). Injected on every load, including the remote
 /// :7823 web UI, via `.initialization_script` on the main window builder.
-pub const SHELL_MARKER_SCRIPT: &str = "Object.defineProperty(window,'peakbotShell',{value:'desktop'});";
+pub const SHELL_MARKER_SCRIPT: &str =
+    "Object.defineProperty(window,'peakbotShell',{value:'desktop'});";
 
 /// Create the `main` window on the bundled status page.
 pub fn create_main(app: &AppHandle, nav: Arc<RwLock<Option<String>>>) -> tauri::Result<()> {
