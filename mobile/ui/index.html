@@ -8,30 +8,49 @@
     />
     <title>PeakBot</title>
     <style>
+      /* SPA dark palette: zinc-950 background (= the window background_color), zinc-100 text. */
       html,
       body {
         margin: 0;
         height: 100%;
-        background: #111318;
-        color: #e6e8ee;
+        background: #09090b;
+        color: #f4f4f5;
         font-family: system-ui, sans-serif;
       }
       main {
         display: grid;
-        place-items: center;
+        place-content: center;
+        gap: 12px;
         height: 100%;
         padding: 24px;
         text-align: center;
       }
+      button {
+        font: inherit;
+        padding: 12px 20px;
+      }
     </style>
   </head>
   <body>
-    <!-- Placeholder: the bundled Profiles page lands in M6. -->
+    <!-- Minimal placeholder: one Open button per saved server. The real Profiles page is M6. -->
     <main>
-      <div>
-        <h1>PeakBot</h1>
-        <p>Profiles page coming soon.</p>
-      </div>
+      <h1>PeakBot</h1>
+      <div id="remotes"></div>
+      <p id="error"></p>
     </main>
+    <script>
+      const { invoke } = window.__TAURI__.core;
+      const show = (e) => (document.getElementById("error").textContent = String(e));
+      invoke("profiles_get")
+        .then((view) => {
+          for (const r of view.remotes) {
+            const b = document.createElement("button");
+            b.textContent = `Open ${r.name}`;
+            b.onclick = () => invoke("profile_open", { target: { remote: r.id } }).catch(show);
+            document.getElementById("remotes").append(b);
+          }
+        })
+        .catch(show);
+    </script>
   </body>
 </html>

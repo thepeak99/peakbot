@@ -1,32 +1,6 @@
-//! `ServerLink` — THE pairing-link parser (plan §2.3); implemented in M2.
-//!
-//! TESTER'S LOCKS — Phase 2, lock 1 (RED until M2 lands): written BEFORE the
-//! implementation, against the architect's §2.3 interface:
-//!
-//! ```rust
-//! pub struct ServerLink(url::Url);            // private; parse is the only constructor
-//! impl ServerLink {
-//!     pub fn parse(text: &str) -> Result<ServerLink, LinkError>;
-//!     pub fn url(&self) -> &url::Url;         // https://host[:port]/?token=… (Rust-only)
-//!     pub fn origin(&self) -> url::Origin;
-//!     pub fn host_label(&self) -> String;     // "host:port", never the token
-//! }
-//! impl fmt::Debug for ServerLink;             // origin only
-//! pub enum LinkError { NotAUrl, NotHttps, NoHost, NoToken, HasCredentials }
-//! ```
-//!
-//! Locked: the parse rules in order (trim + `Url::parse` → scheme `https` →
-//! host → no userinfo → exactly one non-empty `token`), the five user-facing
-//! `Display` strings (v2 §5.4, locked), normalization (path `/`, query exactly
-//! `token=<raw value>` byte-for-byte, fragment dropped, port kept), the
-//! 0.27.0 `&ca=sha256:<fp>&profile=<name>` parameters accepted-and-dropped
-//! (QL13), and the secrecy contract: `Debug` and `host_label()` never contain
-//! the token.
-//!
-//! NOTE (NoHost): a successfully `Url::parse`d `https:` URL always carries a
-//! host (the url crate rejects hostless special-scheme URLs at parse), so the
-//! `NoHost` branch is a defensive invariant — its lock is the Display string,
-//! not a parse case.
+//! `ServerLink` — THE pairing-link parser (plan §2.3). `parse` is the only
+//! constructor, so downstream code holds a valid, normalized link whose token
+//! is reachable only through `url()`.
 
 use std::fmt;
 use url::Url;

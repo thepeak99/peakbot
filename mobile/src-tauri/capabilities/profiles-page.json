@@ -1,7 +1,19 @@
 {
   "$schema": "../gen/schemas/mobile-schema.json",
   "identifier": "profiles-page",
-  "description": "Bundled Profiles page only — no remote key: the server origin gets no IPC.",
+  "description": "Bundled Profiles page only. No remote key: Remote and Local server origins get no IPC and no opener. Mobile platforms only, because the barcode plugin exists only there.",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "platforms": ["android", "iOS"],
+  "permissions": [
+    "core:default",
+    "allow-profiles-get",
+    "allow-profile-add",
+    "allow-profile-rename",
+    "allow-profile-remove",
+    "allow-local-consent-set",
+    "allow-profile-open",
+    "barcode-scanner:allow-scan",
+    "barcode-scanner:allow-check-permissions",
+    "barcode-scanner:allow-request-permissions"
+  ]
 }

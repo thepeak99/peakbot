@@ -19,6 +19,7 @@ scripts
 # PeakBot Desktop scripts must remain trackable (the bare 'scripts' above
 # matches any directory named 'scripts', e.g. desktop/scripts/).
 !desktop/scripts/
+!mobile/scripts/
 # The mobile app's README is a shipped doc (not scratch).
 !mobile/**/*.md
 

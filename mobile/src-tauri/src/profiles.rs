@@ -1,54 +1,13 @@
-//! `Profiles` store + `profiles.json` persistence (plan §2.3); implemented in M3.
-//!
-//! TESTER'S LOCKS — Phase 2, lock 2 (RED until M3 lands): written BEFORE the
-//! implementation. The data model is locked verbatim from plan §2.3:
-//!
-//! ```rust
-//! pub struct Profiles { remotes: Vec<Remote>, last: Active, next_id: u32, local_consent: bool }
-//! pub struct Remote  { pub id: RemoteId, pub name: ProfileName, pub link: ServerLink }
-//! pub enum   Active  { Local, Remote(RemoteId) }
-//! pub struct RemoteId(u32);
-//! pub struct ProfileName(String);   // trimmed, 1..=40 chars; default = link.host_label()
-//! pub enum   ProfileError { DuplicateServer, BadName, NoSuchProfile, Link(LinkError) }
-//! ```
-//!
-//! Minimal mutator API the builder must provide (the only writers, per the
-//! v2 §11.7 "private fields; the mutators are the only constructors" rule):
-//!
-//! ```rust
-//! impl Profiles {
-//!     pub fn load(path: &Path) -> Profiles;              // corrupt/missing ⇒ default
-//!     pub fn save(&self, path: &Path) -> io::Result<()>; // tmp + rename in path's parent
-//!     pub fn remotes(&self) -> &[Remote];
-//!     pub fn last(&self) -> &Active;
-//!     pub fn next_id(&self) -> u32;
-//!     pub fn local_consent(&self) -> bool;
-//!     pub fn get(&self, id: RemoteId) -> Option<&Remote>;
-//!     pub fn add(&mut self, link: ServerLink, name: Option<ProfileName>) -> Result<RemoteId, ProfileError>;
-//!     pub fn rename(&mut self, id: RemoteId, name: ProfileName) -> Result<(), ProfileError>;
-//!     pub fn remove(&mut self, id: RemoteId) -> Result<(), ProfileError>;
-//!     pub fn set_last(&mut self, last: Active);
-//!     pub fn set_local_consent(&mut self, consent: bool);
-//! }
-//! impl Default for Profiles; // {remotes:[], last:Local, next_id:1, local_consent:false}
-//! impl RemoteId   { pub fn new(id: u32) -> RemoteId; pub fn get(self) -> u32; }
-//! impl ProfileName { pub fn new(raw: &str) -> Result<ProfileName, ProfileError>;
-//!                    pub fn as_str(&self) -> &str; }
-//! impl Active     { pub fn is_local(&self) -> bool; }
-//! // + derives: Debug, PartialEq on Profiles/Remote/Active/RemoteId/ProfileName/ProfileError
-//! ```
-//!
-//! Locked invariants: P1–P5 (§2.3), corrupt/missing file ⇒ default, ids never
-//! reused, `DuplicateServer` on the same origin (any token), `BadName`
-//! (empty/whitespace, >40 chars), default name = `host_label()`, removing
-//! `last` ⇒ `Local`, dangling `last` parses as `Local`, the §2.3 example JSON
-//! round-trips, and persistence is tmp+rename (no temp litter).
+//! `Profiles` — the app's only persisted state (remotes, `last`, Local consent)
+//! and its `profiles.json` (plan §2.3). The mutators are the only writers, so
+//! P1–P3 hold by construction.
 
 use serde::{Deserialize, Serialize};
 use serde::{
     de::{self, Deserializer},
     ser::{SerializeStruct, Serializer},
 };
+use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::Path;
@@ -89,16 +48,33 @@ impl ProfileName {
     }
 }
 
-/// Errors from mutating the store.
+/// Errors from editing the store. `Display` is what the Profiles page shows.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ProfileError {
     DuplicateServer,
     BadName,
     NoSuchProfile,
-    // Reserved for the "paste a raw link" path (M5); `add` always takes an
-    // already-validated `ServerLink`, so nothing here constructs it yet.
-    #[allow(dead_code)]
+    /// The pasted/scanned text isn't a pairing link (adding a profile).
     Link(LinkError),
+}
+
+impl std::error::Error for ProfileError {}
+
+impl fmt::Display for ProfileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProfileError::DuplicateServer => f.write_str("That server is already in your list."),
+            ProfileError::BadName => f.write_str("Names need 1 to 40 characters."),
+            ProfileError::NoSuchProfile => f.write_str("That profile no longer exists."),
+            ProfileError::Link(e) => e.fmt(f),
+        }
+    }
+}
+
+impl From<LinkError> for ProfileError {
+    fn from(e: LinkError) -> Self {
+        ProfileError::Link(e)
+    }
 }
 
 /// Which profile is active: the Local edition, or a named remote.
@@ -106,12 +82,6 @@ pub enum ProfileError {
 pub enum Active {
     Local,
     Remote(RemoteId),
-}
-
-impl Active {
-    pub fn is_local(&self) -> bool {
-        matches!(self, Active::Local)
-    }
 }
 
 impl Serialize for Active {
@@ -171,10 +141,10 @@ impl<'de> Deserialize<'de> for ServerLink {
 /// The store of paired remotes + active choice, persisted as `profiles.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Profiles {
-    pub remotes: Vec<Remote>,
-    pub last: Active,
-    pub next_id: u32,
-    pub local_consent: bool,
+    remotes: Vec<Remote>,
+    last: Active,
+    next_id: u32,
+    local_consent: bool,
 }
 
 impl Profiles {
@@ -225,9 +195,6 @@ impl Profiles {
     }
     pub fn last(&self) -> &Active {
         &self.last
-    }
-    pub fn next_id(&self) -> u32 {
-        self.next_id
     }
     pub fn local_consent(&self) -> bool {
         self.local_consent
@@ -347,8 +314,8 @@ mod tests {
         let store = Profiles::default();
         assert!(store.remotes().is_empty());
         assert_eq!(store.last(), &Active::Local);
-        assert!(store.last().is_local());
-        assert_eq!(store.next_id(), 1);
+        assert_eq!(*store.last(), Active::Local);
+        assert_eq!(store.next_id, 1);
         assert!(!store.local_consent());
     }
 
@@ -358,7 +325,7 @@ mod tests {
         let store = Profiles::load(&dir.path().join("profiles.json"));
         assert!(store.remotes().is_empty());
         assert_eq!(store.last(), &Active::Local);
-        assert_eq!(store.next_id(), 1);
+        assert_eq!(store.next_id, 1);
         assert!(!store.local_consent());
     }
 
@@ -370,7 +337,7 @@ mod tests {
         let store = Profiles::load(&p);
         assert!(store.remotes().is_empty());
         assert_eq!(store.last(), &Active::Local);
-        assert_eq!(store.next_id(), 1);
+        assert_eq!(store.next_id, 1);
         assert!(!store.local_consent());
     }
 
@@ -382,7 +349,7 @@ mod tests {
         let store = Profiles::load(&p);
         assert!(store.remotes().is_empty());
         assert_eq!(store.last(), &Active::Local);
-        assert_eq!(store.next_id(), 1);
+        assert_eq!(store.next_id, 1);
     }
 
     #[test]
@@ -393,7 +360,7 @@ mod tests {
         let store = Profiles::load(&p);
         assert!(store.remotes().is_empty());
         assert_eq!(store.last(), &Active::Local);
-        assert_eq!(store.next_id(), 1);
+        assert_eq!(store.next_id, 1);
     }
 
     // ── P1: exactly one Local, implicit ──────────────────────────────────
@@ -530,7 +497,7 @@ mod tests {
             .unwrap();
         assert_eq!(a, RemoteId::new(1));
         assert_eq!(b, RemoteId::new(2));
-        assert_eq!(store.next_id(), 3);
+        assert_eq!(store.next_id, 3);
     }
 
     #[test]
@@ -549,7 +516,7 @@ mod tests {
             .unwrap();
         assert_ne!(c, a, "ids are monotonic — never reused after remove");
         assert_eq!(c, RemoteId::new(3));
-        assert_eq!(store.next_id(), 4);
+        assert_eq!(store.next_id, 4);
     }
 
     // ── names ────────────────────────────────────────────────────────────
@@ -735,7 +702,7 @@ mod tests {
             &format!("https://nas.lan:7823/?token={EXAMPLE_TOKEN}")
         );
         assert_eq!(store.last(), &Active::Remote(RemoteId::new(1)));
-        assert_eq!(store.next_id(), 2);
+        assert_eq!(store.next_id, 2);
         assert!(store.local_consent());
     }
 
@@ -803,7 +770,7 @@ mod tests {
         );
         assert_eq!(reloaded.remotes()[1].name.as_str(), "b.lan:9443");
         assert_eq!(reloaded.last(), &Active::Remote(a));
-        assert_eq!(reloaded.next_id(), store.next_id());
+        assert_eq!(reloaded.next_id, store.next_id);
         assert!(reloaded.local_consent());
     }
 
@@ -828,5 +795,20 @@ mod tests {
             vec!["profiles.json".to_string()],
             "tmp+rename must leave exactly the target file, no temp litter"
         );
+    }
+
+    #[test]
+    fn link_errors_display_their_locked_string_verbatim() {
+        // The page shows `ProfileError` text; a bad pasted link must surface
+        // the locked `LinkError` wording unchanged.
+        for e in [
+            LinkError::NotAUrl,
+            LinkError::NotHttps,
+            LinkError::NoHost,
+            LinkError::NoToken,
+            LinkError::HasCredentials,
+        ] {
+            assert_eq!(ProfileError::from(e.clone()).to_string(), e.to_string());
+        }
     }
 }
