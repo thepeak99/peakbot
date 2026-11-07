@@ -14,6 +14,10 @@
 # The ci.yml and lock contracts were landed in M1 and are GREEN already —
 # they are guards that must stay green.
 #
+# Phase 4 iOS locks (plan §4.4 "Tester locks FIRST", IOS-1..IOS-4) live in
+# mobile/tests/ios-contracts.sh and are invoked from here — this file stays
+# the single CI entry point.
+#
 # Runs NO docker, NO cargo, NO network: pure file greps.
 #
 # Run:  sh mobile/tests/contracts.sh        (from the repo root, or anywhere)
@@ -128,6 +132,19 @@ if [ -e "$ML" ]; then
     bad "no mobile/src-tauri/Cargo.lock (D8: one workspace, one lock)"
 else
     ok "no mobile/src-tauri/Cargo.lock (D8)"
+fi
+
+# ── Phase 4 iOS (RED until IOS-1..IOS-4; plan §4.4 "Tester locks FIRST") ──
+# Separate file: its own ✅/❌ lines and counters; its exit status folds
+# into this verdict so CI keeps exactly one entry point.
+if [ -f "$script_dir/ios-contracts.sh" ]; then
+    if sh "$script_dir/ios-contracts.sh"; then
+        ok "ios-contracts: Phase 4 iOS static locks pass"
+    else
+        bad "ios-contracts: Phase 4 iOS static locks failing (see ❌ above)"
+    fi
+else
+    bad "mobile/tests/ios-contracts.sh exists"
 fi
 
 # ── verdict ──────────────────────────────────────────────────────────────
