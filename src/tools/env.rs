@@ -255,6 +255,16 @@ pub fn delegate_enabled(agent: &ResolvedAgent) -> bool {
     !agent.subagents.is_empty()
 }
 
+/// `file_create` among the registered built-ins after the `profile.tools`
+/// filter: the full edition always lists it, so the filter alone decides;
+/// the Local edition never compiles the tool. The single source of truth the
+/// derived memory rule reads (mobile plan §2.7) — it can never drift from
+/// `main_agent_tool_names`, which applies the same `allows` gate to the same
+/// base list.
+pub fn file_create_registered(tools: &NameFilter) -> bool {
+    cfg!(feature = "host") && tools.allows("file_create")
+}
+
 /// The shell the name projections assume. They are pure (no shell
 /// detection), so they report a POSIX host; the real build uses the
 /// detected shell, which only changes `bash`/`bash_bg` into

@@ -360,11 +360,13 @@ fn core_guidance(shell: Option<&ShellKind>) -> String {
     out
 }
 
-/// memory.md is kept through the file tools, which the Local edition doesn't
-/// have: there a profile's `memory:` setting is inert (no prompt section, no
-/// compaction).
-fn memory_applies(memory: &crate::config::MemoryConfig) -> bool {
-    memory.enabled && cfg!(feature = "host")
+/// The derived memory rule (mobile plan §2.7): the memory.md prompt section
+/// and the compaction memory flush apply iff `memory.enabled ∧ file_create
+/// is registered` — `file_create` after the `profile.tools` filter (never
+/// present in the Local edition). ONE predicate for both call sites, so the
+/// prompt and the flush can never drift from the actual registration.
+fn memory_applies(memory: &crate::config::MemoryConfig, tools: &crate::config::NameFilter) -> bool {
+    memory.enabled && crate::tools::env::file_create_registered(tools)
 }
 
 /// The `# Environment Information` block (cwd, time, version, OS, binary,
@@ -453,7 +455,7 @@ pub fn build_agent_prompt(
         }
     }
 
-    if memory_applies(&profile.memory) {
+    if memory_applies(&profile.memory, &profile.tools) {
         prompt.push_str(MEMORY_PROMPT_SECTION);
     }
     prompt.push_str(&skills.to_system_prompt_section_filtered(&agent.main.skills));
@@ -1746,9 +1748,9 @@ impl AgentRunner {
                         // profile setting, so it follows the session's Bound.
                         let memory_threshold = rebuild_ctx
                             .as_ref()
-                            .map(|ctx| &ctx.bound.profile.memory)
-                            .filter(|memory| memory_applies(memory))
-                            .map(|memory| memory.threshold_bytes);
+                            .map(|ctx| (&ctx.bound.profile.memory, &ctx.bound.profile.tools))
+                            .filter(|(memory, tools)| memory_applies(memory, tools))
+                            .map(|(memory, _)| memory.threshold_bytes);
                         if !memory_compaction_done
                             && let Some(threshold) = memory_threshold
                             && let Some(sm) = state_manager.as_ref()
