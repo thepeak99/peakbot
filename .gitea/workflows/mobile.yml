@@ -1,0 +1,67 @@
+name: mobile
+
+on:
+  workflow_dispatch:
+
+jobs:
+  mobile:
+    name: build Android APK (manual)
+    runs-on: dind
+    timeout-minutes: 120
+    # Runs on the Alpine host: it drives the HOST docker daemon (the dind
+    # runner ships docker) and the pure-git checkout needs only git + sh.
+    # No job-level container — bind mounts are unsafe on this runner.
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      # Android signing (optional): all four empty (or undefined) ⇒ the
+      # Makefile debug path — debug keystore, `...-arm64-debug.apk`, never
+      # released. Gitea expands an undefined secret to an empty string,
+      # which make + build-android.sh treat as "no secrets".
+      ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+
+    steps:
+      - name: Checkout (no-node, pure git)
+        run: |
+          git init -q
+          git fetch --depth=1 \
+            "https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git" \
+            "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+      - name: Check required tools
+        run: |
+          for t in make docker git; do
+            command -v "$t" >/dev/null || { echo "missing tool on runner: $t (add it to the runner image)"; exit 1; }
+          done
+          # Artifact upload (actions/upload-artifact@v3) is a JS action and needs
+          # node on the host; the dind host is the same Alpine host as
+          # release.yml, whose tool check (make curl jq docker git awk rclone)
+          # omits node — there is no upload-artifact step here, so this job
+          # prints each APK's sha256 + size instead. When node is added to the
+          # runner image (apk add nodejs), add:
+          #   - uses: actions/upload-artifact@v3
+          #     with: { name: mobile-android-apks, path: output/mobile/*.apk }
+          if command -v node >/dev/null 2>&1; then
+            echo "node available on host — actions/upload-artifact@v3 can be enabled"
+          else
+            echo "ℹ️  no node on the host — APK upload deferred (sha256 + size below)"
+          fi
+      - name: Build Android APK
+        run: make mobile-android CONTAINER_BUILDER=docker
+      # The signed (or debug) APK lands at
+      # output/mobile/PeakBot-Mobile-<v>-android-arm64[-debug].apk. `make`
+      # + smoke-android.sh fail the build on any violation, so the APK must
+      # exist once here — but print it anyway: the run log carries the
+      # artifact identity (sha256 + size) until upload is wired.
+      - name: List APKs (sha256 + size)
+        run: |
+          set -eu
+          ls -lh output/mobile/*.apk || { echo "❌ no APK in output/mobile"; exit 1; }
+          for apk in output/mobile/*.apk; do
+            printf '📦 %s  %s  %s\n' \
+              "$(basename "$apk")" \
+              "$(ls -lh "$apk" | awk '{print $5}')" \
+              "$(sha256sum "$apk" | awk '{print $1}')"
+          done

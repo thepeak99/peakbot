@@ -117,6 +117,16 @@ jobs:
           cargo fmt --manifest-path desktop/Cargo.toml --all -- --check
           cargo clippy --locked --manifest-path desktop/Cargo.toml --workspace --all-targets -- -D warnings
           cargo test --locked --manifest-path desktop/Cargo.toml --workspace
+      # Mobile crate (peakbot-mobile): member of the root workspace, so both
+      # checks run from the repo root against the shared lock (D8). The
+      # webkit/gtk deps installed above already cover the Tauri glue; `cargo
+      # fmt` needs no step here — the root `ci` job runs `cargo fmt --all`,
+      # which includes this member.
+      - name: Mobile clippy + test
+        run: |
+          cargo clippy --locked -p peakbot-mobile --all-targets -- -D warnings
+          cargo test --locked -p peakbot-mobile
+          sh mobile/tests/contracts.sh
       # Static tests for the Windows desktop pipeline (T01–T48): shell
       # contract checks on build-desktop.sh / the Dockerfiles / the Makefile,
       # plus smoke-windows.sh unit-tested against fake PEs. No docker build.
