@@ -1,10 +1,10 @@
 #!/bin/sh
 #
-# ios-sim.sh — PeakBot Mobile simulator build (IOS-3, plan §3.3).
+# ios-sim.sh — PeakBot Mobile simulator build.
 #
 # Host script on the Mac (Xcode can't run in a container). Tauri 2.12's
 # `ios build` always archives + signs after building, and without a team it
-# exits 1 at the archive step (I-D7) — by then the simulator .app is already
+# exits 1 at the archive step — by then the simulator .app is already
 # in DerivedData. So the script:
 #   1. records a start timestamp (the freshness reference)
 #   2. web/dist (always rebuilt — the Local core embeds the SPA) +

@@ -1,7 +1,7 @@
-//! L3 contract (mobile plan §2.11 / §4.3 test 1) — RED.
+//! Local core embed contract.
 //!
-//! **RED today by COMPILE ERROR:** `peakbot::embed` does not exist yet. L3
-//! ("boot extraction — the key remaining engineering item") moves the full
+//! **RED today by COMPILE ERROR:** `peakbot::embed` does not exist yet. The
+//! boot extraction ("the key remaining engineering item") moves the full
 //! web boot sequence out of `main.rs` (storage, uploads, `SessionDeps`,
 //! models snapshot) into ONE lib fn — **`peakbot::boot::web_boot`** — that
 //! both `main` and `embed` call, and exposes:
@@ -28,8 +28,9 @@
 //! }
 //! ```
 //!
-//! This is the S15/S16 1006 regression lock: in the spike only the
-//! *needs_setup* server booted, so a chat `/ws` closed `1006`. L3 boots a
+//! This is the S15/S16 1006 regression lock: early on only the
+//! *needs_setup* server booted, so a chat `/ws` closed `1006`. The embed
+//! boots a
 //! **full chat session**, so a user message over `/ws` completes with the
 //! provider's reply.
 //!
@@ -279,6 +280,6 @@ fn main_calls_the_shared_web_boot_fn() {
     assert!(
         main_src.contains("boot::web_boot("),
         "src/main.rs must call the shared boot fn `peakbot::boot::web_boot` \
-         (the one L3 extracts so main and embed never diverge)"
+         (the one the embed extracts so main and embed never diverge)"
     );
 }

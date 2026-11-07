@@ -97,7 +97,7 @@ mod tests {
 
     // ── the locked sentinel consts (cross-side pin, lock 4) ──────────────
 
-    /// `web/src/settings/mobileGating.test.tsx` (F2) asserts the exact
+    /// `web/src/settings/mobileGating.test.tsx` asserts the exact
     /// `a[href="peakbot-mobile:profiles"]` — read at compile time so this pin
     /// is deterministic.
     const WEB_MOBILE_GATING: &str = include_str!("../../../web/src/settings/mobileGating.test.tsx");

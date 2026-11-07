@@ -10364,7 +10364,7 @@ profiles:
     //     message is posted per stop; the next turn runs normally.
 }
 
-// ─── Local edition canary (mobile plan §2.7/§3.5, task L1) ───────────────
+// ─── Local edition canary ────────────────────────────────────────────────
 //
 // The Local edition (no `host` feature) exposes EXACTLY the five
 // non-execution built-ins — a leaked `host` dependency widens the set and
@@ -10387,7 +10387,7 @@ fn local_edition_canary() {
     );
 }
 
-// ─── dirs guard (mobile plan §2.6, task L2) ──────────────────────────────
+// ─── dirs guard ──────────────────────────────────────────────────────────
 //
 // `src/paths.rs` is the ONLY module that may call the platform-dir
 // helpers (the `dirs` crate and the `directories` crate's project-dirs
@@ -10444,7 +10444,7 @@ fn dirs_calls_appear_only_in_paths_module() {
     );
 }
 
-// ─── Local persona (mobile plan §2.7 trap 3, task L1) ────────────────────
+// ─── Local persona ───────────────────────────────────────────────────────
 //
 // The Local edition (no `host` feature) ships its OWN built-in
 // persona/core guidance: it runs on the user's phone; it can fetch pages,
@@ -10455,8 +10455,8 @@ fn dirs_calls_appear_only_in_paths_module() {
 //
 // RED today: the built-in persona (src/system_prompt_persona.txt) says
 // "You operate in the user's local filesystem and can read, write, and
-// execute code", and the core guidance names the file tools. L1 replaces
-// both with the Local text.
+// execute code", and the core guidance names the file tools. The Local cut
+// replaces both with the Local text.
 #[cfg(all(test, not(feature = "host")))]
 mod local_persona_tests {
     use super::*;

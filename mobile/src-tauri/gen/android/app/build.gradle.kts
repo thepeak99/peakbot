@@ -26,13 +26,13 @@ android {
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
     }
-    // Release signing (M7): keystore.properties carries storePassword,
+    // Release signing: keystore.properties carries storePassword,
     // keyPassword, keyAlias and storeFile. Path: the ANDROID_KEYSTORE_PROPERTIES
-    // env var (CI: the tmpfs file decoded from the BuildKit secrets, plan
-    // §3.1), else the Tauri convention rootProject/keystore.properties
+    // env var (CI: the tmpfs file decoded from the BuildKit secrets), else
+    // the Tauri convention rootProject/keystore.properties
     // (git-ignored). No file ⇒ no release signingConfig ⇒ a release build
     // refuses to assemble; debug builds are unaffected (they use AGP's
-    // default debug keystore from /root/.android — plan D7).
+    // default debug keystore from /root/.android).
     signingConfigs {
         val keystorePropertiesFile = file(
             System.getenv("ANDROID_KEYSTORE_PROPERTIES")
@@ -64,7 +64,7 @@ android {
             }
         }
         getByName("release") {
-            // M7: sign with the release key when keystore.properties is
+            // Sign with the release key when keystore.properties is
             // present (tmpfs in CI); without it a release build fails
             // loudly at the signing step.
             signingConfigs.findByName("release")?.let { signingConfig = it }

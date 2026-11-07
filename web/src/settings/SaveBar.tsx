@@ -169,7 +169,7 @@ export function RestartBanner({ keys, desktop, onLater, onRestartNow }: RestartB
           Restart now
         </button>
       ) : shell() === "mobile" && edition() === "local" ? (
-        // L7: the mobile shell restarts the Local core when it sees this
+        // The mobile shell restarts the Local core when it sees this
         // navigation — the only SPA→shell restart message.
         <a
           data-testid="restart-banner-restart"

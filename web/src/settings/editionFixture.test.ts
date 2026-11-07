@@ -1,4 +1,4 @@
-// Cross-side pin for the settings `boot` block (L7 follow-up). The SPA read
+// Cross-side pin for the settings `boot` block. The SPA read
 // `meta.edition` (top-level) while the server sends `boot.edition`, so on a
 // real Local server `edition()` was always "full" — and both sides' own
 // tests passed because each modelled its own idea of the shape.

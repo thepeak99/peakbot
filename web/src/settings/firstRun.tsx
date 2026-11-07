@@ -174,7 +174,7 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
   const [putOk, setPutOk] = useState<PutOk | null>(null);
 
   const phase = deriveSetupPhase(meta, global.exists);
-  // L7 (driven by the meta prop Boot passes from the same boot read): the
+  // Driven by the meta prop Boot passes from the same boot read: the
   // local edition (phone build) skips the "Web access" step — the server is
   // loopback-only by construction — and the PATH fact (the binary runs from
   // the APK; PATH has no meaning there). The edition lives in the `boot`
@@ -355,7 +355,7 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
         </div>
         <span className="text-[11px] text-zinc-600">Esc to close</span>
       </header>
-      {/* F3 (S8): below the sm breakpoint the side rail collapses to a top
+      {/* Below the sm breakpoint the side rail collapses to a top
           stepper so the wizard fits ≤ 412 CSS px (360/412 phone frames)
           with "Next"/"Finish" always in the footer and no horizontal
           overflow. */}
@@ -398,7 +398,7 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
       <div className="flex min-h-0 flex-1">
         {/* Left rail: numbered steps with status dots. Later steps are
             disabled until visited. Collapses to a top stepper below the
-            sm breakpoint (F3, ≤ 412 CSS px on phones). */}
+            sm breakpoint (≤ 412 CSS px on phones). */}
         <nav className="hidden w-56 shrink-0 overflow-y-auto border-r border-zinc-800 p-4 sm:block">
           <div className="mb-2 text-[10px] uppercase tracking-wide text-zinc-600">Setup</div>
           {steps.map((s, i) => {
@@ -469,7 +469,7 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
                   <div>Config · {meta.global_path}</div>
                   <div>Data dir · {meta.facts.data_dir}</div>
                   <div>Version · {meta.facts.version}</div>
-                  {/* L7: the local edition omits the PATH fact (APK build —
+                  {/* The local edition omits the PATH fact (APK build —
                       PATH has no meaning on the phone); the full edition
                       keeps the line, reading "unknown" when the install
                       probe is absent. */}
@@ -659,7 +659,7 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
                   </select>
                 </Field>
                 {/* The persona picker is full-edition only: Local has its
-                    own built-in persona (L1), so the Code Crusader /
+                    own built-in persona, so the Code Crusader /
                     engineer / reviewer choices don't apply there. The
                     default answer (persona: null) writes no `persona` key —
                     which on Local IS the Local built-in persona. */}

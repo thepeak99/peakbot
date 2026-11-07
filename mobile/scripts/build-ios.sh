@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# build-ios.sh — PeakBot Mobile iOS .ipa build (IOS-4, plan §3.2).
+# build-ios.sh — PeakBot Mobile iOS .ipa build.
 #
 # Host script on the Mac (Xcode can't run in a container). The single
 # entry point for `make mobile-ios`.

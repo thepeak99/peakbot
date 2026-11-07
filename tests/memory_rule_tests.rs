@@ -1,4 +1,4 @@
-//! Memory rule (mobile plan §2.7 derived rule / §4.3 test 3) — RED.
+//! Memory rule (derived rule; Local-edition gate).
 //!
 //! The locked rule: **the memory.md prompt section (and the compaction
 //! memory flush, which shares the same gate) is present iff
@@ -13,7 +13,7 @@
 //! section although `file_create` is not registered. Every other row is
 //! green today and stays a guard.
 //!
-//! **The seam the builder (L5) must implement:** `build_agent_prompt`
+//! **The seam to implement:** `build_agent_prompt`
 //! decides the memory section by the SAME registration check the tool build
 //! uses — `file_create` in `main_agent_tool_names` for the bound agent
 //! (i.e. `profile.tools.allows("file_create")` in the full edition, never in

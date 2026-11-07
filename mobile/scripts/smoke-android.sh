@@ -1,10 +1,10 @@
 #!/bin/sh
 #
-# smoke-android.sh <apk> — PeakBot Mobile APK assertions (M8, plan §3.1).
+# smoke-android.sh <apk> — PeakBot Mobile APK assertions.
 #
 # Runs INSIDE the Dockerfile.mobile-android toolchain container (aapt2,
 # apksigner, zipalign from build-tools 36.0.0). Fails the build (exit 1)
-# on any violation. Wired into build-android.sh (M7); also usable standalone:
+# on any violation. Wired into build-android.sh; also usable standalone:
 #   sh mobile/scripts/smoke-android.sh output/mobile/PeakBot-Mobile-<v>-android-arm64.apk
 #
 # Assertions:
@@ -14,19 +14,20 @@
 #   2. apksigner verify --print-certs (always). A release-signed APK (any
 #      name other than *-debug.apk) additionally pins its cert SHA-256
 #      against mobile/release-cert.sha256 (one fingerprint line, the
-#      apksigner format). REL-1 has not created that file yet: when it is
-#      absent, print a warning for release builds and skip the pin.
-#   3. zipalign -c -P 16 -v 4 — 16 KB page alignment (S10 / R11)
+#      apksigner format). The pin file has not been created yet: when it
+#      is absent, print a warning for release builds and skip the pin.
+#   3. zipalign -c -P 16 -v 4 — 16 KB page alignment
 #   4. merged manifest (aapt2 dump xmltree): networkSecurityConfig present
 #      + allowBackup="false" (no cloud backup of the token/config)
 #   5. the NSC resource (extracted from the APK): src="user" trust anchors
 #      (user-installed PeakBot CA) + the 127.0.0.1 domain-config (cleartext
 #      for the in-process Local core only)
-#   6. size < 40 MB (41943040 bytes; plan §3.1 — spike: 22.1 MB). Release
+#   6. size < 40 MB (41943040 bytes; measured on a development build:
+#      22.1 MB). Release
 #      builds only: debug APKs are never released (unstripped .so, debug
 #      symbols) and skip the cap.
 #
-# L10 hook (Phase 3, plan §4.3 test 6): the symbol check (llvm-nm -D /
+# Host-only symbol leak hook: the symbol check (llvm-nm -D /
 # strings on the unstripped .so — no portable_pty, TokioChildProcess,
 # BashTool, ratatui) lands there as the body of run_l10_symbol_check().
 
@@ -154,7 +155,7 @@ else
     echo "ℹ️  smoke: debug build — the 40 MB release size cap does not apply (debug is never released)"
 fi
 
-# ── L10 (Phase 3, plan §4.3 test 6): host-only symbol leak check ─────────
+# ── host-only symbol leak check ──────────────────────────────────────────
 # The unstripped mobile lib must not link host-only code (the shell/PTY,
 # BashTool, the ratatui TUI). Rust internals are mostly not exported as
 # dynamic symbols, so `llvm-nm -D` alone isn't enough — we also scan

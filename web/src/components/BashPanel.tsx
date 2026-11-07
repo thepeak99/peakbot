@@ -29,7 +29,7 @@ export function BashPanel({ panel }: { panel: BashPanelData }) {
     if (el && followRef.current) el.scrollTop = el.scrollHeight;
   }, [body]);
 
-  // L7: the local edition (phone build) has no shell to run bash in — the
+  // The local edition (phone build) has no shell to run bash in — the
   // panel renders nothing (after the hooks: the hook order must stay stable).
   if (edition() === "local") return null;
 

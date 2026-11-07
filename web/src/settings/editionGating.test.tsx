@@ -1,11 +1,11 @@
-// SPA per-edition gating (mobile plan §2.5 / §4.3 test 5, L7) — written
+// SPA per-edition gating — written
 // BEFORE the code, RED.
 //
 // The edition signal: `boot.edition: "full" | "local"` on `GET
 // /api/settings` (the Rust side is locked in tests/edition_settings.rs).
 // Missing ⇒ `"full"` (old servers keep today's behaviour).
 //
-// **The locked contract (builder L7 implements exactly this):**
+// **The locked contract (implemented exactly this way):**
 //
 // 1. `web/src/settings/types.ts` — `SettingsMeta.boot` gains
 //    `edition?: "full" | "local"` (OPTIONAL — old servers omit it). The

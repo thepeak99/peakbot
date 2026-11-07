@@ -347,7 +347,7 @@ export function Composer({
                 ref={fileInputRef}
                 type="file"
                 multiple
-                // L7: the local edition (phone build) accepts images only —
+                // The local edition (phone build) accepts images only —
                 // the Local server answers non-image uploads with 415.
                 accept={edition() === "local" ? "image/*" : undefined}
                 onChange={onPickFiles}

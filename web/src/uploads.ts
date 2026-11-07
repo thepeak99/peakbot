@@ -14,7 +14,7 @@ function errorMessage(status: number, body: string): string {
   try {
     const parsed = JSON.parse(body) as { error?: unknown };
     if (typeof parsed.error === "string" && parsed.error) {
-      // L7: the Local server rejects non-image uploads (415) — say what the
+      // The Local server rejects non-image uploads (415) — say what the
       // phone can do instead of surfacing the wire token.
       if (status === 415 && parsed.error === "images_only") {
         return "PeakBot on this phone can only attach images.";

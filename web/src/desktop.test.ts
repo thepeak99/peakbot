@@ -28,7 +28,7 @@ afterEach(() => {
   delete g.isTauri;
 });
 
-// ── shell seam (mobile plan §2.5, task F1) ───────────────────────────────
+// ── shell seam ────────────────────────────────────────────────────────────
 // `shell()` reads `window.peakbotShell` — the marker the shell's init
 // script injects: exactly "desktop" or "mobile". Anything else — missing,
 // garbage, the wrong type — is "browser" (SH1 fail-safe). `isDesktop()`
@@ -36,7 +36,7 @@ afterEach(() => {
 // consulted: old desktop apps still set `isTauri` without the marker, and
 // a Tauri window without the marker must read as "browser".
 //
-// RED today: desktop.ts does not export shell() yet (F1). The dynamic
+// RED today: desktop.ts does not export shell() yet. The dynamic
 // import (this file's existing module-surface pattern) keeps the rest of
 // this file green until the seam lands.
 
@@ -321,11 +321,11 @@ describe("clipboard image IPC seam", () => {
 // ── module surface (close-to-tray removal + auto-update) ─────────────────
 // The Desktop pane is gone: `DesktopView`, `getDesktopSettings` and
 // `toggleDesktopBackground` are no longer exported. The seam carries
-// exactly eight exports: the shell detection pair (F1), the edition pair
-// (L7), the theme command, the two update commands, and the
+// exactly eight exports: the shell detection pair, the edition pair,
+// the theme command, the two update commands, and the
 // clipboard-image read.
 //
-// RED today: `shell` is not exported yet (F1).
+// RED today: `shell` is not exported yet.
 
 describe("module surface", () => {
   it("exports exactly isDesktop, shell, edition, setBootEdition, setDesktopTheme, getUpdateStatus, installUpdate, readClipboardImage", async () => {

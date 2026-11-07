@@ -6,10 +6,10 @@
 //   the priority order modal → popover → Settings (an already-handled
 //   defaultPrevented Esc is left to the modal/popover).
 //
-// The section CONTENT panes land across M5 tasks: Providers & Models
-// (T25, ./providers), MCP servers (T26, ./mcp), the Profiles master-detail
-// (T27/T27b, ./profiles + T28 ./agent: list → profile page → agent page with
-// breadcrumbs) and General (T29, ./general) are real; the remaining sections
+// The section CONTENT panes: Providers & Models
+// (./providers), MCP servers (./mcp), the Profiles master-detail
+// (./profiles + ./agent: list → profile page → agent page with
+// breadcrumbs) and General (./general) are real; the remaining sections
 // render a neutral empty state so the shell stays navigable. The shell wires
 // the full save flow: debounced validate → PUT with base_sha256 → 409 stale
 // banner / 422 error panel / 200 toast + restart banner.
@@ -106,7 +106,7 @@ const SECTIONS: Record<Section, { label: string; desc: string }> = {
 const REPO_BANNER =
   "The repo file may only contain profiles:. Repo profiles are listed first and the first one is the default for conversations started here. A repo profile with the same name as a global one replaces it entirely (no merge).";
 
-// L7 (mobile plan §2.5): the Local edition (phone build) offers none of
+// The Local edition (phone build) offers none of
 // these sections — no MCP servers, no in-SPA profile management (the shell
 // owns the profile list), no machine facts, no raw file editing. The nav and
 // the collapsed section select drop them; the default active section
@@ -157,11 +157,11 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
   const [flash, setFlash] = useState<{ section: Section; pathKey: string } | null>(null);
 
   const desktop = isDesktop();
-  // F2: the mobile shell's profile list is a shell page
+  // The mobile shell's profile list is a shell page
   // (peakbot-mobile:profiles), not an SPA route — Settings exposes it as a
   // row; desktop/browser keep today's in-app Profiles section only.
   const mobile = shell() === "mobile";
-  // L7: what THIS server can do (boot.edition, set by getSettings on every
+  // What THIS server can do (boot.edition, set by getSettings on every
   // successful read). The local edition hides the machine-side sections.
   const local = edition() === "local";
 
@@ -384,7 +384,7 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
   const st = store.state();
   const dirty = store.isDirty(scope);
   const validateRes = st.validate;
-  // L7: the section actually shown. In the local edition a hidden section
+  // The section actually shown. In the local edition a hidden section
   // (the default "profiles" among them) is never offered, so the view falls
   // back to the first visible one.
   const activeSection: Section =
@@ -495,7 +495,7 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
     },
     { group: "ADVANCED", items: [{ id: "raw", label: "Raw YAML" }] },
   ];
-  // L7: the local edition drops its hidden sections from the nav (groups that
+  // The local edition drops its hidden sections from the nav (groups that
   // lose all items disappear with them).
   const visibleGroups = local
     ? navGroups
@@ -667,7 +667,7 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
           }}
         >
         <main className="min-w-0 flex-1 overflow-auto p-4 sm:p-6">
-          {/* F2: the mobile shell manages profiles in its own page
+          {/* The mobile shell manages profiles in its own page
               (peakbot-mobile:profiles sentinel, classified by the nav guard);
               the SPA has no in-page equivalent, so it offers the shell's
               row instead of (and never alongside) a browser open. */}
@@ -753,10 +753,10 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
             </div>
           )}
 
-          {/* Section panes. Providers (T25), MCP servers (T26), the Profiles
-              master-detail (T27/T27b/T28) and General (T29) are the real
+          {/* Section panes. Providers, MCP servers, the Profiles
+              master-detail and General are the real
               content; the remaining sections keep a neutral empty state
-              until their M5 tasks land. */}
+              until their section panes land. */}
           {activeSection === "providers" ? (
             <ProvidersPane />
           ) : activeSection === "mcps" ? (

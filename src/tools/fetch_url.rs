@@ -422,7 +422,7 @@ mod tests {
 
     // ── schema ─────────────────────────────────────────────────────────────
 
-    /// Pinned from the pre-POST `definition()` and re-pinned after the L6
+    /// Pinned from the pre-POST `definition()` and re-pinned after the
     /// `headers` addition: with `allow_post: false` the schema must be
     /// byte-for-byte stable, so existing model behaviour cannot drift. The
     /// description literal is copied verbatim (same continuation style) from

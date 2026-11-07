@@ -1,8 +1,8 @@
-//! iOS glue (IOS-2, plan §2.9 / I-D10): the WKWebView edge-swipe back
+//! iOS glue: the WKWebView edge-swipe back
 //! gesture and the data root's exclusion from iCloud backups. Compiled for
 //! the iOS target only — the sim build (`ios-sim.sh`) is the compile check.
 
-/// I1 / I-D10: Tauri 2.12 has no builder option for WKWebView's edge-swipe
+/// Tauri 2.12 has no builder option for WKWebView's edge-swipe
 /// back/forward gestures (wry has the attribute, Tauri doesn't plumb it), so
 /// set the property natively. Off by default in WKWebView.
 pub fn enable_back_gestures(w: &tauri::WebviewWindow) {
@@ -20,7 +20,7 @@ pub fn enable_back_gestures(w: &tauri::WebviewWindow) {
 
 /// The data root `D` holds pairing tokens and the Local core's config, so it
 /// must not ride along in an iCloud backup: set the
-/// `NSURLIsExcludedFromBackupKey` resource value on it at boot (IOS-2).
+/// `NSURLIsExcludedFromBackupKey` resource value on it at boot.
 pub fn exclude_data_root_from_backup(data_root: &std::path::Path) {
     use objc2_foundation::{NSNumber, NSString, NSURL, NSURLIsExcludedFromBackupKey};
 

@@ -1,4 +1,4 @@
-// Mobile SPA gating (mobile plan §2.5, tasks F1/F2) — written BEFORE the
+// Mobile SPA gating — written BEFORE the
 // code.
 //
 // The one new seam: `shell()` from ../desktop — "desktop" | "mobile" |
@@ -12,10 +12,10 @@
 //     ABSENT;
 //   - `browser` and `desktop` keep today's behaviour.
 //
-// RED today: `shell()` does not exist (F1) and neither the "Switch
-// profile" row nor the mobile gating exist (F2). Both Tauri shells set
+// RED today: `shell()` does not exist and neither the "Switch
+// profile" row nor the mobile gating exist. Both Tauri shells set
 // `window.isTauri = true`, so today a mobile shell is mistaken for
-// desktop (R18): the mobile rows fail on that, while the desktop and
+// desktop: the mobile rows fail on that, while the desktop and
 // browser rows are GUARDS that must stay green before and after. The
 // marker globals are
 // set/deleted per test; `__TAURI__` is stubbed like the other desktop
@@ -110,7 +110,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-// ─── "Switch profile" row (F2) ───────────────────────────────────────────
+// ─── "Switch profile" row ────────────────────────────────────────────────
 
 describe('Settings "Switch profile" row (F2)', () => {
   it("mobile: renders the row with the exact peakbot-mobile:profiles href", async () => {
@@ -133,7 +133,7 @@ describe('Settings "Switch profile" row (F2)', () => {
   });
 });
 
-// ─── update banner per shell (F1/F2) ─────────────────────────────────────
+// ─── update banner per shell ─────────────────────────────────────────────
 
 describe("update banner per shell (F1/F2)", () => {
   function installInvoke(impl: () => Promise<unknown>) {
@@ -182,7 +182,7 @@ describe("update banner per shell (F1/F2)", () => {
   });
 });
 
-// ─── desktop tab strip per shell (F1/F2) ─────────────────────────────────
+// ─── desktop tab strip per shell ─────────────────────────────────────────
 // main.tsx computes `isDesktop() ? bootDesktopTabs() : null` before first
 // render and App renders the strip iff the value is non-null. The probe
 // reproduces exactly that chain (no socket needed): the pure tab views
@@ -223,7 +223,7 @@ describe("desktop tab strip per shell (F1/F2)", () => {
   });
 });
 
-// ─── peakbot-desktop:restart path per shell (F2) ─────────────────────────
+// ─── peakbot-desktop:restart path per shell ──────────────────────────────
 // SettingsInner passes `desktop={isDesktop()}` to the RestartBanner; its
 // "Restart now" button is the SPA's only `peakbot-desktop:restart`
 // navigation. In the mobile shell the button must not render at all.
@@ -258,7 +258,7 @@ describe("peakbot-desktop:restart path per shell (F2)", () => {
   });
 });
 
-// ─── "Connect a phone or another PeakBot" panel per shell (F2) ──────────
+// ─── "Connect a phone or another PeakBot" panel per shell ────────────────
 // GeneralPane renders the panel whenever the pairing facts are available;
 // the mobile shell must not render it at all (the phone IS the pairing
 // target — the panel would tell it to pair with itself).

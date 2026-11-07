@@ -3193,7 +3193,7 @@ profiles:
     }
 }
 
-// ─── Local edition Config::parse errors (mobile plan §2.7, task L1) ──────
+// ─── Local edition Config::parse errors ──────────────────────────────────
 //
 // The Local cut (no `host` feature) rejects at parse time every capability
 // the binary lacks: execution tools, MCP servers, vector stores, and config
@@ -3206,7 +3206,7 @@ profiles:
 // never returns an Ok with an empty set.
 //
 // RED today (default build, no `host` feature yet): all four configs parse
-// Ok. GREEN after L1 adds the Local rejections.
+// Ok. GREEN after the Local rejections land.
 #[cfg(all(test, not(feature = "host")))]
 mod local_parse {
     use super::*;
@@ -3222,7 +3222,7 @@ mod local_parse {
     const VECTOR_DB: &str = "providers:\n  - name: p\n    type: openai\n    api_key: k\n    models:\n      - name: m1\n        alias: a\nprofiles:\n  p:\n    vector_db:\n      db_path: /tmp/v1.db\n      embeddings:\n        base_url: https://e.example/v1\n        model: bge\n        dimensions: 8\n    agents:\n      a:\n        model: a\n";
 
     /// A remote profile next to a local one, so the ONLY relevant error
-    /// after L1 is the remote-profile rejection itself.
+    /// after the Local cut is the remote-profile rejection itself.
     const REMOTE_PROFILE: &str = "providers:\n  - name: p\n    type: openai\n    api_key: k\n    models:\n      - name: m1\n        alias: a\nprofiles:\n  relay:\n    remote:\n      url: https://nas.lan:7823\n      token: tok123\n      ca: sha256:3f9a0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab\n      profile: dev\n  p:\n    agents:\n      a:\n        model: a\n";
 
     fn parse(yaml: &str) -> Result<Config, ConfigErrors> {

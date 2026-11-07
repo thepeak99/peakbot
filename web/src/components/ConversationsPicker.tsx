@@ -76,7 +76,7 @@ export function ConversationsPicker({
   catalog?: CatalogProfile[];
 }) {
   const desktop = isDesktop();
-  // F2 (R12): in the mobile shell `window.open` is shimmed to a top-level
+  // In the mobile shell `window.open` is shimmed to a top-level
   // navigation, so a same-origin open would replace the SPA page (Back
   // returns). The mobile shell owns new conversations, so the header "+" is
   // gated off there too (foreign URLs only ever go to the system browser).
@@ -219,7 +219,7 @@ export function ConversationsPicker({
 
       {/* Desktop: the "+" lives in the tab strip instead. Mobile: no new
           tab exists — window.open is a top-level navigation in the mobile
-          shell (R12), so this same-origin open is gated off (see F2). */}
+          shell, so this same-origin open is gated off. */}
       {!desktop && !mobile && (
         <button
           onClick={openNewTab}

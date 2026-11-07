@@ -1,12 +1,11 @@
-//! `boot.edition` + Local `415 images_only` (mobile plan §2.5/§2.8 / §4.3
-//! test 2) — RED.
+//! `boot.edition` + Local `415 images_only`.
 //!
 //! **RED today by BEHAVIOUR** (both compile fine in every edition):
-//!   - `GET /api/settings` has no `boot.edition` field yet (L4 adds
-//!     `"edition": "full" | "local"` to the `boot` block, in BOTH normal and
+//!   - `GET /api/settings` has no `boot.edition` field yet (the `boot`
+//!     block gains `"edition": "full" | "local"`, in BOTH normal and
 //!     needs_setup modes, derived from `cfg!(feature = "host")`);
-//!   - the Local edition accepts a PDF upload today (L4 adds the
-//!     `415 {"error":"images_only"}` gate — QL7: Local attachments are images
+//!   - the Local edition accepts a PDF upload today (the
+//!     `415 {"error":"images_only"}` gate lands — QL7: Local attachments are images
 //!     only).
 //!
 //! **No `LocalCore` dependency:** the settings and uploads routers are driven
@@ -152,12 +151,12 @@ async fn settings_reports_the_edition_in_normal_mode() {
     );
 }
 
-/// Cross-side pin (L7): the web suite
+/// Cross-side pin: the web suite
 /// (`web/src/settings/editionGating.test.tsx`) feeds `getSettings()` the
 /// `boot` block of the shared fixture `fixtures/settings_boot_local.json`.
 /// The live response's `boot` key set must equal the fixture's, so a server
 /// that moves/renames a boot key (e.g. `edition` to top-level) breaks both
-/// sides at once — the L7 bug where the web read a top-level `edition` the
+/// sides at once — the bug where the web read a top-level `edition` the
 /// server never sent.
 #[tokio::test]
 async fn boot_block_shape_matches_the_shared_fixture() {
@@ -267,7 +266,8 @@ async fn local_image_upload_is_ok() {
 }
 
 /// Full edition: a PDF upload is allowed (200) — the images-only gate is
-/// Local-only. This row is a guard that the L4 gate does not leak into host.
+/// Local-only. This row is a guard that the images-only gate does not leak
+/// into host.
 #[cfg(feature = "host")]
 #[tokio::test]
 async fn full_edition_pdf_upload_is_ok() {

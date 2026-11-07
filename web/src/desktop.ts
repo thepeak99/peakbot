@@ -22,7 +22,7 @@ export function isDesktop(): boolean {
   return shell() === "desktop";
 }
 
-// ── edition signal (L7) ───────────────────────────────────────────────────
+// ── edition signal ────────────────────────────────────────────────────────
 // What THIS server can do: `boot.edition` on `GET /api/settings`.
 // `"full"` (host build) is the default until the first boot read; a read
 // WITHOUT the field (old servers) resets it back to `"full"`. `getSettings()`

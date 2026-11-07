@@ -1,7 +1,7 @@
-//! `paths::Roots` seam contract (mobile plan §2.6, task L2) — RED.
+//! `paths::Roots` seam contract.
 //!
 //! RED today by COMPILE ERROR: `peakbot::paths` does not exist yet. The
-//! builder (L2) must expose, in a new `src/paths.rs` — the ONLY module that
+//! module must expose, in a new `src/paths.rs` — the ONLY module that
 //! may call `dirs::` / use `ProjectDirs` (the lib test
 //! `dirs_calls_appear_only_in_paths_module` locks that):
 //!
@@ -20,7 +20,7 @@
 //!
 //! Every CURRENT `dirs::`/`ProjectDirs` call site and the public path fn
 //! it backs. Sites with no public fn are covered by the text-scan guard
-//! only and are listed here so L2 routes them too:
+//! only and are listed here so the module routes them too:
 //!   config root : config::get_config_dir / get_config_file_path
 //!                 (src/config/mod.rs, via directories_next::ProjectDirs)
 //!   data root   : attachments::UploadStore::default_root

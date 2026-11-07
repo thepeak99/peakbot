@@ -1,6 +1,6 @@
-// Shared TS types for the Settings SPA — verbatim from the 0.24 config plan
-// (M5 "shared TS types" block). These are the wire contract with the Settings
-// API (spec §8.2) and are NOT to be re-shaped by the M5 builders.
+// Shared TS types for the Settings SPA — verbatim from the 0.24 config plan.
+// These are the wire contract with the Settings
+// API and are NOT to be re-shaped by the settings builders.
 
 export type Scope = "global" | "repo";
 export type Seg = string | number;

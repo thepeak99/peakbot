@@ -89,7 +89,7 @@ export function BottomBar({
         catalog={catalog}
       />
 
-      {/* L7: the local edition (phone build) has no cwd of its own to
+      {/* The local edition (phone build) has no cwd of its own to
           pick — the shell owns the working directory. */}
       {cwd && edition() !== "local" && (
         <CwdPicker

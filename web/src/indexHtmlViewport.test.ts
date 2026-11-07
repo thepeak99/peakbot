@@ -1,4 +1,4 @@
-// Static contract (mobile plan §2.5, task F3): `web/index.html`'s
+// Static contract: `web/index.html`'s
 // viewport meta content is EXACTLY the locked string —
 // `viewport-fit=cover` is what lets the SPA read the safe-area insets
 // (notch / Dynamic Island / home indicator) and

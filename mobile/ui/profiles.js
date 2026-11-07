@@ -1,13 +1,13 @@
-/* PeakBot Mobile — the bundled Profiles page (plan §2.1, M6).
+/* PeakBot Mobile — the bundled Profiles page.
  *
- * D3: every profile open goes through `profile_open`, and Rust navigates
+ * Every profile open goes through `profile_open`, and Rust navigates
  * the webview (WebviewWindow::navigate). This file never steers the page
  * to a profile URL — a script-initiated load would make Android drop the
  * Profiles page from history, so Back would exit the app. The one anchor
  * in this UI (Install certificate…) is a top-level navigation the nav
  * guard classifies External → system browser.
  *
- * L9: the always-first Local row ("On this phone"), its consent sheet and
+ * The always-first Local row ("On this phone"), its consent sheet and
  * the Local cold-start open.
  */
 "use strict";

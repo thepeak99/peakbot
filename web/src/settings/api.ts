@@ -40,7 +40,7 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 
 /** GET /api/settings (…?convo=<uuid> when given). Every successful read
  *  updates the edition seam (desktop.ts) — the single read point for
- *  Boot, Settings and the wizard (L7). */
+ *  Boot, Settings and the wizard. */
 export function getSettings(convo?: string): Promise<SettingsMeta> {
   return request<SettingsMeta>(
     convo ? `/api/settings?convo=${encodeURIComponent(convo)}` : "/api/settings",

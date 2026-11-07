@@ -389,9 +389,9 @@ describe("Composer paste — files only reachable via clipboardData.items", () =
 // nothing. Never preventDefault — the default for a paste with no files
 // and no text inserts nothing.
 //
-// RED today: Composer.onPaste has no Linux fallback, so L1/L2/L3/L8 fail
-// (the IPC is never called). L4–L7 are regression guards and are green
-// before the implementation.
+// RED today: Composer.onPaste has no Linux fallback, so the four cases
+// that exercise the IPC fail. The other four are regression guards and
+// are green before the implementation.
 //
 // The UA is ALWAYS stubbed: jsdom's default UA is "(linux)" on Linux CI
 // and "(darwin)" on a Mac, so leaving it unstubbed is non-deterministic.

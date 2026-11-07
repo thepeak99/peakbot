@@ -1,35 +1,35 @@
 #!/bin/sh
 #
-# ios-contracts.sh — static contract tests for the Phase 4 iOS build
-# (plan §4.4 "Tester locks FIRST", IOS-1..IOS-4; pure file greps + awk,
+# ios-contracts.sh — static contract tests for the iOS build
+# (pure file greps + awk,
 #  runs on Linux CI — no Mac, no xcodebuild, no plutil).
 #
 # Written BEFORE the implementation: expect RED until the developer lands
-#   IOS-1  mobile/src-tauri/Info.ios.plist + committed gen/apple (tauri ios
+#   Project  mobile/src-tauri/Info.ios.plist + committed gen/apple (tauri ios
 #          init: bundle sh.shifu.mobile, team placeholder, Rust build phase
 #          = `npm run -- tauri ios xcode-script`)
-#   IOS-2  iOS glue in mobile/src-tauri/src/ (lib.rs or ios.rs):
+#   Glue     iOS glue in mobile/src-tauri/src/ (lib.rs or ios.rs):
 #          #[cfg(target_os = "ios")] edge-swipe via with_webview +
-#          setAllowsBackForwardNavigationGestures(true) (I-D10), and
+#          setAllowsBackForwardNavigationGestures(true), and
 #          NSURLIsExcludedFromBackupKey on the data root
-#   IOS-3  mobile/scripts/ios-sim.sh (plan §3.3)
-#   IOS-4  mobile/scripts/build-ios.sh (plan §3.2) + `make mobile-ios`
+#   Sim      mobile/scripts/ios-sim.sh
+#   Build    mobile/scripts/build-ios.sh + `make mobile-ios`
 # The rust-toolchain.toml and with_webview checks are GREEN guards
-# (I-D4' toolchain pin; the Android nav glue already uses with_webview).
+# (toolchain pin; the Android nav glue already uses with_webview).
 #
 # EXACT STRINGS THE BUILDER MUST HIT (the contract, check by check):
 #
 # Info.ios.plist (structural awk — no plutil on Linux):
 #   * NSAppTransportSecurity dict CONTAINING NSAllowsLocalNetworking=<true/>
 #   * NSCameraUsageDescription string EXACTLY
-#     "Scan the pairing QR code shown by PeakBot."  (plan §2.9)
+#     "Scan the pairing QR code shown by PeakBot."
 #   * NSLocalNetworkUsageDescription string NON-EMPTY
 #   * no NSAllowsArbitraryLoads anywhere
 #
-# build-ios.sh (plan §3.2):
+# build-ios.sh:
 #   * xcodebuild -version  +  26.3            (pinned Xcode assertion)
 #   * /usr/local/bin AND /opt/homebrew/bin    (brew on non-login ssh PATH)
-#   * npm run tauri --                        (D6; never a global `tauri`
+#   * npm run tauri --                        (never a global `tauri`
 #     line — any line STARTING with `tauri ` fails the contract)
 #   * npm ci
 #   * npm run build                           (web/dist, like build-android)
@@ -39,7 +39,7 @@
 #     (output/mobile/PeakBot-Mobile-<v>-ios.ipa, <v> from tauri.conf.json)
 #   * no `set -x` (signing identities never echoed)
 #
-# ios-sim.sh (plan §3.3):
+# ios-sim.sh:
 #   * START_TS  +  `date +%s >`  +  -newer     (freshness reference file)
 #   * DerivedData  +  debug-iphonesimulator/PeakBot.app
 #   * npm run tauri -- ios build  +  --debug --ci
@@ -51,27 +51,27 @@
 #   * 2>&1  and  build.log appearing >= 2 times (captured, then printed
 #     on failure — a non-zero exit is tolerated ONLY for a fresh .app)
 #
-# gen/apple (IOS-1):
+# gen/apple:
 #   * directory exists, is COMMITTED (git ls-files non-empty)
 #   * project.yml and/or *.pbxproj: `npm run -- tauri ios xcode-script`
-#     (the Rust build phase, I-D4') and bundle id sh.shifu.mobile
+#     (the Rust build phase) and bundle id sh.shifu.mobile
 #   * no hardcoded team id: `DEVELOPMENT_TEAM` must be empty/placeholder,
 #     never a 10-char [A-Z0-9] id
 #
-# rust-toolchain.toml (I-D4' guard, GREEN): channel = "1.95.0" + the three
+# rust-toolchain.toml (guard, GREEN): channel = "1.95.0" + the three
 #   apple-ios targets (aarch64-apple-ios, aarch64-apple-ios-sim,
 #   x86_64-apple-ios) — matched with the closing quote so the -sim
 #   entry cannot satisfy the device entry.
 #
-# glue (IOS-2, in mobile/src-tauri/src/lib.rs OR ios.rs, LIVE lines only —
+# glue (in mobile/src-tauri/src/lib.rs OR ios.rs, LIVE lines only —
 #   comments cannot satisfy these):
 #   * #[cfg(target_os = "ios")]
-#   * setAllowsBackForwardNavigationGestures set to true — the spike's
+#   * setAllowsBackForwardNavigationGestures set to true — the
 #     objc2 form `...Gestures: true]` or a helper call `...(true)`
 #   * NSURLIsExcludedFromBackupKey
 #   * with_webview (guard — already GREEN from the Android nav glue)
 #
-# Makefile (IOS-4):
+# Makefile:
 #   * a real `mobile-ios:` target (anchored — .PHONY alone is not enough)
 #   * referencing mobile/scripts/build-ios.sh
 #
@@ -115,7 +115,7 @@ grep_bad() {
 
 # grep_ok_live <name> <fixed-string> <file...> — passes only when the string
 # occurs on a NON-COMMENT line (header comments naming the symbols must not
-# satisfy the contract; same rule as contracts.sh L10). Shell-style `#` only.
+# satisfy the contract; same live-line rule as contracts.sh). Shell-style `#` only.
 grep_ok_live() {
     name=$1; str=$2; shift 2
     if grep -v '^[[:space:]]*#' "$@" 2>/dev/null | grep -qF -- "$str"; then ok "$name"; else bad "$name (missing live: $str)"; fi
@@ -155,7 +155,7 @@ grep_ok_count() {
     if [ "$n" -ge "$3" ]; then ok "$1"; else bad "$1 (found $n, need >= $3: $2)"; fi
 }
 
-# ── Info.ios.plist (IOS-1, plan §2.9) ─────────────────────────────────────
+# ── Info.ios.plist ───────────────────────────────────────────────────────
 
 if [ ! -f "$PL" ]; then
     bad "Info.ios.plist exists"
@@ -215,7 +215,7 @@ else
     grep_bad "plist: no NSAllowsArbitraryLoads" "NSAllowsArbitraryLoads" "$PL"
 fi
 
-# ── build-ios.sh (IOS-4, plan §3.2) ───────────────────────────────────────
+# ── build-ios.sh ─────────────────────────────────────────────────────────
 
 if [ ! -f "$BI" ]; then
     bad "mobile/scripts/build-ios.sh exists"
@@ -245,7 +245,7 @@ else
     grep_bad "build-ios has no 'set -x' (secrets never echoed)" "set -x" "$BI"
 fi
 
-# ── ios-sim.sh (IOS-3, plan §3.3) ─────────────────────────────────────────
+# ── ios-sim.sh ───────────────────────────────────────────────────────────
 
 if [ ! -f "$SI" ]; then
     bad "mobile/scripts/ios-sim.sh exists"
@@ -277,7 +277,7 @@ else
     grep_ok_count "ios-sim build.log written AND printed on failure" "build.log" 2 "$SI"
 fi
 
-# ── gen/apple (IOS-1) ─────────────────────────────────────────────────────
+# ── gen/apple ────────────────────────────────────────────────────────────
 
 if [ ! -d "$GA" ]; then
     bad "gen/apple directory exists (tauri ios init, IOS-1)"
@@ -312,23 +312,23 @@ grep_ok "toolchain lists aarch64-apple-ios" '"aarch64-apple-ios",' "$RT"
 grep_ok "toolchain lists aarch64-apple-ios-sim" '"aarch64-apple-ios-sim",' "$RT"
 grep_ok "toolchain lists x86_64-apple-ios" '"x86_64-apple-ios",' "$RT"
 
-# ── iOS glue (IOS-2, plan §2.9 / I-D10) ───────────────────────────────────
+# ── iOS glue ─────────────────────────────────────────────────────────────
 
-# lib.rs (spike layout) or a dedicated ios.rs module — LIVE lines only, so a
+# lib.rs or a dedicated ios.rs module — LIVE lines only, so a
 # comment naming the API cannot satisfy the contract.
 grep_ok_live_rust "glue: #[cfg(target_os = \"ios\")] block" '#[cfg(target_os = "ios")]' $GLUE
 # The edge-swipe selector, set ON. Both canonical forms are accepted:
-# the spike's objc2 call `msg_send![wk, setAllowsBackForwardNavigationGestures: true]`
+# the objc2 call `msg_send![wk, setAllowsBackForwardNavigationGestures: true]`
 # and a wrapped helper call `setAllowsBackForwardNavigationGestures(true)`.
 grep_ok_re_live "glue: setAllowsBackForwardNavigationGestures set to true" \
     'setAllowsBackForwardNavigationGestures[[:space:]]*\([[:space:]]*true[[:space:]]*\)|setAllowsBackForwardNavigationGestures[[:space:]]*:[[:space:]]*true' \
     $GLUE
 grep_ok_live_rust "glue: NSURLIsExcludedFromBackupKey on the data root" "NSURLIsExcludedFromBackupKey" $GLUE
 # Guard (already GREEN): the edge-swipe goes through the existing with_webview
-# seam (lib.rs nav glue); IOS-2 adds the iOS branch next to it.
+# seam (lib.rs nav glue); the iOS branch sits next to it.
 grep_ok_live_rust "glue: with_webview seam (guard)" "with_webview" $GLUE
 
-# ── Makefile (IOS-4) ──────────────────────────────────────────────────────
+# ── Makefile ──────────────────────────────────────────────────────────────
 
 # A real target (anchored — a .PHONY mention alone must not count).
 grep_ok_re "Makefile has a mobile-ios: target" '^mobile-ios[[:space:]]*:' "$MK"

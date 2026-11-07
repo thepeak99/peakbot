@@ -1,5 +1,4 @@
-//! `fetch_url` headers — TOOL-ARGUMENT contract (mobile plan §2.8 / §4.3
-//! test 4, L6) — RED.
+//! `fetch_url` headers — TOOL-ARGUMENT contract.
 //!
 //! **ORCHESTRATOR DECISION (supersedes the config-field version this file
 //! replaced):** `headers` is an optional ARGUMENT of the `fetch_url` tool
@@ -8,7 +7,7 @@
 //! in v1), so the model passes the headers itself, on every call it wants
 //! them on.
 //!
-//! **The locked contract (builder L6 implements exactly this):**
+//! **The locked contract (implemented exactly this way):**
 //!
 //! Wire shape — an optional JSON object, a string→string map (the simplest
 //! shape for models):

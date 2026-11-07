@@ -6,7 +6,7 @@ mod link;
 mod local;
 mod nav;
 mod profiles;
-// iOS glue (IOS-2): the edge-swipe back gesture + the data root's backup
+// iOS glue: the edge-swipe back gesture + the data root's backup
 // exclusion. Compiled for the iOS target only.
 #[cfg(target_os = "ios")]
 mod ios;
@@ -417,8 +417,8 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .initialization_script(INIT_SCRIPT)
         .on_navigation(move |url| on_navigation(&handle, url))
         .build()?;
-    // IOS-2: `D` excludes itself from iCloud backups, and the WKWebView gets
-    // the edge-swipe back gesture (off by default; no Tauri option — I-D10).
+    // `D` excludes itself from iCloud backups, and the WKWebView gets
+    // the edge-swipe back gesture (off by default; no Tauri option).
     #[cfg(target_os = "ios")]
     {
         ios::exclude_data_root_from_backup(&dirs.data);
@@ -588,7 +588,7 @@ mod init_script_tests {
     const EXPECTED: &str = "Object.defineProperty(window,'peakbotShell',{value:'mobile'});\n\
 window.open=function(u){if(u){location.href=new URL(String(u),location.href).href}return null};";
 
-    /// `web/src/desktop.test.ts` (F1) sets `window.peakbotShell` to exactly
+    /// `web/src/desktop.test.ts` sets `window.peakbotShell` to exactly
     /// `"desktop"` / `"mobile"` — read at compile time so the cross-side pin
     /// is deterministic.
     const WEB_DESKTOP_TEST: &str = include_str!("../../../web/src/desktop.test.ts");
