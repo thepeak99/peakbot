@@ -459,7 +459,7 @@ async fn get_settings(
         "builtin_persona": crate::SYSTEM_PROMPT_PERSONA,
         "mcp_status": mcp_status(state.deps.as_ref()),
         "boot": {
-            // What this server can do (mobile plan §2.5): `full` with the
+            // What this server can do: `full` with the
             // `host` feature, `local` without. The SPA reads it from Boot.
             "edition": if cfg!(feature = "host") { "full" } else { "local" },
             "bind": state.boot_web.bind.to_string(),

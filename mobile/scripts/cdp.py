@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dev helper (plan D11): evaluate JS in the app's WebView over Chrome DevTools Protocol.
+"""Dev helper: evaluate JS in the app's WebView over Chrome DevTools Protocol.
 
 usage: cdp.py <port> '<js expression>'   (prints the JSON result)
        cdp.py <port> --url                (prints the current page URL)

@@ -91,7 +91,7 @@ SI="$root/mobile/scripts/ios-sim.sh"
 GA="$root/mobile/src-tauri/gen/apple"
 RT="$root/mobile/rust-toolchain.toml"
 MK="$root/Makefile"
-# The glue may live in lib.rs (spike layout) or a dedicated ios.rs module.
+# The glue may live in lib.rs or a dedicated ios.rs module.
 GLUE="$root/mobile/src-tauri/src/lib.rs $root/mobile/src-tauri/src/ios.rs"
 
 PASS=0
@@ -177,7 +177,7 @@ else
         bad "plist: NSAllowsLocalNetworking=true inside NSAppTransportSecurity"
     fi
 
-    # Exact §2.9 camera string (word-for-word — the App Store review string).
+    # Exact camera string (word-for-word — the App Store review string).
     if awk '
         /<key>NSCameraUsageDescription<\/key>/ { c = 1; next }
         c == 1 && /<string>/ {
@@ -220,13 +220,13 @@ fi
 if [ ! -f "$BI" ]; then
     bad "mobile/scripts/build-ios.sh exists"
 else
-    # Pinned Xcode (axlotl: 26.3 — the current floor, §3.2).
+    # Pinned Xcode (axlotl: 26.3 — the current floor).
     grep_ok "build-ios asserts xcodebuild -version" "xcodebuild -version" "$BI"
     grep_ok "build-ios pins Xcode 26.3" "26.3" "$BI"
-    # brew is not on a non-login ssh PATH: extend for BOTH prefixes (I-D2').
+    # brew is not on a non-login ssh PATH: extend for BOTH prefixes.
     grep_ok "build-ios PATH /usr/local/bin (Intel brew)" "/usr/local/bin" "$BI"
     grep_ok "build-ios PATH /opt/homebrew/bin (Apple-silicon brew)" "/opt/homebrew/bin" "$BI"
-    # D6: the CLI is a devDependency — always `npm run tauri --`; a line
+    # The CLI is a devDependency — always `npm run tauri --`; a line
     # starting with a bare `tauri` is the global-CLI anti-pattern.
     grep_ok "build-ios uses 'npm run tauri --'" "npm run tauri --" "$BI"
     grep_bad_re "build-ios never calls a global tauri" '^[[:space:]]*tauri[[:space:]]' "$BI"
@@ -250,7 +250,7 @@ fi
 if [ ! -f "$SI" ]; then
     bad "mobile/scripts/ios-sim.sh exists"
 else
-    # I-D7: `ios build` exits 1 at the archive step (no team) — the sim .app
+    # `ios build` exits 1 at the archive step (no team) — the sim .app
     # is already in DerivedData by then. So: record a start timestamp, and
     # tolerate the non-zero exit ONLY if the .app is NEWER than it.
     grep_ok "ios-sim records start timestamp (START_TS)" "START_TS" "$SI"
@@ -258,7 +258,7 @@ else
     grep_ok "ios-sim freshness check uses -newer" "-newer" "$SI"
     grep_ok "ios-sim looks under DerivedData" "DerivedData" "$SI"
     grep_ok "ios-sim app path debug-iphonesimulator/PeakBot.app" "debug-iphonesimulator/PeakBot.app" "$SI"
-    # The build command (D6) with the sim flags.
+    # The build command with the sim flags.
     grep_ok "ios-sim uses 'npm run tauri -- ios build'" "npm run tauri -- ios build" "$SI"
     grep_ok "ios-sim flags --debug --ci" "--debug --ci" "$SI"
     # Target chosen by arch: Intel x86_64, Apple silicon aarch64-sim.
@@ -280,10 +280,10 @@ fi
 # ── gen/apple ────────────────────────────────────────────────────────────
 
 if [ ! -d "$GA" ]; then
-    bad "gen/apple directory exists (tauri ios init, IOS-1)"
+    bad "gen/apple directory exists (tauri ios init)"
 else
     ok "gen/apple directory exists"
-    # The Rust build phase (I-D4'): the Xcode phase must run the CLI through
+    # The Rust build phase: the Xcode phase must run the CLI through
     # npm, in project.yml (xcodegen) and/or the generated .pbxproj.
     grep_ok "gen/apple Rust phase 'npm run -- tauri ios xcode-script'" \
         "npm run -- tauri ios xcode-script" "$GA/project.yml" "$GA"/*.pbxproj
@@ -302,7 +302,7 @@ else
     fi
 fi
 
-# ── rust-toolchain.toml (I-D4' guard — GREEN) ─────────────────────────────
+# ── rust-toolchain.toml ─────────────────────────────
 
 # The Xcode Rust phase ignores RUSTUP_TOOLCHAIN; rustup reads this file from
 # cargo's cwd. The closing quote in each target string keeps the -sim entry

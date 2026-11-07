@@ -3197,7 +3197,7 @@ profiles:
 //
 // The Local cut (no `host` feature) rejects at parse time every capability
 // the binary lacks: execution tools, MCP servers, vector stores, and config
-// `remote:` profiles (QL12). Locked messages (substring, case-sensitive):
+// `remote:` profiles. Locked messages (substring, case-sensitive):
 //   tools.only: [bash]      → "`bash` isn't available in PeakBot on this phone"
 //   mcps: (non-empty)       → "MCP servers are not available in PeakBot on this phone"
 //   profiles.X.vector_db    → "vector databases are not available in PeakBot on this phone"

@@ -22,8 +22,8 @@ function viewportContent(html: string): string | null {
   return m ? m[1] : null;
 }
 
-describe("web/index.html viewport meta (F3)", () => {
-  it("the viewport meta content is exactly the locked §2.5 string", () => {
+describe("web/index.html viewport meta", () => {
+  it("the viewport meta content is exactly the locked string", () => {
     const html = readFileSync(INDEX_HTML, "utf8");
     expect(viewportContent(html)).toBe(VIEWPORT_CONTENT);
   });

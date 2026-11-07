@@ -61,7 +61,7 @@ jobs:
           cargo fmt --all -- --check
           cargo clippy --all-targets --locked -- -D warnings
           # No `--workspace`: default-members is the root crate (the mobile
-          # crate joins the workspace, plan D8) — the ci job never needs
+          # crate joins the workspace) — the ci job never needs
           # webkit, and the mobile crate is checked in the `desktop` job.
           cargo test --locked
       # Local edition: the core without the `host` feature, as phones embed
@@ -118,7 +118,7 @@ jobs:
           cargo clippy --locked --manifest-path desktop/Cargo.toml --workspace --all-targets -- -D warnings
           cargo test --locked --manifest-path desktop/Cargo.toml --workspace
       # Mobile crate (peakbot-mobile): member of the root workspace, so both
-      # checks run from the repo root against the shared lock (D8). The
+      # checks run from the repo root against the shared lock. The
       # webkit/gtk deps installed above already cover the Tauri glue; `cargo
       # fmt` needs no step here — the root `ci` job runs `cargo fmt --all`,
       # which includes this member.

@@ -45,7 +45,7 @@ type ShellModule = { shell?: unknown };
 async function loadShell(): Promise<() => string> {
   const mod = (await import("./desktop")) as ShellModule;
   if (typeof mod.shell !== "function") {
-    throw new Error("desktop.ts does not export shell() yet (F1)");
+    throw new Error("desktop.ts does not export shell() yet");
   }
   return mod.shell as () => string;
 }
@@ -53,7 +53,7 @@ async function loadShell(): Promise<() => string> {
 type WithShell = { peakbotShell?: unknown };
 const sg = globalThis as WithShell;
 
-describe("shell() seam (F1)", () => {
+describe("shell() seam", () => {
   afterEach(() => {
     delete sg.peakbotShell;
     delete g.isTauri;

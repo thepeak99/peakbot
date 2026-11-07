@@ -130,7 +130,7 @@ $(OUTPUT_DIR)/$(ANDROID_BIN): Dockerfile.android
 ##                       (Dockerfile.mobile-android, `toolchain` stage): JDK 17,
 ##                       SDK platforms 36+37, build-tools 36.0.0, NDK r28c,
 ##                       Rust 1.95 + both Android targets, cargo-ndk 4.1.2, Node 22.
-##                       The APK build stage (M7) is added on top of it.
+##                       The APK build stage is added on top of it.
 mobile-android-image:
 	@echo "📱 Building the PeakBot Mobile Android toolchain image..."
 	$(CONTAINER_BUILDER) build \
@@ -140,7 +140,7 @@ mobile-android-image:
 		.
 	@echo "✅ localhost/peakbot-mobile-android:toolchain"
 
-# Mobile Android (Tauri shell — mobile/). Named volumes (plan D7 + M7):
+# Mobile Android (Tauri shell — mobile/). Named volumes:
 # peakbot-mobile-android-home holds /root/.android (the debug keystore, so
 # debug APKs upgrade over each other across builds); the rest are caches.
 # The dev pbm-* volumes are the manual dev-loop volumes — these are the
@@ -151,11 +151,11 @@ MOBILE_ANDROID_GRADLE_VOL  := peakbot-mobile-android-gradle
 MOBILE_ANDROID_CARGO_VOL   := peakbot-mobile-android-cargo
 MOBILE_ANDROID_TARGET_VOL  := peakbot-mobile-android-target
 
-## mobile-android: Build the PeakBot Mobile Android APK (M7). Runs
+## mobile-android: Build the PeakBot Mobile Android APK. Runs
 ##                 mobile/scripts/build-android.sh INSIDE the toolchain
 ##                 container (worktree at /w): web/dist (always rebuilt) →
 ##                 npm ci → `npm run tauri -- android build --apk
-##                 --target aarch64 --ci -- --locked` → smoke (M8).
+##                 --target aarch64 --ci -- --locked` → smoke.
 ##                 Release signing: ANDROID_KEYSTORE_B64 +
 ##                 ANDROID_KEYSTORE_PASSWORD + ANDROID_KEY_ALIAS +
 ##                 ANDROID_KEY_PASSWORD in the environment cross the
@@ -202,8 +202,8 @@ mobile-android: mobile-android-image
 	  "$$image" sh mobile/scripts/build-android.sh
 
 
-## mobile-ios: Build the PeakBot Mobile iOS .ipa (IOS-4). HOST SCRIPT on a
-##             Mac (Xcode 26.3 pinned, §3.2 — no container): asserts the
+## mobile-ios: Build the PeakBot Mobile iOS .ipa. HOST SCRIPT on a
+##             Mac (Xcode 26.3 pinned — no container): asserts the
 ##             Xcode, requires APPLE_DEVELOPMENT_TEAM from the environment
 ##             (the human's team — never the repo; no secrets echoed),
 ##             web/dist → npm ci → `npm run tauri -- ios build

@@ -192,7 +192,7 @@ function stubSettingsFetch(bootMeta: SettingsMeta) {
 
 // ─── edition() seam ───────────────────────────────────────────────────────
 
-describe("edition() seam (L7)", () => {
+describe("edition() seam", () => {
   it("defaults to full before any boot read", () => {
     expect(edition()).toBe("full");
   });

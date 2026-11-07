@@ -1,5 +1,5 @@
 //! `Profiles` — the app's only persisted state (remotes, `last`, Local consent)
-//! and its `profiles.json` (plan §2.3). The mutators are the only writers, so
+//! and its `profiles.json`. The mutators are the only writers, so
 //! P1–P3 hold by construction.
 
 use serde::{Deserialize, Serialize};
@@ -674,7 +674,7 @@ mod tests {
         );
     }
 
-    // ── the §2.3 example JSON, both directions ───────────────────────────
+    // ── the example JSON, both directions ───────────────────────────
 
     const EXAMPLE_TOKEN: &str = "deadbeefdeadbeefdeadbeefdeadbeef";
 
@@ -682,7 +682,7 @@ mod tests {
     fn json_round_trip_of_the_23_example() {
         let dir = TmpDir::new();
         let p = dir.path().join("profiles.json");
-        // The exact §2.3 example shape (`…` = a real token here).
+        // The exact example shape (`…` = a real token here).
         std::fs::write(
             &p,
             format!(
@@ -733,10 +733,7 @@ mod tests {
             }}"#
         ))
         .unwrap();
-        assert_eq!(
-            value, expected,
-            "the wire format is the §2.3 example, exactly"
-        );
+        assert_eq!(value, expected, "the wire format is the example, exactly");
     }
 
     // ── persistence: tmp + rename ────────────────────────────────────────

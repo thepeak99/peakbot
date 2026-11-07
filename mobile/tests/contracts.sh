@@ -94,7 +94,7 @@ else
     grep_ok "smoke: arm64-v8a" "arm64-v8a" "$SA"
     # Release signing: cert fingerprint checked against the pinned one.
     grep_ok "smoke: apksigner verify --print-certs" "apksigner verify --print-certs" "$SA"
-    # 16 KB page alignment (S10 / R11).
+    # 16 KB page alignment.
     grep_ok "smoke: zipalign -c -P 16 -v 4" "zipalign -c -P 16 -v 4" "$SA"
     # Manifest: networkSecurityConfig reference + no cloud backup of the
     # token/config.
@@ -112,9 +112,9 @@ else
     # lines, so the stub's header comments cannot satisfy these.
     grep_ok_live "smoke: run_l10_symbol_check is called (uncommented)" 'run_l10_symbol_check "$apk"' "$SA"
     for sym in portable_pty TokioChildProcess BashTool ratatui; do
-        grep_ok_live "smoke: L10 symbol list names $sym (uncommented)" "$sym" "$SA"
+        grep_ok_live "smoke: symbol check names $sym (uncommented)" "$sym" "$SA"
     done
-    grep_ok_live "smoke: L10 runs llvm-nm -D (uncommented)" "llvm-nm -D" "$SA"
+    grep_ok_live "smoke: symbol check runs llvm-nm -D (uncommented)" "llvm-nm -D" "$SA"
 fi
 
 # ── ci.yml (guard) ───────────────────────────────────────────────────────
@@ -130,9 +130,9 @@ grep_bad "ci: no root 'cargo test --workspace'" "cargo test --workspace" "$CI"
 # ── lock policy (guard) ──────────────────────────────────────────────────
 
 if [ -e "$ML" ]; then
-    bad "no mobile/src-tauri/Cargo.lock (D8: one workspace, one lock)"
+    bad "no mobile/src-tauri/Cargo.lock (one workspace, one lock)"
 else
-    ok "no mobile/src-tauri/Cargo.lock (D8)"
+    ok "no mobile/src-tauri/Cargo.lock"
 fi
 
 # ── iOS (delegates to ios-contracts.sh) ──────────────────────────────────

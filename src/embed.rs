@@ -1,9 +1,8 @@
-//! The in-process core a phone app embeds (Local edition, mobile plan
-//! §2.11). The app picks a loopback listener and a per-launch token; the
+//! The in-process core a phone app embeds (Local edition). The app picks a loopback listener and a per-launch token; the
 //! core boots from `<config root>/config.yaml` and serves the full web UI
 //! on whatever listener it is handed — again after iOS reclaims one.
 //!
-//! Local limits (§2.8): global config only (`RepoMode::Ignore`), no skills,
+//! Local limits: global config only (`RepoMode::Ignore`), no skills,
 //! no MCP, no shell. A missing or invalid config boots the needs_setup
 //! server, so the first-run wizard can write one; only IO fails the boot.
 

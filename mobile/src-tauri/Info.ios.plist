@@ -3,10 +3,10 @@
 <plist version="1.0">
 <dict>
 	<!-- Merged by Tauri into the generated Info.plist at every build, so a
-	     `tauri ios init` regen keeps these keys (plan §2.9). -->
+	     `tauri ios init` regen keeps these keys. -->
 
 	<!-- Local profile: the in-app core serves the SPA on http://127.0.0.1:47823
-	     (plan §2.9). Local networking only — plain https elsewhere. -->
+	     Local networking only — plain https elsewhere. -->
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>

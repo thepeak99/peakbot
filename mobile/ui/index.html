@@ -35,7 +35,7 @@
         height: 100%;
         overflow-y: auto;
         box-sizing: border-box;
-        /* safe-area insets (S8): status bar on top, home indicator below. */
+        /* safe-area insets: status bar on top, home indicator below. */
         padding:
           calc(env(safe-area-inset-top, 0px) + 16px) 16px
           calc(env(safe-area-inset-bottom, 0px) + 20px);
@@ -264,7 +264,7 @@
       <h1>PeakBot</h1>
       <p id="status" role="status" aria-live="polite" hidden></p>
 
-      <!-- Can't-reach help (locked strings, v2 §5.4). -->
+      <!-- Can't-reach help (locked strings). -->
       <section id="cant-reach" class="panel" aria-labelledby="cr-title" hidden>
         <h2 id="cr-title">Can't reach <span id="cr-host"></span>.</h2>
         <ul class="checklist">

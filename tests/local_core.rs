@@ -204,7 +204,7 @@ async fn local_core_contract() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config_root = tmp.path().join("config");
     std::fs::create_dir_all(&config_root).expect("config root");
-    // One data root per the §2.6 layout: config/data/cache under the tempdir.
+    // One data root per the data-root layout: config/data/cache under the tempdir.
     paths::init_roots(Roots {
         config: config_root.clone(),
         data: tmp.path().join("data"),
@@ -267,12 +267,12 @@ async fn local_core_contract() {
     task_c.abort();
 }
 
-/// `main` and `embed` share ONE boot fn (plan §2.11): the shared symbol is
+/// `main` and `embed` share ONE boot fn: the shared symbol is
 /// **`peakbot::boot::web_boot`**. The CLI's web-mode boot calls it instead of
 /// building the web UI inline, and `embed::LocalCore::boot` calls it too.
 /// This source-scan lock pins that `src/main.rs` actually calls
 /// `boot::web_boot(…)` (a web-mode boot that bypasses it would let the CLI
-/// and the embed diverge — the R9 regression the plan names). The embed side
+/// and the embed diverge — the regression this test guards). The embed side
 /// is exercised at runtime by `local_core_contract` above.
 #[test]
 fn main_calls_the_shared_web_boot_fn() {

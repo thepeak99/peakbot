@@ -46,7 +46,7 @@ html.light {
   --profile-pink: #db2777;
 }
 
-/* Window background (S8): the SPA dark background token —
+/* Window background: the SPA dark background token —
    `--color-zinc-950` (the theme's "app background", remapped by the
    `html.light` block above). Never a hard-coded hex: the shell window's
    `background_color` and the mobile Profiles page use the same colour,

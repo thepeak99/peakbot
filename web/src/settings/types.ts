@@ -1,4 +1,4 @@
-// Shared TS types for the Settings SPA — verbatim from the 0.24 config plan.
+// Shared TS types for the Settings SPA — verbatim from the 0.24 config.
 // These are the wire contract with the Settings
 // API and are NOT to be re-shaped by the settings builders.
 

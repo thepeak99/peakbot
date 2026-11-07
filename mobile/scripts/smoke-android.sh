@@ -105,7 +105,7 @@ if [ "$kind" = release ]; then
     fi
 fi
 
-# ── 3. 16 KB page alignment (S10 / R11) ─────────────────────────────────
+# ── 3. 16 KB page alignment ─────────────────────────────────
 zipalign -c -P 16 -v 4 "$apk" >/dev/null 2>&1 \
     || fail "zipalign -c -P 16 -v 4 — the APK is not 16 KB-page aligned"
 ok "zipalign -c -P 16 -v 4 (16 KB pages)"
@@ -142,7 +142,7 @@ printf '%s\n' "$nsc" | grep -qF '127.0.0.1' \
 ok "NSC 127.0.0.1 domain-config"
 
 # ── 6. size cap (release only) ───────────────────────────────────────────
-# 40 MB = 41943040 bytes (plan §3.1; the spike measured 22.1 MB and the
+# 40 MB = 41943040 bytes (a development build measured 22.1 MB and the
 # core link is ~2× the remote-only build). Debug APKs are never released
 # and carry unstripped symbols, so they skip the release cap.
 MAX_BYTES=41943040
@@ -176,7 +176,7 @@ run_l10_symbol_check() {
         export PATH="${NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
     fi
     command -v llvm-nm >/dev/null 2>&1 \
-        || fail "L10: llvm-nm not found (NDK llvm toolchain missing?)"
+        || fail "symbol check: llvm-nm not found (NDK llvm toolchain missing?)"
 
     # Locate the unstripped lib the APK links (when not given explicitly). The
     # debug build is unstripped (release is stripped by
@@ -193,7 +193,7 @@ run_l10_symbol_check() {
         done
         [ -n "$so" ] || so=$(find "$root" -type f -name 'libpeakbot_mobile_lib.so' 2>/dev/null | head -n 1)
     fi
-    [ -n "$so" ] || fail "L10: no libpeakbot_mobile_lib.so to symbol-check (build incomplete?)"
+    [ -n "$so" ] || fail "symbol check: no libpeakbot_mobile_lib.so to symbol-check (build incomplete?)"
 
     # Checked names (host-only code that must not be in the mobile build).
     bad=""
@@ -205,9 +205,9 @@ run_l10_symbol_check() {
         fi
     done
     if [ -n "$bad" ]; then
-        fail "L10: host-only symbol '$bad' found in $so — host code leaked into the mobile build"
+        fail "symbol check: host-only symbol '$bad' found in $so — host code leaked into the mobile build"
     fi
-    ok "L10: no host-only symbols (portable_pty, TokioChildProcess, BashTool, ratatui) in $so"
+    ok "symbol check: no host-only symbols (portable_pty, TokioChildProcess, BashTool, ratatui) in $so"
 }
 run_l10_symbol_check "$apk"
 

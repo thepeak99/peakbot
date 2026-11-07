@@ -1,12 +1,12 @@
 #!/bin/sh
 #
-# build-android.sh — PeakBot Mobile Android APK build (M7).
+# build-android.sh — PeakBot Mobile Android APK build.
 #
 # The single entry point for `make mobile-android` and CI. Runs INSIDE the
 # Dockerfile.mobile-android toolchain container with the worktree mounted at
-# /w. Plan §3.1: `npm run tauri --` (D6 — a global CLI breaks the gradle
+# /w. `npm run tauri --` (a global CLI breaks the gradle
 # callback), the four CARGO_PROFILE_RELEASE_* size env vars, `--locked`
-# (D8 — the root workspace lock is the only lock), the D7 named volume for
+# (the root workspace lock is the only lock), the named volume for
 # /root/.android (mounted by the Makefile, so debug APKs upgrade over each
 # other), and release signing via BuildKit secrets → tmpfs keystore.properties
 # → the committed gradle signingConfig.
@@ -21,10 +21,10 @@
 #      ANDROID_KEY_ALIAS + ANDROID_KEY_PASSWORD present (tmpfs, written by
 #      the Makefile) → keystore.jks + keystore.properties on the same tmpfs
 #      → release build → output/mobile/PeakBot-Mobile-<v>-android-arm64.apk
-#      absent → debug build (AGP's default debug keystore from the D7
+#      absent → debug build (AGP's default debug keystore from the
 #      /root/.android volume) → output/mobile/PeakBot-Mobile-<v>-android-
 #      arm64-debug.apk — a debug APK is never released
-#   5. smoke-android.sh (M8) on the result — fails the build on any violation
+#   5. smoke-android.sh on the result — fails the build on any violation
 #
 # The secrets live only in the tmpfs /run/secrets mount; they are never
 # echoed and never land in the worktree.
@@ -50,11 +50,11 @@ echo "🕸️  building the SPA (make web equivalent)..."
 (cd "$root/web" && npm ci --no-audit --no-fund && npm run build)
 touch "$root/web/dist/.gitkeep"
 
-# 2. D6: the CLI is a devDependency in mobile/package.json — always go
+# 2. The CLI is a devDependency in mobile/package.json — always go
 #    through `npm run tauri --`, never a global tauri.
 (cd "$root/mobile" && npm ci --no-audit --no-fund)
 
-# Release size settings come from env (plan §3.1): the workspace profiles
+# Release size settings come from env: the workspace profiles
 # live at the root and must not change the CLI build.
 export CARGO_PROFILE_RELEASE_OPT_LEVEL=s
 export CARGO_PROFILE_RELEASE_LTO=true
@@ -102,7 +102,7 @@ fi
 echo "🔨 tauri android build ($kind): npm run tauri -- android build $tauri_build_args -- --locked"
 cd "$root/mobile"
 # `-- --locked`: the extra args after `--` are passed to the cargo runner
-# (cargo-ndk), so the build uses the root workspace lock (D8).
+# (cargo-ndk), so the build uses the root workspace lock.
 npm run tauri -- android build $tauri_build_args -- --locked
 
 # Tauri 2.12 lays the APK out at outputs/apk/universal/<kind>/app-universal-
@@ -113,7 +113,7 @@ apk_src=$(ls "$apk_glob"/*/"$kind"/app*.apk "$apk_glob"/"$kind"/app*.apk 2>/dev/
 [ -n "$apk_src" ] && [ -f "$apk_src" ] \
     || { echo "❌ no APK found under $apk_glob for the $kind build" >&2; exit 1; }
 
-# 5. Deliverable + smoke (M8): any violation fails the build.
+# 5. Deliverable + smoke: any violation fails the build.
 mkdir -p "$root/output/mobile"
 cp "$apk_src" "$root/output/mobile/$out_name"
 ls -lh "$root/output/mobile/$out_name"

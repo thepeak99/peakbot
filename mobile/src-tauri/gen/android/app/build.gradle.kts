@@ -58,7 +58,7 @@ android {
             isMinifyEnabled = false
             packaging {
                 // No armv7/i686: release is arm64-v8a only; x86_64 is for dev
-                // emulator APKs (plan §3.1).
+                // emulator APKs.
                 jniLibs.keepDebugSymbols.add("*/arm64-v8a/*.so")
                 jniLibs.keepDebugSymbols.add("*/x86_64/*.so")
             }

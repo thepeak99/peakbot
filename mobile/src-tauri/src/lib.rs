@@ -1,4 +1,4 @@
-//! PeakBot Mobile — the Tauri glue (plan §2.2): plugins, the main window, the
+//! PeakBot Mobile — the Tauri glue: plugins, the main window, the
 //! nav guard wiring and the Profiles page commands. Decisions live in the pure
 //! modules (`link`, `profiles`, `nav`) and the Local core's lifecycle in
 //! `local`; this file only wires them to Tauri.
@@ -27,16 +27,16 @@ use local::{Local, should_restart};
 use nav::{Known, Nav};
 use profiles::{Active, ProfileError, ProfileName, Profiles, Remote, RemoteId};
 
-/// The single init script injected on every origin, both OSes (plan §2.3).
+/// The single init script injected on every origin, both OSes.
 /// Declares the mobile shell marker and shims `window.open` as a top-level
-/// navigation (I-D8) the nav guard can classify. Locked bytes — no trailing newline.
+/// navigation the nav guard can classify. Locked bytes — no trailing newline.
 pub const INIT_SCRIPT: &str = "Object.defineProperty(window,'peakbotShell',{value:'mobile'});\nwindow.open=function(u){if(u){location.href=new URL(String(u),location.href).href}return null};";
 
 /// The SPA's dark app background (Tailwind zinc-950); the Profiles page uses
 /// the same colour so no white band shows behind either.
 const BACKGROUND: Color = Color(9, 9, 11, 255);
 
-/// The app's two storage roots (plan §2.6): `data` holds `profiles.json` and
+/// The app's two storage roots: `data` holds `profiles.json` and
 /// the Local core's config/data; `cache` its cache.
 struct AppDirs {
     data: PathBuf,
@@ -47,10 +47,10 @@ impl AppDirs {
     fn resolve(app: &AppHandle) -> tauri::Result<AppDirs> {
         let path = app.path();
         // Android: Tauri's app_data_dir() is the app root (`Context.dataDir`);
-        // the data root is `Context.filesDir` under it (R14).
+        // the data root is `Context.filesDir` under it.
         #[cfg(target_os = "android")]
         let data = path.app_data_dir()?.join("files");
-        // iOS (§2.6): the data root is app_data_dir() itself
+        // iOS: the data root is app_data_dir() itself
         // (`…/Library/Application Support/sh.shifu.mobile`) and the cache
         // app_cache_dir() — nothing under `…/peakbot`.
         #[cfg(not(target_os = "android"))]
@@ -72,7 +72,7 @@ impl AppDirs {
 }
 
 /// The Profiles store: `profiles.json` is the persistence, the mutex the one
-/// live copy (plan §2.3).
+/// live copy.
 struct Store {
     path: PathBuf,
     profiles: Mutex<Profiles>,
@@ -178,7 +178,7 @@ fn profile_rename(store: State<'_, Store>, id: u32, name: String) -> Result<(), 
 }
 
 // Commands that touch the webview are async so they run on the async runtime,
-// never on Android's UI thread (the same deadlock class as D2).
+// never on Android's UI thread (the same deadlock class as `on_navigation` below).
 #[tauri::command]
 async fn profile_remove(
     window: WebviewWindow,
@@ -252,7 +252,7 @@ fn require_local_consent(consented: bool) -> Result<(), String> {
     }
 }
 
-/// D3: every profile open is a Rust (browser-initiated) navigation, so
+/// every profile open is a Rust (browser-initiated) navigation, so
 /// Android keeps the Profiles page in history and Back returns to it.
 #[tauri::command]
 async fn profile_open(
@@ -300,7 +300,7 @@ fn app_index_url() -> Url {
     Url::parse(base).expect("static url")
 }
 
-/// D2: returns at once; every side effect is spawned, because opener/navigate
+/// returns at once; every side effect is spawned, because opener/navigate
 /// calls inside Android's `shouldOverrideUrlLoading` deadlock the UI thread (ANR).
 fn on_navigation(app: &AppHandle, url: &Url) -> bool {
     let remotes: Vec<url::Origin> = app
@@ -343,7 +343,7 @@ fn on_navigation(app: &AppHandle, url: &Url) -> bool {
     false
 }
 
-/// §2.4: only the Local page may restart the phone's core — a Remote page
+/// Only the Local page may restart the phone's core — a Remote page
 /// sending the sentinel does nothing. A failed restart lands on the Profiles
 /// page, where opening Local again shows the error.
 async fn restart_local(app: &AppHandle) {
@@ -373,7 +373,7 @@ async fn restart_local(app: &AppHandle) {
     }
 }
 
-/// §2.9: back in the foreground, re-serve the Local core if its listener
+/// Back in the foreground, re-serve the Local core if its listener
 /// was reclaimed; if that moved the port, follow it from the Local page.
 async fn resume_local(app: &AppHandle) {
     let Some((old, url)) = app.state::<Local>().resume().await else {
@@ -443,7 +443,7 @@ pub fn run() {
                 )])
                 .build(),
         )
-        // D1: the default click handler turns `<a target=_blank>` into an
+        // the default click handler turns `<a target=_blank>` into an
         // opener IPC call the server origin may not make, so the link died.
         // Off, it reaches the nav guard like any navigation (→ External).
         .plugin(
@@ -581,7 +581,7 @@ mod glue_tests {
 mod init_script_tests {
     use super::INIT_SCRIPT;
 
-    /// The locked bytes (plan §2.3 + the I-D8 `window.open` shim): two
+    /// The locked bytes: two
     /// lines, ONE `\n` between them, no trailing newline — same style as the
     /// desktop `SHELL_MARKER_SCRIPT`
     /// (`Object.defineProperty(window,'peakbotShell',{value:'desktop'});`).
@@ -611,7 +611,7 @@ window.open=function(u){if(u){location.href=new URL(String(u),location.href).hre
 
     #[test]
     fn init_script_shims_window_open_as_top_level_navigation() {
-        // I-D8: every window.open becomes a top-level navigation the guard
+        // every window.open becomes a top-level navigation the guard
         // classifies (foreign → External → system browser).
         assert!(INIT_SCRIPT.contains(
             "window.open=function(u){if(u){location.href=new URL(String(u),location.href).href}return null};"

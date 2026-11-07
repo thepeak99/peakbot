@@ -4,12 +4,12 @@
 #
 # Pure toolchain: NO COPY of the source. The worktree is bind-mounted at run
 # time, so any build context works (an empty one is fastest) and the image
-# stays edition-agnostic. Phase 2 (M7) appends the APK build stage below.
+# stays edition-agnostic. Phase 2 appends the APK build stage below.
 #
 #   podman build --target toolchain -t localhost/peakbot-mobile-android:toolchain -f Dockerfile.mobile-android .
 #   docker build --target toolchain -t localhost/peakbot-mobile-android:toolchain -f Dockerfile.mobile-android .
 #
-# Pins (locked, mobile-plan §3.1):
+# Pins (locked):
 #   base            eclipse-temurin:17-jdk
 #   cmdline-tools   13114758
 #   SDK platforms   android-36 + android-37.0 (compileSdk = targetSdk = 37; AGP pulls 36)
@@ -18,7 +18,7 @@
 #   Rust            1.95.0 + aarch64-linux-android + x86_64-linux-android (dev emulator APKs)
 #   cargo-ndk       4.1.2 (PR check)
 #   Node            22.23.4 (official tarball; no global @tauri-apps/cli — a global
-#                    CLI breaks the gradle callback, plan D6; M7 gets 2.12.4 via
+#                    CLI breaks the gradle callback; the APK build gets 2.12.4 via
 #                    `npm ci` in mobile/)
 #
 # No `COPY vendor/`: the root `[patch.crates-io]` (vendored termios) resolves
@@ -36,7 +36,7 @@ ARG NDK_PKG=28.2.13676358
 
 ENV DEBIAN_FRONTEND=noninteractive
 # cc/linker + python3: aws-lc-sys and friends compile for Android in this image
-# (proven in the spike); unzip/curl/xz: the tarballs below.
+# (proven by the Android check); unzip/curl/xz: the tarballs below.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         unzip curl ca-certificates git xz-utils build-essential pkg-config file python3 \
     && rm -rf /var/lib/apt/lists/*
@@ -70,10 +70,10 @@ ENV NDK_HOME=$ANDROID_HOME/ndk/${NDK_PKG}
 ENV ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_PKG}
 
 # Gradle caches live under /root/.gradle and the debug keystore under
-# /root/.android — M7 mounts named volumes there (plan D7).
+# /root/.android — the APK build mounts named volumes there.
 WORKDIR /w
 
-# Toolchain self-check: every line below must match mobile-plan §3.1.
+# Toolchain self-check: every line below must match
 RUN echo '== sdkmanager --list_installed ==' \
     && sdkmanager --list_installed \
     && echo '== rustc -V ==' \

@@ -79,7 +79,7 @@ async fn upload_handler(
         );
     }
 
-    // Local edition: images only (mobile plan §2.8 / QL7). Buffer the bounded
+    // Local edition: images only. Buffer the bounded
     // body so the magic can be sniffed before anything is written; a
     // non-image is a 415 with the exact body the SPA matches verbatim. The
     // full edition streams straight to the store and accepts any file.
@@ -149,7 +149,7 @@ async fn read_bounded(body: Body, max_bytes: u64) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-/// The Local edition's whole upload rule (QL7): images only. Sniff the
+/// The Local edition's whole upload rule: images only. Sniff the
 /// body's magic — the SAME four formats `describe` accepts as an `Image` —
 /// and return `true` iff it is one of them. Size is enforced separately: a
 /// sniffed-but-oversized image is still an image and gets the 413, not the

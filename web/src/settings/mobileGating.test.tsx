@@ -79,7 +79,7 @@ async function flush() {
 
 /** marker: "desktop" / "mobile" set the peakbotShell global AND
  *  `isTauri = true` — both real Tauri shells set `window.isTauri` on every
- *  origin, which is exactly why the SPA must stop reading it (R18);
+ *  origin, which is exactly why the SPA must stop reading it;
  *  "browser" leaves both absent. */
 function setShell(marker: "desktop" | "mobile" | "browser") {
   delete g.peakbotShell;
@@ -112,7 +112,7 @@ afterEach(() => {
 
 // ─── "Switch profile" row ────────────────────────────────────────────────
 
-describe('Settings "Switch profile" row (F2)', () => {
+describe('Settings "Switch profile" row', () => {
   it("mobile: renders the row with the exact peakbot-mobile:profiles href", async () => {
     setShell("mobile");
     mount(<Settings convo={null} onClose={() => {}} />);
@@ -135,7 +135,7 @@ describe('Settings "Switch profile" row (F2)', () => {
 
 // ─── update banner per shell ─────────────────────────────────────────────
 
-describe("update banner per shell (F1/F2)", () => {
+describe("update banner per shell", () => {
   function installInvoke(impl: () => Promise<unknown>) {
     const invoke = vi.fn(impl);
     g.__TAURI__ = { core: { invoke } };
@@ -201,7 +201,7 @@ function TabStripProbe() {
   );
 }
 
-describe("desktop tab strip per shell (F1/F2)", () => {
+describe("desktop tab strip per shell", () => {
   it("mobile: no tab strip", () => {
     setShell("mobile");
     mount(<TabStripProbe />);
@@ -228,7 +228,7 @@ describe("desktop tab strip per shell (F1/F2)", () => {
 // "Restart now" button is the SPA's only `peakbot-desktop:restart`
 // navigation. In the mobile shell the button must not render at all.
 
-describe("peakbot-desktop:restart path per shell (F2)", () => {
+describe("peakbot-desktop:restart path per shell", () => {
   function mountBanner(): void {
     mount(
       <RestartBanner
@@ -263,7 +263,7 @@ describe("peakbot-desktop:restart path per shell (F2)", () => {
 // the mobile shell must not render it at all (the phone IS the pairing
 // target — the panel would tell it to pair with itself).
 
-describe('"Connect a phone or another PeakBot" panel per shell (F2)', () => {
+describe('"Connect a phone or another PeakBot" panel per shell', () => {
   function ctxValue(): SettingsCtxValue {
     return {
       scope: "global",

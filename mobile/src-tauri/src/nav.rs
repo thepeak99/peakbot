@@ -1,9 +1,8 @@
-//! `classify(url, known) -> Nav` — the webview's security boundary (plan
-//! §2.3): it only ever displays the app page or a known profile origin.
+//! `classify(url, known) -> Nav` — the webview's security boundary: it only ever displays the app page or a known profile origin.
 
 use url::Url;
 
-/// What a webview navigation may do (plan §2.3). First match wins.
+/// What a webview navigation may do. First match wins.
 #[derive(Debug, PartialEq)]
 pub enum Nav {
     /// The page may display (app or known profile origin).
@@ -12,7 +11,7 @@ pub enum Nav {
     External,
     /// Navigate to the mobile-only profiles screen.
     Profiles,
-    /// Ask the app to restart the Local core (gate is in the handler, §2.4).
+    /// Ask the app to restart the Local core.
     RestartLocal,
     /// Refuse.
     Block,
@@ -22,7 +21,7 @@ pub const PROFILES_SENTINEL: &str = "peakbot-mobile:profiles";
 pub const RESTART_SENTINEL: &str = "peakbot-mobile:restart";
 
 /// The server's CA download. The Profiles page's [Install certificate…]
-/// opens it in the system browser (plan §2.1) — it lives on the known
+/// opens it in the system browser — it lives on the known
 /// remote origin, so the origin rule would display it in the webview,
 /// where a certificate can't be installed.
 pub const CA_PATH: &str = "/peakbot-ca.crt";
@@ -35,7 +34,7 @@ pub struct Known<'a> {
     pub remotes: &'a [url::Origin],
 }
 
-/// Classify a navigation (first match wins, §2.3 rule order).
+/// Classify a navigation (first match wins, in rule order).
 pub fn classify(url: &Url, known: &Known<'_>) -> Nav {
     // (1)+(2): exactly the two sentinels; any other `peakbot-*:` URL falls
     // through to (6) Block — it is not an open namespace.
@@ -49,7 +48,7 @@ pub fn classify(url: &Url, known: &Known<'_>) -> Nav {
         return Nav::Allow;
     }
     // (4a): the CA download on a known profile origin goes to the system
-    // browser (plan §2.1) — the webview can't install a certificate.
+    // browser — the webview can't install a certificate.
     let o = url.origin();
     if url.path() == CA_PATH && (known.local.is_some_and(|l| o == *l) || known.remotes.contains(&o))
     {
@@ -126,7 +125,7 @@ mod tests {
     #[test]
     fn restart_sentinel_is_restart_local() {
         // v3: `classify` is unconditional — the Local-only gate is in the
-        // spawned handler (§2.4 "Restart gate"), not here.
+        // spawned handler, not here.
         assert_eq!(classify(&u(RESTART_SENTINEL), &none()), Nav::RestartLocal);
     }
 

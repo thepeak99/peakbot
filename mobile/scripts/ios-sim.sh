@@ -10,7 +10,7 @@
 #   2. web/dist (always rebuilt — the Local core embeds the SPA) +
 #      cd mobile && npm ci, then
 #      `npm run tauri -- ios build --target <x86_64|aarch64-sim>
-#      --debug --ci` (D6: the CLI is a devDependency; Intel = x86_64,
+#      --debug --ci` (the CLI is a devDependency; Intel = x86_64,
 #      Apple silicon = aarch64-sim)
 #   3. tolerates the non-zero exit ONLY if
 #      DerivedData/peakbot-mobile-*/Build/Products/debug-iphonesimulator/
@@ -23,7 +23,7 @@
 #
 # With a team set, the same script works (the archive then succeeds).
 # Sim results on loopback are approximate: the sim shares the Mac's
-# network namespace (I-D13).
+# network namespace.
 
 set -u
 
@@ -31,12 +31,12 @@ set -u
 root=$(cd "$(dirname "$0")/../.." && pwd)
 mobile="$root/mobile"
 
-# brew is not on a non-login ssh PATH (I-D2'): extend for BOTH prefixes
+# brew is not on a non-login ssh PATH: extend for BOTH prefixes
 # (Intel /usr/local, Apple silicon /opt/homebrew) + the pinned node/cargo.
 # ~/.cargo/bin goes FIRST: brew may carry its own `rust` formula (axlotl:
 # 1.99.1) whose cargo ignores rust-toolchain.toml and has no iOS std.
 export PATH="$HOME/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:$HOME/.local/opt/node-v22.23.4-darwin-x64/bin:$PATH"
-# The pinned Xcode (axlotl: 26.3, §3.2) — xcode-select may point elsewhere.
+# The pinned Xcode (axlotl: 26.3) — xcode-select may point elsewhere.
 export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode-26.3.0.app/Contents/Developer}"
 
 # Target by arch: Intel x86_64, Apple silicon aarch64-sim (the tauri flag
@@ -47,14 +47,14 @@ case "$(uname -m)" in
   *) echo "❌ unknown arch: $(uname -m)" >&2; exit 1 ;;
 esac
 
-# 1. Freshness reference (I-D7): the .app must be NEWER than this file.
+# 1. Freshness reference: the .app must be NEWER than this file.
 mkdir -p "$root/output/mobile"
 START_TS_FILE="$root/output/mobile/.sim-build-start"
 date +%s > "$START_TS_FILE"
 
 # 2. The Local core embeds the SPA from web/dist: ALWAYS build it (a
 #    "build if absent" check silently shipped a stale SPA; the `make web`
-#    equivalent). D6: the CLI is a devDependency in mobile/package.json.
+#    equivalent). The CLI is a devDependency in mobile/package.json.
 echo "🕸️  building the SPA (make web equivalent)..."
 (cd "$root/web" && npm ci --no-audit --no-fund && npm run build) || { echo "❌ web build failed" >&2; exit 1; }
 touch "$root/web/dist/.gitkeep"
@@ -65,7 +65,7 @@ echo "🔨 npm run tauri -- ios build --target $TARGET --debug --ci"
     > "$root/output/mobile/build.log" 2>&1)
 rc=$?
 if [ "$rc" -ne 0 ]; then
-    echo "ℹ️  ios build exited $rc (expected without a team — I-D7); checking DerivedData for a fresh .app..."
+    echo "ℹ️  ios build exited $rc (expected without a team); checking DerivedData for a fresh .app..."
 fi
 
 # 3. The deliverable .app: it must exist AND be fresh — else fail with
@@ -94,6 +94,6 @@ if ! xcrun simctl list devices booted | grep -q "(Booted)"; then
 fi
 xcrun simctl install booted "$root/output/mobile/sim/PeakBot.app" \
     || { echo "❌ simctl install failed" >&2; exit 1; }
-# Launch BACKGROUNDED: simctl launch can hang over ssh (spike run 2).
+# Launch BACKGROUNDED: simctl launch can hang over ssh.
 (xcrun simctl launch booted sh.shifu.mobile &)
 echo "🚀 launched sh.shifu.mobile on the booted simulator"

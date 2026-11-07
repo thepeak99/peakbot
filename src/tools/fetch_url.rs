@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 const MAX_RESPONSE_CHARS: usize = 50_000;
 
-// Header limits checked by `validate_headers` (plan §2.8): at most 20 headers,
+// Header limits checked by `validate_headers`: at most 20 headers,
 // each name at most 64 bytes, each value at most 8192 bytes (8 KiB).
 const MAX_HEADERS: usize = 20;
 const MAX_NAME_BYTES: usize = 64;
@@ -153,7 +153,7 @@ impl Tool for FetchUrlTool {
     type Output = String;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
-        // The `headers` property is present in BOTH editions (plan §2.8):
+        // The `headers` property is present in BOTH editions:
         // an optional string→string map, validated in `parse`, never required.
         // The two editions differ only in the POST-specific fields and the
         // wording of the description.

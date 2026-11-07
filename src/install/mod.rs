@@ -112,7 +112,7 @@ pub const fn target_exe_name() -> &'static str {
 }
 
 // ===========================================================================
-// §E.3 — install target resolution (pure; depends only on `crate::paths`).
+// Install target resolution (pure; depends only on `crate::paths`).
 // ===========================================================================
 
 /// Resolve the per-user install target for the current build target.

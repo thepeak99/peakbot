@@ -258,7 +258,7 @@ pub fn delegate_enabled(agent: &ResolvedAgent) -> bool {
 /// `file_create` among the registered built-ins after the `profile.tools`
 /// filter: the full edition always lists it, so the filter alone decides;
 /// the Local edition never compiles the tool. The single source of truth the
-/// derived memory rule reads (mobile plan §2.7) — it can never drift from
+/// derived memory rule reads — it can never drift from
 /// `main_agent_tool_names`, which applies the same `allows` gate to the same
 /// base list.
 pub fn file_create_registered(tools: &NameFilter) -> bool {

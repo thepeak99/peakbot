@@ -189,7 +189,7 @@ pub fn get_default_skills_dirs(session_cwd: &Path) -> Vec<PathBuf> {
 /// Returns the populated registry plus any user-facing load warnings (a bad
 /// skill is skipped, never fatal) so callers can surface them in the UI.
 pub fn load_default_skills(session_cwd: &Path) -> (SkillRegistry, Vec<String>) {
-    // The Local edition never discovers skills (mobile plan §2.8): an empty
+    // The Local edition never discovers skills: an empty
     // registry, whatever the working directory holds — on boot AND reload.
     #[cfg(not(feature = "host"))]
     {

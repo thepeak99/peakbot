@@ -15,7 +15,7 @@
 const { invoke } = window.__TAURI__.core;
 const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
 const PROBE_TIMEOUT_MS = 8000;
-// Locked consent text (plan §2.1): shown once, before Local first opens.
+// Locked consent text: shown once, before Local first opens.
 const LOCAL_CONSENT_TEXT =
   "Your messages are sent to the AI provider you configure, using your own API key.";
 
@@ -149,7 +149,7 @@ async function openRemote(r) {
   if (await probe(r.origin)) {
     clearStatus();
     try {
-      // D3: Rust navigates the webview; this page stays in history.
+      // Rust navigates the webview; this page stays in history.
       await invoke("profile_open", { target: { remote: r.id } });
     } catch (e) {
       setStatus(String(e));
@@ -181,7 +181,7 @@ async function openLocal() {
       render();
     }
     setStatus("Starting PeakBot on this phone…");
-    // D3: Rust navigates the webview; this page stays in history.
+    // Rust navigates the webview; this page stays in history.
     await invoke("profile_open", { target: "local" });
     clearStatus();
   } catch (e) {
@@ -190,7 +190,7 @@ async function openLocal() {
   }
 }
 
-/* ── Can't-reach help (locked strings, v2 §5.4) ─────────────────────── */
+/* ── Can't-reach help (locked strings) ─────────────────────── */
 
 function showCantReach(r) {
   unreachable = r;
@@ -383,7 +383,7 @@ async function deleteRemote(r) {
   }
 }
 
-/* ── Wiring + cold start (plan §2.1) ────────────────────────────────── */
+/* ── Wiring + cold start ────────────────────────────────── */
 
 $("add-server").addEventListener("click", openAdd);
 $("add-cancel").addEventListener("click", closeAdd);

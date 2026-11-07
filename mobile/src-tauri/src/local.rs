@@ -1,4 +1,4 @@
-//! The Local core ("PeakBot on this phone", plan §2.11): the app's only
+//! The Local core ("PeakBot on this phone"): the app's only
 //! stateful native piece. Binds loopback, boots `peakbot::embed::LocalCore`,
 //! serves it, and restarts / re-serves it on demand.
 
@@ -13,7 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use url::{Origin, Url};
 
-/// QL9: the preferred port; busy ⇒ an ephemeral one.
+/// the preferred port; busy ⇒ an ephemeral one.
 const PORT: u16 = 47823;
 /// `profile_open`'s budget for the core to answer HTTP.
 const READY_WITHIN: Duration = Duration::from_secs(5);
@@ -45,7 +45,7 @@ impl Local {
     }
 
     /// Start the core if it isn't running (re-serving it if its listener
-    /// died) and return the URL the webview opens — never handed to JS (D3).
+    /// died) and return the URL the webview opens — never handed to JS.
     pub async fn ensure(&self) -> Result<Url, String> {
         let _guard = self.lifecycle.lock().await;
         if self.is_running() {
@@ -70,7 +70,7 @@ impl Local {
         Ok(self.url())
     }
 
-    /// Foreground again (§2.9): iOS may have reclaimed the listener while
+    /// Foreground again: iOS may have reclaimed the listener while
     /// suspended. Returns the old origin and the new URL if the port moved.
     pub async fn resume(&self) -> Option<(Origin, Url)> {
         let _guard = self.lifecycle.lock().await;
@@ -151,7 +151,7 @@ fn start_error(e: impl std::fmt::Display) -> String {
     format!("Couldn't start PeakBot on this phone: {e}")
 }
 
-/// Loopback only (§2.8): other apps on the phone can reach it, hence the
+/// Loopback only: other apps on the phone can reach it, hence the
 /// token. `SO_REUSEADDR` so a restart rebinds over the old core's TIME_WAITs.
 fn bind(preferred: u16) -> io::Result<TcpListener> {
     let listen = |port: u16| {
@@ -190,7 +190,7 @@ fn origin_url(port: u16) -> Url {
     Url::parse(&format!("http://127.0.0.1:{port}/")).expect("static url")
 }
 
-/// §2.4 restart gate: only a page on the Local origin may restart the core.
+/// Restart gate: only a page on the Local origin may restart the core.
 pub fn should_restart(current: &Url, local: Option<&Origin>) -> bool {
     local.is_some_and(|l| current.origin() == *l)
 }

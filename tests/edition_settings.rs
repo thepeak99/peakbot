@@ -5,7 +5,7 @@
 //!     block gains `"edition": "full" | "local"`, in BOTH normal and
 //!     needs_setup modes, derived from `cfg!(feature = "host")`);
 //!   - the Local edition accepts a PDF upload today (the
-//!     `415 {"error":"images_only"}` gate lands — QL7: Local attachments are images
+//!     `415 {"error":"images_only"}` gate lands — Local attachments are images
 //!     only).
 //!
 //! **No `LocalCore` dependency:** the settings and uploads routers are driven
@@ -195,7 +195,7 @@ async fn boot_block_shape_matches_the_shared_fixture() {
     );
 }
 
-// ═══ Local upload: images only (QL7) ═════════════════════════════════════
+// ═══ Local upload: images only ═════════════════════════════════════
 
 #[cfg(not(feature = "host"))]
 fn png_bytes() -> Vec<u8> {
@@ -232,7 +232,7 @@ async fn post_upload(addr: SocketAddr, name: &str, body: Vec<u8>) -> reqwest::Re
 }
 
 /// Local edition: a PDF (non-image) upload is a `415` with the EXACT body
-/// `{"error":"images_only"}` (QL7).
+/// `{"error":"images_only"}`.
 #[cfg(not(feature = "host"))]
 #[tokio::test]
 async fn local_pdf_upload_is_415_images_only() {

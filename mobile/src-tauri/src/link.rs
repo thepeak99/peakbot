@@ -1,4 +1,4 @@
-//! `ServerLink` — THE pairing-link parser (plan §2.3). `parse` is the only
+//! `ServerLink` — THE pairing-link parser. `parse` is the only
 //! constructor, so downstream code holds a valid, normalized link whose token
 //! is reachable only through `url()`.
 
@@ -6,7 +6,7 @@ use std::fmt;
 use url::Url;
 
 /// The five user-facing rejections for a pairing link. `Display` wording is
-/// locked (v2 §5.4); these are what the UI surfaces verbatim.
+/// locked; these are what the UI surfaces verbatim.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum LinkError {
     NotAUrl,
@@ -62,7 +62,7 @@ impl ServerLink {
         }
     }
 
-    /// Trim + apply the §2.3 rules in order: parse (NotAUrl) → scheme https
+    /// Trim + apply the rules in order: parse (NotAUrl) → scheme https
     /// (NotHttps) → host (NoHost) → no userinfo (HasCredentials) → exactly one
     /// non-empty `token` (NoToken), then normalize (path `/`, raw `token=…`,
     /// no fragment, port kept).
@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn parse_accepts_027_link_with_ca_and_profile_and_drops_both() {
-        // QL13: 0.27.0 entry links carry `&ca=sha256:<64-hex>` and may carry
+        // 0.27.0 entry links carry `&ca=sha256:<64-hex>` and may carry
         // `&profile=<name>` — accepted, then dropped like any extra param.
         let ca = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
         let link = ok(&format!(
@@ -365,7 +365,7 @@ mod tests {
         assert_eq!(ok("https://[::1]:7823/?token=t").host_label(), "[::1]:7823");
     }
 
-    // ── the locked user-facing strings (v2 §5.4) ─────────────────────────
+    // ── the locked user-facing strings ─────────────────────────
 
     #[test]
     fn link_error_display_strings_are_locked() {

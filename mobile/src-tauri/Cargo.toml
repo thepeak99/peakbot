@@ -1,5 +1,5 @@
-# PeakBot Mobile — the Tauri 2 shell (plan §2.2). Member of the root
-# workspace: one Cargo.lock (D8), `--locked` everywhere.
+# PeakBot Mobile — the Tauri 2 shell. Member of the root
+# workspace: one Cargo.lock, `--locked` everywhere.
 [package]
 name = "peakbot-mobile"
 version = "0.27.0"

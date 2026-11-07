@@ -360,7 +360,7 @@ fn core_guidance(shell: Option<&ShellKind>) -> String {
     out
 }
 
-/// The derived memory rule (mobile plan §2.7): the memory.md prompt section
+/// The derived memory rule: the memory.md prompt section
 /// and the compaction memory flush apply iff `memory.enabled ∧ file_create
 /// is registered` — `file_create` after the `profile.tools` filter (never
 /// present in the Local edition). ONE predicate for both call sites, so the
@@ -613,8 +613,8 @@ pub struct RebuildContext {
 }
 
 impl RebuildContext {
-    /// How a reload reads the repo file. The Local edition NEVER reads one
-    /// (mobile plan §2.8): the global config is the only config, so the repo
+    /// How a reload reads the repo file. The Local edition NEVER reads one:
+    /// the global config is the only config, so the repo
     /// file is ignored whatever the pin says. In the full edition a pinned
     /// profile is a global profile, so the repo file is ignored under a pin
     /// (spec §6.5).
@@ -10514,7 +10514,7 @@ mod local_persona_tests {
     }
 }
 
-// ─── Local reload: no repo config, no skills (mobile plan §2.8) ──────────
+// ─── Local reload: no repo config, no skills ──────────
 //
 // The Local edition's session verbs (`/new`, `/cd`, `/model`, `/load`)
 // re-read the config and rescan skills on every reload. In the full edition
@@ -10560,7 +10560,7 @@ mod local_reload_tests {
         assert_eq!(
             ctx.repo_mode(),
             RepoMode::Ignore,
-            "the Local edition never reads a repo file on reload (mobile plan §2.8)"
+            "the Local edition never reads a repo file on reload"
         );
     }
 

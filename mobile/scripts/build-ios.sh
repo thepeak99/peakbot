@@ -6,10 +6,10 @@
 # entry point for `make mobile-ios`.
 #
 # Steps:
-#   1. assert the pinned Xcode (axlotl floor: 26.3, §3.2)
+#   1. assert the pinned Xcode (axlotl floor: 26.3)
 #   2. APPLE_DEVELOPMENT_TEAM from the human's environment (never the repo)
 #   3. web/dist (always rebuilt — the Local core embeds the SPA)
-#   4. cd mobile && npm ci (@tauri-apps/cli 2.12.4 devDependency, D6)
+#   4. cd mobile && npm ci (@tauri-apps/cli 2.12.4 devDependency)
 #   5. npm run tauri -- ios build --target aarch64
 #      --export-method app-store-connect
 #   6. output/mobile/PeakBot-Mobile-<v>-ios.ipa (<v> from tauri.conf.json)
@@ -24,15 +24,15 @@ set -eu
 root=$(cd "$(dirname "$0")/../.." && pwd)
 mobile="$root/mobile"
 
-# brew is not on a non-login ssh PATH (I-D2'): extend for BOTH prefixes
+# brew is not on a non-login ssh PATH: extend for BOTH prefixes
 # (Intel /usr/local, Apple silicon /opt/homebrew) + the pinned node/cargo.
 # ~/.cargo/bin goes FIRST: brew may carry its own `rust` formula (axlotl:
 # 1.99.1) whose cargo ignores rust-toolchain.toml and has no iOS std.
 export PATH="$HOME/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:$HOME/.local/opt/node-v22.23.4-darwin-x64/bin:$PATH"
-# The pinned Xcode (axlotl: 26.3, §3.2) — xcode-select may point elsewhere.
+# The pinned Xcode (axlotl: 26.3) — xcode-select may point elsewhere.
 export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode-26.3.0.app/Contents/Developer}"
 
-# 1. Pinned Xcode: the current upload floor (§3.2 — Xcode 27 needs Tahoe
+# 1. Pinned Xcode: the current upload floor (Xcode 27 needs Tahoe
 #    26.6, which axlotl can't run).
 xcode_line=$(xcodebuild -version | head -n 1)
 case "$xcode_line" in
@@ -43,7 +43,7 @@ echo "🛠️  $xcode_line"
 
 # 2. The team comes from the human's environment — never from the repo.
 [ -n "${APPLE_DEVELOPMENT_TEAM:-}" ] \
-    || { echo "❌ APPLE_DEVELOPMENT_TEAM is not set (the human's team, §3.2)" >&2; exit 1; }
+    || { echo "❌ APPLE_DEVELOPMENT_TEAM is not set (the human's team)" >&2; exit 1; }
 export APPLE_DEVELOPMENT_TEAM
 
 # Version: mobile/src-tauri/tauri.conf.json (the single source of truth;
@@ -59,11 +59,11 @@ echo "🕸️  building the SPA (make web equivalent)..."
 (cd "$root/web" && npm ci --no-audit --no-fund && npm run build)
 touch "$root/web/dist/.gitkeep"
 
-# 4. D6: the CLI is a devDependency in mobile/package.json — always go
+# 4. The CLI is a devDependency in mobile/package.json — always go
 #    through `npm run tauri --`, never a global tauri.
 (cd "$mobile" && npm ci --no-audit --no-fund)
 
-# 5. The app-store archive + export (§3.2). Tauri 2.12's `ios build`
+# 5. The app-store archive + export. Tauri 2.12's `ios build`
 #    archives and signs for the device; with the team it exports the .ipa.
 find "$mobile/src-tauri/gen/apple/build" -name '*.ipa' -exec rm -f {} + 2>/dev/null || true
 echo "🔨 npm run tauri -- ios build --target aarch64 --export-method app-store-connect"
