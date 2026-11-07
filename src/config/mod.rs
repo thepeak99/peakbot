@@ -89,7 +89,10 @@ pub struct OpenRouterConfig {
 #[serde(deny_unknown_fields)]
 pub struct OllamaConfig {
     /// Base URL (default: http://localhost:11434)
-    #[serde(default = "default_ollama_url")]
+    #[serde(
+        default = "default_ollama_url",
+        deserialize_with = "deserialize_base_url"
+    )]
     pub base_url: String,
     /// Model name (e.g., "llama3", "qwen2.5:14b", "mistral")
     pub model: String,
@@ -111,7 +114,10 @@ pub struct OpenAIConfig {
     pub api_key: Option<String>,
     /// Base URL for the OpenAI API (default: https://api.openai.com/v1)
     /// Can be overridden to use compatible endpoints (e.g., Azure OpenAI, local proxies)
-    #[serde(default = "default_openai_url")]
+    #[serde(
+        default = "default_openai_url",
+        deserialize_with = "deserialize_base_url"
+    )]
     pub base_url: String,
     /// Model to use (e.g., "gpt-4o", "gpt-4o-mini", "o1-preview")
     pub model: String,
@@ -154,7 +160,10 @@ pub struct AnthropicConfig {
     pub api_key: Option<String>,
     /// Base URL for the Anthropic Messages API (default: https://api.anthropic.com).
     /// Point this at e.g. `http://localhost:8080` for a local llama-server.
-    #[serde(default = "default_anthropic_url")]
+    #[serde(
+        default = "default_anthropic_url",
+        deserialize_with = "deserialize_base_url"
+    )]
     pub base_url: String,
     /// Model to use (e.g., "claude-3-5-sonnet-latest", or any model served
     /// by a local Anthropic-compatible endpoint).
@@ -202,7 +211,10 @@ pub struct LlamaCppConfig {
     #[serde(default)]
     pub api_key: Option<String>,
     /// Base URL for the llama.cpp API (default: http://localhost:8080)
-    #[serde(default = "default_llamacpp_url")]
+    #[serde(
+        default = "default_llamacpp_url",
+        deserialize_with = "deserialize_base_url"
+    )]
     pub base_url: String,
     /// Model to use (e.g., "llama3", "qwen2.5:14b", any model running in llama.cpp)
     pub model: String,
@@ -222,6 +234,24 @@ pub struct LlamaCppConfig {
 
 fn default_ollama_url() -> String {
     "http://localhost:11434".to_string()
+}
+
+/// Normalize a user-supplied provider base URL at the parse boundary: the
+/// transport (rig) joins the endpoint path with exactly one `/`, so a
+/// trailing slash in the config — e.g. a pasted `https://host/v1/` — would
+/// produce `https://host/v1//chat/completions`, a 404 on strict providers.
+/// Every source (wizard, hand-edit, registry) lands here, so this is the
+/// one place the shape is enforced.
+pub(crate) fn normalize_base_url(url: &str) -> String {
+    url.trim_end_matches('/').to_string()
+}
+
+fn deserialize_base_url<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    Ok(normalize_base_url(&raw))
 }
 
 fn default_openai_url() -> String {
@@ -1102,6 +1132,58 @@ pub(crate) static CONFIG_ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Provider base_url normalization (trailing slash) ────────────────
+    //
+    // The transport (rig) joins the endpoint path with exactly one `/`,
+    // so `base_url: https://host/v1/` in the config would become
+    // `https://host/v1//chat/completions` — a 404 on strict providers.
+    // The parse boundary strips trailing slashes for every source.
+
+    fn provider_base_url(p: &ProviderConfig) -> &str {
+        match p {
+            ProviderConfig::OpenAI(c) => &c.base_url,
+            ProviderConfig::Anthropic(c) => &c.base_url,
+            ProviderConfig::LlamaCpp(c) => &c.base_url,
+            ProviderConfig::Ollama(c) => &c.base_url,
+            ProviderConfig::OpenRouter(_) => panic!("openrouter has no base_url"),
+            #[cfg(feature = "mock")]
+            ProviderConfig::Mock => panic!("mock has no base_url"),
+        }
+    }
+
+    #[test]
+    fn base_url_trailing_slash_is_stripped_on_parse() {
+        let cases = [
+            (
+                "openai",
+                "http://10.0.2.2:18089/v1/",
+                "http://10.0.2.2:18089/v1",
+            ),
+            ("llamacpp", "http://10.0.2.2:8080/", "http://10.0.2.2:8080"),
+            (
+                "anthropic",
+                "https://host.example/v1/messages/",
+                "https://host.example/v1/messages",
+            ),
+            ("ollama", "http://10.0.2.2:11434/", "http://10.0.2.2:11434"),
+        ];
+        for (kind, with_slash, expected) in cases {
+            let yaml = format!("type: {kind}\nconfig:\n  base_url: {with_slash}\n  model: m\n");
+            let p: ProviderConfig =
+                serde_yaml::from_str(&yaml).unwrap_or_else(|e| panic!("{kind}: {e}"));
+            assert_eq!(provider_base_url(&p), expected, "{kind}");
+        }
+    }
+
+    #[test]
+    fn base_url_without_trailing_slash_is_untouched() {
+        let p: ProviderConfig = serde_yaml::from_str(
+            "type: openai\nconfig:\n  base_url: https://api.openai.com/v1\n  model: gpt-4o\n",
+        )
+        .unwrap();
+        assert_eq!(provider_base_url(&p), "https://api.openai.com/v1");
+    }
 
     #[test]
     fn tools_filter_default_allows_everything() {
