@@ -10,11 +10,15 @@ pub const PEAKBOT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod attachments;
 pub mod bg_processes;
+pub mod boot;
 pub mod config;
 mod context_manager;
 mod conversation;
 mod conversation_manager;
 mod conversation_title;
+// The phone app's in-process core: Local-edition limits by construction.
+#[cfg(not(feature = "host"))]
+pub mod embed;
 mod hooks;
 pub mod http;
 pub mod image_cache;

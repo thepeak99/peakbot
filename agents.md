@@ -331,6 +331,8 @@ Prefer skills or MCP servers over baking tools into the binary. Skills: drop a d
 ```
 src/
 ├── main.rs / lib.rs        # entry, AgentRunner, system prompt building
+├── boot.rs                 # session_deps + web_boot: the boot shared by main and embed
+├── embed.rs                # LocalCore — the phone app's in-process core (Local edition only)
 ├── session.rs              # SessionDeps + create_session factory
 ├── config/                 # Config::parse (the one boundary), migration, BUILTIN_TOOL_NAMES
 ├── providers/              # DynAgent, create_provider, per-provider constructors, add_builtin_tools

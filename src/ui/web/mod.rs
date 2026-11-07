@@ -276,6 +276,28 @@ impl Ui for WebUi {
     }
 
     async fn run(&mut self) -> Result<()> {
+        let app = self.router();
+        // Detached: the reaper lives as long as the process.
+        let _ = self.spawn_reaper();
+        if self.tls {
+            self.serve_tls(app).await
+        } else {
+            self.serve_plain(app).await
+        }
+    }
+
+    async fn shutdown(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl WebUi {
+    /// The full route table — SPA, `/ws` (or its needs_setup guard), the
+    /// settings/system/upload/conversation/proxy APIs — behind the token
+    /// gate. No listener, TLS or banner: `run` adds those for the CLI, and
+    /// an embedder serves this on its own listener (`embed::LocalCore`).
+    /// State lives behind `Arc`s, so every clone serves the same sessions.
+    pub fn router(&self) -> Router {
         let mut app: Router = Router::new()
             .route("/commands", get(commands_handler))
             // Registered before `.fallback` (the SPA catch-all) and before
@@ -373,32 +395,23 @@ impl Ui for WebUi {
         if self.tls {
             app = app.merge(Router::new().route("/peakbot-ca.crt", get(ca_cert_handler)));
         }
-
-        // Reaper: periodically expire sessions idle (no sockets) past the TTL.
-        // A detached task tied to the process lifetime — the registry it holds
-        // is the same one every connection shares. needs_setup mode has no
-        // registry (no sessions), so no reaper.
-        if let Some(registry) = self.ws_state.registry.clone() {
-            let ttl = self.ws_state.session_ttl;
-            let tick = self.reaper_tick;
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(tick);
-                loop {
-                    interval.tick().await;
-                    registry.reap(ttl);
-                }
-            });
-        }
-
-        if self.tls {
-            self.serve_tls(app).await
-        } else {
-            self.serve_plain(app).await
-        }
+        app
     }
 
-    async fn shutdown(&mut self) -> Result<()> {
-        Ok(())
+    /// Reaper: periodically expire sessions idle (no sockets) past the TTL.
+    /// The registry it holds is the one every connection shares. needs_setup
+    /// mode has no registry (no sessions), so no reaper (`None`).
+    pub fn spawn_reaper(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let registry = self.ws_state.registry.clone()?;
+        let ttl = self.ws_state.session_ttl;
+        let tick = self.reaper_tick;
+        Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tick);
+            loop {
+                interval.tick().await;
+                registry.reap(ttl);
+            }
+        }))
     }
 }
 

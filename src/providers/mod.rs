@@ -335,6 +335,19 @@ pub fn create_provider(
                 Arc::new(SessionHook::new(None)), // Empty hook for Ollama
             ))
         }
+        #[cfg(feature = "mock")]
+        ProviderConfig::Mock => {
+            let (agent, info, receiver, hook) = create_fixed_mock_agent(
+                system_prompt,
+                tool_env,
+                bash_env,
+                delegate,
+                todo_tool,
+                state_manager,
+                shell_kind,
+            );
+            Ok((DynAgent::Mock(agent), info, Some(receiver), Arc::new(hook)))
+        }
     }
 }
 
@@ -420,7 +433,65 @@ pub fn create_compaction_model(
             let agent = client.agent(model).preamble(COMPACTION_PREAMBLE).build();
             Ok(CompactionModel::Ollama(agent))
         }
+        #[cfg(feature = "mock")]
+        ProviderConfig::Mock => {
+            let model = MockCompletionModel::replying(crate::mock::MOCK_REPLY);
+            let agent = AgentBuilder::new(model)
+                .preamble(COMPACTION_PREAMBLE)
+                .build();
+            Ok(CompactionModel::Mock(agent))
+        }
     }
+}
+
+/// The `type: mock` provider's main agent: a [`MockCompletionModel`] that
+/// answers every prompt with [`crate::mock::MOCK_REPLY`], wired exactly like a
+/// real provider (context-tracking hook, the planned built-ins, `delegate`)
+/// so an end-to-end session runs the production path minus the network.
+#[cfg(feature = "mock")]
+fn create_fixed_mock_agent(
+    system_prompt: &str,
+    tool_env: &ToolEnv,
+    bash_env: Env,
+    delegate: Option<Arc<SubAgentDeps>>,
+    todo_tool: Option<TodoTool>,
+    state_manager: Arc<StateManager>,
+    shell_kind: Option<&ShellKind>,
+) -> (
+    Agent<MockCompletionModel, SessionHook>,
+    ProviderInfo,
+    mpsc::UnboundedReceiver<SourcedEvent>,
+    SessionHook,
+) {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let hook = SessionHook::with_context_tracking(Some(sender.clone()), state_manager.stats_arc())
+        .with_state_manager(&state_manager)
+        .with_wire_label("mock".to_string(), "mock".to_string());
+    let agent_builder = AgentBuilder::new(MockCompletionModel::replying(crate::mock::MOCK_REPLY))
+        .preamble(system_prompt)
+        .default_max_turns(tool_env.max_turns)
+        .hook(hook.clone());
+    let delegate = delegate.map(|d| Arc::new(d.with_event_sink(Some(sender))));
+    let agent = add_builtin_tools(
+        agent_builder,
+        tool_env,
+        bash_env,
+        todo_tool,
+        delegate,
+        Some(state_manager),
+        shell_kind,
+        None,
+        true,
+    )
+    .build();
+    let info = ProviderInfo {
+        name: "mock".to_string(),
+        model: "mock".to_string(),
+        supports_vision: false,
+        preserve_reasoning: false,
+        display_reasoning: false,
+    };
+    (agent, info, receiver, hook)
 }
 
 /// Create a mock CompactionModel for testing
@@ -678,6 +749,8 @@ fn wire_label_of(config: &ProviderConfig) -> (String, String) {
         ProviderConfig::Anthropic(c) => ("anthropic".to_string(), c.model.clone()),
         ProviderConfig::LlamaCpp(c) => ("llamacpp".to_string(), c.model.clone()),
         ProviderConfig::Ollama(c) => ("ollama".to_string(), c.model.clone()),
+        #[cfg(feature = "mock")]
+        ProviderConfig::Mock => ("mock".to_string(), "mock".to_string()),
     }
 }
 
@@ -1416,6 +1489,25 @@ pub(crate) fn build_sub_agent(
                 false,
             );
             Ok((DynAgent::Ollama(builder.build()), Arc::new(hook)))
+        }
+        #[cfg(feature = "mock")]
+        ProviderConfig::Mock => {
+            let builder = AgentBuilder::new(MockCompletionModel::replying(crate::mock::MOCK_REPLY))
+                .preamble(preamble)
+                .default_max_turns(max_turns)
+                .hook(hook.clone());
+            let builder = add_builtin_tools(
+                builder,
+                tool_env,
+                bash_env,
+                None,
+                None,
+                Some(state_manager),
+                shell_kind,
+                None,
+                false,
+            );
+            Ok((DynAgent::Mock(builder.build()), Arc::new(hook)))
         }
     }
 }

@@ -463,6 +463,8 @@ fn build_provider_config(prov: &ProviderEntry, model: &ModelEntry) -> ProviderCo
             temperature: model.temperature,
             vision: model.vision,
         }),
+        #[cfg(feature = "mock")]
+        ProviderType::Mock => ProviderConfig::Mock,
     }
 }
 

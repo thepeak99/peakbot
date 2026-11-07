@@ -1,7 +1,8 @@
 //! Mock completion model for integration testing
 //!
-//! This module is only compiled when running tests (`cargo test`).
-//! It provides MockCompletionModel for testing the agent loop without real API calls.
+//! Compiled only under `feature = "mock"`. Provides MockCompletionModel for
+//! testing the agent loop without real API calls, and the fixed-reply model
+//! behind the `type: mock` provider.
 
 use crate::mock::response::MockResponse;
 use rig_core::completion::message::Message;
@@ -46,6 +47,9 @@ pub struct MockCompletionModel {
     /// Armed once via [`Self::arm_hang`]: the next completion stays pending
     /// until its future is dropped, flipping the flag (Stop-cancellation proof).
     hang: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    /// The text answered once the queue is empty ([`Self::replying`]);
+    /// `None` keeps the scripted model's "no responses queued" error.
+    fallback: Option<String>,
 }
 
 /// Never resolves: `poll` always returns `Pending`, and dropping the future
@@ -79,6 +83,17 @@ impl MockCompletionModel {
             recorded_requests: Arc::new(Mutex::new(Vec::new())),
             default_usage: RigUsage::default(),
             hang: Arc::new(Mutex::new(None)),
+            fallback: None,
+        }
+    }
+
+    /// A model that answers every request with `text` (after any queued
+    /// responses) — the config-addressable `type: mock` provider, which has
+    /// no test around it to script a queue.
+    pub fn replying(text: impl Into<String>) -> Self {
+        Self {
+            fallback: Some(text.into()),
+            ..Self::new()
         }
     }
 
@@ -202,9 +217,14 @@ impl CompletionModel for MockCompletionModel {
                 tool_count: request.tools.len(),
             });
 
-        let response = self.responses.lock().unwrap().pop_front().ok_or_else(|| {
-            CompletionError::ProviderError("MockCompletionModel: no responses queued".to_string())
-        });
+        let queued = self.responses.lock().unwrap().pop_front();
+        let response = queued
+            .or_else(|| self.fallback.clone().map(MockResponse::text))
+            .ok_or_else(|| {
+                CompletionError::ProviderError(
+                    "MockCompletionModel: no responses queued".to_string(),
+                )
+            });
 
         match response {
             Ok(MockResponse::Text { content, usage }) => {

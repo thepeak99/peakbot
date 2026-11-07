@@ -45,6 +45,10 @@ pub enum ProviderType {
     Anthropic,
     LlamaCpp,
     Ollama,
+    /// A fixed-reply model (`mock::MOCK_REPLY`) for no-key end-to-end tests;
+    /// absent from non-mock builds, where `type: mock` stays a parse error.
+    #[cfg(feature = "mock")]
+    Mock,
 }
 
 impl fmt::Display for ProviderType {
@@ -55,6 +59,8 @@ impl fmt::Display for ProviderType {
             ProviderType::Anthropic => write!(f, "anthropic"),
             ProviderType::LlamaCpp => write!(f, "llamacpp"),
             ProviderType::Ollama => write!(f, "ollama"),
+            #[cfg(feature = "mock")]
+            ProviderType::Mock => write!(f, "mock"),
         }
     }
 }
@@ -252,6 +258,10 @@ pub enum ProviderConfig {
     LlamaCpp(LlamaCppConfig),
     #[serde(rename = "ollama")]
     Ollama(OllamaConfig),
+    /// The `type: mock` provider: no settings, see [`ProviderType::Mock`].
+    #[cfg(feature = "mock")]
+    #[serde(rename = "mock")]
+    Mock,
 }
 
 impl Default for ProviderConfig {
@@ -270,6 +280,8 @@ impl ProviderConfig {
             ProviderConfig::Anthropic(c) => c.max_tokens,
             ProviderConfig::LlamaCpp(c) => c.max_tokens,
             ProviderConfig::Ollama(_) => 4096,
+            #[cfg(feature = "mock")]
+            ProviderConfig::Mock => 4096,
         }
     }
 }
