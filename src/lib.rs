@@ -613,13 +613,23 @@ pub struct RebuildContext {
 }
 
 impl RebuildContext {
-    /// How a reload reads the repo file: a pinned profile is a global profile,
-    /// so the repo file is ignored entirely under a pin (spec §6.5).
+    /// How a reload reads the repo file. The Local edition NEVER reads one
+    /// (mobile plan §2.8): the global config is the only config, so the repo
+    /// file is ignored whatever the pin says. In the full edition a pinned
+    /// profile is a global profile, so the repo file is ignored under a pin
+    /// (spec §6.5).
     pub fn repo_mode(&self) -> RepoMode {
-        if self.profile_pin.is_some() {
+        #[cfg(not(feature = "host"))]
+        {
             RepoMode::Ignore
-        } else {
-            RepoMode::Include
+        }
+        #[cfg(feature = "host")]
+        {
+            if self.profile_pin.is_some() {
+                RepoMode::Ignore
+            } else {
+                RepoMode::Include
+            }
         }
     }
 }
@@ -10501,5 +10511,82 @@ mod local_persona_tests {
                 "the Local persona uses the word `{word}` — state denials without it"
             );
         }
+    }
+}
+
+// ─── Local reload: no repo config, no skills (mobile plan §2.8) ──────────
+//
+// The Local edition's session verbs (`/new`, `/cd`, `/model`, `/load`)
+// re-read the config and rescan skills on every reload. In the full edition
+// that means `<cwd>/.peakbot/config.yaml` and the skills dirs; in the Local
+// edition it must mean NOTHING — the global config only (`RepoMode::Ignore`)
+// and an empty `SkillRegistry`. The two edition switches the reload path
+// reads are pinned here directly.
+#[cfg(all(test, not(feature = "host")))]
+mod local_reload_tests {
+    use super::*;
+    use crate::config::resolve::{ParseCtx, Source};
+
+    /// One provider + one profile, so `default_bound()` resolves.
+    const GLOBAL_YAML: &str = "providers:\n  - name: p\n    type: openai\n    api_key: k\n    models:\n      - { name: m1, alias: a }\nprofiles:\n  dev:\n    agents:\n      main:\n        model: a\n";
+
+    fn parse_global() -> Config {
+        Config::parse(
+            Source {
+                path: std::path::Path::new("/global/config.yaml"),
+                text: GLOBAL_YAML,
+            },
+            None,
+            &ParseCtx { known_skills: &[] },
+        )
+        .expect("fixture global must parse")
+    }
+
+    /// A reload in the Local edition reads the repo file with
+    /// `RepoMode::Ignore`, so `<cwd>/.peakbot/config.yaml` is never merged —
+    /// whatever the `--profile` pin says.
+    #[test]
+    fn local_reload_ignores_repo_config() {
+        let config = parse_global();
+        let ctx = RebuildContext {
+            bound: config.catalog.default_bound(),
+            config: Arc::new(config),
+            mcp_handles: Arc::new(Vec::new()),
+            shell_kind: None,
+            skills: SkillRegistry::new(),
+            todo_tool: None,
+            profile_pin: None,
+        };
+        assert_eq!(
+            ctx.repo_mode(),
+            RepoMode::Ignore,
+            "the Local edition never reads a repo file on reload (mobile plan §2.8)"
+        );
+    }
+
+    /// A reload in the Local edition rescans skills with `load_default_skills`
+    /// — which must come back empty even when a valid skill sits in the
+    /// session's skills dir.
+    #[test]
+    fn local_reload_ignores_skills_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let skill = dir.path().join(".agents").join("skills").join("my-skill");
+        std::fs::create_dir_all(&skill).expect("skill dir");
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: my-skill\ndescription: A test skill\n---\n# My Skill\n",
+        )
+        .expect("SKILL.md");
+
+        let (registry, warnings) = load_default_skills(dir.path());
+        assert!(
+            registry.is_empty(),
+            "the Local edition must never discover skills; got: {:?}",
+            registry.names()
+        );
+        assert!(
+            warnings.is_empty(),
+            "an undiscovered skill dir yields no warnings; got: {warnings:?}"
+        );
     }
 }
