@@ -10757,3 +10757,151 @@ profiles:
     //   * Queued messages are discarded on both stops; exactly ONE system
     //     message is posted per stop; the next turn runs normally.
 }
+
+// ─── Local edition canary (mobile plan §2.7/§3.5, task L1) ───────────────
+//
+// The Local edition (no `host` feature) exposes EXACTLY the five
+// non-execution built-ins — a leaked `host` dependency widens the set and
+// this fails. CI runs
+// `cargo test --lib --no-default-features local_edition_canary -- --exact`
+// and requires `1 passed`; the fn sits at the crate root (no module prefix)
+// so the `--exact` filter matches its full name.
+#[cfg(all(test, not(feature = "host")))]
+#[test]
+fn local_edition_canary() {
+    let local: std::collections::BTreeSet<&str> =
+        crate::config::BUILTIN_TOOL_NAMES.iter().copied().collect();
+    let want: std::collections::BTreeSet<&str> =
+        ["fetch_url", "fetch_page", "web_search", "todo", "think"]
+            .into_iter()
+            .collect();
+    assert_eq!(
+        local, want,
+        "the Local edition exposes exactly the five non-execution built-ins"
+    );
+}
+
+// ─── dirs guard (mobile plan §2.6, task L2) ──────────────────────────────
+//
+// `src/paths.rs` is the ONLY module that may call `dirs::` / use
+// `ProjectDirs` — Android has no HOME and the `paths::Roots` seam must be
+// the single place platform roots are read. Text scan of every
+// `src/**/*.rs` file: any other file containing the strings fails. The
+// needles are built with `concat!` so this file itself never contains them.
+#[cfg(test)]
+fn walk_rs_files(path: &std::path::Path, visit: &mut dyn FnMut(&std::path::Path, &str)) {
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            walk_rs_files(&p, visit);
+        } else if p.extension().is_some_and(|e| e == "rs") {
+            if let Ok(text) = std::fs::read_to_string(&p) {
+                visit(&p, &text);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn dirs_calls_appear_only_in_paths_module() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let src = manifest.join("src");
+    let allowed = src.join("paths.rs");
+    let needles: [&str; 2] = [concat!("dirs", "::"), concat!("Project", "Dirs")];
+    let mut offenders: Vec<String> = Vec::new();
+    let mut visit = |p: &std::path::Path, text: &str| {
+        if p == allowed {
+            return;
+        }
+        for needle in &needles {
+            if text.contains(needle) {
+                offenders.push(format!(
+                    "{} contains `{needle}`",
+                    p.strip_prefix(manifest).unwrap().display()
+                ));
+                break;
+            }
+        }
+    };
+    walk_rs_files(&src, &mut visit);
+    assert!(
+        offenders.is_empty(),
+        "dirs::/ProjectDirs calls outside src/paths.rs:\n{}",
+        offenders.join("\n")
+    );
+}
+
+// ─── Local persona (mobile plan §2.7 trap 3, task L1) ────────────────────
+//
+// The Local edition (no `host` feature) ships its OWN built-in
+// persona/core guidance: it runs on the user's phone; it can fetch pages,
+// call HTTP APIs, search the web when configured, keep todos — and it must
+// claim NO filesystem access, NO code execution, NO writing code. The test
+// renders the full built-in prompt of a `Head::BuiltIn` agent (memory off,
+// no shell, no skills, no agents.md) and asserts the absence.
+//
+// RED today: the built-in persona (src/system_prompt_persona.txt) says
+// "You operate in the user's local filesystem and can read, write, and
+// execute code", and the core guidance names the file tools. L1 replaces
+// both with the Local text.
+#[cfg(all(test, not(feature = "host")))]
+mod local_persona_tests {
+    use super::*;
+
+    /// A built-in (`Head::BuiltIn`) agent with memory off, so the rendered
+    /// prompt is exactly persona + core guidance + env block.
+    const LOCAL_YAML: &str = "providers:\n  - name: openrouter\n    type: openrouter\n    api_key: sk-test\n    models:\n      - { name: anthropic/claude-3.7-sonnet, alias: sonnet }\nprofiles:\n  main:\n    memory:\n      enabled: false\n    agents:\n      solo:\n        model: sonnet\n";
+
+    fn local_prompt() -> String {
+        use crate::config::resolve::{ParseCtx, Source};
+        let cfg = Config::parse(
+            Source {
+                path: std::path::Path::new("/global/config.yaml"),
+                text: LOCAL_YAML,
+            },
+            None,
+            &ParseCtx { known_skills: &[] },
+        )
+        .expect("local persona fixture must parse");
+        let bound = cfg
+            .catalog
+            .resolve("main", "solo")
+            .expect("the built-in agent resolves");
+        let cwd = tempfile::tempdir().expect("tempdir");
+        build_agent_prompt(
+            bound.agent(),
+            &bound.profile,
+            &SkillRegistry::new(),
+            None,
+            cwd.path(),
+        )
+    }
+
+    fn contains_word(text: &str, word: &str) -> bool {
+        text.split(|c: char| !c.is_alphabetic())
+            .any(|tok| tok == word)
+    }
+
+    #[test]
+    fn local_persona_makes_no_file_or_execution_capability_claims() {
+        let prompt = local_prompt().to_lowercase();
+
+        for needle in ["filesystem", "file system", "execute", "write code"] {
+            assert!(
+                !prompt.contains(needle),
+                "the Local persona claims `{needle}` — the Local edition has no such capability"
+            );
+        }
+        for word in ["file", "files"] {
+            assert!(
+                !contains_word(&prompt, word),
+                "the Local persona uses the word `{word}` — state denials without it"
+            );
+        }
+    }
+}

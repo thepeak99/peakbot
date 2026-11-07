@@ -114,3 +114,38 @@ pub fn focus_main(app: &AppHandle) {
         let _ = win.set_focus();
     }
 }
+
+// ─── shell marker (mobile plan §2.5, task F1) ────────────────────────────
+//
+// The desktop webview gets the SAME init-script seam as the mobile shell:
+// `window.peakbotShell = 'desktop'`. The SPA's `shell()` (web/src/desktop.ts)
+// reads the marker and stops consulting `window.isTauri`; a Tauri window
+// without the marker must read as a plain browser.
+//
+// RED: SHELL_MARKER_SCRIPT does not exist yet — F1 adds it here and injects
+// it on the main window via `.initialization_script(SHELL_MARKER_SCRIPT)`.
+
+#[cfg(test)]
+mod shell_marker_tests {
+    use super::SHELL_MARKER_SCRIPT;
+
+    /// The exact marker definition — byte-for-byte the mobile init script's
+    /// definition (plan §2.3) with 'desktop' in place of 'mobile'.
+    const MARKER_DEF: &str = "Object.defineProperty(window,'peakbotShell',{value:'desktop'});";
+
+    #[test]
+    fn desktop_init_script_defines_peakbot_shell_as_desktop() {
+        assert!(
+            SHELL_MARKER_SCRIPT.contains(MARKER_DEF),
+            "the init script must define peakbotShell as 'desktop'; got: {SHELL_MARKER_SCRIPT}"
+        );
+    }
+
+    #[test]
+    fn desktop_init_script_never_carries_the_mobile_marker() {
+        assert!(
+            !SHELL_MARKER_SCRIPT.contains("{value:'mobile'}"),
+            "desktop must not carry the mobile marker; got: {SHELL_MARKER_SCRIPT}"
+        );
+    }
+}

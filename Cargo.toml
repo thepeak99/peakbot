@@ -6,6 +6,11 @@ edition = "2024"
 [features]
 mock = []
 
+# The mobile Local cut (Phase 1 L1) adds the `host` feature; the
+# cfg-gated Local tests reference it before the feature exists.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("host"))'] }
+
 [dependencies]
 rig-core = { version = "0.38", features = ["rmcp"] }
 rmcp = { version = "1.6", features = [

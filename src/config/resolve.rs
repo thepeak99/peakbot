@@ -3171,3 +3171,116 @@ profiles:
         assert!(matches!(&entries[2], CatalogEntry::Remote(_)));
     }
 }
+
+// ─── Local edition Config::parse errors (mobile plan §2.7, task L1) ──────
+//
+// The Local cut (no `host` feature) rejects at parse time every capability
+// the binary lacks: execution tools, MCP servers, vector stores, and config
+// `remote:` profiles (QL12). Locked messages (substring, case-sensitive):
+//   tools.only: [bash]      → "`bash` isn't available in PeakBot on this phone"
+//   mcps: (non-empty)       → "MCP servers are not available in PeakBot on this phone"
+//   profiles.X.vector_db    → "vector databases are not available in PeakBot on this phone"
+//   profiles.X.remote       → "remote profiles are not available in PeakBot on this phone"
+// A filtered-to-empty tool set is unrepresentable: the parse ERRORS — it
+// never returns an Ok with an empty set.
+//
+// RED today (default build, no `host` feature yet): all four configs parse
+// Ok. GREEN after L1 adds the Local rejections.
+#[cfg(all(test, not(feature = "host")))]
+mod local_parse {
+    use super::*;
+
+    /// Minimal valid providers block; the per-case YAMLs are whole literals
+    /// (`concat!` takes only literals).
+    const VALID: &str = "providers:\n  - name: p\n    type: openai\n    api_key: k\n    models:\n      - name: m1\n        alias: a\nprofiles:\n  p:\n    agents:\n      a:\n        model: a\n";
+
+    const TOOLS_ONLY_BASH: &str = "providers:\n  - name: p\n    type: openai\n    api_key: k\n    models:\n      - name: m1\n        alias: a\nprofiles:\n  p:\n    tools:\n      only: [bash]\n    agents:\n      a:\n        model: a\n";
+
+    const MCPS_NONEMPTY: &str = "providers:\n  - name: p\n    type: openai\n    api_key: k\n    models:\n      - name: m1\n        alias: a\nmcps:\n  - name: playwright\n    command: npx\nprofiles:\n  p:\n    agents:\n      a:\n        model: a\n";
+
+    const VECTOR_DB: &str = "providers:\n  - name: p\n    type: openai\n    api_key: k\n    models:\n      - name: m1\n        alias: a\nprofiles:\n  p:\n    vector_db:\n      db_path: /tmp/v1.db\n      embeddings:\n        base_url: https://e.example/v1\n        model: bge\n        dimensions: 8\n    agents:\n      a:\n        model: a\n";
+
+    /// A remote profile next to a local one, so the ONLY relevant error
+    /// after L1 is the remote-profile rejection itself.
+    const REMOTE_PROFILE: &str = "providers:\n  - name: p\n    type: openai\n    api_key: k\n    models:\n      - name: m1\n        alias: a\nprofiles:\n  relay:\n    remote:\n      url: https://nas.lan:7823\n      token: tok123\n      ca: sha256:3f9a0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab\n      profile: dev\n  p:\n    agents:\n      a:\n        model: a\n";
+
+    fn parse(yaml: &str) -> Result<Config, ConfigErrors> {
+        Config::parse(
+            Source {
+                path: std::path::Path::new("/global/config.yaml"),
+                text: yaml,
+            },
+            None,
+            &ParseCtx { known_skills: &[] },
+        )
+    }
+
+    fn assert_error_contains(yaml: &str, needle: &str) {
+        let res = parse(yaml);
+        assert!(
+            res.is_err(),
+            "Local config must be a parse error; got Ok (no message can match `{needle}`)"
+        );
+        let messages: Vec<String> = match res {
+            Ok(_) => Vec::new(),
+            Err(errors) => errors.0.iter().map(|e| e.message.clone()).collect(),
+        };
+        assert!(
+            messages.iter().any(|m| m.contains(needle)),
+            "no error mentions `{needle}`; got: {messages:?}"
+        );
+    }
+
+    /// Control: the harness config itself is valid, so the REDs below are
+    /// the missing Local rejections, not a broken fixture.
+    #[test]
+    fn local_minimal_valid_config_still_parses() {
+        assert!(
+            parse(VALID).is_ok(),
+            "the minimal harness config must be valid: {:?}",
+            parse(VALID)
+        );
+    }
+
+    #[test]
+    fn local_tools_only_bash_is_a_parse_error() {
+        assert_error_contains(
+            TOOLS_ONLY_BASH,
+            "`bash` isn't available in PeakBot on this phone",
+        );
+    }
+
+    #[test]
+    fn local_tools_only_bash_never_yields_an_empty_tool_set() {
+        // The S13 trap: `only: [bash]` must not silently resolve to an
+        // empty tool set — the parse fails instead.
+        assert!(
+            parse(TOOLS_ONLY_BASH).is_err(),
+            "tools.only: [bash] in Local must be an error, never an empty set"
+        );
+    }
+
+    #[test]
+    fn local_mcps_nonempty_is_a_parse_error() {
+        assert_error_contains(
+            MCPS_NONEMPTY,
+            "MCP servers are not available in PeakBot on this phone",
+        );
+    }
+
+    #[test]
+    fn local_vector_db_is_a_parse_error() {
+        assert_error_contains(
+            VECTOR_DB,
+            "vector databases are not available in PeakBot on this phone",
+        );
+    }
+
+    #[test]
+    fn local_remote_profile_is_a_parse_error() {
+        assert_error_contains(
+            REMOTE_PROFILE,
+            "remote profiles are not available in PeakBot on this phone",
+        );
+    }
+}

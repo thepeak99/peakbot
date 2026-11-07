@@ -58,6 +58,95 @@ describe("isDesktop", () => {
   });
 });
 
+// ── shell seam (mobile plan §2.5, task F1) ───────────────────────────────
+// `shell()` reads `window.peakbotShell` — the marker the shell's init
+// script injects: exactly "desktop" or "mobile". Anything else — missing,
+// garbage, the wrong type — is "browser" (SH1 fail-safe). `isDesktop()`
+// becomes `shell() === "desktop"`, and `window.isTauri` is NO LONGER
+// consulted: old desktop apps still set `isTauri` without the marker, and
+// a Tauri window without the marker must read as "browser".
+//
+// RED today: desktop.ts does not export shell() yet (F1). The dynamic
+// import (this file's existing module-surface pattern) keeps the rest of
+// this file green until the seam lands.
+
+type ShellModule = { shell?: unknown };
+
+async function loadShell(): Promise<() => string> {
+  const mod = (await import("./desktop")) as ShellModule;
+  if (typeof mod.shell !== "function") {
+    throw new Error("desktop.ts does not export shell() yet (F1)");
+  }
+  return mod.shell as () => string;
+}
+
+type WithShell = { peakbotShell?: unknown };
+const sg = globalThis as WithShell;
+
+describe("shell() seam (F1)", () => {
+  afterEach(() => {
+    delete sg.peakbotShell;
+    delete g.isTauri;
+  });
+
+  it("returns 'desktop' when window.peakbotShell is exactly 'desktop'", async () => {
+    sg.peakbotShell = "desktop";
+    const shell = await loadShell();
+    expect(shell()).toBe("desktop");
+  });
+
+  it("returns 'mobile' when window.peakbotShell is exactly 'mobile'", async () => {
+    sg.peakbotShell = "mobile";
+    const shell = await loadShell();
+    expect(shell()).toBe("mobile");
+  });
+
+  it("returns 'browser' when window.peakbotShell is missing", async () => {
+    const shell = await loadShell();
+    expect(shell()).toBe("browser");
+  });
+
+  it.each([
+    ["the uppercase 'DESKTOP'", "DESKTOP"],
+    ["the mixed-case 'Desktop'", "Desktop"],
+    ["the empty string", ""],
+    ["the padded marker ' mobile '", " mobile "],
+    ["the string 'true'", "true"],
+    ["the number 1", 1],
+    ["true", true],
+    ["null", null],
+    ["an object", {}],
+  ] as const)("returns 'browser' for the garbage marker %s", async (_label, value) => {
+    sg.peakbotShell = value;
+    const shell = await loadShell();
+    expect(shell()).toBe("browser");
+  });
+
+  it("isDesktop() is true exactly when shell() is 'desktop'", async () => {
+    const shell = await loadShell();
+    for (const marker of ["desktop", "mobile", undefined] as const) {
+      if (marker === undefined) delete sg.peakbotShell;
+      else sg.peakbotShell = marker;
+      expect(isDesktop()).toBe(shell() === "desktop");
+    }
+  });
+
+  it("a Tauri window WITHOUT the marker reads as 'browser' (isTauri not consulted)", async () => {
+    g.isTauri = true; // old desktop apps set this automatically
+    const shell = await loadShell();
+    expect(shell()).toBe("browser");
+    expect(isDesktop()).toBe(false);
+  });
+
+  it("a Tauri window WITH the desktop marker stays desktop", async () => {
+    g.isTauri = true;
+    sg.peakbotShell = "desktop";
+    const shell = await loadShell();
+    expect(shell()).toBe("desktop");
+    expect(isDesktop()).toBe(true);
+  });
+});
+
 // ── desktop IPC seam (theme_set + update commands) ───────────────────────
 // The web page's ONLY way to talk to the desktop app is the seam in
 // desktop.ts: setDesktopTheme(theme) → invoke("theme_set", { theme }),
@@ -261,19 +350,22 @@ describe("clipboard image IPC seam", () => {
 
 // ── module surface (close-to-tray removal + auto-update) ─────────────────
 // The Desktop pane is gone: `DesktopView`, `getDesktopSettings` and
-// `toggleDesktopBackground` are no longer exported. The seam now carries
-// exactly five exports: detection, the theme command, the two update
-// commands, and the clipboard-image read.
+// `toggleDesktopBackground` are no longer exported. The seam carries
+// exactly six exports: the shell detection pair (F1), the theme command,
+// the two update commands, and the clipboard-image read.
+//
+// RED today: `shell` is not exported yet (F1).
 
 describe("module surface", () => {
-  it("exports exactly isDesktop, setDesktopTheme, getUpdateStatus, installUpdate, readClipboardImage", async () => {
-    const mod = await import("./desktop");
+  it("exports exactly isDesktop, shell, setDesktopTheme, getUpdateStatus, installUpdate, readClipboardImage", async () => {
+    const mod = (await import("./desktop")) as Record<string, unknown>;
     expect(Object.keys(mod).sort()).toEqual([
       "getUpdateStatus",
       "installUpdate",
       "isDesktop",
       "readClipboardImage",
       "setDesktopTheme",
+      "shell",
     ]);
   });
 });
