@@ -74,6 +74,17 @@ name = "install_render_tests"
 path = "tests/install_render_tests.rs"
 required-features = ["host"]
 
+# L3 contract (mobile plan §4.3 test 1): the `embed::LocalCore` boot/serve
+# surface, the full `/ws` chat turn, and the shared `boot::web_boot` fn. The
+# body is `#[cfg(not(feature = "host"))]` — the self dev-dependency
+# (default-features = false, features = ["mock"]) keeps `mock` on for every
+# test build, so the cfg is what keeps the default (host) build green.
+# Run: cargo test --locked --no-default-features --features mock --test local_core
+[[test]]
+name = "local_core"
+path = "tests/local_core.rs"
+required-features = ["mock"]
+
 [dependencies]
 rig-core = "0.38"
 rmcp = { version = "1.6", optional = true, features = [
@@ -223,7 +234,7 @@ rustls-platform-verifier = "0.6"
 
 [dev-dependencies]
 tempfile = "3.27"
-insta = { version = "1.40", features = ["yaml", "serde", "filters"] }
+insta = { version = "1.40", features = ["yaml", "serde", "filters", "json"] }
 # `default-features = false`: with defaults on, this self edge would switch
 # `host` back on and `--no-default-features` would silently test the host build.
 peakbot = { path = ".", default-features = false, features = ["mock"] }

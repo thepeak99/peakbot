@@ -51,6 +51,13 @@ grep_bad() {
     if grep -qF -- "$2" "$3" 2>/dev/null; then bad "$1 (forbidden: $2 in $3)"; else ok "$1"; fi
 }
 
+# grep_ok_live <name> <fixed-string> <file> — passes only when the string
+# occurs on a NON-COMMENT line. L10: the stub's header comments already name
+# the symbols, so a plain grep would be GREEN without any implementation.
+grep_ok_live() {
+    if grep -v '^[[:space:]]*#' "$3" 2>/dev/null | grep -qF -- "$2"; then ok "$1"; else bad "$1 (missing live: $2 in $3)"; fi
+}
+
 # ── build-android.sh (RED until M7) ──────────────────────────────────────
 
 if [ ! -f "$BA" ]; then
@@ -94,6 +101,15 @@ else
     grep_ok "smoke: NSC 127.0.0.1 domain-config" "127.0.0.1" "$SA"
     # Size cap (spike: 22.1 MB; the core link is ~2× the remote-only build).
     grep_ok "smoke: size cap 40" "40" "$SA"
+    # L10 (Phase 3, plan §4.3 test 6): the unstripped-.so symbol check must be
+    # LIVE — an uncommented call, a body that names the four host-only
+    # symbols, and a real `llvm-nm -D` scan. grep_ok_live ignores comment
+    # lines, so the stub's header comments cannot satisfy these.
+    grep_ok_live "smoke: run_l10_symbol_check is called (uncommented)" 'run_l10_symbol_check "$apk"' "$SA"
+    for sym in portable_pty TokioChildProcess BashTool ratatui; do
+        grep_ok_live "smoke: L10 symbol list names $sym (uncommented)" "$sym" "$SA"
+    done
+    grep_ok_live "smoke: L10 runs llvm-nm -D (uncommented)" "llvm-nm -D" "$SA"
 fi
 
 # ── ci.yml (GREEN since M1 — guard) ──────────────────────────────────────
