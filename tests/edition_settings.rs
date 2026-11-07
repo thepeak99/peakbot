@@ -17,12 +17,15 @@
 //! That is what makes it a true edition table, not a compile-fail.
 
 use axum::Router;
+// `png_bytes` (the Local upload fixture) is the only use — gate the import
+// with the same cfg so the host build has no unused import.
+#[cfg(not(feature = "host"))]
 use base64::Engine;
-use peakbot::attachments::UploadStore;
-use peakbot::config::resolve::{Config, ParseCtx, Source};
-use peakbot::config::UploadsConfig;
-use peakbot::session::SessionDeps;
 use peakbot::SkillRegistry;
+use peakbot::attachments::UploadStore;
+use peakbot::config::UploadsConfig;
+use peakbot::config::resolve::{Config, ParseCtx, Source};
+use peakbot::session::SessionDeps;
 use peakbot::ui::web::registry::SessionRegistry;
 use peakbot::ui::web::settings::{BootWeb, SettingsState, TokenSource, router as settings_router};
 use peakbot::ui::web::uploads::router as uploads_router;
@@ -31,7 +34,11 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 /// The edition this build is: `full` with `host`, `local` without.
-const EDITION: &str = if cfg!(feature = "host") { "full" } else { "local" };
+const EDITION: &str = if cfg!(feature = "host") {
+    "full"
+} else {
+    "local"
+};
 
 /// Valid 0.24 global with an offline Ollama provider (never contacted).
 const GLOBAL_024: &str = "providers:\n  - name: local\n    type: ollama\n    models:\n      - { name: llama3, alias: local }\nprofiles:\n  dev:\n    agents:\n      main:\n        model: local\n";
@@ -120,10 +127,7 @@ async fn get_settings(addr: SocketAddr) -> serde_json::Value {
 async fn settings_reports_the_edition_in_needs_setup_mode() {
     let addr = spawn_settings(state(None)).await;
     let v = get_settings(addr).await;
-    assert_eq!(
-        v["needs_setup"], true,
-        "deps None ⇒ needs_setup; got: {v}"
-    );
+    assert_eq!(v["needs_setup"], true, "deps None ⇒ needs_setup; got: {v}");
     assert_eq!(
         v["boot"]["edition"], EDITION,
         "boot.edition must be {EDITION:?} in needs_setup mode; boot = {}",
@@ -173,7 +177,10 @@ async fn spawn_uploads() -> SocketAddr {
 async fn post_upload(addr: SocketAddr, name: &str, body: Vec<u8>) -> reqwest::Response {
     client()
         .post(format!("http://{addr}/api/uploads"))
-        .query(&[("convo", Uuid::new_v4().to_string()), ("name", name.to_string())])
+        .query(&[
+            ("convo", Uuid::new_v4().to_string()),
+            ("name", name.to_string()),
+        ])
         .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
         .body(body)
         .send()
@@ -196,8 +203,7 @@ async fn local_pdf_upload_is_415_images_only() {
     // The exact body — no prose, no extra keys (the SPA matches it verbatim).
     let text = resp.text().await.unwrap();
     assert_eq!(
-        text,
-        r#"{"error":"images_only"}"#,
+        text, r#"{"error":"images_only"}"#,
         "the 415 body must be exactly {{\"error\":\"images_only\"}}; got: {text}"
     );
 }
