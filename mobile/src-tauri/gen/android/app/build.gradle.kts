@@ -1,3 +1,4 @@
+import java.io.FileInputStream
 import java.util.Properties
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
@@ -25,6 +26,30 @@ android {
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
     }
+    // Release signing (M7): keystore.properties carries storePassword,
+    // keyPassword, keyAlias and storeFile. Path: the ANDROID_KEYSTORE_PROPERTIES
+    // env var (CI: the tmpfs file decoded from the BuildKit secrets, plan
+    // §3.1), else the Tauri convention rootProject/keystore.properties
+    // (git-ignored). No file ⇒ no release signingConfig ⇒ a release build
+    // refuses to assemble; debug builds are unaffected (they use AGP's
+    // default debug keystore from /root/.android — plan D7).
+    signingConfigs {
+        val keystorePropertiesFile = file(
+            System.getenv("ANDROID_KEYSTORE_PROPERTIES")
+                ?: rootProject.file("keystore.properties").absolutePath
+        )
+        if (keystorePropertiesFile.exists()) {
+            val keystoreProperties = Properties().apply {
+                FileInputStream(keystorePropertiesFile).use { load(it) }
+            }
+            create("release") {
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+                storeFile = file(keystoreProperties.getProperty("storeFile") ?: "")
+                storePassword = keystoreProperties.getProperty("storePassword")
+            }
+        }
+    }
     buildTypes {
         getByName("debug") {
             manifestPlaceholders["usesCleartextTraffic"] = "true"
@@ -39,6 +64,10 @@ android {
             }
         }
         getByName("release") {
+            // M7: sign with the release key when keystore.properties is
+            // present (tmpfs in CI); without it a release build fails
+            // loudly at the signing step.
+            signingConfigs.findByName("release")?.let { signingConfig = it }
             optimization {
                enable = true
             }

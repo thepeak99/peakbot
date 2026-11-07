@@ -2,7 +2,7 @@
         web dev \
         desktop-test desktop-test-windows desktop-fonttest desktop-dev desktop-linux desktop-macos desktop-windows desktop \
         desktop-updater \
-        mobile-android-image \
+        mobile-android-image mobile-android \
         release release-check release-bump release-tag \
         release-build-linux release-build-windows release-build-macos release-build-android \
         release-publish release-publish-shifu release-publish-github
@@ -138,6 +138,68 @@ mobile-android-image:
 		-f Dockerfile.mobile-android \
 		.
 	@echo "✅ localhost/peakbot-mobile-android:toolchain"
+
+# Mobile Android (Tauri shell — mobile/). Named volumes (plan D7 + M7):
+# peakbot-mobile-android-home holds /root/.android (the debug keystore, so
+# debug APKs upgrade over each other across builds); the rest are caches.
+# The dev pbm-* volumes are the manual dev-loop volumes — these are the
+# make/CI ones.
+MOBILE_ANDROID_IMAGE       := localhost/peakbot-mobile-android:toolchain
+MOBILE_ANDROID_HOME_VOL    := peakbot-mobile-android-home
+MOBILE_ANDROID_GRADLE_VOL  := peakbot-mobile-android-gradle
+MOBILE_ANDROID_CARGO_VOL   := peakbot-mobile-android-cargo
+MOBILE_ANDROID_TARGET_VOL  := peakbot-mobile-android-target
+
+## mobile-android: Build the PeakBot Mobile Android APK (M7). Runs
+##                 mobile/scripts/build-android.sh INSIDE the toolchain
+##                 container (worktree at /w): web/dist (if absent) →
+##                 npm ci → `npm run tauri -- android build --apk
+##                 --target aarch64 --ci -- --locked` → smoke (M8).
+##                 Release signing: ANDROID_KEYSTORE_B64 +
+##                 ANDROID_KEYSTORE_PASSWORD + ANDROID_KEY_ALIAS +
+##                 ANDROID_KEY_PASSWORD in the environment cross the
+##                 container boundary as a tmpfs /run/secrets mount (a
+##                 0700 tmpdir in /tmp — tmpfs on Linux — bound to
+##                 /run/secrets; the container script decodes the keystore
+##                 and writes keystore.properties to that same tmpfs).
+##                 Never argv contents, never env, never echoed (same
+##                 discipline as the desktop-updater BuildKit secrets).
+##                 No secrets ⇒ debug-signed PeakBot-Mobile-<v>-android-
+##                 arm64-debug.apk (never released). Output: output/mobile/.
+mobile-android: mobile-android-image
+	@set -eu; \
+	builder="$(CONTAINER_BUILDER)"; \
+	image="$(MOBILE_ANDROID_IMAGE)"; \
+	for v in "$(MOBILE_ANDROID_HOME_VOL)" "$(MOBILE_ANDROID_GRADLE_VOL)" \
+	         "$(MOBILE_ANDROID_CARGO_VOL)" "$(MOBILE_ANDROID_TARGET_VOL)"; do \
+	  "$$builder" volume create "$$v" >/dev/null 2>&1 || true; \
+	done; \
+	secrets_mount=""; \
+	if [ -n "$${ANDROID_KEYSTORE_B64:-}" ] && [ -n "$${ANDROID_KEYSTORE_PASSWORD:-}" ] \
+	   && [ -n "$${ANDROID_KEY_ALIAS:-}" ] && [ -n "$${ANDROID_KEY_PASSWORD:-}" ]; then \
+	  secret_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/pbm-android-secrets.XXXXXX"); \
+	  chmod 700 "$$secret_dir"; \
+	  trap 'rm -rf "$$secret_dir"' EXIT; \
+	  { printf '%s' "$$ANDROID_KEYSTORE_B64";        } > "$$secret_dir/ANDROID_KEYSTORE_B64"; \
+	  { printf '%s' "$$ANDROID_KEYSTORE_PASSWORD";   } > "$$secret_dir/ANDROID_KEYSTORE_PASSWORD"; \
+	  { printf '%s' "$$ANDROID_KEY_ALIAS";           } > "$$secret_dir/ANDROID_KEY_ALIAS"; \
+	  { printf '%s' "$$ANDROID_KEY_PASSWORD";        } > "$$secret_dir/ANDROID_KEY_PASSWORD"; \
+	  chmod 600 "$$secret_dir"/*; \
+	  secrets_mount="-v $$secret_dir:/run/secrets:z"; \
+	  echo "🔏 Release signing: /run/secrets tmpfs mount prepared (4 secrets)"; \
+	else \
+	  echo "ℹ️  no ANDROID_KEYSTORE_* secrets — debug-signed -debug.apk (never released)"; \
+	fi; \
+	"$$builder" run --rm --memory=12g --memory-swap=12g \
+	  -v "$(CURDIR):/w:z" \
+	  -v "$(MOBILE_ANDROID_TARGET_VOL):/w/target:z" \
+	  -v "$(MOBILE_ANDROID_HOME_VOL):/root/.android:z" \
+	  -v "$(MOBILE_ANDROID_GRADLE_VOL):/root/.gradle:z" \
+	  -v "$(MOBILE_ANDROID_CARGO_VOL):/opt/cargo/registry:z" \
+	  $$secrets_mount \
+	  -w /w \
+	  "$$image" sh mobile/scripts/build-android.sh
+
 
 ## web: Build the web UI (web/dist/) — required for bare `peakbot` to serve the real SPA.
 ##        CI and Docker builds run the Node stage automatically; this is for local dev.
