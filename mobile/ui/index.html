@@ -149,6 +149,16 @@
         text-overflow: ellipsis;
         white-space: nowrap;
       }
+      .badge {
+        flex: none;
+        font-size: 12px;
+        line-height: 1;
+        padding: 4px 8px;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        background: var(--surface);
+        color: var(--muted);
+      }
       .chevron {
         color: var(--faint);
         font-size: 20px;
@@ -273,8 +283,8 @@
         </div>
       </section>
 
-      <!-- One row per Remote; L9 adds the Local row here, always first. -->
-      <ul id="list" class="list" aria-label="Remote servers"></ul>
+      <!-- "On this phone" (Local) first, then one row per Remote. -->
+      <ul id="list" class="list" aria-label="Profiles"></ul>
 
       <!-- Add server: paste a link or scan the pairing QR. -->
       <section id="add" class="panel" aria-labelledby="add-title" hidden>

@@ -233,6 +233,18 @@ fn local_consent_set(store: State<'_, Store>) -> Result<(), String> {
     })
 }
 
+/// Defence in depth for the consent sheet: the page is not the only gate, so
+/// opening Local without the recorded consent is refused here too.
+const CONSENT_REQUIRED: &str = "Accept the notice first.";
+
+fn require_local_consent(consented: bool) -> Result<(), String> {
+    if consented {
+        Ok(())
+    } else {
+        Err(CONSENT_REQUIRED.to_string())
+    }
+}
+
 /// D3: every profile open is a Rust (browser-initiated) navigation, so
 /// Android keeps the Profiles page in history and Back returns to it.
 #[tauri::command]
@@ -244,6 +256,8 @@ async fn profile_open(
 ) -> Result<(), String> {
     let url = match target {
         Target::Local => {
+            // Before the core even starts: no consent, no Local.
+            require_local_consent(store.read(|p| p.local_consent()))?;
             let url = local.ensure().await?;
             store.mutate(|p| {
                 p.set_last(Active::Local);
@@ -509,6 +523,35 @@ mod glue_tests {
             .mutate(|p| p.add(ServerLink::parse("http://nas.lan/?token=x")?, None))
             .unwrap_err();
         assert_eq!(err, link::LinkError::NotHttps.to_string());
+    }
+
+    #[test]
+    fn local_open_is_refused_until_consent_is_recorded() {
+        assert_eq!(
+            require_local_consent(false),
+            Err("Accept the notice first.".to_string())
+        );
+        assert_eq!(require_local_consent(true), Ok(()));
+    }
+
+    #[test]
+    fn consent_set_then_gate_opens_and_persists() {
+        let dir =
+            std::env::temp_dir().join(format!("peakbot-mobile-consent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = store_at(dir.join("profiles.json"));
+        // Fresh store: the gate reads the same flag `profile_open` reads.
+        assert!(require_local_consent(store.read(|p| p.local_consent())).is_err());
+        store
+            .mutate(|p| {
+                p.set_local_consent(true);
+                Ok(())
+            })
+            .unwrap();
+        assert!(require_local_consent(store.read(|p| p.local_consent())).is_ok());
+        // …and survives a restart of the app.
+        assert!(Profiles::load(&store.path).local_consent());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -7,13 +7,17 @@
  * in this UI (Install certificate…) is a top-level navigation the nav
  * guard classifies External → system browser.
  *
- * L9: `renderLocalRow` is the slot for the always-first Local row.
+ * L9: the always-first Local row ("On this phone"), its consent sheet and
+ * the Local cold-start open.
  */
 "use strict";
 
 const { invoke } = window.__TAURI__.core;
 const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
 const PROBE_TIMEOUT_MS = 8000;
+// Locked consent text (plan §2.1): shown once, before Local first opens.
+const LOCAL_CONSENT_TEXT =
+  "Your messages are sent to the AI provider you configure, using your own API key.";
 
 let view = null; // the last profiles_get() result
 let unreachable = null; // the remote in the can't-reach panel, if any
@@ -43,10 +47,37 @@ function render() {
   for (const r of view.remotes) list.append(remoteRow(r));
 }
 
-// L9: the Local row ("On this phone") goes first, with the consent sheet
-// on first use. Returning a row from here is all the list needs.
+// The Local row ("On this phone"): always first, never deletable or
+// renamable, so no ⋯ menu. Tapping it runs the same path as a cold start.
 function renderLocalRow(_view) {
-  return null;
+  const li = document.createElement("li");
+  li.className = "row";
+
+  const open = document.createElement("button");
+  open.className = "row-open";
+  open.id = "local-open";
+  open.setAttribute("aria-label", "Open PeakBot on this phone");
+  const labels = document.createElement("span");
+  labels.className = "row-labels";
+  const name = document.createElement("span");
+  name.className = "row-name";
+  name.textContent = "On this phone";
+  const sub = document.createElement("span");
+  sub.className = "row-host";
+  sub.textContent = "Uses your own API key";
+  labels.append(name, sub);
+  const badge = document.createElement("span");
+  badge.className = "badge";
+  badge.textContent = "Local";
+  const chev = document.createElement("span");
+  chev.className = "chevron";
+  chev.setAttribute("aria-hidden", "true");
+  chev.textContent = "›";
+  open.append(labels, badge, chev);
+  open.addEventListener("click", openLocal);
+
+  li.append(open);
+  return li;
 }
 
 function remoteRow(r) {
@@ -127,6 +158,36 @@ async function openRemote(r) {
   }
   clearStatus();
   showCantReach(r);
+}
+
+/* ── Opening Local (tap and cold start share this path) ─────────────── */
+
+// First use: the consent sheet. Continue records it (`local_consent_set`),
+// Cancel leaves the list untouched. Rust refuses `profile_open("local")`
+// without the recorded consent too — this sheet is not the only gate.
+async function openLocal() {
+  hideCantReach();
+  clearStatus();
+  try {
+    if (!view.local.consented) {
+      const ok = await openDialog({
+        title: "On this phone",
+        text: LOCAL_CONSENT_TEXT,
+        okLabel: "Continue",
+      });
+      if (!ok) return;
+      await invoke("local_consent_set");
+      view = await invoke("profiles_get");
+      render();
+    }
+    setStatus("Starting PeakBot on this phone…");
+    // D3: Rust navigates the webview; this page stays in history.
+    await invoke("profile_open", { target: "local" });
+    clearStatus();
+  } catch (e) {
+    // "Couldn't start PeakBot on this phone: …" / "Accept the notice first."
+    setStatus(String(e));
+  }
 }
 
 /* ── Can't-reach help (locked strings, v2 §5.4) ─────────────────────── */
@@ -345,13 +406,16 @@ async function init() {
   }
   render();
   // Cold start: a fresh process has an empty sessionStorage. Set the flag
-  // first, then open `last` exactly like a tap (if it is a remote that
-  // still exists) — so Back from the server lands here, and a later
-  // return to this page never auto-opens again.
+  // first, then open `last` exactly like a tap (a remote that still
+  // exists, or Local once the notice is accepted — never the consent sheet
+  // unprompted) — so Back from the server lands here, and a later return
+  // to this page never auto-opens again.
   if (sessionStorage.opened === undefined) {
     sessionStorage.opened = "1";
     const last = view.last;
-    if (last && typeof last === "object" && typeof last.remote === "number") {
+    if (last === "local") {
+      if (view.local.consented) openLocal();
+    } else if (last && typeof last === "object" && typeof last.remote === "number") {
       const r = view.remotes.find((x) => x.id === last.remote);
       if (r) openRemote(r);
     }
