@@ -3,6 +3,7 @@
         desktop-test desktop-test-windows desktop-fonttest desktop-dev desktop-linux desktop-macos desktop-windows desktop \
         desktop-updater \
         mobile-android-image mobile-android \
+        mobile-ios \
         release release-check release-bump release-tag \
         release-build-linux release-build-windows release-build-macos release-build-android \
         release-publish release-publish-shifu release-publish-github
@@ -199,6 +200,19 @@ mobile-android: mobile-android-image
 	  $$secrets_mount \
 	  -w /w \
 	  "$$image" sh mobile/scripts/build-android.sh
+
+
+## mobile-ios: Build the PeakBot Mobile iOS .ipa (IOS-4). HOST SCRIPT on a
+##             Mac (Xcode 26.3 pinned, §3.2 — no container): asserts the
+##             Xcode, requires APPLE_DEVELOPMENT_TEAM from the environment
+##             (the human's team — never the repo; no secrets echoed),
+##             web/dist → npm ci → `npm run tauri -- ios build
+##             --target aarch64 --export-method app-store-connect` →
+##             output/mobile/PeakBot-Mobile-<v>-ios.ipa, which the human
+##             uploads (Transporter / xcrun altool). The simulator path is
+##             mobile/scripts/ios-sim.sh.
+mobile-ios:
+	@sh mobile/scripts/build-ios.sh
 
 
 ## web: Build the web UI (web/dist/) — required for bare `peakbot` to serve the real SPA.
