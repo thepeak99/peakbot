@@ -6,7 +6,7 @@ mod doc_index;
 mod doc_search;
 pub mod env;
 mod fetch_page;
-mod fetch_url;
+pub mod fetch_url;
 #[cfg(feature = "host")]
 pub mod file_edit;
 #[cfg(feature = "host")]
