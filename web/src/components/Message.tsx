@@ -122,13 +122,16 @@ function sameThinking(a: string[] | undefined, b: string[] | undefined): boolean
   return true;
 }
 
-// Only /images/, http(s)://, and data: become <img>: a bare local path the
-// backend left unresolved would hit the SPA catch-all route and render broken.
+// Only /images/, /r/<profile>/images/ (server relay re-roots image URLs to
+// the remote profile), http(s)://, and data: become <img>: a bare local
+// path the backend left unresolved would hit the SPA catch-all route.
 // Type guard: after this check `src` is a usable string.
+const REMOTE_IMAGE_RE = /^\/r\/[^/]+\/images\//;
 function isRenderableImageSrc(src: string | undefined): src is string {
   return (
     src !== undefined &&
     (src.startsWith("/images/") ||
+      REMOTE_IMAGE_RE.test(src) ||
       src.startsWith("http://") ||
       src.startsWith("https://") ||
       src.startsWith("data:"))

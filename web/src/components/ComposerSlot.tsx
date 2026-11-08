@@ -48,5 +48,7 @@ export const ComposerSlot = memo(function ComposerSlot({
   const { uploadLimits, ...props } = live ?? PARKED;
   const attachments = useAttachments(convo, uploadLimits, base);
   useImperativeHandle(ref, () => ({ add: attachments.add }), [attachments.add]);
-  return <Composer {...props} hidden={live === null} attachments={attachments} />;
+  return (
+    <Composer {...props} base={base} hidden={live === null} attachments={attachments} />
+  );
 });

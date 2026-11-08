@@ -90,6 +90,9 @@ export interface ComposerProps {
   pendingInput: number;
   /** Upload state, owned by ComposerSlot (one per tab). */
   attachments?: Attachments;
+  /** `/r/<L>` proxy prefix of this tab's profile ("" = local); attachment
+   * fallback URLs need it to route to the right server. */
+  base?: string;
   /** `AppState.supports_vision` — drives the ⚠ on image chips. */
   supportsVision?: boolean;
   /** Gear-gate result (settingsGearEnabled). The `Ctrl+, settings` hint only
@@ -117,6 +120,7 @@ export function Composer({
   onClearWatch,
   pendingInput,
   attachments = NO_ATTACHMENTS,
+  base = "",
   supportsVision = true,
   settingsEnabled = true,
   stopPending = false,
@@ -336,6 +340,7 @@ export function Composer({
                     key={chip.key}
                     chip={chip}
                     supportsVision={supportsVision}
+                    base={base}
                     onRemove={() => attachments.remove(chip.key)}
                   />
                 ))}
