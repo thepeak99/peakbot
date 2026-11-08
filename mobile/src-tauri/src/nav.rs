@@ -1,68 +1,51 @@
-//! `classify(url, known) -> Nav` — the webview's security boundary: it only ever displays the app page or a known profile origin.
+//! `classify(url) -> Nav` — the webview's security boundary: it only ever
+//! displays the app's bundled page or the on-device core's loopback origin.
 
 use url::Url;
 
 /// What a webview navigation may do. First match wins.
 #[derive(Debug, PartialEq)]
 pub enum Nav {
-    /// The page may display (app or known profile origin).
+    /// The page may display (the app's bundled page or the loopback core).
     Allow,
     /// Open in the system browser.
     External,
-    /// Navigate to the mobile-only profiles screen.
-    Profiles,
     /// Ask the app to restart the Local core.
     RestartLocal,
     /// Refuse.
     Block,
 }
 
-pub const PROFILES_SENTINEL: &str = "peakbot-mobile:profiles";
 pub const RESTART_SENTINEL: &str = "peakbot-mobile:restart";
 
-/// The server's CA download. The Profiles page's [Install certificate…]
-/// opens it in the system browser — it lives on the known
-/// remote origin, so the origin rule would display it in the webview,
-/// where a certificate can't be installed.
-pub const CA_PATH: &str = "/peakbot-ca.crt";
-
-/// Origins the app may display: the Local loopback origin + paired remotes.
-/// Built per navigation so back/forward re-asks the guard (N1).
-#[derive(Debug, PartialEq, Eq)]
-pub struct Known<'a> {
-    pub local: Option<&'a url::Origin>,
-    pub remotes: &'a [url::Origin],
-}
-
 /// Classify a navigation (first match wins, in rule order).
-pub fn classify(url: &Url, known: &Known<'_>) -> Nav {
-    // (1)+(2): exactly the two sentinels; any other `peakbot-*:` URL falls
-    // through to (6) Block — it is not an open namespace.
-    match url.as_str() {
-        PROFILES_SENTINEL => return Nav::Profiles,
-        RESTART_SENTINEL => return Nav::RestartLocal,
-        _ => {}
+pub fn classify(url: &Url) -> Nav {
+    // The restart sentinel: the one `peakbot-mobile:*` URL the app recognises.
+    if url.as_str() == RESTART_SENTINEL {
+        return Nav::RestartLocal;
     }
-    // (3): the app's own origin (local assets + dev server).
+    // `peakbot-mobile:*` is NOT an open namespace — any other mobile sentinel
+    // (and the desktop one) is refused, not an open door.
+    if url.scheme() == "peakbot-mobile" || url.scheme() == "peakbot-desktop" {
+        return Nav::Block;
+    }
+    // The app's own origin: the bundled page (Android `http://tauri.localhost`,
+    // Apple `tauri://localhost`).
     if is_app_origin(url) {
         return Nav::Allow;
     }
-    // (4a): the CA download on a known profile origin goes to the system
-    // browser — the webview can't install a certificate.
-    let o = url.origin();
-    if url.path() == CA_PATH && (known.local.is_some_and(|l| o == *l) || known.remotes.contains(&o))
-    {
-        return Nav::External;
-    }
-    // (4): any known origin. The only way http: is allowed (the Local loopback).
-    if known.local.is_some_and(|l| o == *l) || known.remotes.contains(&o) {
+    // The on-device core: loopback, plain http, on any port (the preferred
+    // port may have fallen back to an ephemeral one). The only way http: is
+    // ever displayed.
+    if url.scheme() == "http" && url.host_str() == Some("127.0.0.1") {
         return Nav::Allow;
     }
-    // (5): open externally.
+    // Foreign http(s) servers (remotes reach the core's relay, never the
+    // webview), plus mailto:/tel: — open in the system browser.
     if matches!(url.scheme(), "http" | "https" | "mailto" | "tel") {
         return Nav::External;
     }
-    // (6): intent:, file:, data:, javascript:, other — refuse.
+    // about:, data:, javascript:, intent:, file:, anything else — refuse.
     Nav::Block
 }
 

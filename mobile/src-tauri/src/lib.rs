@@ -1,43 +1,35 @@
-//! PeakBot Mobile — the Tauri glue: plugins, the main window, the
-//! nav guard wiring and the Profiles page commands. Decisions live in the pure
-//! modules (`link`, `profiles`, `nav`) and the Local core's lifecycle in
-//! `local`; this file only wires them to Tauri.
-mod link;
+//! PeakBot Mobile — the Tauri glue: plugins, the main window and the nav
+//! guard. Decisions live in the pure `nav` module; the Local core's
+//! lifecycle in `local`. This file only wires them to Tauri.
 mod local;
 mod nav;
-mod profiles;
 // iOS glue: the edge-swipe back gesture + the data root's backup
 // exclusion. Compiled for the iOS target only.
 #[cfg(target_os = "ios")]
 mod ios;
 
 use std::path::PathBuf;
-use std::sync::Mutex;
 
-use serde::{Deserialize, Serialize};
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use tauri::webview::Color;
-use tauri::{
-    AppHandle, Manager, RunEvent, State, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
-};
+use tauri::{AppHandle, Manager, RunEvent, Url, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_log::log;
 use tauri_plugin_opener::OpenerExt;
 
-use link::ServerLink;
 use local::{Local, should_restart};
-use nav::{Known, Nav};
-use profiles::{Active, ProfileError, ProfileName, Profiles, Remote, RemoteId};
+use nav::Nav;
 
 /// The single init script injected on every origin, both OSes.
 /// Declares the mobile shell marker and shims `window.open` as a top-level
 /// navigation the nav guard can classify. Locked bytes — no trailing newline.
 pub const INIT_SCRIPT: &str = "Object.defineProperty(window,'peakbotShell',{value:'mobile'});\nwindow.open=function(u){if(u){location.href=new URL(String(u),location.href).href}return null};";
 
-/// The SPA's dark app background (Tailwind zinc-950); the Profiles page uses
-/// the same colour so no white band shows behind either.
+/// The SPA's dark app background (Tailwind zinc-950); the bundled error page
+/// uses the same colour so no band of a different colour shows.
 const BACKGROUND: Color = Color(9, 9, 11, 255);
 
-/// The app's two storage roots: `data` holds `profiles.json` and
-/// the Local core's config/data; `cache` its cache.
+/// The app's two storage roots: `data` holds the Local core's config/data;
+/// `cache` its cache.
 struct AppDirs {
     data: PathBuf,
     cache: PathBuf,
@@ -71,226 +63,23 @@ impl AppDirs {
     }
 }
 
-/// The Profiles store: `profiles.json` is the persistence, the mutex the one
-/// live copy.
-struct Store {
-    path: PathBuf,
-    profiles: Mutex<Profiles>,
-}
-
-impl Store {
-    fn read<T>(&self, f: impl FnOnce(&Profiles) -> T) -> T {
-        f(&self.profiles.lock().expect("profiles lock"))
-    }
-
-    /// Apply `f` to a copy, save it, then replace memory — a failed save
-    /// leaves both the file and memory unchanged.
-    fn mutate<T>(
-        &self,
-        f: impl FnOnce(&mut Profiles) -> Result<T, ProfileError>,
-    ) -> Result<T, String> {
-        let mut live = self.profiles.lock().expect("profiles lock");
-        let mut next = live.clone();
-        let out = f(&mut next).map_err(|e| e.to_string())?;
-        next.save(&self.path)
-            .map_err(|e| format!("Couldn't save your profiles: {e}"))?;
-        *live = next;
-        Ok(out)
-    }
-}
-
-/// What the Profiles page sees. Never a token or a URL that carries one (P4).
-#[derive(Serialize)]
-struct ProfilesView {
-    local: LocalView,
-    remotes: Vec<RemoteView>,
-    last: Active,
-}
-
-#[derive(Serialize)]
-struct LocalView {
-    consented: bool,
-    running: bool,
-}
-
-impl ProfilesView {
-    fn of(p: &Profiles, local_running: bool) -> ProfilesView {
-        ProfilesView {
-            local: LocalView {
-                consented: p.local_consent(),
-                running: local_running,
-            },
-            remotes: p.remotes().iter().map(RemoteView::of).collect(),
-            last: *p.last(),
+/// Where the `main` window first loads: the on-device core's URL on success,
+/// or the bundled error page (`index.html#<reason>`) on failure. Pure, so the
+/// launch decision is unit-tested without a Tauri runtime.
+fn launch_url(core: Result<Url, String>) -> WebviewUrl {
+    match core {
+        Ok(url) => WebviewUrl::External(url),
+        Err(reason) => {
+            // The page reads it with decodeURIComponent, so encode everything
+            // but alphanumerics (form-encoding would turn spaces into `+`).
+            let hash = utf8_percent_encode(&reason, NON_ALPHANUMERIC);
+            WebviewUrl::App(format!("index.html#{hash}").into())
         }
     }
 }
 
-#[derive(Serialize)]
-struct RemoteView {
-    id: u32,
-    name: String,
-    host_label: String,
-    origin: String,
-}
-
-impl RemoteView {
-    fn of(r: &Remote) -> RemoteView {
-        RemoteView {
-            id: r.id.get(),
-            name: r.name.as_str().to_string(),
-            host_label: r.link.host_label(),
-            origin: r.link.origin().ascii_serialization(),
-        }
-    }
-}
-
-/// `profile_open`'s argument: `"local"` or `{"remote": id}`.
-#[derive(Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum Target {
-    Local,
-    Remote(u32),
-}
-
-#[tauri::command]
-fn profiles_get(store: State<'_, Store>, local: State<'_, Local>) -> ProfilesView {
-    store.read(|p| ProfilesView::of(p, local.is_running()))
-}
-
-#[tauri::command]
-fn profile_add(
-    store: State<'_, Store>,
-    text: String,
-    name: Option<String>,
-) -> Result<RemoteView, String> {
-    store.mutate(|p| {
-        let link = ServerLink::parse(&text)?;
-        let name = name.as_deref().map(ProfileName::new).transpose()?;
-        let id = p.add(link, name)?;
-        Ok(RemoteView::of(p.get(id).expect("just added")))
-    })
-}
-
-#[tauri::command]
-fn profile_rename(store: State<'_, Store>, id: u32, name: String) -> Result<(), String> {
-    store.mutate(|p| p.rename(RemoteId::new(id), ProfileName::new(&name)?))
-}
-
-// Commands that touch the webview are async so they run on the async runtime,
-// never on Android's UI thread (the same deadlock class as `on_navigation` below).
-#[tauri::command]
-async fn profile_remove(
-    window: WebviewWindow,
-    store: State<'_, Store>,
-    id: u32,
-) -> Result<(), String> {
-    store.mutate(|p| p.remove(RemoteId::new(id)))?;
-    // The removed server's token cookie must leave the jar; the other remotes
-    // re-authenticate from their stored link on the next open.
-    window
-        .clear_all_browsing_data()
-        .map_err(|e| e.to_string())?;
-    #[cfg(target_os = "android")]
-    clear_cookies(&window).map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// wry's Android `clear_all_browsing_data` keeps cookies (and its cookie
-/// delete API is a no-op), so wipe them through `CookieManager` directly.
-#[cfg(target_os = "android")]
-fn clear_cookies(window: &WebviewWindow) -> tauri::Result<()> {
-    use tauri::wry::prelude::jni::{JNIEnv, errors::Result, objects::JObject, objects::JValue};
-
-    fn wipe(env: &mut JNIEnv) -> Result<()> {
-        let manager = env
-            .call_static_method(
-                "android/webkit/CookieManager",
-                "getInstance",
-                "()Landroid/webkit/CookieManager;",
-                &[],
-            )?
-            .l()?;
-        let no_callback = JObject::null();
-        env.call_method(
-            &manager,
-            "removeAllCookies",
-            "(Landroid/webkit/ValueCallback;)V",
-            &[JValue::Object(&no_callback)],
-        )?;
-        env.call_method(&manager, "flush", "()V", &[])?;
-        Ok(())
-    }
-
-    window.with_webview(|webview| {
-        webview.jni_handle().exec(|env, _activity, _webview| {
-            if let Err(e) = wipe(env) {
-                let _ = env.exception_clear();
-                log::warn!("cookie wipe: {e}");
-            }
-        })
-    })
-}
-
-#[tauri::command]
-fn local_consent_set(store: State<'_, Store>) -> Result<(), String> {
-    store.mutate(|p| {
-        p.set_local_consent(true);
-        Ok(())
-    })
-}
-
-/// Defence in depth for the consent sheet: the page is not the only gate, so
-/// opening Local without the recorded consent is refused here too.
-const CONSENT_REQUIRED: &str = "Accept the notice first.";
-
-fn require_local_consent(consented: bool) -> Result<(), String> {
-    if consented {
-        Ok(())
-    } else {
-        Err(CONSENT_REQUIRED.to_string())
-    }
-}
-
-/// every profile open is a Rust (browser-initiated) navigation, so
-/// Android keeps the Profiles page in history and Back returns to it.
-#[tauri::command]
-async fn profile_open(
-    window: WebviewWindow,
-    store: State<'_, Store>,
-    local: State<'_, Local>,
-    target: Target,
-) -> Result<(), String> {
-    let url = match target {
-        Target::Local => {
-            // Before the core even starts: no consent, no Local.
-            require_local_consent(store.read(|p| p.local_consent()))?;
-            let url = local.ensure().await?;
-            store.mutate(|p| {
-                p.set_last(Active::Local);
-                Ok(())
-            })?;
-            url
-        }
-        Target::Remote(id) => {
-            let id = RemoteId::new(id);
-            store.mutate(|p| {
-                let url = p
-                    .get(id)
-                    .ok_or(ProfileError::NoSuchProfile)?
-                    .link
-                    .url()
-                    .clone();
-                p.set_last(Active::Remote(id));
-                Ok(url)
-            })?
-        }
-    };
-    window.navigate(url).map_err(|e| e.to_string())
-}
-
-/// The bundled Profiles page, as the webview first loads it. Android serves the
-/// bundle from `http://tauri.localhost`, Apple from `tauri://localhost`.
+/// The bundled page, as the webview loads it. Android serves the bundle from
+/// `http://tauri.localhost`, Apple from `tauri://localhost`.
 fn app_index_url() -> Url {
     let base = if cfg!(target_os = "android") {
         "http://tauri.localhost/"
@@ -300,18 +89,10 @@ fn app_index_url() -> Url {
     Url::parse(base).expect("static url")
 }
 
-/// returns at once; every side effect is spawned, because opener/navigate
+/// Returns at once; every side effect is spawned, because opener/navigate
 /// calls inside Android's `shouldOverrideUrlLoading` deadlock the UI thread (ANR).
 fn on_navigation(app: &AppHandle, url: &Url) -> bool {
-    let remotes: Vec<url::Origin> = app
-        .state::<Store>()
-        .read(|p| p.remotes().iter().map(|r| r.link.origin()).collect());
-    let local = app.state::<Local>().origin();
-    let known = Known {
-        local: local.as_ref(),
-        remotes: &remotes,
-    };
-    let nav = nav::classify(url, &known);
+    let nav = nav::classify(url);
     log::info!("nav {nav:?} {}", without_query(url));
     match nav {
         Nav::Allow => return true,
@@ -324,16 +105,6 @@ fn on_navigation(app: &AppHandle, url: &Url) -> bool {
                 }
             });
         }
-        Nav::Profiles => {
-            let app = app.clone();
-            tauri::async_runtime::spawn(async move {
-                if let Some(w) = app.get_webview_window("main")
-                    && let Err(e) = w.navigate(app_index_url())
-                {
-                    log::warn!("navigate to profiles: {e}");
-                }
-            });
-        }
         Nav::RestartLocal => {
             let app = app.clone();
             tauri::async_runtime::spawn(async move { restart_local(&app).await });
@@ -343,9 +114,9 @@ fn on_navigation(app: &AppHandle, url: &Url) -> bool {
     false
 }
 
-/// Only the Local page may restart the phone's core — a Remote page
-/// sending the sentinel does nothing. A failed restart lands on the Profiles
-/// page, where opening Local again shows the error.
+/// Only a page on the Local origin may restart the phone's core — a page
+/// elsewhere sending the sentinel does nothing. A failed restart lands on the
+/// bundled error page, which names the reason.
 async fn restart_local(app: &AppHandle) {
     let Some(window) = app.get_webview_window("main") else {
         return;
@@ -387,7 +158,7 @@ async fn resume_local(app: &AppHandle) {
     }
 }
 
-/// For logs: a profile URL's query carries its token.
+/// For logs: a core URL's query carries its token.
 fn without_query(url: &Url) -> String {
     let mut u = url.clone();
     u.set_query(None);
@@ -407,12 +178,17 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         dirs.cache.display(),
         dirs.core_roots()
     );
-    let path = dirs.data.join("profiles.json");
-    let profiles = Mutex::new(Profiles::load(&path));
-    app.manage(Store { path, profiles });
+
+    // The core is the webview's only origin, so it starts before the window
+    // exists. setup() is sync, so block_on is fine — the core serves on the
+    // async runtime's worker threads. On failure the window opens the bundled
+    // error page with the reason in its fragment.
+    let first = launch_url(tauri::async_runtime::block_on(
+        app.state::<Local>().ensure(),
+    ));
 
     let handle = app.handle().clone();
-    let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+    let window = WebviewWindowBuilder::new(app, "main", first)
         .background_color(BACKGROUND)
         .initialization_script(INIT_SCRIPT)
         .on_navigation(move |url| on_navigation(&handle, url))
@@ -454,14 +230,6 @@ pub fn run() {
     #[cfg(mobile)]
     let builder = builder.plugin(tauri_plugin_barcode_scanner::init());
     builder
-        .invoke_handler(tauri::generate_handler![
-            profiles_get,
-            profile_add,
-            profile_rename,
-            profile_remove,
-            local_consent_set,
-            profile_open
-        ])
         .setup(setup)
         .build(tauri::generate_context!())
         .expect("error while building PeakBot Mobile")
@@ -541,7 +309,7 @@ window.open=function(u){if(u){location.href=new URL(String(u),location.href).hre
 #[cfg(test)]
 mod launch_tests {
     use super::*;
-    use url::form_urlencoded;
+    use percent_encoding::percent_decode_str;
 
     /// The URL `local.ensure()` hands back: loopback, token in the query.
     fn core_url(port: u16, token: &str) -> Url {
@@ -555,12 +323,10 @@ mod launch_tests {
     fn decoded_reason(page: &std::path::Path) -> Option<String> {
         let s = page.to_string_lossy();
         let hash = s.strip_prefix("index.html#")?;
-        if hash.is_empty() {
-            return Some(String::new());
-        }
-        form_urlencoded::parse(hash.as_bytes())
-            .next()
-            .map(|(_, value)| value.into_owned())
+        percent_decode_str(hash)
+            .decode_utf8()
+            .ok()
+            .map(|reason| reason.into_owned())
     }
 
     #[test]
@@ -603,8 +369,8 @@ mod launch_tests {
         let page = launch_url(Err("café".to_string()));
         match page {
             WebviewUrl::App(p) => {
-                let hash = p
-                    .to_string_lossy()
+                let page = p.to_string_lossy();
+                let hash = page
                     .strip_prefix("index.html#")
                     .expect("the bundled page with a hash");
                 assert_eq!(hash, "caf%C3%A9");
@@ -695,7 +461,7 @@ mod capability_tests {
         // The barcode plugin exists only on the phone targets.
         assert_eq!(
             sorted_str_array(&cap("loopback")["platforms"], "platforms"),
-            ["iOS", "android"]
+            ["android", "iOS"]
         );
     }
 

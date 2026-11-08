@@ -19,9 +19,9 @@
 #   3. zipalign -c -P 16 -v 4 — 16 KB page alignment
 #   4. merged manifest (aapt2 dump xmltree): networkSecurityConfig present
 #      + allowBackup="false" (no cloud backup of the token/config)
-#   5. the NSC resource (extracted from the APK): src="user" trust anchors
-#      (user-installed PeakBot CA) + the 127.0.0.1 domain-config (cleartext
-#      for the in-process Local core only)
+#   5. the NSC resource (extracted from the APK): NO src="user" trust
+#      anchor (the shell trusts system CAs only) + the 127.0.0.1
+#      domain-config (cleartext for the in-process Local core only)
 #   6. size < 40 MB (41943040 bytes; measured on a development build:
 #      22.1 MB). Release
 #      builds only: debug APKs are never released (unstripped .so, debug
@@ -124,7 +124,7 @@ allow_backup=$(printf '%s\n' "$manifest" | grep -F 'allowBackup' | sed 's/.*allo
     || fail "the merged manifest does not have allowBackup=\"false\" (got '${allow_backup:-<none>}')"
 ok 'manifest allowBackup="false"'
 
-# ── 5. the NSC resource: user CA anchors + 127.0.0.1 cleartext ──────────
+# ── 5. the NSC resource: system CAs only + 127.0.0.1 cleartext ──────────
 # Release resource shrinking renames the file (debug: res/xml/
 # network_security_config.xml, release: res/8G.xml) — look it up by
 # resource name, not by path.
@@ -132,11 +132,12 @@ nsc_file=$(aapt2 dump resources "$apk" | awk '/xml\/network_security_config/{f=1
 [ -n "$nsc_file" ] || fail "no xml/network_security_config resource in the APK"
 nsc=$(aapt2 dump xmltree --file "$nsc_file" "$apk") \
     || fail "aapt2 dump xmltree $nsc_file"
-# The user-installed PeakBot CA is trusted: <certificates src="user" />
+# A user-installed CA must not be trusted: <certificates src="user" />
 # renders as `A: src(…)=(Raw: "user")` in the xmltree dump.
-printf '%s\n' "$nsc" | grep -F 'src' | grep -qF '(Raw: "user")' \
-    || fail 'the NSC has no src="user" trust anchor'
-ok 'NSC src="user"'
+if printf '%s\n' "$nsc" | grep -F 'src' | grep -qF '(Raw: "user")'; then
+    fail 'the NSC trusts user-installed CAs (src="user")'
+fi
+ok 'NSC has no src="user" anchor'
 printf '%s\n' "$nsc" | grep -qF '127.0.0.1' \
     || fail "the NSC has no 127.0.0.1 domain-config (Local cleartext)"
 ok "NSC 127.0.0.1 domain-config"

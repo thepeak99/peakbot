@@ -17,10 +17,9 @@ tauri-build = { version = "2.7", features = [] }
 tauri = { version = "2.12.4", features = [] }
 tauri-plugin-opener = "2.7"
 tauri-plugin-log = "2.10"
-# THE pairing-link parser + Profiles store + nav guard.
+# The nav guard's URL parsing and the error page's fragment encoding.
 url = "2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+percent-encoding = "2"
 # The Local core: the root crate compiled without `host`. One app,
 # one artifact — no `local` feature.
 peakbot = { path = "../..", default-features = false }
@@ -45,3 +44,7 @@ tauri-plugin-barcode-scanner = "2"
 [target.'cfg(target_os = "ios")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSError"] }
+
+[dev-dependencies]
+# The capability tests read the ACL files.
+serde_json = "1"

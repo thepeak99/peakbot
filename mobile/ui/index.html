@@ -9,333 +9,46 @@
     <meta name="theme-color" content="#09090b" />
     <title>PeakBot</title>
     <style>
-      /* SPA dark palette (web/src/index.css): zinc-950 background (= the shell
-         window's background_color, so no band of a different colour), zinc-100
-         text, zinc-400/500 muted, zinc-800 borders, zinc-900 surfaces. */
-      :root {
-        --bg: #09090b;
-        --surface: #18181b;
-        --border: #27272a;
-        --text: #f4f4f5;
-        --muted: #a1a1aa;
-        --faint: #71717a;
-        --error: #f87171;
-      }
+      /* The shell window's background (zinc-950) so no band of a different
+         colour shows behind the one message. */
       html,
       body {
         margin: 0;
         height: 100%;
-        background: var(--bg);
-        color: var(--text);
+        background: #09090b;
+        color: #f4f4f5;
         font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
         font-size: 16px;
-        line-height: 1.4;
+        line-height: 1.5;
       }
-      #app {
+      main {
         height: 100%;
-        overflow-y: auto;
         box-sizing: border-box;
+        display: flex;
+        align-items: center;
+        justify-content: center;
         /* safe-area insets: status bar on top, home indicator below. */
         padding:
-          calc(env(safe-area-inset-top, 0px) + 16px) 16px
-          calc(env(safe-area-inset-bottom, 0px) + 20px);
+          calc(env(safe-area-inset-top, 0px) + 24px) 24px
+          calc(env(safe-area-inset-bottom, 0px) + 24px);
       }
-      h1 {
-        font-size: 24px;
-        margin: 0 0 12px;
-      }
-      h2 {
-        font-size: 18px;
-        margin: 0 0 8px;
-      }
-      button,
-      a.btn {
-        font: inherit;
-        min-height: 44px;
-        min-width: 44px;
-        border-radius: 8px;
-        border: 1px solid var(--border);
-        background: var(--surface);
-        color: var(--text);
-        padding: 10px 16px;
-        cursor: pointer;
-        text-decoration: none;
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        box-sizing: border-box;
-      }
-      button.primary,
-      a.primary {
-        background: var(--text);
-        color: var(--bg);
-        border-color: var(--text);
-        font-weight: 600;
-      }
-      button.danger {
-        color: var(--error);
-        border-color: #7f1d1d;
-      }
-      button:active,
-      a.btn:active {
-        filter: brightness(1.25);
-      }
-      input {
-        font: inherit;
-        box-sizing: border-box;
-        width: 100%;
-        min-height: 44px;
-        padding: 10px 12px;
-        border-radius: 8px;
-        border: 1px solid var(--border);
-        background: var(--surface);
-        color: var(--text);
-      }
-      label {
-        display: block;
-        margin: 14px 0 6px;
-        color: var(--muted);
-        font-size: 14px;
-      }
-      .list {
-        list-style: none;
-        margin: 0 0 12px;
-        padding: 0;
-        border: 1px solid var(--border);
-        border-radius: 12px;
-        overflow: hidden;
-      }
-      .row {
-        display: flex;
-        align-items: stretch;
-        border-bottom: 1px solid var(--border);
-      }
-      .row:last-child {
-        border-bottom: 0;
-      }
-      .row-open {
-        flex: 1;
-        min-width: 0;
-        display: flex;
-        align-items: center;
-        gap: 10px;
-        min-height: 56px;
-        border: 0;
-        background: transparent;
-        border-radius: 0;
-        text-align: left;
-        padding: 8px 4px 8px 14px;
-        color: inherit;
-      }
-      .row-open:active {
-        background: var(--surface);
-      }
-      .row-labels {
-        flex: 1;
-        min-width: 0;
-        display: flex;
-        flex-direction: column;
-      }
-      .row-name {
-        font-size: 16px;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      .row-host {
-        font-size: 13px;
-        color: var(--faint);
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      .badge {
-        flex: none;
-        font-size: 12px;
-        line-height: 1;
-        padding: 4px 8px;
-        border-radius: 999px;
-        border: 1px solid var(--border);
-        background: var(--surface);
-        color: var(--muted);
-      }
-      .chevron {
-        color: var(--faint);
-        font-size: 20px;
-        flex: none;
-      }
-      .row-menu {
-        flex: none;
-        width: 44px;
-        border: 0;
-        border-left: 1px solid var(--border);
-        border-radius: 0;
-        background: transparent;
-        font-size: 18px;
-        color: var(--muted);
-      }
-      .empty {
-        padding: 16px 14px;
-        color: var(--faint);
-        font-size: 14px;
-      }
-      .add-server {
-        width: 100%;
-        min-height: 48px;
-        font-size: 16px;
-      }
-      .panel {
-        border: 1px solid var(--border);
-        border-radius: 12px;
-        padding: 14px;
-        margin: 0 0 12px;
-      }
-      .checklist {
-        margin: 8px 0;
-        padding-left: 20px;
-        color: var(--muted);
-        font-size: 14px;
-      }
-      .checklist li {
-        margin: 4px 0;
-      }
-      .steps {
-        margin: 8px 0;
-        color: var(--muted);
-        font-size: 14px;
-      }
-      .row-buttons {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 8px;
-        margin-top: 12px;
-      }
-      .row-buttons > * {
-        flex: 1 1 auto;
-      }
-      #status {
-        color: var(--muted);
-        font-size: 14px;
-        margin: 0 0 12px;
-      }
-      .error {
-        color: var(--error);
-        font-size: 14px;
-        margin: 10px 0 0;
-        white-space: pre-wrap;
-      }
-      /* Dialog: dimmed scrim, centred card. */
-      #dialog {
-        position: fixed;
-        inset: 0;
-        background: rgb(0 0 0 / 0.6);
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        padding: 24px;
-        z-index: 10;
-      }
-      .dialog-card {
-        background: var(--bg);
-        border: 1px solid var(--border);
-        border-radius: 12px;
-        padding: 16px;
-        width: 100%;
-        max-width: 340px;
-        box-sizing: border-box;
-      }
-      .dialog-card p {
-        color: var(--muted);
-        font-size: 14px;
-        margin: 8px 0;
-      }
-      .menu-item {
-        width: 100%;
-        justify-content: flex-start;
-        margin-top: 8px;
-      }
-      [hidden] {
-        display: none !important;
+      p {
+        max-width: 42ch;
+        margin: 0;
+        text-align: center;
       }
     </style>
   </head>
   <body>
-    <div id="app">
-      <h1>PeakBot</h1>
-      <p id="status" role="status" aria-live="polite" hidden></p>
-
-      <!-- Can't-reach help (locked strings). -->
-      <section id="cant-reach" class="panel" aria-labelledby="cr-title" hidden>
-        <h2 id="cr-title">Can't reach <span id="cr-host"></span>.</h2>
-        <ul class="checklist">
-          <li>same network or VPN?</li>
-          <li>server running?</li>
-          <li>certificate installed and trusted on this phone?</li>
-        </ul>
-        <p class="steps" id="cr-steps"></p>
-        <div class="row-buttons">
-          <!-- Top-level navigation: the nav guard classifies it External and
-               the system browser opens it (no opener IPC — not granted). -->
-          <a id="cr-install" class="btn" href="#">Install certificate…</a>
-          <button id="cr-retry" class="btn">Retry</button>
-          <button id="cr-edit" class="btn">Edit</button>
-          <button id="cr-close" class="btn">Close</button>
-        </div>
-      </section>
-
-      <!-- "On this phone" (Local) first, then one row per Remote. -->
-      <ul id="list" class="list" aria-label="Profiles"></ul>
-
-      <!-- Add server: paste a link or scan the pairing QR. -->
-      <section id="add" class="panel" aria-labelledby="add-title" hidden>
-        <h2 id="add-title">Add server</h2>
-        <label for="add-link">Link</label>
-        <input
-          id="add-link"
-          type="text"
-          enterkeyhint="go"
-          autocomplete="off"
-          autocapitalize="none"
-          spellcheck="false"
-          placeholder="https://host:port/?token=…"
-        />
-        <div class="row-buttons">
-          <button id="add-scan" class="btn">Scan QR</button>
-        </div>
-        <label for="add-name">Name (optional)</label>
-        <input
-          id="add-name"
-          type="text"
-          enterkeyhint="done"
-          autocomplete="off"
-          placeholder="e.g. Home server"
-        />
-        <p id="add-error" class="error" role="alert" hidden></p>
-        <div class="row-buttons">
-          <button id="add-submit" class="btn primary">Add</button>
-          <button id="add-cancel" class="btn">Cancel</button>
-        </div>
-      </section>
-
-      <button id="add-server" class="btn add-server">+ Add server</button>
-
-      <!-- Dialog: ⋯ menu (Rename / Delete), rename, delete confirmation. -->
-      <div id="dialog" hidden>
-        <div class="dialog-card" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
-          <h2 id="dialog-title"></h2>
-          <p id="dialog-text" hidden></p>
-          <input id="dialog-input" type="text" hidden autocomplete="off" enterkeyhint="done" />
-          <div id="dialog-menu" hidden>
-            <button id="menu-rename" class="btn menu-item">Rename</button>
-            <button id="menu-delete" class="btn menu-item danger">Delete</button>
-          </div>
-          <div id="dialog-actions" class="row-buttons">
-            <button id="dialog-ok" class="btn primary"></button>
-            <button id="dialog-cancel" class="btn">Cancel</button>
-          </div>
-        </div>
-      </div>
-    </div>
-    <script src="profiles.js"></script>
+    <main>
+      <p>Couldn't start PeakBot on this phone: <span id="reason"></span>. Close the app and open it again.</p>
+    </main>
+    <script>
+      // The reason is the percent-encoded URL fragment the shell set
+      // (index.html#<reason>); decode it back for display.
+      document.getElementById("reason").textContent = decodeURIComponent(
+        location.hash.replace(/^#/, ""),
+      );
+    </script>
   </body>
 </html>
