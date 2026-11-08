@@ -110,6 +110,8 @@ const CA = `sha256:${"0123456789abcdef".repeat(4)}`;
 const LINK = `https://10.2.0.48:7899/?token=pito&ca=${CA}&profile=dev`;
 const EXPECTED_NAME = "dev on 10.2.0.48"; // host label port-less (paste tests)
 
+const KEY = "sk-or-test-key-123456";
+
 // ─── mount / DOM plumbing ───────────────────────────────────────────────
 
 let root: Root | undefined;
@@ -151,6 +153,16 @@ function q<T extends Element = HTMLElement>(id: string): T {
 }
 const has = (id: string) => host.querySelector(tid(id)) !== null;
 const text = (id: string) => q(id).textContent ?? "";
+
+// The interactive control: the testid'd node itself (if it is one), or the
+// control inside the widget wrapper.
+function ctl<T extends HTMLElement = HTMLInputElement>(id: string): T {
+  const el = q(id);
+  if (el.matches("input,select,textarea,button")) return el as T;
+  const inner = el.querySelector("input,select,textarea,button");
+  if (!inner) throw new Error(`no control inside testid: ${id}`);
+  return inner as T;
+}
 
 function click(el: Element) {
   act(() => {
@@ -426,9 +438,11 @@ describe("FirstRun — Local edition first profile name", () => {
     stubApi();
     mountWizard({ m: { boot: LOCAL_BOOT } });
     intoProviderPath();
-    // Ollama needs no API key; one preset model is enough for the step.
     const preset = host.querySelector('[data-testid="fr-model-preset-0"]');
     if (preset) click(preset);
+    // The hosted default (openrouter) needs a key; type it so the step is
+    // valid and Next advances.
+    typeInto(ctl<HTMLInputElement>("fr-provider-apikey"), KEY);
     click(q("firstrun-next"));
     expect(has("firstrun-step-agent")).toBe(true);
     expect(text("firstrun-agent-banner")).toContain("On this phone");
@@ -441,6 +455,9 @@ describe("FirstRun — Local edition first profile name", () => {
     intoProviderPath();
     const preset = host.querySelector('[data-testid="fr-model-preset-0"]');
     if (preset) click(preset);
+    // The hosted default (openrouter) needs a key; type it so the step is
+    // valid and Next advances.
+    typeInto(ctl<HTMLInputElement>("fr-provider-apikey"), KEY);
     click(q("firstrun-next")); // → agent
     click(q("firstrun-next")); // → review (no web step on Local)
     expect(has("firstrun-step-review")).toBe(true);

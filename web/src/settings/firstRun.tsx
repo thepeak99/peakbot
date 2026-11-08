@@ -209,10 +209,7 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
   // from the same read).
   const local = meta.boot?.edition === "local";
   const [answers, setAnswers] = useState<FirstRunAnswers>({
-    // Local starts on a keyless type; a hosted one is picked on purpose.
-    provider: local
-      ? { type: "ollama", name: "ollama", base_url: BASE_URL_PRESETS.ollama, models: [] }
-      : { type: "openrouter", name: "openrouter", models: [] },
+    provider: { type: "openrouter", name: "openrouter", models: [] },
     agent: { model: "", persona: null, subagents: false },
     web: { access: "local", token: null },
   });
