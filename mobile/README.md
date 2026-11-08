@@ -1,39 +1,37 @@
 # PeakBot Mobile
 
 **PeakBot Mobile** is a Tauri 2 shell (app id `sh.shifu.mobile`, display name PeakBot)
-for Android and iOS. Its only native screen is the **Profiles** page; each profile
-is just an origin the webview loads.
+for Android and iOS. Its webview only ever loads the on-device PeakBot core
+(`http://127.0.0.1:<port>`); remote servers are `remote:` profiles in the core's
+`config.yaml`, served through the existing relay exactly like desktop, so there is
+one conversation list. The native Profiles page is gone.
 
-## Remote profiles
+## Connect your server
 
-A Remote profile points at an existing PeakBot server; the phone loads the
-server's own SPA over HTTPS.
+- **The server** must run PeakBot 0.27.0 or newer with the same protocol version
+  (version match is strict). On the server, open Settings → General → "Connect a
+  phone or another PeakBot" to get a pairing link (it now includes the server's
+  port, unless the server is on 443).
+- **Add it:** in the app, go to Settings → Profiles → "+ Add remote profile", then
+  paste the pairing link or tap **Scan QR** (phone only).
+- **No CA install:** the pairing link's `ca: sha256:…` pins the server's CA, so
+  there is nothing to install on the phone.
 
-- **Setup the server:** use a recent PeakBot — the release that ships PeakBot
-  Mobile — with `general.web` set to `bind: 0.0.0.0:7823`, `tls: true`, and a web
-  token.
-- **Pair:** on the server, open Settings → General → "Connect a phone or another
-  PeakBot" to get a pairing link. In the app, paste the link or scan its QR.
-- **Trust the server:** the phone must trust the server's self-signed CA. The app
-  has an *Install certificate…* shortcut that opens
-  `https://host:7823/peakbot-ca.crt` in your browser, then install it:
-  - **Android:** Settings → Security → Install a certificate → CA.
-  - **iOS:** open `https://host:7823/peakbot-ca.crt` in Safari, then
-    Settings → VPN & Device Management → install the profile →
-    Settings → General → About → Certificate Trust Settings, and set it to full
-    trust.
-- **Off your LAN:** put the server on Tailscale and pair by its `*.ts.net` address
-  with a real certificate — no CA install on the phone.
+Going back on Android closes the Settings screen and the QR camera before leaving
+the app.
 
 ## On this phone
 
-**On this phone** runs a PeakBot core built into the app, in-process, with no code
-execution. It gets the read-only tools `fetch_url`, `fetch_page`, `web_search`
-(only when SearXNG is configured), `todo`, and `think`; takes image-only
-attachments; and uses **your own API key** — your messages go to your configured
-provider with that key. A consent notice appears on first use. It never runs
-commands or edits files. Your config and data stay on the phone and are excluded
-from backups.
+**On this phone** (the local profile's default name) runs a PeakBot core built into
+the app, in-process, with no code execution. It gets the read-only tools
+`fetch_url`, `fetch_page`, `web_search` (only when SearXNG is configured), `todo`,
+and `think`; takes image-only attachments; and uses **your own API key** — your
+messages go to your configured provider with that key. A consent notice appears on
+the provider step ("Agree and continue"). It never runs commands or edits files.
+Your config and data stay on the phone and are excluded from backups.
+
+On first launch the wizard offers either "Set up an AI provider on this device" or
+"Connect to my PeakBot server" (no API key needed for the latter).
 
 ## Notify me when the agent finishes
 
@@ -62,6 +60,6 @@ pairing with plain-HTTP servers (HTTPS only).
 
 ## Repo layout
 
-`mobile/` is the Tauri 2 app: `src-tauri/` (Rust glue + config), `ui/` (the
-Profiles page), `scripts/` (build, simulator, and CDP helpers), and `tests/`
-(contract tests).
+`mobile/` is the Tauri 2 app: `src-tauri/` (Rust glue + config), `ui/` (web UI
+assets), `scripts/` (build, simulator, and CDP helpers), and `tests/` (contract
+tests).

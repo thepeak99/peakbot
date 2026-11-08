@@ -5,16 +5,22 @@ This file is the working draft for the next release. When a version is tagged, t
 ## Changes
 
 - **PeakBot Mobile for Android and iOS** (built in `mobile/`). A Tauri 2 shell
-  (app id `sh.shifu.mobile`, name PeakBot) whose only native screen is the Profiles
-  page. It offers **Remote** profiles — pair a PeakBot server by pasting its
-  pairing link or scanning its QR (HTTPS only: the server needs `tls: true`,
-  `bind: 0.0.0.0:7823`, a web token, and its CA installed on the phone) — and an
-  **On this phone** Local profile (a PeakBot core with no code execution:
-  fetch/search, todo, think, image-only attachments, your own API key, a first-use
-  consent notice; config and data stay on the phone and are excluded from
-  backups). Core changes this release: `fetch_url` gains a `headers` argument;
-  provider `base_url` values with a trailing slash are now tolerated; and the web
-  SPA gains a `window.peakbotShell` marker (desktop / mobile / plain browser).
+  (app id `sh.shifu.mobile`, name PeakBot) whose webview now loads only the on-device
+  PeakBot core; remote servers are `remote:` profiles relayed exactly like desktop,
+  so there is one conversation list. The native Profiles page is gone.
+  - **On this phone** — a built-in PeakBot core with no code execution: fetch/search,
+    todo, think, image-only attachments, your own API key, consent on the provider
+    step; config and data stay on the phone and are excluded from backups.
+  - **Connect a server** — Settings → Profiles → "+ Add remote profile", then paste
+    the pairing link or scan its QR (phone only). No CA install: the pairing
+    link's `ca: sha256:…` pins the server CA, and the link now carries the server
+    port unless 443. Servers must run PeakBot 0.27.0 or newer with the matching
+    protocol version.
+  - The first-launch wizard offers "Set up an AI provider on this device" or
+    "Connect to my PeakBot server" (no API key needed for the latter).
+  Core changes this release: `fetch_url` gains a `headers` argument; provider
+  `base_url` values with a trailing slash are now tolerated; and the web SPA gains
+  a `window.peakbotShell` marker (desktop / mobile / plain browser).
 
 ### Fixes
 
