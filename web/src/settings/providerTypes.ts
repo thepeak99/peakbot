@@ -39,3 +39,7 @@ export const MODEL_PRESETS: Record<ProviderType, [string, string, number][]> = {
     ["llama3.2:3b", "llama", 4096],
   ],
 };
+
+/** The Local edition's consent notice, shown where a provider is saved. */
+export const PROVIDER_CONSENT =
+  "Your messages are sent to the AI provider you configure, using your own API key.";
