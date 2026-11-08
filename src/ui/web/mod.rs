@@ -88,8 +88,8 @@ pub mod registry;
 mod remote;
 pub mod settings;
 pub mod system;
-// Remote-profile E2E: the Local edition has no `remote:` profiles.
-#[cfg(all(test, feature = "host"))]
+// Remote-profile E2E: `remote:` profiles parse in every edition.
+#[cfg(test)]
 mod t4_tests;
 pub mod tls;
 pub mod uploads;
@@ -761,23 +761,34 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
     // from ONE fresh global-config parse, never the boot catalogue: a
     // remote added or edited after boot must route on the NEXT attach.
     // Only an attach naming a profile that is not LOCAL in the boot
-    // catalogue pays for the parse — a name has one kind per config, so a
-    // no-profile or boot-local attach can never be remote (local freshness
-    // is the session's own reload's job).
-    let (remote_profile, fresh_catalog) = match profile
+    // catalogue pays for the parse (a name has one kind per config; local
+    // freshness is the session's own reload's job), as does an unpinned
+    // attach on a relay-only boot catalogue.
+    let fresh = match profile
         .as_deref()
         .filter(|p| !boot_has_local(registry.boot_catalog(), p))
     {
-        Some(p) => match remote::fresh_attach(p) {
-            Ok(found) => found,
-            // E-CONFIG: exactly one locked error frame, then close. A
-            // broken global config disables remote attaches — it never
-            // falls back to a local session.
-            Err(e) => {
-                refuse(out_tx, writer_task, e.to_string()).await;
-                return;
-            }
-        },
+        Some(p) => Some(remote::fresh_attach(p)),
+        // A relay-only config has no local session to mint, so an unpinned
+        // attach takes the home remote's path. A relayed attach never does:
+        // it keeps the E-CHAIN / local behaviour.
+        None if profile.is_none()
+            && !relayed
+            && registry.boot_catalog().default_bound().is_none() =>
+        {
+            Some(remote::fresh_home_attach())
+        }
+        None => None,
+    };
+    let (remote_profile, fresh_catalog) = match fresh {
+        Some(Ok(found)) => found,
+        // E-CONFIG: exactly one locked error frame, then close. A
+        // broken global config disables remote attaches — it never
+        // falls back to a local session.
+        Some(Err(e)) => {
+            refuse(out_tx, writer_task, e.to_string()).await;
+            return;
+        }
         None => (None, Vec::new()),
     };
 

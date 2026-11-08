@@ -15,7 +15,7 @@
 // banner / 422 error panel / 200 toast + restart banner.
 
 import { useCallback, useEffect, useReducer, useState } from "react";
-import { edition, isDesktop, shell } from "../desktop";
+import { edition, isDesktop } from "../desktop";
 import { ApiError, getConfig, getSettings, putConfig, validateConfig } from "./api";
 import { createStore } from "./store";
 import { get, parse, set, stringify } from "./yamlDoc";
@@ -106,12 +106,9 @@ const SECTIONS: Record<Section, { label: string; desc: string }> = {
 const REPO_BANNER =
   "The repo file may only contain profiles:. Repo profiles are listed first and the first one is the default for conversations started here. A repo profile with the same name as a global one replaces it entirely (no merge).";
 
-// The Local edition (phone build) offers none of
-// these sections — no MCP servers, no in-SPA profile management (the shell
-// owns the profile list), no machine facts, no raw file editing. The nav and
-// the collapsed section select drop them; the default active section
-// ("profiles") is hidden, so it falls back to the first visible one.
-const HIDDEN_LOCAL_SECTIONS: readonly Section[] = ["mcps", "profiles", "system", "raw"];
+// The Local edition (phone build) hides the MCP, System and Raw YAML panes
+// (nav + collapsed select drop them); Profiles stays and is the default.
+const HIDDEN_LOCAL_SECTIONS: readonly Section[] = ["mcps", "system", "raw"];
 
 /** A config map value (profiles / agents) as a plain record. */
 function asMap(v: unknown): Record<string, unknown> {
@@ -157,10 +154,6 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
   const [flash, setFlash] = useState<{ section: Section; pathKey: string } | null>(null);
 
   const desktop = isDesktop();
-  // The mobile shell's profile list is a shell page
-  // (peakbot-mobile:profiles), not an SPA route — Settings exposes it as a
-  // row; desktop/browser keep today's in-app Profiles section only.
-  const mobile = shell() === "mobile";
   // What THIS server can do (boot.edition, set by getSettings on every
   // successful read). The local edition hides the machine-side sections.
   const local = edition() === "local";
@@ -384,9 +377,8 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
   const st = store.state();
   const dirty = store.isDirty(scope);
   const validateRes = st.validate;
-  // The section actually shown. In the local edition a hidden section
-  // (the default "profiles" among them) is never offered, so the view falls
-  // back to the first visible one.
+  // The section actually shown. In the local edition a hidden section is
+  // never offered, so the fallback is the first visible pane.
   const activeSection: Section =
     local && HIDDEN_LOCAL_SECTIONS.includes(active) ? "providers" : active;
   // Raw pane text (contract): rawText ?? (dirty ? stringify(draft) : savedText).
@@ -551,7 +543,7 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
   return (
     <div className="fixed inset-0 z-40 flex flex-col bg-zinc-950 text-zinc-100">
       {/* Head: ← Back to chat · Settings title · scope switch · Ctrl , hint */}
-      <header className="flex min-h-14 flex-wrap items-center gap-x-4 gap-y-2 border-b border-zinc-800 px-4 py-2">
+      <header className="flex min-h-14 flex-wrap items-center gap-x-4 gap-y-2 border-b border-zinc-800 px-4 pb-2 pt-[max(0.5rem,env(safe-area-inset-top))]">
         <button
           onClick={onClose}
           className="cursor-pointer text-xs text-zinc-400 hover:text-zinc-200"
@@ -667,20 +659,6 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
           }}
         >
         <main className="min-w-0 flex-1 overflow-auto p-4 sm:p-6">
-          {/* The mobile shell manages profiles in its own page
-              (peakbot-mobile:profiles sentinel, classified by the nav guard);
-              the SPA has no in-page equivalent, so it offers the shell's
-              row instead of (and never alongside) a browser open. */}
-          {mobile && (
-            <a
-              href="peakbot-mobile:profiles"
-              className="flex cursor-pointer items-center gap-2 rounded border border-zinc-800 bg-zinc-900/40 px-3 py-2 text-xs text-zinc-200 hover:bg-zinc-900 hover:text-zinc-300"
-              title="Profile list is managed by the mobile shell"
-            >
-              Switch profile
-            </a>
-          )}
-
           {/* Mobile: the nav collapses into a select under the head */}
           <select
             value={

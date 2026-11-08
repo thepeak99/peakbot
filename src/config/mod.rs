@@ -15,6 +15,7 @@ pub mod model_registry;
 pub mod named;
 pub mod remote;
 pub mod resolve;
+use anyhow::Context;
 pub use errors::{ConfigError, ConfigErrors, ConfigFileKind};
 pub use file::{
     ConversationConfig, Env, General, ProfileUi, SearchConfig, VectorDbConfig, WebConfig,
@@ -24,12 +25,10 @@ pub use model_registry::{
     BootSelection, ModelEntry, ModelRegistry, ProviderEntry, RegistryError, ResolvedModel,
 };
 pub use resolve::{
-    AgentInfo, Bound, Catalog, Config, DbPathSpec, Head, LoadError, Member, Origin, ParseCtx,
+    AgentInfo, Bound, Catalog, Config, DbPathSpec, Head, Home, LoadError, Member, Origin, ParseCtx,
     ProfileInfo, RepoMode, ResolvedAgent, ResolvedProfile, Selection, Source, Subagent,
     SubagentInfo, VectorSpec, boot_only_diff,
 };
-
-use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;

@@ -769,6 +769,14 @@ fn reload_config(
         ));
         return messages;
     }
+    // A live session's `Bound` can never point at a remote profile: a file
+    // with no local profile left keeps the previous config.
+    if fresh.catalog.default_bound().is_none() {
+        messages.push(
+            "⚠ config.yaml has no local profile left — keeping the previous config.".to_string(),
+        );
+        return messages;
+    }
 
     // 4. Boot-only blocks keep their boot value until a restart.
     for key in crate::config::resolve::boot_only_diff(&ctx.config, &fresh) {
@@ -5130,7 +5138,10 @@ profiles:
     #[cfg(feature = "mock")]
     fn rebuild_ctx_for(config: Config) -> RebuildContext {
         RebuildContext {
-            bound: config.catalog.default_bound(),
+            bound: config
+                .catalog
+                .default_bound()
+                .expect("the fixture has a local profile"),
             config: Arc::new(config),
             mcp_handles: Arc::new(Vec::new()),
             shell_kind: None,
@@ -9921,7 +9932,10 @@ profiles:
 
             let sm = StateManager::new_arc();
             let ctx = RebuildContext {
-                bound: config.catalog.default_bound(),
+                bound: config
+                    .catalog
+                    .default_bound()
+                    .expect("the fixture has a local profile"),
                 config: Arc::new(config),
                 mcp_handles: Arc::new(Vec::new()),
                 shell_kind: None,
@@ -10549,7 +10563,10 @@ mod local_reload_tests {
     fn local_reload_ignores_repo_config() {
         let config = parse_global();
         let ctx = RebuildContext {
-            bound: config.catalog.default_bound(),
+            bound: config
+                .catalog
+                .default_bound()
+                .expect("the fixture has a local profile"),
             config: Arc::new(config),
             mcp_handles: Arc::new(Vec::new()),
             shell_kind: None,

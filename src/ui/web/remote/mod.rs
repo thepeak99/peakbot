@@ -38,29 +38,34 @@ pub(super) mod listing;
 pub(super) mod proxy;
 pub(super) mod relay;
 
-// Every remote test drives a config `remote:` profile, which the Local
-// edition rejects at parse time — the relay is unreachable there.
-#[cfg(all(test, feature = "host"))]
+// Every remote test drives a config `remote:` profile, which every
+// edition parses — the relay runs in the Local edition too.
+#[cfg(test)]
 mod client_tests;
 
-#[cfg(all(test, feature = "host"))]
+#[cfg(test)]
 mod relay_tests;
 
-#[cfg(all(test, feature = "host"))]
+#[cfg(test)]
 mod test_support;
 
 // T7/T8 (merged list, kill routing, `/r/` proxy): shared fixture + tests.
-#[cfg(all(test, feature = "host"))]
+#[cfg(test)]
 mod t78_support;
 
-#[cfg(all(test, feature = "host"))]
+#[cfg(test)]
 mod t7_tests;
 
-#[cfg(all(test, feature = "host"))]
+#[cfg(test)]
 mod t8_tests;
 
-#[cfg(all(test, feature = "host"))]
+#[cfg(test)]
 mod t9_tests;
+
+// Unpinned attach on a relay-only config (remotes through the on-device
+// core).
+#[cfg(test)]
+mod t10_tests;
 
 pub type WsStream = tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -732,4 +737,16 @@ pub fn fresh_attach(
 ) -> Result<(Option<Arc<RemoteProfile>>, Vec<ProfileInfo>), RemoteError> {
     let cfg = load_config()?;
     Ok((cfg.catalog.remote(name).cloned(), cfg.catalog.infos()))
+}
+
+/// The unpinned-attach counterpart of [`fresh_attach`]: the remote the
+/// config homes *right now* (a relay-only config has no local session to
+/// mint), plus the fresh catalogue. `None` when the fresh home is local.
+pub fn fresh_home_attach() -> Result<(Option<Arc<RemoteProfile>>, Vec<ProfileInfo>), RemoteError> {
+    let cfg = load_config()?;
+    let remote = match cfg.catalog.home() {
+        crate::config::resolve::Home::Remote(r) => Some(r),
+        crate::config::resolve::Home::Local(_) => None,
+    };
+    Ok((remote, cfg.catalog.infos()))
 }

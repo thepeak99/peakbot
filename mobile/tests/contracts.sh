@@ -9,8 +9,11 @@
 #   - mobile/scripts/smoke-android.sh: every smoke assertion
 #     (aapt2 badging package/versionName/minSdk 24/targetSdk 37/arm64-v8a
 #     only, apksigner verify --print-certs, zipalign -c -P 16 -v 4, manifest
-#     networkSecurityConfig + allowBackup=false, NSC src="user" + the
-#     127.0.0.1 domain-config, size < 40 MB)
+#     networkSecurityConfig + allowBackup=false, NSC 127.0.0.1
+#     domain-config WITHOUT a src="user" anchor, size < 40 MB)
+#   - the one-origin mobile shell: the static error page (no IPC), the
+#     deleted native profile machinery and its commands, the
+#     capabilities/loopback.json ACL, and the NSC without the user-CA anchor
 # The ci.yml and lock contracts are GREEN already —
 # they are guards that must stay green.
 #
@@ -50,9 +53,11 @@ grep_ok() {
     if grep -qF -- "$2" "$3" 2>/dev/null; then ok "$1"; else bad "$1 (missing: $2 in $3)"; fi
 }
 
-# grep_bad <name> <fixed-string> <file> — passes when the string is ABSENT.
+# grep_bad <name> <fixed-string> <file...> — passes when the string is
+# ABSENT from every file.
 grep_bad() {
-    if grep -qF -- "$2" "$3" 2>/dev/null; then bad "$1 (forbidden: $2 in $3)"; else ok "$1"; fi
+    name=$1; str=$2; shift 2
+    if grep -qF -- "$str" "$@" 2>/dev/null; then bad "$name (forbidden: $str in $*)"; else ok "$name"; fi
 }
 
 # grep_ok_live <name> <fixed-string> <file> — passes only when the string
@@ -100,9 +105,11 @@ else
     # token/config.
     grep_ok "smoke: manifest networkSecurityConfig" "networkSecurityConfig" "$SA"
     grep_ok "smoke: manifest allowBackup=false" 'allowBackup="false"' "$SA"
-    # NSC: user-installed CA anchors + cleartext for 127.0.0.1 only.
-    grep_ok "smoke: NSC src=\"user\"" 'src="user"' "$SA"
+    # NSC: cleartext for 127.0.0.1 only — and the smoke must assert the
+    # user-CA anchor is ABSENT (no user-installed PeakBot CAs any more).
     grep_ok "smoke: NSC 127.0.0.1 domain-config" "127.0.0.1" "$SA"
+    grep_ok_live "smoke: asserts the src=\"user\" anchor is ABSENT" 'the NSC trusts user-installed CAs (src="user")' "$SA"
+    grep_bad "smoke: no positive src=\"user\" assertion" "the NSC has no src=\"user\" trust anchor" "$SA"
     # Size cap (measured on a development build: 22.1 MB; the core link is
     # ~2× the remote-only build).
     grep_ok "smoke: size cap 40" "40" "$SA"
@@ -116,6 +123,70 @@ else
     done
     grep_ok_live "smoke: symbol check runs llvm-nm -D (uncommented)" "llvm-nm -D" "$SA"
 fi
+
+# ── the one-origin mobile shell ──────────────────────────────────────────
+# The webview loads only the on-device core (http://127.0.0.1:<port>).
+# The bundled page is the static "the core didn't start" error page; the
+# native profile machinery, its commands and the consent gate are gone;
+# the loopback capability is the only ACL that reaches a remote origin;
+# the NSC trusts system CAs only.
+
+UII="$root/mobile/ui/index.html"
+NSC="$root/mobile/src-tauri/gen/android/app/src/main/res/xml/network_security_config.xml"
+SRC="$root/mobile/src-tauri/src"
+
+# The bundled page: a tiny static error page that shows
+# "Couldn't start PeakBot on this phone: <reason>. Close the app and open
+# it again." with <reason> read from location.hash — and no Tauri IPC.
+grep_ok "ui: error page shows the locked message (reason slot)" "Couldn't start PeakBot on this phone: " "$UII"
+grep_ok "ui: error page shows the locked message (restart slot)" ". Close the app and open it again." "$UII"
+grep_ok "ui: error page reads the reason from location.hash" "location.hash" "$UII"
+grep_bad "ui: error page uses no Tauri IPC" "__TAURI" "$UII"
+# The native Profiles page and its script are deleted.
+if [ -e "$root/mobile/ui/profiles.js" ]; then
+    bad "ui: profiles.js is gone"
+else
+    ok "ui: profiles.js is gone"
+fi
+# No consent gate in the Rust glue.
+grep_bad "rust: no require_local_consent gate" "require_local_consent" $SRC/*.rs
+grep_bad "rust: no local_consent_set command" "local_consent_set" $SRC/*.rs
+
+# The native profile machinery is deleted.
+for gone in \
+    "mobile/src-tauri/src/link.rs" \
+    "mobile/src-tauri/src/profiles.rs" \
+    "mobile/src-tauri/capabilities/profiles-page.json"
+do
+    if [ -e "$root/$gone" ]; then
+        bad "deleted: $gone"
+    else
+        ok "deleted: $gone"
+    fi
+done
+if [ -f "$root/mobile/src-tauri/capabilities/loopback.json" ]; then
+    ok "capabilities/loopback.json exists"
+else
+    bad "capabilities/loopback.json exists"
+fi
+# The six profile commands (plus the Android cookie workaround) are gone.
+# Both name spellings are forbidden: `profile_add`-style and
+# `profiles_add`-style.
+for cmd in profiles_get profile_add profiles_add profile_rename profiles_rename \
+    profile_remove profile_open local_consent_set clear_cookies; do
+    grep_bad "rust: no $cmd in the glue" "$cmd" $SRC/*.rs
+done
+
+# The NSC: system CAs only; the 127.0.0.1 cleartext domain-config stays.
+grep_bad "nsc: no src=\"user\" trust anchor" 'src="user"' "$NSC"
+grep_ok "nsc: 127.0.0.1 cleartext domain-config kept" "127.0.0.1" "$NSC"
+
+# The build-facing scripts must not grep for files the shell no longer has
+# (a dead check would pass forever and hide a regression).
+for gone in "profiles.js" "profiles-page.json" "link.rs" "profiles.rs"; do
+    grep_bad "smoke: no reference to deleted $gone" "$gone" "$SA"
+    grep_bad "ios-contracts: no reference to deleted $gone" "$gone" "$script_dir/ios-contracts.sh"
+done
 
 # ── ci.yml (guard) ───────────────────────────────────────────────────────
 

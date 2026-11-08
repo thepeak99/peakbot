@@ -4,9 +4,10 @@
 // The one new seam: `shell()` from ../desktop — "desktop" | "mobile" |
 // "browser", read from `window.peakbotShell` (the shell's init-script
 // marker). When `shell() === "mobile"`:
-//   - Settings gains a "Switch profile" row whose href is EXACTLY
-//     `peakbot-mobile:profiles` (the sentinel the mobile nav guard
-//     classifies — never a `peakbot-desktop:*` path);
+//   - Settings has NO "Switch profile" row — the shell's profile list is
+//     gone, the SPA's Profiles pane is the one list (visible in the Local
+//     edition), and `peakbot-mobile:profiles` is referenced nowhere in
+//     web/src (the source-tree grep lives in noShellProfilesSentinel.test.ts);
 //   - the desktop tab strip, the update banner, every `peakbot-desktop:*`
 //     navigation, and the "Connect a phone or another PeakBot" panel are
 //     ABSENT;
@@ -110,26 +111,23 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-// ─── "Switch profile" row ────────────────────────────────────────────────
+// ─── the shell "Switch profile" row is gone ──────────────────────────────
+// The mobile shell no longer owns the profile list: the SPA's Profiles pane
+// is visible in the Local edition, so Settings offers no
+// `peakbot-mobile:profiles` row in ANY shell — and nothing in web/src
+// references that sentinel any more (the nav guard's remote arms and the
+// sentinel itself go with the native page).
 
-describe('Settings "Switch profile" row', () => {
-  it("mobile: renders the row with the exact peakbot-mobile:profiles href", async () => {
-    setShell("mobile");
-    mount(<Settings convo={null} onClose={() => {}} />);
-    await flush();
-
-    const row = host.querySelector('a[href="peakbot-mobile:profiles"]');
-    expect(row, "the mobile shell must offer 'Switch profile'").not.toBeNull();
-    expect(row?.textContent).toContain("Switch profile");
-  });
-
+describe("the shell 'Switch profile' row is gone", () => {
   it.each([
+    ["mobile", "mobile"],
     ["desktop", "desktop"],
     ["browser", "browser"],
-  ] as const)("%s: no 'Switch profile' row (unchanged)", (_label, marker) => {
+  ] as const)("%s: no 'Switch profile' row", (_label, marker) => {
     setShell(marker);
     mount(<Settings convo={null} onClose={() => {}} />);
     expect(host.querySelector('a[href="peakbot-mobile:profiles"]')).toBeNull();
+    expect(host.textContent).not.toContain("Switch profile");
   });
 });
 

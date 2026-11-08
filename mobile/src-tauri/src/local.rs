@@ -15,7 +15,7 @@ use url::{Origin, Url};
 
 /// the preferred port; busy ⇒ an ephemeral one.
 const PORT: u16 = 47823;
-/// `profile_open`'s budget for the core to answer HTTP.
+/// The budget for the core to answer HTTP on start/restart.
 const READY_WITHIN: Duration = Duration::from_secs(5);
 
 /// The Local core, if running. `lifecycle` serialises start/restart/heal
@@ -147,8 +147,10 @@ impl Running {
     }
 }
 
+/// The reason the page shows verbatim after `Couldn't start PeakBot on this
+/// phone: ` — the page owns that prefix, the core supplies only the reason.
 fn start_error(e: impl std::fmt::Display) -> String {
-    format!("Couldn't start PeakBot on this phone: {e}")
+    e.to_string()
 }
 
 /// Loopback only: other apps on the phone can reach it, hence the

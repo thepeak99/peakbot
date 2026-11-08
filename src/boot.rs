@@ -9,6 +9,7 @@
 //! means (the CLI exits; the phone shows setup).
 
 use crate::config::Config;
+use crate::config::resolve::Home;
 use crate::ui::web::settings::{SettingsBoot, TokenSource};
 use crate::ui::{WebUi, build_models_snapshot};
 use crate::{ConversationStorage, FileStorage, McpServerHandle, SessionDeps, ShellKind};
@@ -92,18 +93,26 @@ pub enum WebSession {
 
 /// The ONE web boot: the models snapshot and starting alias for the
 /// picker, the settings surface's boot facts, and the `WebUi` itself.
-/// Fails only when the deps' `--profile` pin names no profile — the CLI
-/// validates the pin first, and the embedded core never pins.
+/// Fails only when the deps' `--profile` pin names no local profile — the
+/// CLI validates the pin first, and the embedded core never pins. A
+/// relay-only config boots Ready with no models and an empty alias: the
+/// remote catalog and list come from the relay on attach.
 pub fn web_boot(web: WebBoot, session: WebSession) -> anyhow::Result<WebUi> {
     let (deps, models, active_alias, migrate_error) = match session {
         WebSession::Ready(deps) => {
-            let start = deps
-                .config
-                .catalog
-                .start_bound(deps.profile_pin.as_deref())
-                .map_err(anyhow::Error::msg)?;
-            let active_alias = start.agent().main.model.alias.clone();
-            let models = build_models_snapshot(&deps.config.registry);
+            let (models, active_alias) = match deps.config.catalog.home() {
+                Home::Local(_) => {
+                    let start = deps
+                        .config
+                        .catalog
+                        .start_bound(deps.profile_pin.as_deref())
+                        .map_err(anyhow::Error::msg)?;
+                    let active_alias = start.agent().main.model.alias.clone();
+                    let models = build_models_snapshot(&deps.config.registry);
+                    (models, active_alias)
+                }
+                Home::Remote(_) => (Vec::new(), String::new()),
+            };
             (Some(deps), models, active_alias, None)
         }
         WebSession::NeedsSetup { migrate_error } => {
@@ -126,4 +135,47 @@ pub fn web_boot(web: WebBoot, session: WebSession) -> anyhow::Result<WebUi> {
         web.tls_names,
         settings,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::resolve::{Config, ParseCtx, Source};
+    use crate::session::test_support::test_deps;
+    use crate::storage::InMemoryStorage;
+    use crate::ui::web::settings::TokenSource;
+    use std::sync::Arc;
+
+    /// Mobile relay: a relay-only config (no providers, no local profile)
+    /// boots the web UI as Ready — no models, empty active alias — instead
+    /// of panicking on the CE1-era `default_bound` expect.
+    #[test]
+    fn web_boot_relay_only_config_is_ready_not_a_panic() {
+        let yaml = "profiles:\n  dev on nas:\n    remote:\n      url: https://nas.lan:7823\n      token: tok123\n      ca: sha256:3f9a0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab\n      profile: dev\n";
+        let config = Config::parse(
+            Source {
+                path: std::path::Path::new("/global/config.yaml"),
+                text: yaml,
+            },
+            None,
+            &ParseCtx { known_skills: &[] },
+        )
+        .expect("a relay-only config must parse");
+        let mut deps = test_deps(Some(Arc::new(InMemoryStorage::default())));
+        deps.config = Arc::new(config);
+        let dir = tempfile::tempdir().expect("boot dir");
+        let web = WebBoot {
+            addr: "127.0.0.1:0".parse().expect("loopback addr"),
+            token: None,
+            token_source: TokenSource::None,
+            tls: false,
+            tls_names: Vec::new(),
+            config_dir: dir.path().to_path_buf(),
+            boot_cwd: dir.path().to_path_buf(),
+        };
+        // A relay-only config must boot Ready (no models, empty alias).
+        let ui = web_boot(web, WebSession::Ready(Arc::new(deps)))
+            .expect("a relay-only config boots the web UI as Ready");
+        let _ = ui; // the WebUi is unrunnable in a unit test; Ready-ness is the assertion
+    }
 }

@@ -1,0 +1,16 @@
+{
+  "$schema": "../gen/schemas/mobile-schema.json",
+  "identifier": "loopback",
+  "description": "The on-device core's SPA (loopback origin) may call ONLY the barcode scanner — no other IPC.",
+  "windows": ["main"],
+  "platforms": ["android", "iOS"],
+  "remote": {
+    "urls": ["http://127.0.0.1:*"]
+  },
+  "permissions": [
+    "barcode-scanner:allow-scan",
+    "barcode-scanner:allow-check-permissions",
+    "barcode-scanner:allow-request-permissions",
+    "barcode-scanner:allow-cancel"
+  ]
+}
