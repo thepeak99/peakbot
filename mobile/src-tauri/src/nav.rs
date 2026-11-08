@@ -74,255 +74,174 @@ fn is_app_origin(u: &Url) -> bool {
     }
     matches!(u.scheme(), "http" | "https") && u.host_str() == Some("tauri.localhost")
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn u(s: &str) -> url::Url {
-        url::Url::parse(s).unwrap_or_else(|e| panic!("test URL {s:?} must parse: {e}"))
+    fn u(s: &str) -> Url {
+        Url::parse(s).unwrap_or_else(|e| panic!("test URL {s:?} must parse: {e}"))
     }
 
-    fn origin(s: &str) -> url::Origin {
-        u(s).origin()
-    }
-
-    fn known<'a>(local: Option<&'a url::Origin>, remotes: &'a [url::Origin]) -> Known<'a> {
-        Known { local, remotes }
-    }
-
-    fn none() -> Known<'static> {
-        known(None, &[])
-    }
-
-    // ── the locked sentinel consts (cross-side pin, lock 4) ──────────────
-
-    /// `web/src/settings/mobileGating.test.tsx` asserts the exact
-    /// `a[href="peakbot-mobile:profiles"]` — read at compile time so this pin
-    /// is deterministic.
-    const WEB_MOBILE_GATING: &str = include_str!("../../../web/src/settings/mobileGating.test.tsx");
-
-    #[test]
-    fn sentinel_consts_are_locked() {
-        assert_eq!(PROFILES_SENTINEL, "peakbot-mobile:profiles");
-        assert_eq!(RESTART_SENTINEL, "peakbot-mobile:restart");
-    }
-
-    #[test]
-    fn profiles_sentinel_matches_the_web_test_href() {
-        assert!(
-            WEB_MOBILE_GATING.contains(format!(r#"a[href="{PROFILES_SENTINEL}"]"#).as_str()),
-            "web/src/settings/mobileGating.test.tsx must pin href={PROFILES_SENTINEL:?}"
-        );
-    }
-
-    // ── rule 1+2: the sentinels ──────────────────────────────────────────
-
-    #[test]
-    fn profiles_sentinel_is_profiles() {
-        assert_eq!(classify(&u(PROFILES_SENTINEL), &none()), Nav::Profiles);
-    }
+    // ── the sentinels ────────────────────────────────────────────────────
 
     #[test]
     fn restart_sentinel_is_restart_local() {
-        // v3: `classify` is unconditional — the Local-only gate is in the
-        // spawned handler, not here.
-        assert_eq!(classify(&u(RESTART_SENTINEL), &none()), Nav::RestartLocal);
+        assert_eq!(classify(&u(RESTART_SENTINEL)), Nav::RestartLocal);
     }
 
-    // ── rule 3: app origins ──────────────────────────────────────────────
+    #[test]
+    fn profiles_sentinel_is_blocked() {
+        // The native Profiles page is gone: its sentinel is no longer
+        // recognised and falls through to Block like any other.
+        assert_eq!(classify(&u("peakbot-mobile:profiles")), Nav::Block);
+    }
+
+    #[test]
+    fn unknown_mobile_sentinel_is_blocked() {
+        // `peakbot-mobile:*` is NOT an open namespace: only the restart
+        // sentinel is recognised.
+        assert_eq!(classify(&u("peakbot-mobile:report")), Nav::Block);
+    }
+
+    #[test]
+    fn desktop_sentinel_is_blocked() {
+        assert_eq!(classify(&u("peakbot-desktop:restart")), Nav::Block);
+    }
+
+    // ── the app's own origin (the bundled error page) ────────────────────
 
     #[test]
     fn app_origin_tauri_localhost_is_allow() {
-        assert_eq!(classify(&u("tauri://localhost"), &none()), Nav::Allow);
+        assert_eq!(classify(&u("tauri://localhost")), Nav::Allow);
     }
 
     #[test]
     fn app_origin_http_tauri_localhost_is_allow() {
-        assert_eq!(classify(&u("http://tauri.localhost/"), &none()), Nav::Allow);
+        assert_eq!(classify(&u("http://tauri.localhost/")), Nav::Allow);
     }
 
     #[test]
     fn app_origin_https_tauri_localhost_is_allow() {
+        assert_eq!(classify(&u("https://tauri.localhost/settings")), Nav::Allow);
+    }
+
+    #[test]
+    fn app_origin_with_error_page_hash_is_allow() {
+        // The window's failure state is the bundled page with its
+        // URL-encoded reason in the hash.
         assert_eq!(
-            classify(&u("https://tauri.localhost/settings"), &none()),
+            classify(&u("http://tauri.localhost/index.html#it%20failed")),
             Nav::Allow
         );
     }
 
-    // ── rule 4: known origins ────────────────────────────────────────────
+    // ── the one origin: the loopback core, on any port ───────────────────
 
     #[test]
-    fn known_remote_origin_is_allow() {
-        let remotes = [origin("https://nas.lan:7823")];
-        assert_eq!(
-            classify(&u("https://nas.lan:7823/"), &known(None, &remotes)),
-            Nav::Allow
-        );
+    fn loopback_core_origin_is_allow() {
+        // The ONLY way http: is ever allowed: the on-device core.
+        assert_eq!(classify(&u("http://127.0.0.1:47823/")), Nav::Allow);
     }
 
     #[test]
-    fn known_remote_subpath_is_allow() {
-        let remotes = [origin("https://nas.lan:7823")];
-        assert_eq!(
-            classify(
-                &u("https://nas.lan:7823/conversations"),
-                &known(None, &remotes)
-            ),
-            Nav::Allow
-        );
-    }
-
-    // ── rule 4a: the CA download goes to the system browser ─────────────
-
-    #[test]
-    fn ca_path_on_known_remote_is_external() {
-        let remotes = [origin("https://nas.lan:7823")];
-        assert_eq!(
-            classify(
-                &u("https://nas.lan:7823/peakbot-ca.crt"),
-                &known(None, &remotes)
-            ),
-            Nav::External
-        );
+    fn loopback_any_port_is_allow() {
+        // The core may have fallen back to an ephemeral port; the guard
+        // must not remember a particular one.
+        for port in [1, 47823, 53211, 9999, 65535] {
+            let url = format!("http://127.0.0.1:{port}/");
+            assert_eq!(classify(&u(&url)), Nav::Allow, "{url}");
+        }
     }
 
     #[test]
-    fn ca_path_on_known_local_is_external() {
-        let local = origin("http://127.0.0.1:47823");
+    fn loopback_subpath_and_query_is_allow() {
         assert_eq!(
-            classify(
-                &u("http://127.0.0.1:47823/peakbot-ca.crt"),
-                &known(Some(&local), &[])
-            ),
-            Nav::External
-        );
-    }
-
-    #[test]
-    fn ca_path_on_unknown_origin_is_external() {
-        // Falls through to rule (5) — external either way.
-        assert_eq!(
-            classify(&u("https://x.example/peakbot-ca.crt"), &none()),
-            Nav::External
-        );
-    }
-
-    #[test]
-    fn ca_path_suffix_on_other_paths_stays_allow() {
-        // The carve-out is the exact path, not a suffix.
-        let remotes = [origin("https://nas.lan:7823")];
-        assert_eq!(
-            classify(
-                &u("https://nas.lan:7823/settings/peakbot-ca.crt"),
-                &known(None, &remotes)
-            ),
+            classify(&u("http://127.0.0.1:47823/settings?token=ab12")),
             Nav::Allow
         );
     }
 
     #[test]
-    fn other_port_same_host_is_external() {
-        let remotes = [origin("https://nas.lan:7823")];
+    fn localhost_name_is_not_the_core_origin() {
+        // The core binds 127.0.0.1; `localhost` is a different host name
+        // (and the NSC blocks its cleartext), so it is a foreign server.
+        assert_eq!(classify(&u("http://localhost:47823/")), Nav::External);
+    }
+
+    #[test]
+    fn https_on_loopback_is_external() {
+        // The core is plain http; an https server on loopback is a
+        // foreign origin like any other.
+        assert_eq!(classify(&u("https://127.0.0.1:8443/")), Nav::External);
+    }
+
+    // ── remotes: every http(s) URL that is not the loopback core ─────────
+
+    #[test]
+    fn https_remote_is_external() {
+        // Remote servers are reached through the core's relay, never
+        // loaded in the webview.
+        assert_eq!(classify(&u("https://nas.lan:7823/")), Nav::External);
+    }
+
+    #[test]
+    fn https_remote_subpath_is_external() {
         assert_eq!(
-            classify(&u("https://nas.lan:9999/"), &known(None, &remotes)),
+            classify(&u("https://nas.lan:7823/conversations")),
             Nav::External
         );
     }
 
     #[test]
-    fn http_same_host_is_external() {
-        // scheme differs → origin differs → never allowed
-        let remotes = [origin("https://nas.lan:7823")];
-        assert_eq!(
-            classify(&u("http://nas.lan:7823/"), &known(None, &remotes)),
-            Nav::External
-        );
+    fn http_remote_is_external() {
+        assert_eq!(classify(&u("http://nas.lan:7823/")), Nav::External);
     }
 
     #[test]
-    fn unknown_https_origin_is_external() {
-        assert_eq!(
-            classify(&u("https://evil.example/"), &none()),
-            Nav::External
-        );
+    fn unknown_https_is_external() {
+        assert_eq!(classify(&u("https://evil.example/")), Nav::External);
     }
 
-    #[test]
-    fn local_loopback_is_allow_when_known_local() {
-        // The ONLY way http: is ever allowed: the Local loopback origin.
-        let local = origin("http://127.0.0.1:47823");
-        assert_eq!(
-            classify(&u("http://127.0.0.1:47823/"), &known(Some(&local), &[])),
-            Nav::Allow
-        );
-    }
-
-    #[test]
-    fn local_loopback_is_external_when_not_known() {
-        assert_eq!(
-            classify(&u("http://127.0.0.1:47823/"), &none()),
-            Nav::External
-        );
-    }
-
-    #[test]
-    fn local_loopback_other_port_is_external() {
-        let local = origin("http://127.0.0.1:47823");
-        assert_eq!(
-            classify(&u("http://127.0.0.1:9999/"), &known(Some(&local), &[])),
-            Nav::External
-        );
-    }
-
-    // ── rule 5: plain external schemes ───────────────────────────────────
+    // ── plain external schemes ───────────────────────────────────────────
 
     #[test]
     fn mailto_is_external() {
-        assert_eq!(
-            classify(&u("mailto:alice@example.com"), &none()),
-            Nav::External
-        );
+        assert_eq!(classify(&u("mailto:alice@example.com")), Nav::External);
     }
 
     #[test]
     fn tel_is_external() {
-        assert_eq!(classify(&u("tel:+15551234567"), &none()), Nav::External);
+        assert_eq!(classify(&u("tel:+15551234567")), Nav::External);
     }
 
-    // ── rule 6: everything else is blocked ───────────────────────────────
+    // ── everything else is blocked ───────────────────────────────────────
+
+    #[test]
+    fn about_blank_is_block() {
+        assert_eq!(classify(&u("about:blank")), Nav::Block);
+    }
+
+    #[test]
+    fn data_is_block() {
+        assert_eq!(classify(&u("data:text/html,<script>")), Nav::Block);
+    }
+
+    #[test]
+    fn javascript_is_block() {
+        assert_eq!(classify(&u("javascript:alert(1)")), Nav::Block);
+    }
 
     #[test]
     fn intent_is_block() {
         assert_eq!(
-            classify(&u("intent:https://x.example#Intent;end"), &none()),
+            classify(&u("intent:https://x.example#Intent;end")),
             Nav::Block
         );
     }
 
     #[test]
     fn file_is_block() {
-        assert_eq!(classify(&u("file:///etc/passwd"), &none()), Nav::Block);
-    }
-
-    #[test]
-    fn data_is_block() {
-        assert_eq!(classify(&u("data:text/html,<script>"), &none()), Nav::Block);
-    }
-
-    #[test]
-    fn javascript_is_block() {
-        assert_eq!(classify(&u("javascript:alert(1)"), &none()), Nav::Block);
-    }
-
-    #[test]
-    fn other_mobile_sentinel_is_block() {
-        // `peakbot-mobile:*` is NOT an open namespace: only the two locked
-        // sentinels are recognised.
-        assert_eq!(classify(&u("peakbot-mobile:report"), &none()), Nav::Block);
-    }
-
-    #[test]
-    fn desktop_sentinel_is_block() {
-        assert_eq!(classify(&u("peakbot-desktop:restart"), &none()), Nav::Block);
+        assert_eq!(classify(&u("file:///etc/passwd")), Nav::Block);
     }
 }

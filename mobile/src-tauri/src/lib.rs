@@ -479,97 +479,6 @@ mod glue_tests {
 
     const LINK: &str = "https://nas.lan:7823/?token=s3cr3t-tok";
 
-    fn store_at(path: PathBuf) -> Store {
-        Store {
-            path,
-            profiles: Mutex::new(Profiles::default()),
-        }
-    }
-
-    #[test]
-    fn profiles_view_never_carries_the_token() {
-        let mut p = Profiles::default();
-        let id = p.add(ServerLink::parse(LINK).unwrap(), None).unwrap();
-        p.set_last(Active::Remote(id));
-        let json = serde_json::to_string(&ProfilesView::of(&p, false)).unwrap();
-        assert_eq!(
-            json,
-            r#"{"local":{"consented":false,"running":false},"remotes":[{"id":1,"name":"nas.lan:7823","host_label":"nas.lan:7823","origin":"https://nas.lan:7823"}],"last":{"remote":1}}"#
-        );
-        assert!(!json.contains("s3cr3t"));
-    }
-
-    #[test]
-    fn target_accepts_exactly_the_two_shapes() {
-        let t = |s: &str| serde_json::from_str::<Target>(s).ok();
-        assert!(matches!(t(r#""local""#), Some(Target::Local)));
-        assert!(matches!(t(r#"{"remote":3}"#), Some(Target::Remote(3))));
-        assert!(t(r#""remote""#).is_none());
-        assert!(t(r#""Local""#).is_none());
-    }
-
-    #[test]
-    fn mutate_saves_then_replaces_memory() {
-        let dir = std::env::temp_dir().join(format!("peakbot-mobile-glue-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let store = store_at(dir.join("profiles.json"));
-        store
-            .mutate(|p| p.add(ServerLink::parse(LINK)?, None))
-            .unwrap();
-        let on_disk = Profiles::load(&store.path);
-        store.read(|live| assert_eq!(*live, on_disk));
-        assert_eq!(on_disk.remotes().len(), 1);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn failed_save_leaves_memory_unchanged() {
-        let store = store_at(PathBuf::from("/nonexistent-peakbot-dir/profiles.json"));
-        let err = store
-            .mutate(|p| p.add(ServerLink::parse(LINK)?, None))
-            .unwrap_err();
-        assert!(err.starts_with("Couldn't save your profiles: "), "{err}");
-        store.read(|live| assert_eq!(*live, Profiles::default()));
-    }
-
-    #[test]
-    fn rejected_link_surfaces_the_locked_string() {
-        let store = store_at(PathBuf::from("/nonexistent-peakbot-dir/profiles.json"));
-        let err = store
-            .mutate(|p| p.add(ServerLink::parse("http://nas.lan/?token=x")?, None))
-            .unwrap_err();
-        assert_eq!(err, link::LinkError::NotHttps.to_string());
-    }
-
-    #[test]
-    fn local_open_is_refused_until_consent_is_recorded() {
-        assert_eq!(
-            require_local_consent(false),
-            Err("Accept the notice first.".to_string())
-        );
-        assert_eq!(require_local_consent(true), Ok(()));
-    }
-
-    #[test]
-    fn consent_set_then_gate_opens_and_persists() {
-        let dir =
-            std::env::temp_dir().join(format!("peakbot-mobile-consent-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let store = store_at(dir.join("profiles.json"));
-        // Fresh store: the gate reads the same flag `profile_open` reads.
-        assert!(require_local_consent(store.read(|p| p.local_consent())).is_err());
-        store
-            .mutate(|p| {
-                p.set_local_consent(true);
-                Ok(())
-            })
-            .unwrap();
-        assert!(require_local_consent(store.read(|p| p.local_consent())).is_ok());
-        // …and survives a restart of the app.
-        assert!(Profiles::load(&store.path).local_consent());
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
     #[test]
     fn logged_urls_drop_the_token() {
         let url = Url::parse(LINK).unwrap();
@@ -626,5 +535,217 @@ window.open=function(u){if(u){location.href=new URL(String(u),location.href).hre
         assert!(WEB_DESKTOP_TEST.contains(r#"peakbotShell = "desktop""#));
         assert!(INIT_SCRIPT.contains("{value:'mobile'}"));
         assert!(!INIT_SCRIPT.contains("{value:'desktop'}"));
+    }
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::*;
+    use url::form_urlencoded;
+
+    /// The URL `local.ensure()` hands back: loopback, token in the query.
+    fn core_url(port: u16, token: &str) -> Url {
+        let mut u = Url::parse(&format!("http://127.0.0.1:{port}/")).expect("static url");
+        u.query_pairs_mut().append_pair("token", token);
+        u
+    }
+
+    /// The reason a `WebviewUrl::App` page decodes back to — the same
+    /// percent-decoding the page does with `decodeURIComponent(location.hash)`.
+    fn decoded_reason(page: &std::path::Path) -> Option<String> {
+        let s = page.to_string_lossy();
+        let hash = s.strip_prefix("index.html#")?;
+        if hash.is_empty() {
+            return Some(String::new());
+        }
+        form_urlencoded::parse(hash.as_bytes())
+            .next()
+            .map(|(_, value)| value.into_owned())
+    }
+
+    #[test]
+    fn launch_url_ok_is_the_core_url_with_its_token() {
+        // Success: the window loads the core's URL, token and all — the
+        // webview's one origin.
+        let u = core_url(47823, "s3cr3t-token");
+        assert_eq!(launch_url(Ok(u.clone())), WebviewUrl::External(u));
+    }
+
+    #[test]
+    fn launch_url_ok_works_on_an_ephemeral_port() {
+        // A busy preferred port falls back to an ephemeral one; the launch
+        // URL just carries whatever port the core bound.
+        let u = core_url(53211, "ab12");
+        assert_eq!(launch_url(Ok(u.clone())), WebviewUrl::External(u));
+    }
+
+    #[test]
+    fn launch_url_err_is_the_bundled_error_page() {
+        assert_eq!(
+            launch_url(Err("boom".to_string())),
+            WebviewUrl::App("index.html#boom".into())
+        );
+    }
+
+    #[test]
+    fn launch_url_err_urlencodes_the_reason() {
+        // Spaces and apostrophes must not reach the URL raw.
+        assert_eq!(
+            launch_url(Err("it didn't answer within 5 seconds".to_string())),
+            WebviewUrl::App("index.html#it%20didn%27t%20answer%20within%205%20seconds".into())
+        );
+    }
+
+    #[test]
+    fn launch_url_err_percent_encodes_utf8() {
+        // The hash is pure-ASCII percent-encoding (the page decodes it as
+        // UTF-8), never raw non-ASCII bytes.
+        let page = launch_url(Err("café".to_string()));
+        match page {
+            WebviewUrl::App(p) => {
+                let hash = p
+                    .to_string_lossy()
+                    .strip_prefix("index.html#")
+                    .expect("the bundled page with a hash");
+                assert_eq!(hash, "caf%C3%A9");
+                assert!(hash.bytes().all(|b| b.is_ascii()), "{hash}");
+            }
+            other => panic!("expected the bundled error page, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn launch_url_err_reason_round_trips_through_the_hash() {
+        // The page shows `Couldn't start PeakBot on this phone: <reason>.
+        // Close the app and open it again.` — `<reason>` is exactly what
+        // the hash decodes back to, byte for byte, for any reason the core
+        // can produce.
+        for reason in [
+            "",
+            "boom",
+            "it didn't answer within 5 seconds",
+            "bind: Address in use (os error 98): http://127.0.0.1:47823/?token=ab12",
+            "café + naïve",
+        ] {
+            let page = launch_url(Err(reason.to_string()));
+            match page {
+                WebviewUrl::App(p) => {
+                    let s = p.to_string_lossy().into_owned();
+                    let hash = s
+                        .strip_prefix("index.html#")
+                        .expect("the bundled page with a hash");
+                    assert!(
+                        hash.bytes().all(|b| b.is_ascii() && b != b' ' && b != b'#'),
+                        "hash must be percent-encoded: {s:?}"
+                    );
+                    let decoded =
+                        decoded_reason(&p).unwrap_or_else(|| panic!("no decodable hash in {s:?}"));
+                    assert_eq!(decoded, reason, "round trip for {reason:?}");
+                }
+                other => panic!("expected the bundled error page, got {other:?}"),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    /// The ACL files the shell ships. Exactly one of them may grant IPC to
+    /// the loopback core origin, and only the barcode-scanner permissions.
+    fn caps_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("capabilities")
+    }
+
+    fn cap(name: &str) -> serde_json::Value {
+        let path = caps_dir().join(format!("{name}.json"));
+        let body = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("capabilities/{name}.json must exist: {e}"));
+        serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("capabilities/{name}.json must be valid JSON: {e}"))
+    }
+
+    /// A string array, sorted so the contract does not depend on order.
+    fn sorted_str_array(v: &serde_json::Value, what: &str) -> Vec<String> {
+        let arr = v
+            .as_array()
+            .unwrap_or_else(|| panic!("capabilities: {what} must be a string array"));
+        let mut out = arr
+            .iter()
+            .map(|x| {
+                x.as_str()
+                    .unwrap_or_else(|| panic!("capabilities: {what} entries must be strings"))
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn loopback_capability_identifier_and_windows() {
+        let cap = cap("loopback");
+        assert_eq!(cap["identifier"], serde_json::json!("loopback"));
+        assert_eq!(sorted_str_array(&cap["windows"], "windows"), ["main"]);
+    }
+
+    #[test]
+    fn loopback_capability_is_mobile_platforms_only() {
+        // The barcode plugin exists only on the phone targets.
+        assert_eq!(
+            sorted_str_array(&cap("loopback")["platforms"], "platforms"),
+            ["iOS", "android"]
+        );
+    }
+
+    #[test]
+    fn loopback_capability_permissions_are_exactly_the_four_barcode_grants() {
+        // Nothing else — no core:default, no app commands. The bundled
+        // error page gets no IPC at all.
+        assert_eq!(
+            sorted_str_array(&cap("loopback")["permissions"], "permissions"),
+            [
+                "barcode-scanner:allow-cancel",
+                "barcode-scanner:allow-check-permissions",
+                "barcode-scanner:allow-request-permissions",
+                "barcode-scanner:allow-scan",
+            ]
+        );
+    }
+
+    #[test]
+    fn loopback_capability_grants_ipc_to_exactly_the_loopback_origin() {
+        // The one origin, on any port — and no other remote pattern.
+        assert_eq!(
+            sorted_str_array(&cap("loopback")["remote"]["urls"], "remote.urls"),
+            ["http://127.0.0.1:*"]
+        );
+    }
+
+    #[test]
+    fn profiles_page_capability_is_gone() {
+        assert!(!caps_dir().join("profiles-page.json").exists());
+    }
+
+    #[test]
+    fn no_other_capability_grants_remote_urls() {
+        let entries =
+            std::fs::read_dir(caps_dir()).unwrap_or_else(|e| panic!("capabilities/: {e}"));
+        for entry in entries {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == "loopback.json" {
+                continue;
+            }
+            let body =
+                std::fs::read_to_string(entry.path()).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let cap: serde_json::Value =
+                serde_json::from_str(&body).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(
+                cap.get("remote").is_none(),
+                "capabilities/{name} must not grant remote urls"
+            );
+        }
     }
 }
