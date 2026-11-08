@@ -18,6 +18,14 @@ use crate::config::resolve::{
     Bound, Catalog, CatalogEntry, Origin, OverrideRejection, ResolvedAgent,
 };
 
+/// The first local's first agent. Every caller reaches these fns through a
+/// boundary (`Catalog::start_bound`, the reload guard) that refuses a
+/// catalog without a local profile, so the `Option` is already checked.
+fn default_bound(cat: &Catalog) -> Bound {
+    cat.default_bound()
+        .expect("the boundary refused a catalog without a local profile")
+}
+
 /// One selection command line, classified.
 #[derive(Debug, PartialEq)]
 pub enum SelectSubmission {
@@ -86,7 +94,7 @@ pub fn resolve_saved_selection(
     pin: Option<&str>,
 ) -> (Bound, Vec<String>) {
     let mut warnings = Vec::new();
-    let first = cat.default_bound();
+    let first = default_bound(cat);
     let profile = match pin {
         Some(name) => cat
             .profile(name)
@@ -175,7 +183,7 @@ pub fn rebind_for_cd(
         .profile(&bound.profile.name)
         .filter(|profile| matches!(profile.origin, Origin::Repo { .. }) || !has_repo_profiles);
     let Some(kept) = kept else {
-        return (cat.default_bound(), Vec::new());
+        return (default_bound(cat), Vec::new());
     };
     match cat.resolve(&kept.name, &bound.agent().main.name) {
         Some(next) => carry_overrides(next, bound, registry),

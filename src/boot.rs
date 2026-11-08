@@ -9,6 +9,7 @@
 //! means (the CLI exits; the phone shows setup).
 
 use crate::config::Config;
+use crate::config::resolve::Home;
 use crate::ui::web::settings::{SettingsBoot, TokenSource};
 use crate::ui::{WebUi, build_models_snapshot};
 use crate::{ConversationStorage, FileStorage, McpServerHandle, SessionDeps, ShellKind};
@@ -92,18 +93,26 @@ pub enum WebSession {
 
 /// The ONE web boot: the models snapshot and starting alias for the
 /// picker, the settings surface's boot facts, and the `WebUi` itself.
-/// Fails only when the deps' `--profile` pin names no profile — the CLI
-/// validates the pin first, and the embedded core never pins.
+/// Fails only when the deps' `--profile` pin names no local profile — the
+/// CLI validates the pin first, and the embedded core never pins. A
+/// relay-only config boots Ready with no models and an empty alias: the
+/// remote catalog and list come from the relay on attach.
 pub fn web_boot(web: WebBoot, session: WebSession) -> anyhow::Result<WebUi> {
     let (deps, models, active_alias, migrate_error) = match session {
         WebSession::Ready(deps) => {
-            let start = deps
-                .config
-                .catalog
-                .start_bound(deps.profile_pin.as_deref())
-                .map_err(anyhow::Error::msg)?;
-            let active_alias = start.agent().main.model.alias.clone();
-            let models = build_models_snapshot(&deps.config.registry);
+            let (models, active_alias) = match deps.config.catalog.home() {
+                Home::Local(_) => {
+                    let start = deps
+                        .config
+                        .catalog
+                        .start_bound(deps.profile_pin.as_deref())
+                        .map_err(anyhow::Error::msg)?;
+                    let active_alias = start.agent().main.model.alias.clone();
+                    let models = build_models_snapshot(&deps.config.registry);
+                    (models, active_alias)
+                }
+                Home::Remote(_) => (Vec::new(), String::new()),
+            };
             (Some(deps), models, active_alias, None)
         }
         WebSession::NeedsSetup { migrate_error } => {
@@ -164,7 +173,7 @@ mod tests {
             config_dir: dir.path().to_path_buf(),
             boot_cwd: dir.path().to_path_buf(),
         };
-        // Panics today (CE1 expect in `default_bound`); must be Ready.
+        // A relay-only config must boot Ready (no models, empty alias).
         let ui = web_boot(web, WebSession::Ready(Arc::new(deps)))
             .expect("a relay-only config boots the web UI as Ready");
         let _ = ui; // the WebUi is unrunnable in a unit test; Ready-ness is the assertion

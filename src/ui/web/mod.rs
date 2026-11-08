@@ -88,8 +88,8 @@ pub mod registry;
 mod remote;
 pub mod settings;
 pub mod system;
-// Remote-profile E2E: the Local edition has no `remote:` profiles.
-#[cfg(all(test, feature = "host"))]
+// Remote-profile E2E: `remote:` profiles parse in every edition.
+#[cfg(test)]
 mod t4_tests;
 pub mod tls;
 pub mod uploads;

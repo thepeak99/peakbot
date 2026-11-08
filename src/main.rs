@@ -194,6 +194,26 @@ fn exit_with(lines: &[String]) -> ! {
     std::process::exit(1);
 }
 
+/// The locked refusal for a relay-only config in a mode that needs a local
+/// profile to bind.
+const RELAY_ONLY_REFUSAL: &str = "every profile in config.yaml is a remote profile — remote profiles open in the web UI (run peakbot without --tui/--stdio)";
+
+/// The ONE CLI decision for a config whose home is a remote profile:
+/// `Some(message)` ⇒ exit with the message (printed, status 1); `None` ⇒
+/// continue. Refuses exactly when the mode is TUI or stdio, the `--profile`
+/// pin is absent, and the home is remote — web mode always continues, and a
+/// pin already names a local profile (`start_bound` refuses a relay-only
+/// pin earlier).
+fn relay_only_refusal(
+    mode: Mode,
+    pin: Option<&str>,
+    home: &peakbot::config::resolve::Home,
+) -> Option<&'static str> {
+    let terminal = matches!(mode, Mode::Tui | Mode::Stdio);
+    (terminal && pin.is_none() && matches!(home, peakbot::config::resolve::Home::Remote(_)))
+        .then_some(RELAY_ONLY_REFUSAL)
+}
+
 /// Spec §4.1 CLI rendering: `"{file}: {path}: {message}"`, one per error,
 /// `{file}` the absolute path of the file the error is in.
 fn render_config_errors(errors: &ConfigErrors, global: &Path, repo: &Path) -> Vec<String> {
@@ -574,9 +594,17 @@ async fn main() -> Result<()> {
     for warning in &config.warnings {
         eprintln!("warning: {warning}");
     }
+    // A relay-only config has no local profile to bind: TUI and stdio
+    // refuse it at the boundary — web is exactly where it belongs.
+    if let Some(message) = relay_only_refusal(mode, cli.profile.as_deref(), &config.catalog.home())
+    {
+        exit_with(&[message.to_string()]);
+    }
     // Validate the pin here, at the boundary, so a bad `--profile` gets the
     // plain one-line exit before any MCP server starts.
-    if let Err(message) = config.catalog.start_bound(cli.profile.as_deref()) {
+    if let Some(pin) = cli.profile.as_deref()
+        && let Err(message) = config.catalog.start_bound(Some(pin))
+    {
         exit_with(&[message]);
     }
 
@@ -771,19 +799,12 @@ mod tests {
 
     // ── The relay-only CLI boundary (extracted pure fn) ─────────────────
     //
-    // Assumed API (does not exist yet — these tests are the RED contract,
-    // and the bin test target fails to compile until it lands):
-    //
-    // ```ignore
-    // /// The ONE CLI decision for a config whose home is a remote
-    // /// profile: `Some(message)` ⇒ exit with the message (printed,
-    // /// status 1); `None` ⇒ continue. Refuses exactly when the mode is
-    // /// TUI or stdio, the `--profile` pin is absent, and the home is
-    // /// remote — web mode always continues, and a pin already names a
-    // /// local profile (validated earlier by `start_bound`).
-    // fn relay_only_refusal(mode: Mode, pin: Option<&str>, home: &peakbot::config::resolve::Home)
-    //     -> Option<&'static str>;
-    // ```
+    // [`relay_only_refusal`] is the ONE CLI decision for a config whose
+    // home is a remote profile: `Some(message)` ⇒ exit with the message
+    // (printed, status 1); `None` ⇒ continue. Refuses exactly when the
+    // mode is TUI or stdio, the `--profile` pin is absent, and the home is
+    // remote — web mode always continues, and a pin already names a local
+    // profile (validated earlier by `start_bound`).
     //
     // The refused message is locked.
     const RELAY_ONLY_REFUSAL: &str = "every profile in config.yaml is a remote profile — remote profiles open in the web UI (run peakbot without --tui/--stdio)";
@@ -811,7 +832,7 @@ mod tests {
         let home = relay_only_home();
         let refusal = relay_only_refusal(Mode::Tui, None, &home);
         assert_eq!(
-            refusal.as_deref(),
+            refusal,
             Some(RELAY_ONLY_REFUSAL),
             "TUI + unpinned + relay-only ⇒ the exact locked refusal"
         );
@@ -822,7 +843,7 @@ mod tests {
         let home = relay_only_home();
         let refusal = relay_only_refusal(Mode::Stdio, None, &home);
         assert_eq!(
-            refusal.as_deref(),
+            refusal,
             Some(RELAY_ONLY_REFUSAL),
             "stdio + unpinned + relay-only ⇒ the exact locked refusal"
         );

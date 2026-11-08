@@ -181,7 +181,7 @@ pub fn pairing_links(
     }
     let links = hosts
         .iter()
-        .map(|host| entry_link(host, token, &fp))
+        .map(|host| entry_link(host, bind.port(), token, &fp))
         .collect();
     PairingWire::Available { links }
 }
@@ -193,18 +193,24 @@ fn is_loopback_name(name: &str) -> bool {
         || name.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
-/// One entry link: `https://<host>/?token=<token>&ca=<fp>` — IPv6 hosts
-/// bracketed, built with [`url::Url`] (design §8.4). The query goes in via
-/// `set_query` so it stays verbatim: `query_pairs_mut` would form-encode
-/// the fingerprint's `:` to `%3A`, and the token is formatted the same
-/// (raw) way as [`WebUi::entry_url`] in `super`.
-fn entry_link(host: &str, token: &str, fp: &str) -> String {
+/// One entry link: `https://<host>[:<port>]/?token=<token>&ca=<fp>` — the
+/// bind port rides the link (a dropped port would dial :443), omitted on
+/// 443; IPv6 hosts bracketed, built with [`url::Url`] (design §8.4). The
+/// query goes in via `set_query` so it stays verbatim: `query_pairs_mut`
+/// would form-encode the fingerprint's `:` to `%3A`, and the token is
+/// formatted the same (raw) way as [`WebUi::entry_url`] in `super`.
+fn entry_link(host: &str, port: u16, token: &str, fp: &str) -> String {
     let host = if host.contains(':') {
         format!("[{host}]")
     } else {
         host.to_string()
     };
-    let mut url = Url::parse(&format!("https://{host}/")).expect("a well-formed host");
+    let authority = if port == 443 {
+        host
+    } else {
+        format!("{host}:{port}")
+    };
+    let mut url = Url::parse(&format!("https://{authority}/")).expect("a well-formed host");
     url.set_query(Some(&format!("token={token}&ca={fp}")));
     url.to_string()
 }

@@ -26,7 +26,9 @@ pub type Env = BTreeMap<String, String>;
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigFile {
-    /// REQUIRED, non-empty list; E1 is checked in `Config::parse`.
+    /// Needed only by local profiles; E1 is checked in `Config::parse` on
+    /// the file, so a relay-only file may omit it.
+    #[serde(default)]
     pub providers: Vec<ProviderEntry>,
     /// Renamed from `mcp_servers`; boot-only.
     #[serde(default)]

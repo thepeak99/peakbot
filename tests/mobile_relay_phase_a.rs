@@ -1,11 +1,6 @@
-//! `Catalog::home()` RED tests for remotes through the on-device core.
+//! `Catalog::home()` tests for remotes through the on-device core.
 //!
-//! **Status: compile-fail until `home()` lands.** `Catalog::home()` and
-//! the `Home` enum do not exist yet, and `default_bound()` still returns
-//! `Bound` (the tests below assume `Option<Bound>`). Kept in their own
-//! file so the other RED tests (which compile) still run.
-//!
-//! Assumed API:
+//! API under test:
 //! ```ignore
 //! // peakbot::config::resolve
 //! pub enum Home {
@@ -61,7 +56,10 @@ fn home_is_first_local_even_when_a_remote_is_listed_first() {
             );
         }
         Home::Remote(remote) => {
-            panic!("a catalog with a local profile homes local, got remote '{remote}'")
+            panic!(
+                "a catalog with a local profile homes local, got remote '{}'",
+                remote.name
+            )
         }
     }
 }

@@ -225,6 +225,14 @@ pub struct ModelRegistry {
 }
 
 impl ModelRegistry {
+    /// An empty registry — a relay-only config declares no local models.
+    pub fn empty() -> Self {
+        Self {
+            by_alias: HashMap::new(),
+            order: Vec::new(),
+        }
+    }
+
     /// Build and validate a registry from the providers list.
     ///
     /// # Errors

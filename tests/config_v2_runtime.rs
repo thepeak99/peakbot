@@ -409,7 +409,10 @@ const SHADOW_REPO: &str = "profiles:\n  dev:\n    env: { REPO_ONLY: r }\n    age
 #[test]
 fn fresh_session_binds_first_profile_first_agent() {
     let cfg = parse_global(GLOBAL_TEAM);
-    let bound = cfg.catalog.default_bound();
+    let bound = cfg
+        .catalog
+        .default_bound()
+        .expect("a local profile ⇒ a default bound");
     assert_eq!(bound.profile.name, "dev", "the first profile");
     assert_eq!(bound.agent().main.name, "team", "its first agent");
     assert_eq!(bound.agent_index, 0);
@@ -439,7 +442,10 @@ fn fresh_session_in_repo_binds_first_repo_profile() {
         "repo profiles lead, in file order, then the globals"
     );
 
-    let bound = cfg.catalog.default_bound();
+    let bound = cfg
+        .catalog
+        .default_bound()
+        .expect("a local profile ⇒ a default bound");
     assert_eq!(
         bound.profile.name, "repo-dev",
         "the first repo profile is the default here"
