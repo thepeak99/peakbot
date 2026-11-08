@@ -127,3 +127,46 @@ pub fn web_boot(web: WebBoot, session: WebSession) -> anyhow::Result<WebUi> {
         settings,
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::resolve::{Config, ParseCtx, Source};
+    use crate::session::test_support::test_deps;
+    use crate::storage::InMemoryStorage;
+    use crate::ui::web::settings::TokenSource;
+    use std::sync::Arc;
+
+    /// Mobile relay: a relay-only config (no providers, no local profile)
+    /// boots the web UI as Ready — no models, empty active alias — instead
+    /// of panicking on the CE1-era `default_bound` expect.
+    #[test]
+    fn web_boot_relay_only_config_is_ready_not_a_panic() {
+        let yaml = "profiles:\n  dev on nas:\n    remote:\n      url: https://nas.lan:7823\n      token: tok123\n      ca: sha256:3f9a0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab\n      profile: dev\n";
+        let config = Config::parse(
+            Source {
+                path: std::path::Path::new("/global/config.yaml"),
+                text: yaml,
+            },
+            None,
+            &ParseCtx { known_skills: &[] },
+        )
+        .expect("a relay-only config must parse");
+        let mut deps = test_deps(Some(Arc::new(InMemoryStorage::default())));
+        deps.config = Arc::new(config);
+        let dir = tempfile::tempdir().expect("boot dir");
+        let web = WebBoot {
+            addr: "127.0.0.1:0".parse().expect("loopback addr"),
+            token: None,
+            token_source: TokenSource::None,
+            tls: false,
+            tls_names: Vec::new(),
+            config_dir: dir.path().to_path_buf(),
+            boot_cwd: dir.path().to_path_buf(),
+        };
+        // Panics today (CE1 expect in `default_bound`); must be Ready.
+        let ui = web_boot(web, WebSession::Ready(Arc::new(deps)))
+            .expect("a relay-only config boots the web UI as Ready");
+        let _ = ui; // the WebUi is unrunnable in a unit test; Ready-ness is the assertion
+    }
+}

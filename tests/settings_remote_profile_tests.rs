@@ -454,9 +454,11 @@ profiles:
 // ===========================================================================
 
 /// §8.4 / §9 T10: the pairing link is the server's entry link plus
-/// `&ca=sha256:…` — `https://<host>/?token=<t>&ca=sha256:<fp>` — with the
-/// first link on `tls::primary_lan_host(bind)`, the rest on the other
-/// SANs minus loopback, and `<fp>` = `tls::ca_fingerprint(tls_dir)`.
+/// `&ca=sha256:…` — `https://<host>:<port>/?token=<t>&ca=sha256:<fp>` —
+/// with the first link on `tls::primary_lan_host(bind)`, the rest on the
+/// other SANs minus loopback, and `<fp>` = `tls::ca_fingerprint(tls_dir)`.
+/// A non-443 bind port rides the link: a dropped port would point the
+/// phone at :443 (a real :7899 server produced a port-less link).
 #[test]
 fn pairing_links_build_entry_links_with_ca() {
     let dir = tempfile::tempdir().unwrap();
@@ -475,13 +477,13 @@ fn pairing_links_build_entry_links_with_ca() {
     };
     assert_eq!(
         links[0],
-        format!("https://192.168.7.7/?token=pito&ca={fp}"),
-        "the first link is the primary LAN host's entry URL + &ca"
+        format!("https://192.168.7.7:7823/?token=pito&ca={fp}"),
+        "the first link is the primary LAN host's entry URL (+ bind port) + &ca"
     );
     assert_eq!(
         links[1],
-        format!("https://bot.example.ts.net/?token=pito&ca={fp}"),
-        "the extra --tls-name SAN follows, same token + ca"
+        format!("https://bot.example.ts.net:7823/?token=pito&ca={fp}"),
+        "the extra --tls-name SAN follows, same port, token + ca"
     );
     for link in &links {
         assert!(
@@ -489,6 +491,51 @@ fn pairing_links_build_entry_links_with_ca() {
             "loopback names are never phone-reachable links: {link}"
         );
     }
+}
+
+/// Mobile relay: a server bound on a non-443 port yields links with that
+/// port — a QR/paste of a port-less link would dial :443 and fail.
+#[test]
+fn pairing_links_non_443_port_is_in_the_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let fp = tls::ca_fingerprint(dir.path()).unwrap();
+    let wire = pairing_links(
+        "192.168.7.7:7899".parse().unwrap(),
+        &[],
+        "pito",
+        Some(dir.path()),
+    );
+    let links = match wire {
+        PairingWire::Available { links } => links,
+        other => panic!("a LAN bind with TLS is Available; got {other:?}"),
+    };
+    assert_eq!(
+        links[0],
+        format!("https://192.168.7.7:7899/?token=pito&ca={fp}"),
+        "the :7899 bind port is in the link"
+    );
+}
+
+/// The 443 case: the default port is omitted (plain `https://<host>/…`).
+#[test]
+fn pairing_links_443_omits_the_port() {
+    let dir = tempfile::tempdir().unwrap();
+    let fp = tls::ca_fingerprint(dir.path()).unwrap();
+    let wire = pairing_links(
+        "192.168.7.7:443".parse().unwrap(),
+        &[],
+        "pito",
+        Some(dir.path()),
+    );
+    let links = match wire {
+        PairingWire::Available { links } => links,
+        other => panic!("a LAN bind with TLS is Available; got {other:?}"),
+    };
+    assert_eq!(
+        links[0],
+        format!("https://192.168.7.7/?token=pito&ca={fp}"),
+        ":443 is the https default — the port stays out of the link"
+    );
 }
 
 /// MP §4.4: a loopback bind is `Unavailable(LoopbackBind)` — checked
@@ -531,8 +578,9 @@ fn pairing_links_no_tls_unavailable() {
 
 /// §8.4 / §9 T10: `GET /api/pairing` answers 200 with
 /// `{"Available":{"links":[…]}}` where the first link is
-/// `https://<primary host>/?token=<t>&ca=sha256:<fp>` and
-/// `<fp> == tls::ca_fingerprint` of the server's cert dir.
+/// `https://<primary host>:<bind port>/?token=<t>&ca=sha256:<fp>` (the
+/// port omitted on 443) and `<fp> == tls::ca_fingerprint` of the server's
+/// cert dir.
 #[tokio::test]
 async fn pairing_endpoint_serves_token_and_ca_links() {
     let sb = Sandbox::new(
@@ -556,8 +604,8 @@ async fn pairing_endpoint_serves_token_and_ca_links() {
     );
     assert_eq!(
         links[0],
-        format!("https://192.168.7.7/?token=pito&ca={fp}"),
-        "the first link = entry URL + &ca, the ca == tls::ca_fingerprint"
+        format!("https://192.168.7.7:7823/?token=pito&ca={fp}"),
+        "the first link = entry URL (+ bind port) + &ca, the ca == tls::ca_fingerprint"
     );
 }
 

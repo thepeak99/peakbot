@@ -769,6 +769,88 @@ mod tests {
         assert!(parse(&["--web", "--tui"]).is_err());
     }
 
+    // ── The relay-only CLI boundary (extracted pure fn) ─────────────────
+    //
+    // Assumed API (does not exist yet — these tests are the RED contract,
+    // and the bin test target fails to compile until it lands):
+    //
+    // ```ignore
+    // /// The ONE CLI decision for a config whose home is a remote
+    // /// profile: `Some(message)` ⇒ exit with the message (printed,
+    // /// status 1); `None` ⇒ continue. Refuses exactly when the mode is
+    // /// TUI or stdio, the `--profile` pin is absent, and the home is
+    // /// remote — web mode always continues, and a pin already names a
+    // /// local profile (validated earlier by `start_bound`).
+    // fn relay_only_refusal(mode: Mode, pin: Option<&str>, home: &peakbot::config::resolve::Home)
+    //     -> Option<&'static str>;
+    // ```
+    //
+    // The refused message is locked.
+    const RELAY_ONLY_REFUSAL: &str = "every profile in config.yaml is a remote profile — remote profiles open in the web UI (run peakbot without --tui/--stdio)";
+
+    /// A relay-only catalog's `Home`: `Home::Remote` (the fixture parses
+    /// once relay-only configs are accepted; the refusal decision is what
+    /// is under test here).
+    fn relay_only_home() -> peakbot::config::resolve::Home {
+        use peakbot::config::resolve::{Config, ParseCtx, Source};
+        let yaml = "profiles:\n  dev on nas:\n    remote:\n      url: https://nas.lan:7823\n      token: tok123\n      ca: sha256:3f9a0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab\n      profile: dev\n";
+        let cfg = Config::parse(
+            Source {
+                path: std::path::Path::new("/global/config.yaml"),
+                text: yaml,
+            },
+            None,
+            &ParseCtx { known_skills: &[] },
+        )
+        .expect("a relay-only config must parse");
+        cfg.catalog.home()
+    }
+
+    #[test]
+    fn tui_mode_refuses_relay_only_config_with_the_locked_string() {
+        let home = relay_only_home();
+        let refusal = relay_only_refusal(Mode::Tui, None, &home);
+        assert_eq!(
+            refusal.as_deref(),
+            Some(RELAY_ONLY_REFUSAL),
+            "TUI + unpinned + relay-only ⇒ the exact locked refusal"
+        );
+    }
+
+    #[test]
+    fn stdio_mode_refuses_relay_only_config_with_the_locked_string() {
+        let home = relay_only_home();
+        let refusal = relay_only_refusal(Mode::Stdio, None, &home);
+        assert_eq!(
+            refusal.as_deref(),
+            Some(RELAY_ONLY_REFUSAL),
+            "stdio + unpinned + relay-only ⇒ the exact locked refusal"
+        );
+    }
+
+    #[test]
+    fn web_mode_continues_for_relay_only_config() {
+        let home = relay_only_home();
+        assert_eq!(
+            relay_only_refusal(Mode::Web, None, &home),
+            None,
+            "web mode is exactly where a relay-only config belongs"
+        );
+    }
+
+    #[test]
+    fn a_pinned_tui_session_does_not_get_the_relay_refusal() {
+        // A pin names a local profile (a relay-only config can't be
+        // pinned at all — `start_bound` refuses it earlier), so the
+        // boundary is not reached: no refusal.
+        let home = relay_only_home();
+        assert_eq!(
+            relay_only_refusal(Mode::Tui, Some("dev"), &home),
+            None,
+            "the refusal is for the UNPINned relay-only case only"
+        );
+    }
+
     #[test]
     fn cli_rejects_web_options_with_tui() {
         assert!(parse(&["--tui", "--bind", "1.2.3.4:1"]).is_err());

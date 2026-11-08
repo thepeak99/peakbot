@@ -3072,16 +3072,35 @@ profiles:
         assert_eq!(msg, "--profile can't pin a remote profile ('home-dev')");
     }
 
-    /// §4.4 row 14 + CE1 (desktop MVP): a profiles map with NO local
-    /// profile (only remote entries) is a parse error at `profiles`.
+    /// Mobile relay: a profiles map with NO local profile and NO providers
+    /// (only remote entries) is a VALID thin-client config — CE1 is gone,
+    /// and E1 is judged on the file, so nothing is missing here.
     #[test]
-    fn all_remote_profiles_are_a_no_local_profile_error() {
-        let yaml = "providers:\n  - name: patchnotes\n    type: openai\n    base_url: https://ai.patchnotes.com/v1\n    api_key: pn-test\n    models:\n      - { name: anthropic/claude-sonnet-4.5, alias: sonnet, max_tokens: 8192 }\nprofiles:\n  home-dev:\n    remote:\n      url: https://10.2.0.48:7823\n      token: pito\n      ca: sha256:3f9a0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab\n      profile: dev\n";
-        let err = parse(yaml, None).expect_err("a local-less profile set must not parse");
-        let e = one_err(&err, &[key("profiles")], "no local profile");
+    fn relay_only_config_parses_without_providers() {
+        let yaml = "profiles:\n  home-dev:\n    remote:\n      url: https://10.2.0.48:7823\n      token: pito\n      ca: sha256:3f9a0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab\n      profile: dev\n";
+        let cfg = parse(yaml, None)
+            .expect("a relay-only config must parse (CE1 deleted, E1 file-judged)");
+        assert_eq!(
+            cfg.catalog.iter().count(),
+            0,
+            "a relay-only catalog has no local profiles"
+        );
+        assert!(
+            cfg.catalog.remote("home-dev").is_some(),
+            "the remote entry is in the catalog"
+        );
+    }
+
+    /// E1 is judged on the FILE: a local profile with no providers at all
+    /// still fails — with the exact, unchanged E1 text.
+    #[test]
+    fn local_profile_without_providers_is_the_exact_e1() {
+        let yaml = "profiles:\n  dev:\n    agents:\n      team:\n        model: sonnet\n";
+        let err = parse(yaml, None).expect_err("a local profile needs providers");
+        let e = one_err(&err, &[key("providers")], "E1");
         assert_eq!(
             e.message,
-            "declare at least one local profile (one with agents)"
+            "declare at least one provider with at least one model"
         );
     }
 
@@ -3297,11 +3316,47 @@ mod local_parse {
         );
     }
 
+    /// Mobile relay: the Local edition ACCEPTS `remote:` profiles — a mixed
+    /// local + remote config parses (this test used to assert the
+    /// `LOCAL_NO_REMOTE` rejection, which is deleted).
     #[test]
-    fn local_remote_profile_is_a_parse_error() {
-        assert_error_contains(
-            REMOTE_PROFILE,
-            "remote profiles are not available in PeakBot on this phone",
+    fn local_edition_accepts_remote_profiles() {
+        let cfg = parse(REMOTE_PROFILE).expect("Local must parse a config with a remote profile");
+        assert!(
+            cfg.catalog.remote("relay").is_some(),
+            "the remote entry is in the Local catalog"
+        );
+    }
+
+    /// Mobile relay: a relay-only config (no providers, no local profile)
+    /// is valid in the Local edition — the phone's normal shape.
+    #[test]
+    fn local_edition_relay_only_parses_without_providers() {
+        let yaml = "profiles:\n  relay:\n    remote:\n      url: https://nas.lan:7823\n      token: tok123\n      ca: sha256:3f9a0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab\n      profile: dev\n";
+        let cfg = parse(yaml).expect("a relay-only config must parse in Local");
+        assert_eq!(cfg.catalog.iter().count(), 0, "no local profiles");
+        assert!(
+            cfg.catalog.remote("relay").is_some(),
+            "remote entry present"
+        );
+    }
+
+    /// E1 is judged on the FILE in the Local edition too: a local profile
+    /// with no providers fails with the exact E1 text.
+    #[test]
+    fn local_edition_local_profile_without_providers_is_the_exact_e1() {
+        let yaml = "profiles:\n  p:\n    agents:\n      a:\n        model: a\n";
+        let res = parse(yaml);
+        assert!(res.is_err(), "a local profile needs providers");
+        let messages: Vec<String> = match res {
+            Ok(_) => Vec::new(),
+            Err(errors) => errors.0.iter().map(|e| e.message.clone()).collect(),
+        };
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "declare at least one provider with at least one model"),
+            "E1 fires exactly: {messages:?}"
         );
     }
 }

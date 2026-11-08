@@ -62,6 +62,11 @@ mod t8_tests;
 #[cfg(all(test, feature = "host"))]
 mod t9_tests;
 
+// Unpinned attach on a relay-only config (remotes through the on-device
+// core).
+#[cfg(all(test, feature = "host"))]
+mod t10_tests;
+
 pub type WsStream = tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// The bounds of §5.12, injectable so tests run in seconds.
