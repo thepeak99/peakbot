@@ -1080,3 +1080,50 @@ async fn directory_rebuilds_the_client_when_the_token_changes() {
         "the changed definition rebuilt the client — the new token is on the wire"
     );
 }
+
+// ── Android 17 local-network permission hint (LNP) ───────────────────────
+// Android 17 gates LAN access behind ACCESS_LOCAL_NETWORK ("Nearby
+// devices"). A denied permission surfaces as a connect timeout, so the
+// E-TIMEOUT text points the user at the permission — on Android only.
+// RED until `fn timeout_hint(os: &str) -> &'static str` exists in mod.rs.
+
+#[test]
+fn timeout_hint_names_nearby_devices_on_android() {
+    let hint = timeout_hint("android");
+    assert!(
+        hint.starts_with(' '),
+        "the hint is appended to a sentence, so it starts with a space: {hint:?}"
+    );
+    for needle in ["Nearby devices", "Android 17+", "local network"] {
+        assert!(hint.contains(needle), "hint lacks {needle:?}: {hint:?}");
+    }
+}
+
+#[test]
+fn timeout_hint_is_empty_off_android() {
+    for os in ["linux", "macos", "windows", "ios"] {
+        assert_eq!(timeout_hint(os), "", "no hint on {os}");
+    }
+}
+
+#[test]
+fn timeout_display_ends_with_the_platform_hint() {
+    let shown = RemoteError::Timeout {
+        profile: PROFILE.to_string(),
+        host: "10.0.0.5:7000".to_string(),
+    }
+    .to_string();
+    assert!(
+        shown.ends_with(timeout_hint(std::env::consts::OS)),
+        "E-TIMEOUT ends with the platform hint: {shown:?}"
+    );
+    assert!(
+        shown.starts_with("Remote profile 'dev' at 10.0.0.5:7000 didn't answer in time."),
+        "the locked E-TIMEOUT sentence is unchanged: {shown:?}"
+    );
+    #[cfg(not(target_os = "android"))]
+    assert!(
+        shown.ends_with("didn't answer in time."),
+        "off Android there is no suffix: {shown:?}"
+    );
+}

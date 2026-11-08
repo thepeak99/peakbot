@@ -78,6 +78,12 @@ abis=$(printf '%s\n' "$badging" | grep -F 'native-code:' | sed "s/^native-code: 
     || fail "native-code ABIs are '${abis:-<none>}', expected exactly 'arm64-v8a'"
 ok "native-code arm64-v8a only"
 
+# Android 17 (API 37) gates LAN access behind ACCESS_LOCAL_NETWORK; the
+# permission must have survived manifest merging into the built APK.
+printf '%s\n' "$badging" | grep -qF "uses-permission: name='android.permission.ACCESS_LOCAL_NETWORK'" \
+    || fail "badging lacks ACCESS_LOCAL_NETWORK"
+ok "badging ACCESS_LOCAL_NETWORK"
+
 # ── 2. signing: always verify; pin the release cert (REL-1) ─────────────
 certs=$(apksigner verify --print-certs "$apk") || fail "apksigner verify --print-certs"
 ok "apksigner verify"

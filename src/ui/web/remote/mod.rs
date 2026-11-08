@@ -140,6 +140,17 @@ pub enum RemoteError {
     },
 }
 
+/// Android 17 drops LAN dials silently without the "Nearby devices" grant; name the fix.
+const ANDROID_LNP_HINT: &str = " On Android 17+, allow PeakBot \"Nearby devices\" in App info → Permissions so it can reach your local network.";
+
+fn timeout_hint(os: &str) -> &'static str {
+    if os == "android" {
+        ANDROID_LNP_HINT
+    } else {
+        ""
+    }
+}
+
 impl fmt::Display for RemoteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -156,7 +167,8 @@ impl fmt::Display for RemoteError {
             Self::Timeout { profile, host } => {
                 write!(
                     f,
-                    "Remote profile '{profile}' at {host} didn't answer in time."
+                    "Remote profile '{profile}' at {host} didn't answer in time.{}",
+                    timeout_hint(std::env::consts::OS)
                 )
             }
             Self::TlsPin { profile, want, got } => write!(

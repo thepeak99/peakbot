@@ -97,6 +97,8 @@ else
     grep_ok "smoke: minSdk 24" "minSdkVersion='24'" "$SA"
     grep_ok "smoke: targetSdk 37" "targetSdkVersion='37'" "$SA"
     grep_ok "smoke: arm64-v8a" "arm64-v8a" "$SA"
+    # Android 17 local-network permission must survive into the built APK.
+    grep_ok "smoke: badging asserts ACCESS_LOCAL_NETWORK" "uses-permission: name='android.permission.ACCESS_LOCAL_NETWORK'" "$SA"
     # Release signing: cert fingerprint checked against the pinned one.
     grep_ok "smoke: apksigner verify --print-certs" "apksigner verify --print-certs" "$SA"
     # 16 KB page alignment.
@@ -187,6 +189,18 @@ for gone in "profiles.js" "profiles-page.json" "link.rs" "profiles.rs"; do
     grep_bad "smoke: no reference to deleted $gone" "$gone" "$SA"
     grep_bad "ios-contracts: no reference to deleted $gone" "$gone" "$script_dir/ios-contracts.sh"
 done
+
+# ── Android local network (LNP) ──────────────────────────────────────────
+# Android 17 (API 37) gates LAN access behind ACCESS_LOCAL_NETWORK ("Nearby
+# devices"): the manifest must declare it and MainActivity must request it
+# at runtime on SDK >= 37.
+
+MANIFEST=mobile/src-tauri/gen/android/app/src/main/AndroidManifest.xml
+MAIN_ACTIVITY=mobile/src-tauri/gen/android/app/src/main/java/sh/shifu/mobile/MainActivity.kt
+grep_ok "lnp: manifest declares ACCESS_LOCAL_NETWORK" '<uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />' "$root/$MANIFEST"
+grep_ok "lnp: MainActivity gates on SDK_INT >= 37" 'Build.VERSION.SDK_INT >= 37' "$root/$MAIN_ACTIVITY"
+grep_ok "lnp: MainActivity calls requestPermissions(arrayOf(LOCAL_NETWORK)" 'requestPermissions(arrayOf(LOCAL_NETWORK)' "$root/$MAIN_ACTIVITY"
+grep_ok "lnp: MainActivity names android.permission.ACCESS_LOCAL_NETWORK" '"android.permission.ACCESS_LOCAL_NETWORK"' "$root/$MAIN_ACTIVITY"
 
 # ── ci.yml (guard) ───────────────────────────────────────────────────────
 

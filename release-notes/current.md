@@ -18,6 +18,7 @@ This file is the working draft for the next release. When a version is tagged, t
     protocol version.
   - The first-launch wizard offers "Set up an AI provider on this device" or
     "Connect to my PeakBot server" (no API key needed for the latter).
+  - **Android 17:** PeakBot Mobile now asks for the "Nearby devices" (local network) permission so it can reach LAN servers; if denied, the timeout error says where to turn it on.
   Core changes this release: `fetch_url` gains a `headers` argument; provider
   `base_url` values with a trailing slash are now tolerated; and the web SPA gains
   a `window.peakbotShell` marker (desktop / mobile / plain browser).

@@ -1,10 +1,15 @@
 package sh.shifu.mobile
 
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.view.View
 import androidx.activity.enableEdgeToEdge
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+
+// Android 17 LNP: LAN dials silently time out without this; loopback is exempt.
+private const val LOCAL_NETWORK = "android.permission.ACCESS_LOCAL_NETWORK"
 
 class MainActivity : TauriActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
@@ -28,6 +33,10 @@ class MainActivity : TauriActivity() {
       )
       view.setPadding(safe.left, safe.top, safe.right, safe.bottom)
       WindowInsetsCompat.CONSUMED
+    }
+    if (Build.VERSION.SDK_INT >= 37 &&
+        checkSelfPermission(LOCAL_NETWORK) != PackageManager.PERMISSION_GRANTED) {
+      requestPermissions(arrayOf(LOCAL_NETWORK), 0x4C4E)
     }
   }
 }
