@@ -177,7 +177,7 @@ jobs:
       # `--mount=type=cache` in the Dockerfile keeps the cargo registry warm
       # across image rebuilds.
       - name: Build the toolchain image (BuildKit-cached)
-        run: docker build --target toolchain -t localhost/peakbot-mobile-android:toolchain .
+        run: docker build -f Dockerfile.mobile-android --target toolchain -t localhost/peakbot-mobile-android:toolchain .
       # Named volumes keep the crate registry and the target dir warm between
       # PRs (fresh per run otherwise); the worktree is bind-mounted, so no
       # source is baked into the image.
