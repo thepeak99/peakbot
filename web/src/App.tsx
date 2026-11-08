@@ -32,6 +32,7 @@ import { FilesPanel } from "./components/FilesPanel";
 import { AgentsPanel } from "./components/AgentsPanel";
 import { Settings, useSettingsToggle } from "./settings/Settings";
 import { useAgent } from "./useAgent";
+import { useSessionVerbs } from "./useSessionVerbs";
 import { apiBase } from "./state";
 import { useConvoTabs } from "./useConvoTabs";
 import type { TabsState } from "./convoTabs";
@@ -210,6 +211,9 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
 
   const runningBg = bg.filter((p) => p.status === "running").length;
   const pendingInput = state?.pending_input_count ?? 0;
+  // A session verb typed while a turn runs (or input is queued) would be
+  // server-queued and lost on Stop — the verb hook re-attaches instead.
+  const busy = isRunning || pendingInput > 0;
 
   const tabs = [
     {
@@ -314,13 +318,23 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
     }
   }, [drawerTab, visibleTabIds]);
 
+  // Composer submits and cwd-picker commits route through the session-verb
+  // hook so a session verb never reaches a busy session.
+  const { submit, switchCwd } = useSessionVerbs({
+    agent,
+    busy,
+    cwd: welcome?.cwd ?? "",
+    loadConversation,
+    onError: showToast,
+  });
+
   const live: ComposerLive = {
     isRunning,
     connected,
     commands,
     onSend: (text, ids) => {
       // Sending always re-pins: you expect to see your own message.
-      send({ type: "send_message", text, attachments: ids });
+      submit(text, ids);
       transcriptRef.current?.jumpToLatest();
     },
     onStop: () => send({ type: "stop" }),
@@ -352,6 +366,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
         conversations={conversations}
         conversationsError={conversationsError}
         send={send}
+        onSwitchCwd={switchCwd}
         onLoadConversation={loadConversation}
         onReattach={reattach}
         notifyEnabled={notify.enabled}
@@ -461,6 +476,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
         dirListing={dirListing}
         recentDirs={recentDirs}
         send={send}
+        onSwitchCwd={switchCwd}
         onLoadConversation={loadConversation}
         onReattach={reattach}
         catalog={catalog}
