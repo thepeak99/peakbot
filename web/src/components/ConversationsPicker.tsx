@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { ConversationSummary } from "../state";
 import type { CatalogProfile } from "../types";
-import { isDesktop, shell } from "../desktop";
+import { isDesktop } from "../desktop";
 
 // Conversations picker in the top bar. Opening it requests a fresh list
 // (`request_conversations`, answered off-band with `conversations_list`);
@@ -76,11 +76,8 @@ export function ConversationsPicker({
   catalog?: CatalogProfile[];
 }) {
   const desktop = isDesktop();
-  // In the mobile shell `window.open` is shimmed to a top-level
-  // navigation, so a same-origin open would replace the SPA page (Back
-  // returns). The mobile shell owns new conversations, so the header "+" is
-  // gated off there too (foreign URLs only ever go to the system browser).
-  const mobile = shell() === "mobile";
+  // Mobile keeps the "+": its window.open is a top-level navigation
+  // (Back returns). Desktop loses it — the tab strip has its own.
   const [open, setOpen] = useState(false);
   // The list arrives async after onOpen(); show a loading hint until it does
   // instead of prematurely flashing "No saved conversations."
@@ -217,10 +214,9 @@ export function ConversationsPicker({
         <span className="text-zinc-600">▾</span>
       </button>
 
-      {/* Desktop: the "+" lives in the tab strip instead. Mobile: no new
-          tab exists — window.open is a top-level navigation in the mobile
-          shell, so this same-origin open is gated off. */}
-      {!desktop && !mobile && (
+      {/* Desktop: the tab strip has its own "+", so this one is hidden;
+          browser and mobile keep it (mobile's window.open is a top-level nav). */}
+      {!desktop && (
         <button
           onClick={openNewTab}
           title="Open a new conversation in a new tab"
