@@ -467,7 +467,7 @@ describe("FirstRun — Welcome (spec §9.13 step 1)", () => {
     expect(banner).toContain("config.yaml.pre-0.24");
   });
 
-  it("welcome_has_no_migrate_button_and_start_fresh_is_the_only_action", () => {
+  it("welcome_offers_the_two_choices_and_no_migrate_button", () => {
     stubApi();
     mountFirstRun({
       m: { legacy_layout: true, migrate_error: "boom" },
@@ -475,7 +475,12 @@ describe("FirstRun — Welcome (spec §9.13 step 1)", () => {
     });
     const pane = q("firstrun-step-welcome");
     const buttons = Array.from(pane.querySelectorAll("button"));
-    expect(buttons.map((b) => b.getAttribute("data-testid"))).toEqual(["firstrun-start-fresh"]);
+    // Two choices: set up a provider on this device, or connect to a
+    // PeakBot server (the relay-only path). No migrate button.
+    expect(buttons.map((b) => b.getAttribute("data-testid"))).toEqual([
+      "firstrun-start-fresh",
+      "firstrun-connect-server",
+    ]);
     expect(buttons.some((b) => /migrate/i.test(b.textContent ?? ""))).toBe(false);
   });
 
