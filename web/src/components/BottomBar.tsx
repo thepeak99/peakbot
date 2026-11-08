@@ -26,6 +26,7 @@ export function BottomBar({
   send,
   onLoadConversation,
   onReattach,
+  onSwitchCwd,
   catalog,
   selection,
   selectionLocked = false,
@@ -44,6 +45,8 @@ export function BottomBar({
   onLoadConversation: (id: string, profile: string | null) => void;
   /** Chip pick across local/remote: re-attach on (profile, agent). */
   onReattach?(profile: string, agent?: string): void;
+  /** Commits a cwd picked in the CwdPicker (App routes busy/idle). */
+  onSwitchCwd?(path: string): void;
   // T32 chat chip (optional — absent ⇒ no chip, as on older servers).
   catalog?: CatalogProfile[];
   selection?: Selection | null;
@@ -95,6 +98,7 @@ export function BottomBar({
           dirListing={dirListing}
           recentDirs={recentDirs}
           send={send}
+          onSwitchCwd={onSwitchCwd ?? (() => {})}
           dropUp
         />
       )}

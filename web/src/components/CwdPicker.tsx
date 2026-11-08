@@ -5,9 +5,9 @@ import type { DirListing, InboundMessage } from "../state";
 // shows the current cwd (basename prominent, full path on hover); clicking
 // it opens a folder picker.
 //
-// Committing a new cwd sends `switch_cwd`, which the backend resolves and
-// validates, then resets the session (same seam as `/cd` / `/model`). So a
-// non-empty transcript is confirmed first.
+// Committing a new cwd calls `onSwitchCwd` — the App routes it (busy → fresh
+// conversation, idle → `switch_cwd` on the socket) — so a non-empty
+// transcript is confirmed first.
 //
 // The picker is purely state-frame-driven: the displayed cwd comes from the
 // AppState `welcome.cwd`, and browsing rides the `list_dir` → `dir_listing`
@@ -36,6 +36,7 @@ export function CwdPicker({
   dirListing,
   recentDirs,
   send,
+  onSwitchCwd,
   // Anchor the small-screen picker panel to the bottom of the viewport
   // (instead of the top) when the chip lives in the mobile bottom bar.
   dropUp = false,
@@ -47,6 +48,9 @@ export function CwdPicker({
    * "Recent" quick-jump section at the top of the picker. */
   recentDirs: string[];
   send: (msg: InboundMessage) => void;
+  /** Commits a chosen directory (App routes it: busy → fresh conversation,
+   * idle → `switch_cwd` on the socket). */
+  onSwitchCwd: (path: string) => void;
   dropUp?: boolean;
 }) {
   const [open, setOpen] = useState(false);
@@ -94,13 +98,11 @@ export function CwdPicker({
     if (path === cwd) return; // no-op when already current
     if (
       hasTranscript &&
-      !window.confirm(
-        `Use "${path}" as the working directory? This starts a new conversation — the current transcript is cleared.`,
-      )
+      !window.confirm(`Use "${path}"? This starts a new conversation.`)
     ) {
       return;
     }
-    send({ type: "switch_cwd", path });
+    onSwitchCwd(path);
   };
 
   const dirs = dirListing?.entries.filter((e) => e.is_dir) ?? [];

@@ -50,8 +50,18 @@ export interface AgentConnection {
    * conversation (the server mints the session and replies `attached`).
    * `profile` (re-)binds the socket to a catalogue profile — remote profiles
    * route through the relay; `null` means local. `agent` rides the ONE
-   * attach of the fresh socket, so the new conversation starts on that pair. */
-  switchConvo: (id: string | null, profile?: string | null, agent?: string) => void;
+   * attach of the fresh socket, so the new conversation starts on that pair.
+   * `firstFrame` is held and sent exactly once on the attach that succeeds —
+   * the busy-session seam (a session verb can't ride the live socket); a
+   * later switchConvo overwrites it, so it never reaches a different
+   * conversation. A tagged wire frame (callers pass fresh literals, so the
+   * `type` tag is the contract, not the `InboundMessage` union). */
+  switchConvo: (
+    id: string | null,
+    profile?: string | null,
+    agent?: string,
+    firstFrame?: { type: string; [key: string]: unknown },
+  ) => void;
 }
 
 function wsUrl(): string {
@@ -94,6 +104,9 @@ export function useAgent(): AgentConnection {
   // Rides exactly one attach (a switchConvo with an agent), then clears, so
   // reconnects re-send only (convo, profile).
   const attachAgentRef = useRef<string | null>(null);
+  // A session verb held for the fresh conversation's first attach. Sent once
+  // on the `attached` that succeeds; survives a reconnect before then.
+  const pendingFrameRef = useRef<{ type: string; [key: string]: unknown } | null>(null);
   const [convo, setConvo] = useState<string | null>(convoRef.current);
   // Pending reconnect timer; shared so `switchConvo` can cancel it.
   const reconnectTimerRef = useRef<number | undefined>(undefined);
@@ -170,6 +183,15 @@ export function useAgent(): AgentConnection {
             break;
           case "attached":
             bindConvo(msg.convo);
+            {
+              // The held frame rides the attach that succeeds; clearing it
+              // first makes a second `attached` a no-op.
+              const held = pendingFrameRef.current;
+              if (held !== null) {
+                pendingFrameRef.current = null;
+                ws.send(JSON.stringify(held));
+              }
+            }
             break;
           case "models_available":
             setModels(msg.models);
@@ -238,11 +260,19 @@ export function useAgent(): AgentConnection {
   // `profile`/`agent` are the chip's reattach (design §6.4): same convo with
   // a new profile still re-attaches, and the agent rides that one attach.
   const switchConvo = useCallback(
-    (id: string | null, profile?: string | null, agent?: string) => {
+    (
+      id: string | null,
+      profile?: string | null,
+      agent?: string,
+      firstFrame?: { type: string; [key: string]: unknown },
+    ) => {
       const profileChanged = profile !== undefined && profile !== profileRef.current;
       if (id === convoRef.current && !profileChanged && agent === undefined) return;
       bindConvo(id, profile);
       attachAgentRef.current = agent ?? null;
+      // Every switch overwrites the held frame, so a verb can never ride
+      // into a conversation the user did not ask for.
+      pendingFrameRef.current = firstFrame ?? null;
       backoffRef.current = 500;
       window.clearTimeout(reconnectTimerRef.current);
       const ws = wsRef.current;

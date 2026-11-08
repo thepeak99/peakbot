@@ -32,6 +32,7 @@ export function TopBar({
   send,
   onLoadConversation,
   onReattach,
+  onSwitchCwd,
   notifyEnabled,
   notifyPermission,
   onToggleNotify,
@@ -63,6 +64,8 @@ export function TopBar({
   onLoadConversation: (id: string, profile: string | null) => void;
   /** Chip pick across local/remote: re-attach on (profile, agent). */
   onReattach?(profile: string, agent?: string): void;
+  /** Commits a cwd picked in the CwdPicker (App routes busy/idle). */
+  onSwitchCwd?(path: string): void;
   notifyEnabled: boolean;
   notifyPermission: NotifyPermission;
   onToggleNotify: () => void;
@@ -133,6 +136,7 @@ export function TopBar({
             dirListing={dirListing}
             recentDirs={recentDirs}
             send={send}
+            onSwitchCwd={onSwitchCwd ?? (() => {})}
           />
         )}
       </div>
