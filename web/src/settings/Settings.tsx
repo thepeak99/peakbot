@@ -543,7 +543,7 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
   return (
     <div className="fixed inset-0 z-40 flex flex-col bg-zinc-950 text-zinc-100">
       {/* Head: ← Back to chat · Settings title · scope switch · Ctrl , hint */}
-      <header className="flex min-h-14 flex-wrap items-center gap-x-4 gap-y-2 border-b border-zinc-800 px-4 py-2">
+      <header className="flex min-h-14 flex-wrap items-center gap-x-4 gap-y-2 border-b border-zinc-800 px-4 pb-2 pt-[max(0.5rem,env(safe-area-inset-top))]">
         <button
           onClick={onClose}
           className="cursor-pointer text-xs text-zinc-400 hover:text-zinc-200"

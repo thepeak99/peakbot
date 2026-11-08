@@ -424,7 +424,7 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
 
   return (
     <div data-testid="firstrun" className="flex h-dvh flex-col bg-zinc-950 text-zinc-100">
-      <header className="flex items-center justify-between border-b border-zinc-800 px-6 py-4">
+      <header className="flex items-center justify-between border-b border-zinc-800 px-6 pb-4 pt-[max(1rem,env(safe-area-inset-top))]">
         <div>
           <h1 className="text-lg font-semibold">Welcome to PeakBot</h1>
           <p className="text-xs text-zinc-500">let's get you set up</p>
