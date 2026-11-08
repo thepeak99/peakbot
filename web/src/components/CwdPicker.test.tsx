@@ -30,6 +30,11 @@ beforeAll(() => {
 // ─── fixture ────────────────────────────────────────────────────────────
 
 // The CwdPicker prop interface as declared in CwdPicker.tsx.
+//
+// CONTRACT 4: committing a directory no longer sends `switch_cwd` itself —
+// it calls the new `onSwitchCwd(path)` prop (the App routes that through the
+// session-verb hook, which re-attaches when busy). `send` is kept for the
+// browse requests (`list_dir` / `request_recent_dirs`).
 interface CwdPickerPropsWithRecent {
   cwd: string;
   hasTranscript: boolean;
@@ -37,6 +42,7 @@ interface CwdPickerPropsWithRecent {
   send: (msg: InboundMessage) => void;
   dropUp?: boolean;
   recentDirs: string[];
+  onSwitchCwd: (path: string) => void;
 }
 
 const baseProps: CwdPickerPropsWithRecent = {
@@ -45,6 +51,7 @@ const baseProps: CwdPickerPropsWithRecent = {
   dirListing: null,
   send: () => {},
   recentDirs: [],
+  onSwitchCwd: () => {},
 };
 
 // ─── mount helper ───────────────────────────────────────────────────────
@@ -133,14 +140,14 @@ describe("CwdPicker — recent dirs", () => {
     expect(el.textContent).not.toContain("Recent");
   });
 
-  // H. Clicking a recent row with no transcript commits it: switch_cwd.
-  it("clicking a recent row with no transcript sends switch_cwd for that path", async () => {
-    const sent: InboundMessage[] = [];
+  // H. Clicking a recent row with no transcript commits it: onSwitchCwd(path).
+  it("clicking a recent row with no transcript calls onSwitchCwd for that path", async () => {
+    const onSwitchCwd = vi.fn();
     const el = await mount({
       ...baseProps,
       hasTranscript: false,
       recentDirs: ["/recent/one"],
-      send: (m) => sent.push(m),
+      onSwitchCwd,
     });
 
     await openPicker(el);
@@ -149,19 +156,20 @@ describe("CwdPicker — recent dirs", () => {
       row.click();
     });
 
-    expect(sent).toContainEqual({ type: "switch_cwd", path: "/recent/one" });
+    expect(onSwitchCwd).toHaveBeenCalledTimes(1);
+    expect(onSwitchCwd).toHaveBeenCalledWith("/recent/one");
   });
 
-  // I. Clicking a recent row WITH a transcript hits the confirm guard and
-  // declines → no switch_cwd.
+  // I. Clicking a recent row WITH a transcript hits the confirm guard (new
+  // text) and declines → no onSwitchCwd.
   it("clicking a recent row with a transcript triggers the confirm guard and stays put when declined", async () => {
-    const sent: InboundMessage[] = [];
+    const onSwitchCwd = vi.fn();
     const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
     const el = await mount({
       ...baseProps,
       hasTranscript: true,
       recentDirs: ["/recent/two"],
-      send: (m) => sent.push(m),
+      onSwitchCwd,
     });
 
     await openPicker(el);
@@ -171,21 +179,22 @@ describe("CwdPicker — recent dirs", () => {
     });
 
     expect(confirmSpy).toHaveBeenCalledTimes(1);
+    // CONTRACT 4: the confirm text is exactly this string.
     expect(confirmSpy).toHaveBeenCalledWith(
-      expect.stringContaining("/recent/two"),
+      'Use "/recent/two"? This starts a new conversation.',
     );
-    expect(sent).not.toContainEqual({ type: "switch_cwd", path: "/recent/two" });
+    expect(onSwitchCwd).not.toHaveBeenCalled();
   });
 
-  // I (proceed). ...and sends switch_cwd when the guard is confirmed.
-  it("clicking a recent row with a transcript sends switch_cwd when confirmed", async () => {
-    const sent: InboundMessage[] = [];
+  // I (proceed). ...and calls onSwitchCwd when the guard is confirmed.
+  it("clicking a recent row with a transcript calls onSwitchCwd when confirmed", async () => {
+    const onSwitchCwd = vi.fn();
     const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
     const el = await mount({
       ...baseProps,
       hasTranscript: true,
       recentDirs: ["/recent/three"],
-      send: (m) => sent.push(m),
+      onSwitchCwd,
     });
 
     await openPicker(el);
@@ -195,7 +204,34 @@ describe("CwdPicker — recent dirs", () => {
     });
 
     expect(confirmSpy).toHaveBeenCalledTimes(1);
-    expect(sent).toContainEqual({ type: "switch_cwd", path: "/recent/three" });
+    expect(confirmSpy).toHaveBeenCalledWith(
+      'Use "/recent/three"? This starts a new conversation.',
+    );
+    expect(onSwitchCwd).toHaveBeenCalledTimes(1);
+    expect(onSwitchCwd).toHaveBeenCalledWith("/recent/three");
+  });
+
+  // Choosing the current cwd is a no-op: no onSwitchCwd, no confirm.
+  it("committing the current cwd does nothing (no onSwitchCwd, no confirm)", async () => {
+    const onSwitchCwd = vi.fn();
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const el = await mount({
+      ...baseProps,
+      hasTranscript: true,
+      onSwitchCwd,
+    });
+
+    await openPicker(el);
+    const useBtn = Array.from(el.querySelectorAll("button")).find((b) =>
+      (b.textContent ?? "").trim() === "Use this directory",
+    );
+    expect(useBtn, "the 'Use this directory' button must render").not.toBeUndefined();
+    await act(async () => {
+      useBtn!.click();
+    });
+
+    expect(onSwitchCwd).not.toHaveBeenCalled();
+    expect(confirmSpy).not.toHaveBeenCalled();
   });
 });
 
