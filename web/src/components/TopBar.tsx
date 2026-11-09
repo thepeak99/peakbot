@@ -4,6 +4,7 @@ import type {
   InboundMessage,
   ModelInfo,
 } from "../state";
+import { isRemote } from "../state";
 import type { CatalogProfile, Selection, SubAgentRun } from "../types";
 import { CwdPicker } from "./CwdPicker";
 import { ConversationsPicker } from "./ConversationsPicker";
@@ -132,18 +133,19 @@ export function TopBar({
           catalog={catalog}
         />
 
-        {/* The local edition (phone build) has no cwd of its own to
-            pick — the shell owns the working directory. */}
-        {cwd && edition() !== "local" && (
-          <CwdPicker
-            cwd={cwd}
-            hasTranscript={hasTranscript}
-            dirListing={dirListing}
-            recentDirs={recentDirs}
-            send={send}
-            onSwitchCwd={onSwitchCwd ?? (() => {})}
-          />
-        )}
+        {/* The Local edition has no cwd of its own (the shell owns it); a
+            remote profile's cwd lives on the remote, reached via the relay. */}
+        {cwd &&
+          (edition() !== "local" || isRemote(selection?.profile ?? null, catalog ?? [])) && (
+            <CwdPicker
+              cwd={cwd}
+              hasTranscript={hasTranscript}
+              dirListing={dirListing}
+              recentDirs={recentDirs}
+              send={send}
+              onSwitchCwd={onSwitchCwd ?? (() => {})}
+            />
+          )}
       </div>
 
       {isRunning && (

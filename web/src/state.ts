@@ -414,8 +414,8 @@ export function select(
 
 // ── Remote-profile routing (design §6.4) ──────────────────────────────
 
-const isRemote = (profile: string, catalog: readonly CatalogProfile[]): boolean =>
-  catalog.find((p) => p.name === profile)?.origin === "remote";
+export const isRemote = (profile: string | null, catalog: readonly CatalogProfile[]): boolean =>
+  profile !== null && catalog.find((p) => p.name === profile)?.origin === "remote";
 
 /** A pick on the chip either rewrites this socket's selection ("select") or
  * needs a fresh socket on the other server ("reattach"). Reattach iff the
