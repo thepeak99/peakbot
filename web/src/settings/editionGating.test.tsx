@@ -35,7 +35,12 @@
 //    - the first-run wizard has no `web` step and no PATH fact (driven by
 //      the `meta` prop, which Boot passes from the same boot read);
 //    - the TopBar/BottomBar CwdPicker (cwd line) is hidden and the Bash
-//      panel renders nothing;
+//      panel renders nothing — EXCEPT the picker when the active
+//      selection is a catalog entry with `origin: "remote"`: the Local
+//      server refuses `list_dir` for itself, but the relay forwards
+//      `list_dir` / `request_recent_dirs` / `switch_cwd` to the full
+//      remote server, so a remote profile keeps its working-directory
+//      picker (see the CwdPicker describe block);
 //    - the composer attach input gets `accept="image/*"`;
 //    - with `shell() === "mobile"` AND local, the "Restart now" control is
 //      an anchor with href EXACTLY `peakbot-mobile:restart` (the only
@@ -45,8 +50,11 @@
 // 5. `full` (and missing edition): everything unchanged — the `full`
 //    tests below are guards that must stay green before and after.
 //
-// All GREEN: the `edition` / `setBootEdition` seam and every local-edition
-// gate above exist; the fixtures use the real server's wire shape.
+// GREEN/RED split: the `edition` / `setBootEdition` seam and every
+// local-edition gate above exist (GREEN); the CwdPicker remote-profile
+// cases (`local + origin "remote"` ⇒ shown in BOTH bars) are RED — the
+// bars gate on `edition() !== "local"` alone, hiding the picker for all
+// profiles. Fixtures use the real server's wire shape.
 //
 // Harness: same style as ./mobileGating.test.tsx — plain createRoot/act +
 // raw DOM queries (no testing-library), marker globals set/deleted per
@@ -69,7 +77,7 @@ import { Composer } from "../components/Composer";
 import { TopBar } from "../components/TopBar";
 import { BottomBar } from "../components/BottomBar";
 import { BashPanel } from "../components/BashPanel";
-import type { BashPanel as BashPanelView } from "../types";
+import type { BashPanel as BashPanelView, CatalogProfile, Selection } from "../types";
 
 type ShellGlobal = {
   peakbotShell?: unknown;
@@ -462,7 +470,47 @@ describe("first-run wizard per edition", () => {
 
 const CWD = "/home/u/proj";
 
-function topBarProps(cwd: string | null): Parameters<typeof TopBar>[0] {
+// The REAL wire shape for a remote catalog entry (resolve.rs
+// `Catalog::infos()`, pinned by selectionChip.remote.test.tsx): origin
+// "remote", NO agents, resolved colour — plus a local profile so the
+// local-origin cases test a populated catalogue, not an empty one.
+const REMOTE_CATALOG: CatalogProfile[] = [
+  {
+    name: "dev",
+    origin: "global",
+    overridesGlobal: false,
+    agents: [{ name: "team", model: "sonnet", subagents: [] }],
+    color: "teal",
+  },
+  {
+    name: "bonsol-dev",
+    origin: "remote",
+    overridesGlobal: false,
+    agents: [],
+    color: "teal",
+  },
+];
+
+const REMOTE_SEL: Selection = { profile: "bonsol-dev", agent: "", subagentModels: {} };
+const GHOST_SEL: Selection = { profile: "ghost", agent: "", subagentModels: {} };
+
+/** A one-entry catalogue of a LOCAL profile with the given origin. */
+function localCatalog(origin: "global" | "repo"): CatalogProfile[] {
+  return [
+    {
+      name: origin === "repo" ? "repo-dev" : "dev",
+      origin,
+      overridesGlobal: false,
+      agents: [{ name: "team", model: "sonnet", subagents: [] }],
+      color: "teal",
+    },
+  ];
+}
+
+function topBarProps(
+  cwd: string | null,
+  over: { catalog?: CatalogProfile[]; selection?: Selection | null } = {},
+): Parameters<typeof TopBar>[0] {
   return {
     isRunning: false,
     connected: true,
@@ -483,13 +531,16 @@ function topBarProps(cwd: string | null): Parameters<typeof TopBar>[0] {
     onToggleNotify: () => {},
     focusMode: true,
     onToggleFocus: () => {},
-    catalog: [],
-    selection: null,
+    catalog: over.catalog ?? [],
+    selection: over.selection ?? null,
     onToast: () => {},
   } as unknown as Parameters<typeof TopBar>[0];
 }
 
-function bottomBarProps(cwd: string | null): Parameters<typeof BottomBar>[0] {
+function bottomBarProps(
+  cwd: string | null,
+  over: { catalog?: CatalogProfile[]; selection?: Selection | null } = {},
+): Parameters<typeof BottomBar>[0] {
   return {
     conversations: [],
     conversationsError: null,
@@ -501,8 +552,8 @@ function bottomBarProps(cwd: string | null): Parameters<typeof BottomBar>[0] {
     recentDirs: [],
     send: () => {},
     onLoadConversation: () => {},
-    catalog: [],
-    selection: null,
+    catalog: over.catalog ?? [],
+    selection: over.selection ?? null,
     onToast: () => {},
   } as unknown as Parameters<typeof BottomBar>[0];
 }
@@ -528,6 +579,90 @@ describe("CwdPicker / cwd line per edition", () => {
   it("full: the bottom bar keeps the cwd picker (unchanged)", () => {
     mount(<BottomBar {...bottomBarProps(CWD)} />);
     expect(host.querySelector(`button[title="${CWD}"]`)).not.toBeNull();
+  });
+
+  // ── the bug: local + a REMOTE profile keeps the picker ─────────────────
+  // The Local server refuses list_dir for ITSELF, but the relay forwards
+  // list_dir / request_recent_dirs / switch_cwd to the full remote server
+  // — so a remote profile (catalog entry, origin "remote") must keep its
+  // working-directory picker in BOTH bars.
+
+  it("local + remote profile: the top bar shows the cwd picker (relay forwards list_dir)", () => {
+    setBootEdition("local");
+    mount(<TopBar {...topBarProps(CWD, { catalog: REMOTE_CATALOG, selection: REMOTE_SEL })} />);
+    expect(
+      host.querySelector(`button[title="${CWD}"]`),
+      "the relay owns the remote's cwd — the picker must be reachable",
+    ).not.toBeNull();
+  });
+
+  it("local + remote profile: the bottom bar shows the cwd picker (relay forwards list_dir)", () => {
+    setBootEdition("local");
+    mount(<BottomBar {...bottomBarProps(CWD, { catalog: REMOTE_CATALOG, selection: REMOTE_SEL })} />);
+    expect(
+      host.querySelector(`button[title="${CWD}"]`),
+      "the relay owns the remote's cwd — the picker must be reachable",
+    ).not.toBeNull();
+  });
+
+  // ── guards: local + NOT-remote stays hidden in both bars ───────────────
+
+  it.each(["global", "repo"] as const)(
+    "local + local profile (origin %s): the top bar keeps the cwd picker hidden",
+    (origin) => {
+      const catalog = localCatalog(origin);
+      setBootEdition("local");
+      mount(
+        <TopBar
+          {...topBarProps(CWD, {
+            catalog,
+            selection: { profile: catalog[0].name, agent: "team", subagentModels: {} },
+          })}
+        />,
+      );
+      expect(host.querySelector(`button[title="${CWD}"]`)).toBeNull();
+    },
+  );
+
+  it.each(["global", "repo"] as const)(
+    "local + local profile (origin %s): the bottom bar keeps the cwd picker hidden",
+    (origin) => {
+      const catalog = localCatalog(origin);
+      setBootEdition("local");
+      mount(
+        <BottomBar
+          {...bottomBarProps(CWD, {
+            catalog,
+            selection: { profile: catalog[0].name, agent: "team", subagentModels: {} },
+          })}
+        />,
+      );
+      expect(host.querySelector(`button[title="${CWD}"]`)).toBeNull();
+    },
+  );
+
+  it("local + null selection: the top bar keeps the cwd picker hidden", () => {
+    setBootEdition("local");
+    mount(<TopBar {...topBarProps(CWD, { catalog: REMOTE_CATALOG, selection: null })} />);
+    expect(host.querySelector(`button[title="${CWD}"]`)).toBeNull();
+  });
+
+  it("local + null selection: the bottom bar keeps the cwd picker hidden", () => {
+    setBootEdition("local");
+    mount(<BottomBar {...bottomBarProps(CWD, { catalog: REMOTE_CATALOG, selection: null })} />);
+    expect(host.querySelector(`button[title="${CWD}"]`)).toBeNull();
+  });
+
+  it("local + profile not in catalog: the top bar keeps the cwd picker hidden", () => {
+    setBootEdition("local");
+    mount(<TopBar {...topBarProps(CWD, { catalog: REMOTE_CATALOG, selection: GHOST_SEL })} />);
+    expect(host.querySelector(`button[title="${CWD}"]`)).toBeNull();
+  });
+
+  it("local + profile not in catalog: the bottom bar keeps the cwd picker hidden", () => {
+    setBootEdition("local");
+    mount(<BottomBar {...bottomBarProps(CWD, { catalog: REMOTE_CATALOG, selection: GHOST_SEL })} />);
+    expect(host.querySelector(`button[title="${CWD}"]`)).toBeNull();
   });
 });
 

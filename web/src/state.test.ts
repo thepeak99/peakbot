@@ -14,7 +14,8 @@
 // mounting the socket (the same reason `selectProfile` was a named export).
 
 import { describe, it, expect } from "vitest";
-import { select, type AppState, type InboundMessage } from "./state";
+import { select, isRemote, type AppState, type InboundMessage } from "./state";
+import type { CatalogProfile } from "./types";
 
 describe("select — models legs (selection-models plan §9.2/9)", () => {
   it("select_builder_omits_absent_fields", () => {
@@ -171,5 +172,41 @@ describe("InboundMessage — select is part of the union, old frames are gone", 
   it("a hand-built select frame satisfies InboundMessage", () => {
     const frame: InboundMessage = { type: "select", profile: "dev", agent: "team" };
     expect(frame).toEqual({ type: "select", profile: "dev", agent: "team" });
+  });
+});
+
+// ─── isRemote — the CwdPicker edition gate ────────────────────────────────
+// RED until implemented: `isRemote` is a PRIVATE const in state.ts; the fix
+// exports it (the bars gate on
+// `edition() !== "local" || isRemote(selection?.profile ?? null, catalog)`
+// so a remote profile keeps its cwd picker on the Local edition — the relay
+// forwards list_dir to the remote server). This import is the only new
+// typecheck failure; under vitest the binding is undefined, so ONLY these
+// tests fail and the rest of the suite is unaffected.
+
+describe("isRemote — catalog origin lookup (exported for the CwdPicker gate)", () => {
+  // The REAL wire shape (resolve.rs `Catalog::infos()`), one entry per origin.
+  const catalog: CatalogProfile[] = [
+    { name: "dev", origin: "global", overridesGlobal: false, agents: [], color: "teal" },
+    { name: "repo-dev", origin: "repo", overridesGlobal: false, agents: [], color: "teal" },
+    { name: "bonsol-dev", origin: "remote", overridesGlobal: false, agents: [], color: "teal" },
+  ];
+
+  it("is_true_only_for_a_remote_origin_entry", () => {
+    expect(isRemote("bonsol-dev", catalog)).toBe(true);
+  });
+
+  it("is_false_for_global_and_repo_profiles", () => {
+    expect(isRemote("dev", catalog)).toBe(false);
+    expect(isRemote("repo-dev", catalog)).toBe(false);
+  });
+
+  it("is_false_for_a_profile_missing_from_the_catalog", () => {
+    expect(isRemote("ghost", catalog)).toBe(false);
+    expect(isRemote("", catalog)).toBe(false);
+  });
+
+  it("is_false_for_an_empty_catalog", () => {
+    expect(isRemote("bonsol-dev", [])).toBe(false);
   });
 });
