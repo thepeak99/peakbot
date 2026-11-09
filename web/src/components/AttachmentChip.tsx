@@ -73,21 +73,26 @@ export function AttachmentChip({
   chip,
   supportsVision,
   onRemove,
+  base = "",
 }: {
   chip: Pending;
   supportsVision: boolean;
   onRemove: () => void;
+  /** `/r/<L>` proxy prefix of the active profile ("" = local); the no-preview
+   * fallback URL must route through it or hits the local server and 404s. */
+  base?: string;
 }) {
   const name = chip.file.name || "pasted file";
   const mime = chip.state === "done" ? chip.attachment.mime : chip.file.type;
   const warn = visionWarning(chip, supportsVision);
   const errored = chip.state === "error";
   const [open, setOpen] = useState(false);
-  // Done chips fall back to the served file if no local preview survived.
+  // Done chips fall back to the served file (via the profile's relay base)
+  // if no local preview survived.
   const src =
     chip.preview ??
     (chip.state === "done"
-      ? `/api/uploads/${chip.attachment.convo}/${chip.attachment.id}`
+      ? `${base}/api/uploads/${chip.attachment.convo}/${chip.attachment.id}`
       : undefined);
 
   if (isThumbnailable(mime) && src && !errored) {
