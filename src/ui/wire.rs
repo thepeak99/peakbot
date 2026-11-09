@@ -178,7 +178,7 @@ pub(crate) struct DirEntryWire {
 /// name. Hidden entries (leading `.`) are omitted — the picker is for
 /// choosing a project cwd, not a file manager.
 pub(crate) fn build_dir_listing(path: &str) -> OutboundMessage {
-    let resolved = match crate::ui::repl::repl_impl::resolve_cd_path(path) {
+    let resolved = match crate::utils::resolve_cd_path(path) {
         Ok(p) => p,
         Err(e) => {
             return OutboundMessage::DirListing {
@@ -494,7 +494,7 @@ mod tests {
                     // picker only ever sends `list_dir` for dir rows.
                     if e.is_dir {
                         assert!(
-                            crate::ui::repl::repl_impl::resolve_cd_path(&e.full_path).is_ok(),
+                            crate::utils::resolve_cd_path(&e.full_path).is_ok(),
                             "resolve_cd_path must accept the server-composed full_path: {expected}"
                         );
                     }

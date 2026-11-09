@@ -103,7 +103,7 @@ fn parse_is_active(stdout: &str) -> RunState {
 
 /// `~/.config/systemd/user/peakbot.service`.
 fn unit_path() -> Result<PathBuf, InstallError> {
-    let config = dirs::config_dir().ok_or_else(|| {
+    let config = crate::paths::platform_config_dir().ok_or_else(|| {
         InstallError::Io(std::io::Error::other(
             "cannot resolve a config directory for the systemd user unit",
         ))

@@ -28,7 +28,12 @@ use super::{
     ModelRegistry, NameFilter, ProviderEntry, RegistryError, ResolvedModel, TAB_NAMES,
     get_config_file_path,
 };
-use crate::vector::normalize_lexical;
+use crate::utils::normalize_lexical;
+
+// The Local edition (no `host` feature) rejects at parse time what its
+// build lacks, so a config never silently loses a capability on the phone.
+const LOCAL_NO_MCPS: &str = "MCP servers are not available in PeakBot on this phone";
+const LOCAL_NO_VECTOR_DB: &str = "vector databases are not available in PeakBot on this phone";
 
 /// L1 (§4.4). Public because reload quotes it for a legacy global.
 pub const L1_MESSAGE: &str = "config.yaml uses the pre-0.24 layout — restart PeakBot to migrate it automatically (the original is kept as config.yaml.pre-0.24)";
@@ -94,10 +99,19 @@ pub enum CatalogEntry {
 }
 
 /// The selectable profiles. ONE ordered list (I1): repo entries first, then
-/// global in file order, local and remote mixed. CE1: at least one Local.
+/// global in file order, local and remote mixed.
 #[derive(Debug)]
 pub struct Catalog {
     entries: Vec<CatalogEntry>,
+}
+
+/// The session's home: the first LOCAL profile, else the first remote
+/// (file order). A total function — a valid catalog always has an entry,
+/// so a relay-only catalog homes the remote and never a bound.
+#[derive(Debug)]
+pub enum Home {
+    Local(Bound),
+    Remote(Arc<RemoteProfile>),
 }
 
 impl Catalog {
@@ -106,15 +120,36 @@ impl Catalog {
         self.entries.iter()
     }
 
+    /// The session's home: the first local profile, else the first remote
+    /// (file order).
+    pub fn home(&self) -> Home {
+        match self.default_bound() {
+            Some(bound) => Home::Local(bound),
+            None => {
+                // E2 + the per-entry errors make an empty catalog
+                // unconstructible; the backstop only names the invariant.
+                let remote = self
+                    .entries
+                    .iter()
+                    .find_map(|e| match e {
+                        CatalogEntry::Remote(r) => Some(Arc::clone(r)),
+                        _ => None,
+                    })
+                    .expect("a catalog without a local profile has a remote");
+                Home::Remote(remote)
+            }
+        }
+    }
+
     /// The first agent of the first LOCAL profile — a remote entry listed
-    /// first never becomes the default (CE1 guarantees a local exists).
-    pub fn default_bound(&self) -> Bound {
-        let profile = self
-            .entries
+    /// first never becomes the default. `None` for a relay-only catalog:
+    /// the `Option` is checked once at each boundary (attach, CLI start,
+    /// reload), never `expect`ed downstream.
+    pub fn default_bound(&self) -> Option<Bound> {
+        self.entries
             .iter()
             .find_map(local_entry)
-            .expect("CE1: at least one local profile");
-        Bound::new(Arc::clone(profile), 0)
+            .map(|profile| Bound::new(Arc::clone(profile), 0))
     }
 
     /// LOCAL only: remotes have no local agents and are never a `Bound`.
@@ -150,9 +185,12 @@ impl Catalog {
     /// when pinned, else the default (first LOCAL profile, first agent). A
     /// pin names only GLOBAL local profiles — repo files are ignored under
     /// a pin (§4.3 PIN), and a remote profile can't be pinned at all.
+    /// `Err` when the catalog has no local profile to bind (relay-only).
     pub fn start_bound(&self, pin: Option<&str>) -> Result<Bound, String> {
         let Some(pin) = pin else {
-            return Ok(self.default_bound());
+            return self.default_bound().ok_or_else(|| {
+                "config.yaml has no local profile — remote profiles open in the web UI".to_string()
+            });
         };
         if self.remote(pin).is_some() {
             return Err(format!("--profile can't pin a remote profile ('{pin}')"));
@@ -503,8 +541,17 @@ impl Config {
             .iter()
             .flat_map(|p| p.models.iter().map(move |m| canonical_alias(p, m)))
             .collect();
-        let registry = build_registry(&file.providers, &declared, &mut global_sink);
+        // E1 is judged on the FILE: providers are needed only when a local
+        // profile is declared — a relay-only file declares no local models.
+        let needs_models = file
+            .profiles
+            .iter()
+            .any(|(_, e)| matches!(e, ProfileEntry::Local(_)));
+        let registry = build_registry(&file.providers, &declared, needs_models, &mut global_sink);
         check_mcps(&file.mcps, &mut global_sink);
+        if !cfg!(feature = "host") && !file.mcps.is_empty() {
+            global_sink.push(vec![key("mcps")], LOCAL_NO_MCPS);
+        }
 
         let mut resolver = Resolver {
             registry: registry.as_ref(),
@@ -623,17 +670,6 @@ impl Config {
                 }
             }
         }
-        // CE1 (desktop MVP): the catalog needs a local profile to bind a
-        // session — judged on the FILE, so a failing local profile reports
-        // its own errors only, not a second "no local" on top.
-        if !file.profiles.is_empty()
-            && !file
-                .profiles
-                .iter()
-                .any(|(_, e)| matches!(e, ProfileEntry::Local(_)))
-        {
-            global_sink.push(vec![key("profiles")], CE1_MESSAGE);
-        }
         let locals: Vec<&ResolvedProfile> = entries
             .iter()
             .filter_map(local_entry)
@@ -705,8 +741,6 @@ impl Config {
 }
 
 const E2_MESSAGE: &str = "declare at least one profile — the first one is the default";
-/// CE1 (desktop MVP): a profiles map with no LOCAL profile at all.
-const CE1_MESSAGE: &str = "declare at least one local profile (one with agents)";
 
 /// RP1 for every non-`profiles` key (collected), else the typed parse.
 fn parse_repo(
@@ -783,10 +817,6 @@ fn serde_error(
         .and_then(|m| m.strip_suffix('`'))
         .map(str::to_string);
     let message = match (missing.as_deref(), path.len()) {
-        (Some("providers"), 0) => {
-            path.push(key("providers"));
-            E1_MESSAGE.to_string()
-        }
         (Some("profiles"), 0) => {
             path.push(key("profiles"));
             E2_MESSAGE.to_string()
@@ -855,15 +885,22 @@ fn bare_message(err: &serde_yaml::Error, path: &[PathSeg]) -> String {
     }
 }
 
-/// E1, else the registry; R1 errors are located at the offending alias.
+/// E1 (only when a local profile is declared), else the registry; R1
+/// errors are located at the offending alias.
 fn build_registry(
     providers: &[ProviderEntry],
     declared: &[String],
+    needs_models: bool,
     sink: &mut Sink,
 ) -> Option<ModelRegistry> {
     if declared.is_empty() {
-        sink.push(vec![key("providers")], E1_MESSAGE);
-        return None;
+        if needs_models {
+            sink.push(vec![key("providers")], E1_MESSAGE);
+            return None;
+        }
+        // A relay-only file declares no local models: an empty registry is
+        // the valid shape, not an error.
+        return Some(ModelRegistry::empty());
     }
     match ModelRegistry::build(providers) {
         Ok(registry) => Some(registry),
@@ -1008,9 +1045,14 @@ impl Resolver<'_> {
                 Some("'delegate' is not a filterable tool — it is on automatically when an agent has subagents".to_string())
             } else if BUILTIN_TOOL_NAMES.contains(&tool) {
                 None
-            } else {
+            } else if cfg!(feature = "host") {
                 Some(format!(
                     "unknown tool '{tool}'. Known tools: {}.",
+                    BUILTIN_TOOL_NAMES.join(", ")
+                ))
+            } else {
+                Some(format!(
+                    "`{tool}` isn't available in PeakBot on this phone. Available tools: {}.",
                     BUILTIN_TOOL_NAMES.join(", ")
                 ))
             }
@@ -1034,6 +1076,9 @@ impl Resolver<'_> {
             (!TAB_NAMES.contains(&tab))
                 .then(|| format!("unknown tab '{tab}'. Known tabs: {}.", TAB_NAMES.join(", ")))
         });
+        if !cfg!(feature = "host") && def.vector_db.is_some() {
+            sink.push(at(&base, &["vector_db"]), LOCAL_NO_VECTOR_DB);
+        }
         let vector = def
             .vector_db
             .as_ref()
@@ -1347,7 +1392,7 @@ fn expand_home(raw: &str) -> Option<PathBuf> {
     } else {
         raw.strip_prefix("~/")?
     };
-    dirs::home_dir().map(|home| home.join(rest))
+    crate::paths::home_dir().map(|home| home.join(rest))
 }
 
 fn profile_info(p: &ResolvedProfile) -> ProfileInfo {
@@ -2357,10 +2402,10 @@ profiles:
 // that must parse), §4.2 (the resolved `RemoteProfile`/`Endpoint`/`Trust`/
 // `CaFingerprint`/`RemoteToken`/`RemoteTarget` and the `CatalogEntry`
 // catalogue), §4.4 (every parse error — one shape, keyed by field path),
-// RP1–RP8 and CE1. They must fail to compile until `config::remote` and
+// RP1–RP8. They must fail to compile until `config::remote` and
 // the `CatalogEntry` catalogue land.
 // ─────────────────────────────────────────────────────────────────────────────
-#[cfg(test)]
+#[cfg(all(test, feature = "host"))]
 mod t3_remote_profile_tests {
     use std::path::Path;
 
@@ -2428,7 +2473,7 @@ profiles:
 
     /// One global config: the remote entry spelled by `entry_body` (the
     /// indented lines under the profile name) plus a minimal local profile,
-    /// so CE1 has a local to stand on.
+    /// so the remote is exercised in a mixed file.
     fn with_remote_entry(entry_name: &str, entry_body: &str) -> String {
         format!(
             "providers:\n  - name: patchnotes\n    type: openai\n    base_url: https://ai.patchnotes.com/v1\n    api_key: pn-test\n    models:\n      - {{ name: anthropic/claude-sonnet-4.5, alias: sonnet, max_tokens: 8192 }}\nprofiles:\n  {entry_name}:\n{entry_body}  local:\n    agents:\n      a:\n        model: sonnet\n"
@@ -3051,16 +3096,35 @@ profiles:
         assert_eq!(msg, "--profile can't pin a remote profile ('home-dev')");
     }
 
-    /// §4.4 row 14 + CE1 (desktop MVP): a profiles map with NO local
-    /// profile (only remote entries) is a parse error at `profiles`.
+    /// Mobile relay: a profiles map with NO local profile and NO providers
+    /// (only remote entries) is a VALID thin-client config — CE1 is gone,
+    /// and E1 is judged on the file, so nothing is missing here.
     #[test]
-    fn all_remote_profiles_are_a_no_local_profile_error() {
-        let yaml = "providers:\n  - name: patchnotes\n    type: openai\n    base_url: https://ai.patchnotes.com/v1\n    api_key: pn-test\n    models:\n      - { name: anthropic/claude-sonnet-4.5, alias: sonnet, max_tokens: 8192 }\nprofiles:\n  home-dev:\n    remote:\n      url: https://10.2.0.48:7823\n      token: pito\n      ca: sha256:3f9a0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab\n      profile: dev\n";
-        let err = parse(yaml, None).expect_err("a local-less profile set must not parse");
-        let e = one_err(&err, &[key("profiles")], "no local profile");
+    fn relay_only_config_parses_without_providers() {
+        let yaml = "profiles:\n  home-dev:\n    remote:\n      url: https://10.2.0.48:7823\n      token: pito\n      ca: sha256:3f9a0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab\n      profile: dev\n";
+        let cfg = parse(yaml, None)
+            .expect("a relay-only config must parse (CE1 deleted, E1 file-judged)");
+        assert_eq!(
+            cfg.catalog.iter().count(),
+            0,
+            "a relay-only catalog has no local profiles"
+        );
+        assert!(
+            cfg.catalog.remote("home-dev").is_some(),
+            "the remote entry is in the catalog"
+        );
+    }
+
+    /// E1 is judged on the FILE: a local profile with no providers at all
+    /// still fails — with the exact, unchanged E1 text.
+    #[test]
+    fn local_profile_without_providers_is_the_exact_e1() {
+        let yaml = "profiles:\n  dev:\n    agents:\n      team:\n        model: sonnet\n";
+        let err = parse(yaml, None).expect_err("a local profile needs providers");
+        let e = one_err(&err, &[key("providers")], "E1");
         assert_eq!(
             e.message,
-            "declare at least one local profile (one with agents)"
+            "declare at least one provider with at least one model"
         );
     }
 
@@ -3072,7 +3136,10 @@ profiles:
         // `home-dev` is FIRST in the file; the local `dev` follows.
         let yaml = "providers:\n  - name: patchnotes\n    type: openai\n    base_url: https://ai.patchnotes.com/v1\n    api_key: pn-test\n    models:\n      - { name: anthropic/claude-sonnet-4.5, alias: sonnet, max_tokens: 8192 }\nprofiles:\n  home-dev:\n    remote:\n      url: https://10.2.0.48:7823\n      token: pito\n      ca: sha256:3f9a0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab\n      profile: dev\n  dev:\n    agents:\n      team:\n        model: sonnet\n      solo:\n        model: sonnet\n";
         let cfg = parse(yaml, None).expect("a remote-first file must parse");
-        let bound = cfg.catalog.default_bound();
+        let bound = cfg
+            .catalog
+            .default_bound()
+            .expect("a local profile ⇒ a default bound");
         assert_eq!(
             bound.selection(),
             Selection {
@@ -3169,5 +3236,153 @@ profiles:
         );
         assert!(matches!(&entries[1], CatalogEntry::Local(_)));
         assert!(matches!(&entries[2], CatalogEntry::Remote(_)));
+    }
+}
+
+// ─── Local edition Config::parse errors ──────────────────────────────────
+//
+// The Local cut (no `host` feature) rejects at parse time every capability
+// the binary lacks: execution tools, MCP servers, and vector stores.
+// Locked messages (substring, case-sensitive):
+//   tools.only: [bash]      → "`bash` isn't available in PeakBot on this phone"
+//   mcps: (non-empty)       → "MCP servers are not available in PeakBot on this phone"
+//   profiles.X.vector_db    → "vector databases are not available in PeakBot on this phone"
+// A filtered-to-empty tool set is unrepresentable: the parse ERRORS — it
+// never returns an Ok with an empty set.
+//
+// `remote:` profiles parse in the Local edition — the phone's normal shape
+// is a relay-only config (see `local_edition_accepts_remote_profiles`).
+#[cfg(all(test, not(feature = "host")))]
+mod local_parse {
+    use super::*;
+
+    /// Minimal valid providers block; the per-case YAMLs are whole literals
+    /// (`concat!` takes only literals).
+    const VALID: &str = "providers:\n  - name: p\n    type: openai\n    api_key: k\n    models:\n      - name: m1\n        alias: a\nprofiles:\n  p:\n    agents:\n      a:\n        model: a\n";
+
+    const TOOLS_ONLY_BASH: &str = "providers:\n  - name: p\n    type: openai\n    api_key: k\n    models:\n      - name: m1\n        alias: a\nprofiles:\n  p:\n    tools:\n      only: [bash]\n    agents:\n      a:\n        model: a\n";
+
+    const MCPS_NONEMPTY: &str = "providers:\n  - name: p\n    type: openai\n    api_key: k\n    models:\n      - name: m1\n        alias: a\nmcps:\n  - name: playwright\n    command: npx\nprofiles:\n  p:\n    agents:\n      a:\n        model: a\n";
+
+    const VECTOR_DB: &str = "providers:\n  - name: p\n    type: openai\n    api_key: k\n    models:\n      - name: m1\n        alias: a\nprofiles:\n  p:\n    vector_db:\n      db_path: /tmp/v1.db\n      embeddings:\n        base_url: https://e.example/v1\n        model: bge\n        dimensions: 8\n    agents:\n      a:\n        model: a\n";
+
+    /// A remote profile next to a local one — the Local edition parses
+    /// both.
+    const REMOTE_PROFILE: &str = "providers:\n  - name: p\n    type: openai\n    api_key: k\n    models:\n      - name: m1\n        alias: a\nprofiles:\n  relay:\n    remote:\n      url: https://nas.lan:7823\n      token: tok123\n      ca: sha256:3f9a0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab\n      profile: dev\n  p:\n    agents:\n      a:\n        model: a\n";
+
+    fn parse(yaml: &str) -> Result<Config, ConfigErrors> {
+        Config::parse(
+            Source {
+                path: std::path::Path::new("/global/config.yaml"),
+                text: yaml,
+            },
+            None,
+            &ParseCtx { known_skills: &[] },
+        )
+    }
+
+    fn assert_error_contains(yaml: &str, needle: &str) {
+        let res = parse(yaml);
+        assert!(
+            res.is_err(),
+            "Local config must be a parse error; got Ok (no message can match `{needle}`)"
+        );
+        let messages: Vec<String> = match res {
+            Ok(_) => Vec::new(),
+            Err(errors) => errors.0.iter().map(|e| e.message.clone()).collect(),
+        };
+        assert!(
+            messages.iter().any(|m| m.contains(needle)),
+            "no error mentions `{needle}`; got: {messages:?}"
+        );
+    }
+
+    /// Control: the harness config itself is valid, so the assertions below
+    /// test the Local rejections, not a broken fixture.
+    #[test]
+    fn local_minimal_valid_config_still_parses() {
+        assert!(
+            parse(VALID).is_ok(),
+            "the minimal harness config must be valid: {:?}",
+            parse(VALID)
+        );
+    }
+
+    #[test]
+    fn local_tools_only_bash_is_a_parse_error() {
+        assert_error_contains(
+            TOOLS_ONLY_BASH,
+            "`bash` isn't available in PeakBot on this phone",
+        );
+    }
+
+    #[test]
+    fn local_tools_only_bash_never_yields_an_empty_tool_set() {
+        // The S13 trap: `only: [bash]` must not silently resolve to an
+        // empty tool set — the parse fails instead.
+        assert!(
+            parse(TOOLS_ONLY_BASH).is_err(),
+            "tools.only: [bash] in Local must be an error, never an empty set"
+        );
+    }
+
+    #[test]
+    fn local_mcps_nonempty_is_a_parse_error() {
+        assert_error_contains(
+            MCPS_NONEMPTY,
+            "MCP servers are not available in PeakBot on this phone",
+        );
+    }
+
+    #[test]
+    fn local_vector_db_is_a_parse_error() {
+        assert_error_contains(
+            VECTOR_DB,
+            "vector databases are not available in PeakBot on this phone",
+        );
+    }
+
+    /// Mobile relay: the Local edition ACCEPTS `remote:` profiles — a mixed
+    /// local + remote config parses (this test used to assert the
+    /// `LOCAL_NO_REMOTE` rejection, which is deleted).
+    #[test]
+    fn local_edition_accepts_remote_profiles() {
+        let cfg = parse(REMOTE_PROFILE).expect("Local must parse a config with a remote profile");
+        assert!(
+            cfg.catalog.remote("relay").is_some(),
+            "the remote entry is in the Local catalog"
+        );
+    }
+
+    /// Mobile relay: a relay-only config (no providers, no local profile)
+    /// is valid in the Local edition — the phone's normal shape.
+    #[test]
+    fn local_edition_relay_only_parses_without_providers() {
+        let yaml = "profiles:\n  relay:\n    remote:\n      url: https://nas.lan:7823\n      token: tok123\n      ca: sha256:3f9a0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab\n      profile: dev\n";
+        let cfg = parse(yaml).expect("a relay-only config must parse in Local");
+        assert_eq!(cfg.catalog.iter().count(), 0, "no local profiles");
+        assert!(
+            cfg.catalog.remote("relay").is_some(),
+            "remote entry present"
+        );
+    }
+
+    /// E1 is judged on the FILE in the Local edition too: a local profile
+    /// with no providers fails with the exact E1 text.
+    #[test]
+    fn local_edition_local_profile_without_providers_is_the_exact_e1() {
+        let yaml = "profiles:\n  p:\n    agents:\n      a:\n        model: a\n";
+        let res = parse(yaml);
+        assert!(res.is_err(), "a local profile needs providers");
+        let messages: Vec<String> = match res {
+            Ok(_) => Vec::new(),
+            Err(errors) => errors.0.iter().map(|e| e.message.clone()).collect(),
+        };
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "declare at least one provider with at least one model"),
+            "E1 fires exactly: {messages:?}"
+        );
     }
 }

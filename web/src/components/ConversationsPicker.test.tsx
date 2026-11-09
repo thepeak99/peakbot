@@ -107,9 +107,9 @@ afterEach(() => {
     container.remove();
     container = null;
   }
-  // Desktop tests install window.isTauri; always start the next test in a
+  // Desktop tests install peakbotShell; always start the next test in a
   // browser.
-  delete (window as unknown as { isTauri?: boolean }).isTauri;
+  delete (window as unknown as { peakbotShell?: string }).peakbotShell;
   vi.restoreAllMocks();
 });
 
@@ -211,13 +211,9 @@ describe("ConversationsPicker — kill error line", () => {
 describe("ConversationsPicker — desktop vs browser (issue #373)", () => {
   function setDesktop(on: boolean): void {
     if (on) {
-      Object.defineProperty(window, "isTauri", {
-        value: true,
-        writable: true,
-        configurable: true,
-      });
+      (window as { peakbotShell?: string }).peakbotShell = "desktop";
     } else {
-      delete (window as unknown as { isTauri?: boolean }).isTauri;
+      delete (window as { peakbotShell?: string }).peakbotShell;
     }
   }
 

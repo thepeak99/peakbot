@@ -2,10 +2,12 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use peakbot::boot::{WebBoot, WebSession};
 use peakbot::config::resolve::{LoadError, ParseCtx, Source};
-use peakbot::config::{ConfigErrors, ConfigFileKind, auto_migrate, resolve_token};
+use peakbot::config::{ConfigErrors, ConfigFileKind, WebConfig, auto_migrate, resolve_token};
+use peakbot::ui::web::settings::TokenSource;
 use peakbot::{
-    Config, FileStorage, RepoMode, ShellKind, Ui,
+    Config, RepoMode, ShellKind, Ui,
     install::{
         InstallAction, InstallOutcome, PathState, ServiceOp, ServicePlan, install_binary,
         install_target, path_state, service_op,
@@ -13,7 +15,6 @@ use peakbot::{
     load_default_skills, load_mcp_servers, print_no_shell_warning,
 };
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -191,6 +192,26 @@ fn exit_with(lines: &[String]) -> ! {
         eprintln!("{line}");
     }
     std::process::exit(1);
+}
+
+/// The locked refusal for a relay-only config in a mode that needs a local
+/// profile to bind.
+const RELAY_ONLY_REFUSAL: &str = "every profile in config.yaml is a remote profile — remote profiles open in the web UI (run peakbot without --tui/--stdio)";
+
+/// The ONE CLI decision for a config whose home is a remote profile:
+/// `Some(message)` ⇒ exit with the message (printed, status 1); `None` ⇒
+/// continue. Refuses exactly when the mode is TUI or stdio, the `--profile`
+/// pin is absent, and the home is remote — web mode always continues, and a
+/// pin already names a local profile (`start_bound` refuses a relay-only
+/// pin earlier).
+fn relay_only_refusal(
+    mode: Mode,
+    pin: Option<&str>,
+    home: &peakbot::config::resolve::Home,
+) -> Option<&'static str> {
+    let terminal = matches!(mode, Mode::Tui | Mode::Stdio);
+    (terminal && pin.is_none() && matches!(home, peakbot::config::resolve::Home::Remote(_)))
+        .then_some(RELAY_ONLY_REFUSAL)
 }
 
 /// Spec §4.1 CLI rendering: `"{file}: {path}: {message}"`, one per error,
@@ -518,7 +539,9 @@ async fn main() -> Result<()> {
     // Config to load — boot the needs_setup server (spec §6.9) and let the
     // SPA show the reason (there is no migrate endpoint).
     if let Some(migrate_error) = migrate_error {
-        return run_needs_setup_web(&cli, &config_dir, &boot_cwd, Some(migrate_error)).await;
+        let web = web_facts(&cli, &config_dir, &boot_cwd, None)?;
+        let migrate_error = Some(migrate_error);
+        return run_web(web, WebSession::NeedsSetup { migrate_error }).await;
     }
 
     // Load skills relative to the boot cwd (an allowed mint-site read of the
@@ -545,7 +568,14 @@ async fn main() -> Result<()> {
             // §6.9: a windowed web session with no global file boots the
             // settings server (needs_setup) — there is no Config yet.
             if windowed_web {
-                return run_needs_setup_web(&cli, &config_dir, &boot_cwd, None).await;
+                let web = web_facts(&cli, &config_dir, &boot_cwd, None)?;
+                return run_web(
+                    web,
+                    WebSession::NeedsSetup {
+                        migrate_error: None,
+                    },
+                )
+                .await;
             }
             print_config_not_found_message(&path);
             anyhow::bail!("No config file found. See instructions above.");
@@ -564,10 +594,19 @@ async fn main() -> Result<()> {
     for warning in &config.warnings {
         eprintln!("warning: {warning}");
     }
-    let start = match config.catalog.start_bound(cli.profile.as_deref()) {
-        Ok(bound) => bound,
-        Err(message) => exit_with(&[message]),
-    };
+    // A relay-only config has no local profile to bind: TUI and stdio
+    // refuse it at the boundary — web is exactly where it belongs.
+    if let Some(message) = relay_only_refusal(mode, cli.profile.as_deref(), &config.catalog.home())
+    {
+        exit_with(&[message.to_string()]);
+    }
+    // Validate the pin here, at the boundary, so a bad `--profile` gets the
+    // plain one-line exit before any MCP server starts.
+    if let Some(pin) = cli.profile.as_deref()
+        && let Err(message) = config.catalog.start_bound(Some(pin))
+    {
+        exit_with(&[message]);
+    }
 
     // Boot-only: every HTTP client built from here on inherits these.
     peakbot::http::init_timeouts(config.general.http.clone());
@@ -585,111 +624,29 @@ async fn main() -> Result<()> {
     // One set of MCP subprocesses for the process. Each session re-derives
     // its tools list from the shared handles (McpTool: Clone), filtered by
     // its profile — see `ToolEnv`.
-    let mcp_handles = Arc::new(load_mcp_servers(&config).await?);
+    let mcp_handles = load_mcp_servers(&config).await?;
 
-    // Create shared conversation storage if enabled. One storage instance
-    // is shared by every session — it writes distinct files per
-    // conversation id (see session::SessionDeps).
-    let conversation = &config.general.conversation;
-    let storage: Option<Arc<dyn peakbot::ConversationStorage>> = if conversation.auto_save {
-        let storage_dir = conversation.storage_dir_or_default();
-        match FileStorage::new(storage_dir.clone()) {
-            Ok(storage) => {
-                tracing::info!("Conversation storage enabled at: {:?}", storage_dir);
-                Some(Arc::new(storage))
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to create conversation storage at {:?}: {}. \
-                     Continuing without persistence.",
-                    storage_dir,
-                    e
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    let registry = config.registry.clone();
-    let active_alias = start.agent().main.model.alias.clone();
-    let web = config.general.web.clone();
-    let uploads = peakbot::attachments::UploadStore::new(
-        peakbot::attachments::UploadStore::default_root(),
-        config.general.uploads,
-    );
-
-    // Build the shared session deps once. Each session (the single
-    // TUI/stdio session, or one per web-socket connection) is built from
-    // these via `create_session`. `Arc` so the web UI can hand a clone to
-    // every connection handler. See `src/session.rs`.
-    let session_deps = Arc::new(peakbot::SessionDeps {
-        config: Arc::new(config),
+    // The shared session deps, built once. Each session (the single
+    // TUI/stdio session, or one per web conversation) is built from these
+    // via `create_session`. See `src/session.rs`.
+    let session_deps = peakbot::boot::session_deps(
+        config,
         skills,
         mcp_handles,
-        boot_notices: std::sync::Mutex::new(boot_notices),
+        boot_notices,
         shell_kind,
-        storage,
-        profile_pin: cli.profile.clone(),
-        uploads,
-    });
+        cli.profile.clone(),
+    );
 
-    use peakbot::ui::{ReplUi, StdioUi, WebUi, build_models_snapshot};
+    use peakbot::ui::{ReplUi, StdioUi, build_models_snapshot};
 
-    // The web UI builds one session per WebSocket connection, so it takes
-    // the deps and never boots a single shared session. The TUI and stdio
-    // views are single-session: build one, drive it, drop it (teardown).
+    // The web UI builds one session per conversation, so it takes the deps
+    // and never boots a single shared session. The TUI and stdio views are
+    // single-session: build one, drive it, drop it (teardown).
     if mode == Mode::Web {
-        // Bind, token and TLS (spec §8.4): CLI first, then `general.web`.
-        // Parse-at-the-boundary: validate here, then trust the
-        // Option<token> inside WebUi.
-        let addr = cli.bind.unwrap_or(web.bind);
-        let env_token = std::env::var("PEAKBOT_WEB_TOKEN").ok();
-        let token = resolve_token(
-            cli.token.as_deref(),
-            env_token.as_deref(),
-            web.token.as_deref(),
-        );
-
-        // An agent that can run shell commands must never be reachable on a
-        // non-loopback address without a secret. Make the footgun impossible.
-        if !addr.ip().is_loopback() && token.is_none() {
-            anyhow::bail!(
-                "refusing to bind the web UI to non-loopback {addr} without a token — \
-                 set --token, PEAKBOT_WEB_TOKEN, or general.web.token"
-            );
-        }
-
-        let tls = cli.tls || web.tls;
-        // The settings surface's boot facts (spec §8.2 `boot` block): the
-        // token source mirrors `resolve_token`'s chain. A failed global
-        // migration already returned the needs_setup server above, so
-        // `migrate_error` is None here.
-        let settings = peakbot::ui::web::settings::SettingsBoot {
-            config_dir: config_dir.clone(),
-            boot_cwd: boot_cwd.clone(),
-            migrate_error: None,
-            token_source: peakbot::ui::web::settings::TokenSource::resolve(
-                cli.token.as_deref(),
-                env_token.as_deref(),
-                web.token.as_deref(),
-            ),
-        };
-        let mut ui = WebUi::new(
-            addr,
-            Some(session_deps.clone()),
-            build_models_snapshot(&registry),
-            active_alias,
-            token,
-            tls,
-            cli.tls_name.clone(),
-            settings,
-        );
-        ui.init().await?;
-        ui.run().await?;
-        ui.shutdown().await?;
-        return Ok(());
+        let general_web = &session_deps.config.general.web;
+        let web = web_facts(&cli, &config_dir, &boot_cwd, Some(general_web))?;
+        return run_web(web, WebSession::Ready(session_deps)).await;
     }
 
     // Single session for the TUI / stdio Views.
@@ -704,7 +661,7 @@ async fn main() -> Result<()> {
         let mut ui = StdioUi::new(
             state_manager.clone(),
             action_sender,
-            build_models_snapshot(&registry),
+            build_models_snapshot(&session_deps.config.registry),
             boot_alias.clone(),
         );
         ui.init().await?;
@@ -713,8 +670,11 @@ async fn main() -> Result<()> {
     } else {
         // The registry lets the View intercept/validate `/model <alias>`
         // before any UiAction is dispatched.
-        let mut ui =
-            ReplUi::new_with_registry(state_manager.clone(), action_sender, registry.clone());
+        let mut ui = ReplUi::new_with_registry(
+            state_manager.clone(),
+            action_sender,
+            session_deps.config.registry.clone(),
+        );
         ui.init().await?;
         ui.run().await?;
         ui.shutdown().await?;
@@ -728,56 +688,54 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// §6.9 needs_setup server: the web UI without session deps — the SPA,
-/// `/api/settings`, `/api/config*` and `/api/system/*`, with `/ws` the 503
-/// setup guard. Reached from a windowed web session whose global file is
-/// missing, or whose boot auto-migration failed (`migrate_error` carries
-/// the reason verbatim). Bind/token/TLS resolve without a config: CLI
-/// flags and env only, the same non-loopback refusal as normal boot.
-async fn run_needs_setup_web(
+/// Bind, token and TLS for the web UI (spec §8.4): CLI flags first, then
+/// `PEAKBOT_WEB_TOKEN`, then `general.web` — absent in needs_setup mode
+/// (§6.9: no config yet), where the defaults apply. Parse-at-the-boundary:
+/// the non-loopback refusal happens here, then `WebUi` trusts its token.
+fn web_facts(
     cli: &Cli,
     config_dir: &Path,
     boot_cwd: &Path,
-    migrate_error: Option<String>,
-) -> Result<()> {
-    let addr = cli.bind.unwrap_or_else(|| {
+    web: Option<&WebConfig>,
+) -> Result<WebBoot> {
+    let addr = cli.bind.or(web.map(|w| w.bind)).unwrap_or_else(|| {
         peakbot::ui::DEFAULT_WEB_ADDR
             .parse()
             .expect("DEFAULT_WEB_ADDR is a valid SocketAddr literal")
     });
     let env_token = std::env::var("PEAKBOT_WEB_TOKEN").ok();
-    let token = resolve_token(cli.token.as_deref(), env_token.as_deref(), None);
+    let config_token = web.and_then(|w| w.token.as_deref());
+    let token = resolve_token(cli.token.as_deref(), env_token.as_deref(), config_token);
+    // An agent that can run shell commands must never be reachable on a
+    // non-loopback address without a secret. Make the footgun impossible.
     if !addr.ip().is_loopback() && token.is_none() {
         anyhow::bail!(
             "refusing to bind the web UI to non-loopback {addr} without a token — \
              set --token, PEAKBOT_WEB_TOKEN, or general.web.token"
         );
     }
-    let tls = cli.tls;
-    let settings = peakbot::ui::web::settings::SettingsBoot {
-        config_dir: config_dir.to_path_buf(),
-        boot_cwd: boot_cwd.to_path_buf(),
-        migrate_error,
-        token_source: peakbot::ui::web::settings::TokenSource::resolve(
+    Ok(WebBoot {
+        addr,
+        token,
+        token_source: TokenSource::resolve(
             cli.token.as_deref(),
             env_token.as_deref(),
-            None,
+            config_token,
         ),
-    };
-    let mut ui = peakbot::ui::WebUi::new(
-        addr,
-        None,
-        Vec::new(),
-        String::new(),
-        token,
-        tls,
-        cli.tls_name.clone(),
-        settings,
-    );
+        tls: cli.tls || web.is_some_and(|w| w.tls),
+        tls_names: cli.tls_name.clone(),
+        config_dir: config_dir.to_path_buf(),
+        boot_cwd: boot_cwd.to_path_buf(),
+    })
+}
+
+/// Boot the web UI through the shared [`peakbot::boot::web_boot`] and serve
+/// it until Ctrl+C.
+async fn run_web(web: WebBoot, session: WebSession) -> Result<()> {
+    let mut ui = peakbot::boot::web_boot(web, session)?;
     ui.init().await?;
     ui.run().await?;
-    ui.shutdown().await?;
-    Ok(())
+    ui.shutdown().await
 }
 
 /// The `tracing` filter directives: `RUST_LOG` verbatim when set, else the mode's
@@ -837,6 +795,81 @@ mod tests {
     fn cli_rejects_conflicting_frontends() {
         assert!(parse(&["--tui", "--stdio"]).is_err());
         assert!(parse(&["--web", "--tui"]).is_err());
+    }
+
+    // ── The relay-only CLI boundary (extracted pure fn) ─────────────────
+    //
+    // [`relay_only_refusal`] is the ONE CLI decision for a config whose
+    // home is a remote profile: `Some(message)` ⇒ exit with the message
+    // (printed, status 1); `None` ⇒ continue. Refuses exactly when the
+    // mode is TUI or stdio, the `--profile` pin is absent, and the home is
+    // remote — web mode always continues, and a pin already names a local
+    // profile (validated earlier by `start_bound`).
+    //
+    // The refused message is locked.
+    const RELAY_ONLY_REFUSAL: &str = "every profile in config.yaml is a remote profile — remote profiles open in the web UI (run peakbot without --tui/--stdio)";
+
+    /// A relay-only catalog's `Home`: `Home::Remote` (the fixture parses
+    /// once relay-only configs are accepted; the refusal decision is what
+    /// is under test here).
+    fn relay_only_home() -> peakbot::config::resolve::Home {
+        use peakbot::config::resolve::{Config, ParseCtx, Source};
+        let yaml = "profiles:\n  dev on nas:\n    remote:\n      url: https://nas.lan:7823\n      token: tok123\n      ca: sha256:3f9a0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab\n      profile: dev\n";
+        let cfg = Config::parse(
+            Source {
+                path: std::path::Path::new("/global/config.yaml"),
+                text: yaml,
+            },
+            None,
+            &ParseCtx { known_skills: &[] },
+        )
+        .expect("a relay-only config must parse");
+        cfg.catalog.home()
+    }
+
+    #[test]
+    fn tui_mode_refuses_relay_only_config_with_the_locked_string() {
+        let home = relay_only_home();
+        let refusal = relay_only_refusal(Mode::Tui, None, &home);
+        assert_eq!(
+            refusal,
+            Some(RELAY_ONLY_REFUSAL),
+            "TUI + unpinned + relay-only ⇒ the exact locked refusal"
+        );
+    }
+
+    #[test]
+    fn stdio_mode_refuses_relay_only_config_with_the_locked_string() {
+        let home = relay_only_home();
+        let refusal = relay_only_refusal(Mode::Stdio, None, &home);
+        assert_eq!(
+            refusal,
+            Some(RELAY_ONLY_REFUSAL),
+            "stdio + unpinned + relay-only ⇒ the exact locked refusal"
+        );
+    }
+
+    #[test]
+    fn web_mode_continues_for_relay_only_config() {
+        let home = relay_only_home();
+        assert_eq!(
+            relay_only_refusal(Mode::Web, None, &home),
+            None,
+            "web mode is exactly where a relay-only config belongs"
+        );
+    }
+
+    #[test]
+    fn a_pinned_tui_session_does_not_get_the_relay_refusal() {
+        // A pin names a local profile (a relay-only config can't be
+        // pinned at all — `start_bound` refuses it earlier), so the
+        // boundary is not reached: no refusal.
+        let home = relay_only_home();
+        assert_eq!(
+            relay_only_refusal(Mode::Tui, Some("dev"), &home),
+            None,
+            "the refusal is for the UNPINned relay-only case only"
+        );
     }
 
     #[test]

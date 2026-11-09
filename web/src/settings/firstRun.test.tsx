@@ -118,7 +118,7 @@ afterEach(() => {
     root = undefined;
   }
   vi.unstubAllGlobals();
-  delete (globalThis as { isTauri?: unknown }).isTauri;
+  delete (globalThis as { peakbotShell?: unknown }).peakbotShell;
   window.history.replaceState(null, "", "/");
 });
 
@@ -358,6 +358,11 @@ describe("buildFirstRunYaml (spec §9.13 generated YAML)", () => {
     expect(doc.general.web).toEqual({ bind: "127.0.0.1:7823" });
   });
 
+  it("local_edition_writes_no_general_block", () => {
+    const doc = parseYaml(buildFirstRunYaml(ANSWERS, { local: true })) as Record<string, unknown>;
+    expect(Object.keys(doc)).toEqual(["providers", "mcps", "profiles"]);
+  });
+
   it("openrouter_omits_base_url_even_when_given", () => {
     const a = clone(ANSWERS);
     a.provider.base_url = "https://openrouter.ai/api/v1";
@@ -462,7 +467,7 @@ describe("FirstRun — Welcome (spec §9.13 step 1)", () => {
     expect(banner).toContain("config.yaml.pre-0.24");
   });
 
-  it("welcome_has_no_migrate_button_and_start_fresh_is_the_only_action", () => {
+  it("welcome_offers_the_two_choices_and_no_migrate_button", () => {
     stubApi();
     mountFirstRun({
       m: { legacy_layout: true, migrate_error: "boom" },
@@ -470,7 +475,12 @@ describe("FirstRun — Welcome (spec §9.13 step 1)", () => {
     });
     const pane = q("firstrun-step-welcome");
     const buttons = Array.from(pane.querySelectorAll("button"));
-    expect(buttons.map((b) => b.getAttribute("data-testid"))).toEqual(["firstrun-start-fresh"]);
+    // Two choices: set up a provider on this device, or connect to a
+    // PeakBot server (the relay-only path). No migrate button.
+    expect(buttons.map((b) => b.getAttribute("data-testid"))).toEqual([
+      "firstrun-start-fresh",
+      "firstrun-connect-server",
+    ]);
     expect(buttons.some((b) => /migrate/i.test(b.textContent ?? ""))).toBe(false);
   });
 
@@ -542,10 +552,11 @@ describe("FirstRun — Welcome (spec §9.13 step 1)", () => {
     });
     expect(text("firstrun-fact-path")).toBe("PATH · not on PATH — install target missing");
 
-    // No install info → the line is omitted (the fixture meta uses null).
+    // No install info (the fixture meta uses null): the full edition
+    // keeps the line — it reads "unknown" instead of being omitted.
     unmountFirstRun();
     mountFirstRun();
-    expect(has("firstrun-fact-path")).toBe(false);
+    expect(text("firstrun-fact-path")).toBe("PATH · unknown");
   });
 
   it("start_fresh_goes_to_the_provider_step", () => {
@@ -807,7 +818,7 @@ describe("FirstRun — Review + Finish (spec §9.13 steps 5–6)", () => {
   });
 
   it("desktop_finish_navigates_restart_sentinel", async () => {
-    (globalThis as { isTauri?: unknown }).isTauri = true;
+    (globalThis as { peakbotShell?: unknown }).peakbotShell = "desktop";
     const calls = stubApi();
     // jsdom cannot navigate to a custom scheme: record the assignment.
     const loc = { href: "http://localhost/", pathname: "/", search: "" };

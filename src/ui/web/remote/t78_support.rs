@@ -452,15 +452,20 @@ pub struct LocalEnv {
 
 impl LocalEnv {
     pub async fn start(remotes: &[RemoteSpec<'_>], extra: Option<Router>) -> Self {
-        let yaml = yaml(remotes);
-        let home = XdgHome::new(&yaml);
+        Self::start_yaml(yaml(remotes), extra).await
+    }
+
+    /// The same env over an arbitrary global config — the mobile-relay
+    /// tests pass a relay-only config (no local profile, no providers).
+    pub async fn start_yaml(global_yaml: String, extra: Option<Router>) -> Self {
+        let home = XdgHome::new(&global_yaml);
         let storage = Arc::new(InMemoryStorage::new());
         let mut deps = deps_ts::test_deps(Some(storage.clone() as Arc<dyn ConversationStorage>));
         deps.config = Arc::new(
             Config::parse(
                 Source {
                     path: std::path::Path::new("/global/config.yaml"),
-                    text: &yaml,
+                    text: &global_yaml,
                 },
                 None,
                 &ParseCtx { known_skills: &[] },

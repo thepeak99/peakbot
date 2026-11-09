@@ -389,9 +389,9 @@ describe("Composer paste — files only reachable via clipboardData.items", () =
 // nothing. Never preventDefault — the default for a paste with no files
 // and no text inserts nothing.
 //
-// RED today: Composer.onPaste has no Linux fallback, so L1/L2/L3/L8 fail
-// (the IPC is never called). L4–L7 are regression guards and are green
-// before the implementation.
+// RED today: Composer.onPaste has no Linux fallback, so the four cases
+// that exercise the IPC fail. The other four are regression guards and
+// are green before the implementation.
 //
 // The UA is ALWAYS stubbed: jsdom's default UA is "(linux)" on Linux CI
 // and "(darwin)" on a Mac, so leaving it unstubbed is non-deterministic.
@@ -408,14 +408,14 @@ describe("Composer paste — Linux desktop clipboard fallback (WebKit Bug 218519
   const flush = () => act(async () => {});
 
   beforeEach(() => {
-    (globalThis as { isTauri?: unknown }).isTauri = true;
+    (globalThis as { peakbotShell?: unknown }).peakbotShell = "desktop";
     invoke = vi.fn(async () => new Uint8Array([1, 2, 3]).buffer);
     (globalThis as { __TAURI__?: unknown }).__TAURI__ = { core: { invoke } };
     uaSpy = vi.spyOn(navigator, "userAgent", "get").mockReturnValue(WEBKITGTK_UA);
   });
 
   afterEach(() => {
-    delete (globalThis as { isTauri?: unknown }).isTauri;
+    delete (globalThis as { peakbotShell?: unknown }).peakbotShell;
     delete (globalThis as { __TAURI__?: unknown }).__TAURI__;
     vi.restoreAllMocks();
   });
@@ -490,7 +490,7 @@ describe("Composer paste — Linux desktop clipboard fallback (WebKit Bug 218519
   });
 
   it("in a browser an empty paste never asks the app", async () => {
-    delete (globalThis as { isTauri?: unknown }).isTauri;
+    delete (globalThis as { peakbotShell?: unknown }).peakbotShell;
     const add = vi.fn();
     const ta = await mountComposer(add);
 

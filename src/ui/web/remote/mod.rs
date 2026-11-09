@@ -38,6 +38,8 @@ pub(super) mod listing;
 pub(super) mod proxy;
 pub(super) mod relay;
 
+// Every remote test drives a config `remote:` profile, which every
+// edition parses — the relay runs in the Local edition too.
 #[cfg(test)]
 mod client_tests;
 
@@ -59,6 +61,11 @@ mod t8_tests;
 
 #[cfg(test)]
 mod t9_tests;
+
+// Unpinned attach on a relay-only config (remotes through the on-device
+// core).
+#[cfg(test)]
+mod t10_tests;
 
 pub type WsStream = tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -133,6 +140,17 @@ pub enum RemoteError {
     },
 }
 
+/// Android 17 drops LAN dials silently without the "Nearby devices" grant; name the fix.
+const ANDROID_LNP_HINT: &str = " On Android 17+, allow PeakBot \"Nearby devices\" in App info → Permissions so it can reach your local network.";
+
+fn timeout_hint(os: &str) -> &'static str {
+    if os == "android" {
+        ANDROID_LNP_HINT
+    } else {
+        ""
+    }
+}
+
 impl fmt::Display for RemoteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -149,7 +167,8 @@ impl fmt::Display for RemoteError {
             Self::Timeout { profile, host } => {
                 write!(
                     f,
-                    "Remote profile '{profile}' at {host} didn't answer in time."
+                    "Remote profile '{profile}' at {host} didn't answer in time.{}",
+                    timeout_hint(std::env::consts::OS)
                 )
             }
             Self::TlsPin { profile, want, got } => write!(
@@ -730,4 +749,16 @@ pub fn fresh_attach(
 ) -> Result<(Option<Arc<RemoteProfile>>, Vec<ProfileInfo>), RemoteError> {
     let cfg = load_config()?;
     Ok((cfg.catalog.remote(name).cloned(), cfg.catalog.infos()))
+}
+
+/// The unpinned-attach counterpart of [`fresh_attach`]: the remote the
+/// config homes *right now* (a relay-only config has no local session to
+/// mint), plus the fresh catalogue. `None` when the fresh home is local.
+pub fn fresh_home_attach() -> Result<(Option<Arc<RemoteProfile>>, Vec<ProfileInfo>), RemoteError> {
+    let cfg = load_config()?;
+    let remote = match cfg.catalog.home() {
+        crate::config::resolve::Home::Remote(r) => Some(r),
+        crate::config::resolve::Home::Local(_) => None,
+    };
+    Ok((remote, cfg.catalog.infos()))
 }

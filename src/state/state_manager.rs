@@ -3,7 +3,9 @@
 //! Single source of truth for app state (chat, todos, stats, context).
 //! Broadcasts changes to UI subscribers via async channels.
 
-use crate::bg_processes::{BgError, BgRegistry, BgStatus, DrainedBlock, StartParams};
+#[cfg(feature = "host")]
+use crate::bg_processes::StartParams;
+use crate::bg_processes::{BgError, BgRegistry, BgStatus, DrainedBlock};
 use crate::context_manager::{CompactionResult, ContextManager};
 use crate::conversation::Conversation;
 use crate::conversation_title::{generate_conversation_title, provisional_title};
@@ -3102,6 +3104,7 @@ impl StateManager {
     /// Spawn a new background process. Returns the [`BgListEntry`] for
     /// the freshly-registered process (id, pid, etc.) so callers can
     /// surface it to the model immediately.
+    #[cfg(feature = "host")]
     pub fn start_bg(
         &self,
         params: StartParams,
@@ -8995,15 +8998,15 @@ mod tests {
     // on a missing API.
     // ─────────────────────────────────────────────────────────────────────
 
-    use std::time::Duration;
-    // PR2: `StartParams.shell` is a `ShellKind` (was `String`).
-    use crate::tools::ShellKind;
-
     /// Build the canonical T1 fixture: a `StateManager` with two live bg
     /// processes (`sleep 30` — they take 30 s to exit naturally, so they're
     /// still running when the test body finishes), a `Running` bash panel,
     /// and a registered bash-stdin sender. Mirrors the design §8 T1 recipe.
+    #[cfg(feature = "host")]
     fn build_t1_fixture() -> Arc<StateManager> {
+        use crate::tools::ShellKind;
+        use std::time::Duration;
+
         let sm = StateManager::new_arc();
         // The bg registry refuses starts until a notify channel is attached
         // (see start_bg at `state_manager.rs:2043-2060`); do that first.
@@ -9059,6 +9062,7 @@ mod tests {
     ///   5. leaves `turn_cancel_token().is_cancelled() == true` (the token
     ///      that `process_message_internal` raced against was cancelled,
     ///      which is what drops the turn's future at the next poll).
+    #[cfg(feature = "host")]
     #[test]
     fn stop_turn_processes_kills_and_reports() {
         let sm = build_t1_fixture();
@@ -9134,6 +9138,7 @@ mod tests {
     /// "leaves the panel idle and the stdin slot cleared after the first
     /// call" assertion — which fails on the stub because the first call
     /// does not touch the panel or stdin.
+    #[cfg(feature = "host")]
     #[test]
     fn stop_turn_processes_is_idempotent() {
         let sm = build_t1_fixture();

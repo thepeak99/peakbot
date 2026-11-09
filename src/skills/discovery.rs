@@ -173,9 +173,9 @@ impl SkillRegistry {
 pub fn get_default_skills_dirs(session_cwd: &Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
 
-    // 1. Global skills directory: ~/.agents/skills
-    if let Some(home) = dirs::home_dir() {
-        let global_skills = home.join(".agents").join("skills");
+    // 1. Global skills directory: ~/.agents/skills (`<data>/skills` under
+    //    embedder roots, where there is no home).
+    if let Some(global_skills) = crate::paths::global_skills_dir() {
         dirs.push(global_skills);
     }
 
@@ -189,23 +189,34 @@ pub fn get_default_skills_dirs(session_cwd: &Path) -> Vec<PathBuf> {
 /// Returns the populated registry plus any user-facing load warnings (a bad
 /// skill is skipped, never fatal) so callers can surface them in the UI.
 pub fn load_default_skills(session_cwd: &Path) -> (SkillRegistry, Vec<String>) {
-    let mut registry = SkillRegistry::new();
-    let mut warnings = Vec::new();
+    // The Local edition never discovers skills: an empty
+    // registry, whatever the working directory holds — on boot AND reload.
+    #[cfg(not(feature = "host"))]
+    {
+        let _ = session_cwd;
+        (SkillRegistry::new(), Vec::new())
+    }
 
-    for dir in get_default_skills_dirs(session_cwd) {
-        if dir.exists() {
-            tracing::info!("Checking for skills in: {}", dir.display());
-            registry.load_from_directory(&dir, &mut warnings);
+    #[cfg(feature = "host")]
+    {
+        let mut registry = SkillRegistry::new();
+        let mut warnings = Vec::new();
+
+        for dir in get_default_skills_dirs(session_cwd) {
+            if dir.exists() {
+                tracing::info!("Checking for skills in: {}", dir.display());
+                registry.load_from_directory(&dir, &mut warnings);
+            }
         }
-    }
 
-    if registry.is_empty() {
-        tracing::info!("No skills found in default locations");
-    } else {
-        tracing::info!("Loaded {} skill(s)", registry.len());
-    }
+        if registry.is_empty() {
+            tracing::info!("No skills found in default locations");
+        } else {
+            tracing::info!("Loaded {} skill(s)", registry.len());
+        }
 
-    (registry, warnings)
+        (registry, warnings)
+    }
 }
 
 #[cfg(test)]

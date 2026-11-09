@@ -1,0 +1,27 @@
+---
+source: tests/fetch_url_headers.rs
+expression: definition_json(false).await
+---
+{
+  "description": "Fetch the content of a URL and return it as text. Use this to retrieve web page content, API responses, or any HTTP GET request. Returns the response body up to 50,000 characters (truncated if longer).",
+  "name": "fetch_url",
+  "parameters": {
+    "properties": {
+      "headers": {
+        "additionalProperties": {
+          "type": "string"
+        },
+        "description": "Optional headers to send with the request (string to string, e.g. {\"Authorization\": \"Bearer x\"}). At most 20 headers, each name at most 64 bytes, each value at most 8192 bytes; Host, Content-Length, Cookie, Transfer-Encoding and Connection are forbidden.",
+        "type": "object"
+      },
+      "url": {
+        "description": "The URL to fetch",
+        "type": "string"
+      }
+    },
+    "required": [
+      "url"
+    ],
+    "type": "object"
+  }
+}

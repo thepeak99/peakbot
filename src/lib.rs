@@ -10,21 +10,30 @@ pub const PEAKBOT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod attachments;
 pub mod bg_processes;
+pub mod boot;
 pub mod config;
 mod context_manager;
 mod conversation;
 mod conversation_manager;
 mod conversation_title;
+// The phone app's in-process core: Local-edition limits by construction.
+#[cfg(not(feature = "host"))]
+pub mod embed;
 mod hooks;
 pub mod http;
 pub mod image_cache;
+#[cfg(feature = "host")]
 pub mod install;
+pub mod line_buffer;
+#[cfg(feature = "host")]
 mod mcp_auth;
 mod memory_compaction;
 #[cfg(feature = "mock")]
 pub mod mock;
+pub mod paths;
 pub mod pipeline;
 mod providers;
+#[cfg(feature = "host")]
 pub mod pty_runner;
 pub mod reasoning;
 pub mod selection;
@@ -38,6 +47,7 @@ mod tool_use_validator;
 pub mod tools;
 pub mod ui;
 pub mod utils;
+#[cfg(feature = "host")]
 pub mod vector;
 pub mod vision;
 
@@ -67,25 +77,24 @@ pub use providers::{
 
 use rig_core::completion::{Message, PromptError};
 use rig_core::tool::ToolDyn;
-use rig_core::tool::rmcp::McpTool;
-use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
-use rmcp::transport::{TokioChildProcess, streamable_http_client::StreamableHttpClientTransport};
 pub use session::{Session, SessionDeps, create_session};
 pub use skills::{SkillRegistry, load_default_skills};
 pub use state::StateManager;
 pub use storage::{ConversationStorage, FileStorage};
 pub use test_runner::{CompactionInfo, TestRunner};
+#[cfg(feature = "host")]
 pub use tools::{
-    BashTool, FetchPageTool, FetchUrlTool, FileCreateTool, FileInsertTool, FileReadTool,
-    FileStrReplaceTool, ListDirectoryTool, PowerShellTool, SearchTool, ShellKind, ThinkTool,
-    TodoArgs, TodoItem, TodoStatus, TodoTool, print_no_shell_warning,
+    BashTool, FileCreateTool, FileInsertTool, FileReadTool, FileStrReplaceTool, ListDirectoryTool,
+    PowerShellTool,
+};
+pub use tools::{
+    FetchPageTool, FetchUrlTool, SearchTool, ShellKind, ThinkTool, TodoArgs, TodoItem, TodoStatus,
+    TodoTool, print_no_shell_warning,
 };
 pub use ui::{Ui, UiAction};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use futures::FutureExt;
-use rmcp::service::{RoleClient, RunningService, ServiceExt};
-use std::process::Stdio;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::debug;
@@ -310,8 +319,16 @@ pub(crate) fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
         .unwrap_or_else(|| "unknown panic".to_string())
 }
 
-const SYSTEM_PROMPT_PERSONA: &str = include_str!("system_prompt_persona.txt");
+#[cfg(feature = "host")]
+pub(crate) const SYSTEM_PROMPT_PERSONA: &str = include_str!("system_prompt_persona.txt");
+#[cfg(feature = "host")]
 const SYSTEM_PROMPT_CORE: &str = include_str!("system_prompt_core.txt");
+// The Local edition has no file or code tools, so the host persona's
+// capability claims would be false there: it carries its own text.
+#[cfg(not(feature = "host"))]
+pub(crate) const SYSTEM_PROMPT_PERSONA: &str = include_str!("system_prompt_persona_local.txt");
+#[cfg(not(feature = "host"))]
+const SYSTEM_PROMPT_CORE: &str = include_str!("system_prompt_core_local.txt");
 const SYSTEM_PROMPT_SHELL: &str = include_str!("system_prompt_shell.txt");
 const MEMORY_PROMPT_SECTION: &str = include_str!("system_prompt_memory.txt");
 
@@ -341,6 +358,15 @@ fn core_guidance(shell: Option<&ShellKind>) -> String {
         out.push_str(&shell_section(shell));
     }
     out
+}
+
+/// The derived memory rule: the memory.md prompt section
+/// and the compaction memory flush apply iff `memory.enabled ∧ file_create
+/// is registered` — `file_create` after the `profile.tools` filter (never
+/// present in the Local edition). ONE predicate for both call sites, so the
+/// prompt and the flush can never drift from the actual registration.
+fn memory_applies(memory: &crate::config::MemoryConfig, tools: &crate::config::NameFilter) -> bool {
+    memory.enabled && crate::tools::env::file_create_registered(tools)
 }
 
 /// The `# Environment Information` block (cwd, time, version, OS, binary,
@@ -429,7 +455,7 @@ pub fn build_agent_prompt(
         }
     }
 
-    if profile.memory.enabled {
+    if memory_applies(&profile.memory, &profile.tools) {
         prompt.push_str(MEMORY_PROMPT_SECTION);
     }
     prompt.push_str(&skills.to_system_prompt_section_filtered(&agent.main.skills));
@@ -587,13 +613,23 @@ pub struct RebuildContext {
 }
 
 impl RebuildContext {
-    /// How a reload reads the repo file: a pinned profile is a global profile,
-    /// so the repo file is ignored entirely under a pin (spec §6.5).
+    /// How a reload reads the repo file. The Local edition NEVER reads one:
+    /// the global config is the only config, so the repo
+    /// file is ignored whatever the pin says. In the full edition a pinned
+    /// profile is a global profile, so the repo file is ignored under a pin
+    /// (spec §6.5).
     pub fn repo_mode(&self) -> RepoMode {
-        if self.profile_pin.is_some() {
+        #[cfg(not(feature = "host"))]
+        {
             RepoMode::Ignore
-        } else {
-            RepoMode::Include
+        }
+        #[cfg(feature = "host")]
+        {
+            if self.profile_pin.is_some() {
+                RepoMode::Ignore
+            } else {
+                RepoMode::Include
+            }
         }
     }
 }
@@ -731,6 +767,14 @@ fn reload_config(
         messages.push(format!(
             "⚠ --profile '{pin}' is no longer configured — keeping the previous config."
         ));
+        return messages;
+    }
+    // A live session's `Bound` can never point at a remote profile: a file
+    // with no local profile left keeps the previous config.
+    if fresh.catalog.default_bound().is_none() {
+        messages.push(
+            "⚠ config.yaml has no local profile left — keeping the previous config.".to_string(),
+        );
         return messages;
     }
 
@@ -1722,9 +1766,9 @@ impl AgentRunner {
                         // profile setting, so it follows the session's Bound.
                         let memory_threshold = rebuild_ctx
                             .as_ref()
-                            .map(|ctx| &ctx.bound.profile.memory)
-                            .filter(|memory| memory.enabled)
-                            .map(|memory| memory.threshold_bytes);
+                            .map(|ctx| (&ctx.bound.profile.memory, &ctx.bound.profile.tools))
+                            .filter(|(memory, tools)| memory_applies(memory, tools))
+                            .map(|(memory, _)| memory.threshold_bytes);
                         if !memory_compaction_done
                             && let Some(threshold) = memory_threshold
                             && let Some(sm) = state_manager.as_ref()
@@ -1772,7 +1816,7 @@ impl AgentRunner {
                             if let Some(t) = started_at {
                                 sm.add_system_message(format!(
                                     "worked for {}",
-                                    crate::ui::repl::spinner::fmt_elapsed(t)
+                                    crate::utils::fmt_elapsed(t)
                                 ));
                             }
                         }
@@ -3731,104 +3775,6 @@ fn refresh_attempt_from_transcript(
     }
 }
 
-/// Handle for a connected MCP server.
-///
-/// Holds both the tools and the service connection. The service connection
-/// must be kept alive for as long as the tools are used, and should be
-/// properly closed on drop to avoid the "RunningService dropped without
-/// explicit close()" warning.
-pub struct McpServerHandle {
-    name: String,
-    tools: Vec<McpTool>,
-    /// The running service connection. Must be closed on drop for clean shutdown.
-    /// This uses a wrapper enum since stdio and HTTP transports return different
-    /// service types internally.
-    service: McpService,
-}
-
-/// Wrapper enum for MCP service connections.
-///
-/// Both stdio and HTTP transports use `RunningService<RoleClient, ()>` when acting
-/// as a client, but the inner service type differs (child process vs HTTP client).
-/// This enum allows us to store the correct type while providing a uniform interface.
-enum McpService {
-    Stdio(Option<RunningService<RoleClient, ()>>),
-    Http(Option<RunningService<RoleClient, ()>>),
-}
-
-impl Drop for McpServerHandle {
-    fn drop(&mut self) {
-        // Take the service out so we don't double-close
-        let service = match &mut self.service {
-            McpService::Stdio(s) => s.take(),
-            McpService::Http(s) => s.take(),
-        };
-
-        if let Some(mut s) = service {
-            // Spawn a task to close the service properly
-            // This avoids blocking in Drop while ensuring clean shutdown
-            tokio::spawn(async move {
-                match s.close().await {
-                    Ok(reason) => {
-                        tracing::debug!("MCP service closed: {:?}", reason);
-                    }
-                    Err(e) => {
-                        tracing::warn!("MCP service close error: {:?}", e);
-                    }
-                }
-            });
-        }
-    }
-}
-
-impl McpServerHandle {
-    /// The server's configured name — the key a profile's `mcps:`
-    /// gate addresses.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn tools(&self) -> &[McpTool] {
-        &self.tools
-    }
-
-    /// Take ownership of the tools, consuming this handle.
-    ///
-    /// Note: The MCP service connection will be closed when this handle is dropped.
-    /// For explicit control over service shutdown, use `close_and_take_tools()` instead.
-    pub fn into_tools(self) -> Vec<Box<dyn ToolDyn>> {
-        // Use ManuallyDrop to prevent our Drop impl from running
-        // since we're consuming the handle intentionally
-        let this = std::mem::ManuallyDrop::new(self);
-
-        // Access fields through the ManuallyDrop'd reference
-        this.tools
-            .iter()
-            .cloned()
-            .map(|tool| Box::new(tool) as Box<dyn ToolDyn>)
-            .collect()
-    }
-
-    /// Close the MCP service connection and get the tools.
-    ///
-    /// This properly closes the service before extracting tools.
-    pub async fn close_and_take_tools(mut self) -> Vec<Box<dyn ToolDyn>> {
-        // Close the service first (extract from Option via take on &mut self)
-        // We need to do this carefully since we can't move out of self.service
-        // Take the service out by matching on &mut self
-        let service = match &mut self.service {
-            McpService::Stdio(s) => s.take(),
-            McpService::Http(s) => s.take(),
-        };
-
-        if let Some(mut s) = service {
-            s.close().await.ok();
-        }
-
-        self.into_tools()
-    }
-}
-
 /// Flatten per-server MCP tool groups into the flat tool list an agent
 /// receives, honouring a profile's `mcps:` gate. Servers keep their
 /// input order, tools keep their per-server order; `None` = no gate
@@ -3852,250 +3798,39 @@ pub fn mcp_tools_for_profile(
         .collect()
 }
 
-pub async fn connect_mcp_server(config: &McpServerConfig) -> Result<McpServerHandle> {
-    // Validate configuration
-    if let Err(e) = config.validate() {
-        return Err(anyhow::anyhow!("Invalid MCP server config: {}", e));
+#[cfg(feature = "host")]
+mod mcp_client;
+
+/// The Local edition has no MCP client. The handle type has no values, so
+/// every `mcp_handles` list is empty by construction and the plumbing that
+/// carries it (`SessionDeps`, `ToolEnv`) stays the same type in both editions.
+#[cfg(not(feature = "host"))]
+mod mcp_client {
+    use super::{Config, Result, ToolDyn};
+
+    pub enum McpServerHandle {}
+
+    impl McpServerHandle {
+        pub fn name(&self) -> &str {
+            match *self {}
+        }
+
+        pub fn tool_boxes(&self) -> Vec<Box<dyn ToolDyn>> {
+            match *self {}
+        }
     }
 
-    match config.transport_type() {
-        McpTransportType::Stdio => connect_mcp_stdio(config).await,
-        McpTransportType::Sse => {
-            // rmcp 0.16 dropped the dedicated SSE client transport. The MCP
-            // spec (2025-03-26) replaced SSE with Streamable HTTP, which is
-            // wire-compatible with most existing "sse" servers. We route
-            // there and warn loudly so users aren't surprised.
-            tracing::warn!(
-                "MCP server '{}': transport_type 'sse' is deprecated; \
-                 routing through streamable-http. Set 'type: streamable-http' \
-                 in your config to silence this warning.",
-                config.name
-            );
-            connect_mcp_http(config).await
-        }
-        McpTransportType::StreamableHttp => connect_mcp_http(config).await,
+    pub async fn load_mcp_servers(_config: &Config) -> Result<Vec<McpServerHandle>> {
+        Ok(Vec::new())
     }
 }
 
-/// Connect to an MCP server using stdio transport (spawns a local process)
-async fn connect_mcp_stdio(config: &McpServerConfig) -> Result<McpServerHandle> {
-    let command = config
-        .command
-        .as_ref()
-        .ok_or_else(|| anyhow!("stdio transport requires 'command'"))?;
-
-    let mut cmd = tokio::process::Command::new(command);
-    if let Some(args) = &config.args {
-        cmd.args(args);
-    }
-    if let Some(env) = &config.env {
-        for (key, value) in env {
-            cmd.env(key, value);
-        }
-    }
-
-    let (transport, _stderr) = TokioChildProcess::builder(cmd)
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("Failed to create child process: {}", e))?;
-
-    let service = ()
-        .serve(transport)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to MCP server: {}", e))?;
-
-    let server_info = service
-        .peer_info()
-        .ok_or_else(|| anyhow!("Can't get MCP info"))?;
-    tracing::info!(
-        "Connected to MCP server '{}': ({}:{})",
-        config.name,
-        server_info.server_info.name,
-        server_info.server_info.version
-    );
-
-    let tools = service
-        .list_all_tools()
-        .await?
-        .into_iter()
-        .map(|tool| McpTool::from_mcp_server(tool, service.peer().clone()))
-        .collect::<Vec<_>>();
-
-    tracing::info!("MCP server '{}' has {} tools", config.name, tools.len());
-
-    // Store the service in our wrapper enum, keeping a clone for the tools
-    Ok(McpServerHandle {
-        name: config.name.clone(),
-        tools,
-        service: McpService::Stdio(Some(service)),
-    })
-}
-
-/// Connect to an MCP server using HTTP transport (remote server)
-async fn connect_mcp_http(config: &McpServerConfig) -> Result<McpServerHandle> {
-    let url = config
-        .url
-        .as_ref()
-        .ok_or_else(|| anyhow!("HTTP transport requires 'url'"))?;
-
-    tracing::info!("Connecting to MCP server '{}' at {}", config.name, url);
-
-    // Surface deprecation warnings (e.g. legacy `auth_token`) at connect
-    // time. `validate()` already rejected the "both set" footgun, so this
-    // is purely informational.
-    for warning in config.deprecation_warnings() {
-        tracing::warn!("{warning}");
-    }
-
-    // Build the streamable-http config with optional bearer token + custom headers.
-    let mut transport_config = StreamableHttpClientTransportConfig::with_uri(url.clone());
-    // Lazily holds the OAuth-aware HTTP client when the server uses oauth.
-    // `None` means the default reqwest client baked into `from_config` will be used.
-    let mut auth_client: Option<crate::mcp_auth::AuthorizedClient> = None;
-
-    match config.auth_resolved() {
-        Some(crate::config::ResolvedAuth::Bearer { token }) => {
-            transport_config = transport_config.auth_header(token);
-        }
-        Some(crate::config::ResolvedAuth::Oauth {
-            client_id,
-            client_secret,
-            scopes,
-        }) => {
-            // Slice 2 + Slice 3a: full OAuth 2.1 + PKCE flow.
-            // - `client_id` absent → DCR (Linear shape)
-            // - `client_id` present → static credentials (Google shape)
-            // `authorize` returns an `AuthClient<reqwest::Client>` that
-            // implements `StreamableHttpClient`, so we feed it into the
-            // transport via `with_client` below.
-            let params = crate::mcp_auth::OauthParams {
-                client_id,
-                client_secret,
-                scopes,
-            };
-            auth_client = Some(
-                crate::mcp_auth::authorize(&config.name, url, params)
-                    .await
-                    .map_err(|e| anyhow!("MCP server '{}': {e}", config.name))?,
-            );
-        }
-        None => {}
-    }
-
-    if let Some(headers) = config.headers.as_ref() {
-        let mut parsed: std::collections::HashMap<::http::HeaderName, ::http::HeaderValue> =
-            std::collections::HashMap::with_capacity(headers.len());
-        for (k, v) in headers {
-            match (
-                ::http::HeaderName::try_from(k.as_str()),
-                ::http::HeaderValue::try_from(v.as_str()),
-            ) {
-                (Ok(name), Ok(value)) => {
-                    parsed.insert(name, value);
-                }
-                _ => {
-                    tracing::warn!(
-                        "MCP server '{}': skipping invalid header '{}: {}'",
-                        config.name,
-                        k,
-                        v
-                    );
-                }
-            }
-        }
-        if !parsed.is_empty() {
-            transport_config = transport_config.custom_headers(parsed);
-        }
-    }
-
-    // `StreamableHttpClientTransport<C>` is generic over the inner HTTP
-    // client, so the two branches produce different concrete types and
-    // can't be unified by a `let transport = if ...`. Drive `.serve`
-    // from inside each arm — the resulting `service` (`RunningService<…>`)
-    // has the same type regardless because the transport type-parameter
-    // is erased by the worker boundary.
-    let service = if let Some(client) = auth_client {
-        // OAuth-aware client: signs every request and silently refreshes
-        // access tokens.
-        ().serve(StreamableHttpClientTransport::with_client(
-            client,
-            transport_config,
-        ))
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to MCP server: {}", e))?
-    } else {
-        ().serve(StreamableHttpClientTransport::with_client(
-            crate::http::client(),
-            transport_config,
-        ))
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to MCP server: {}", e))?
-    };
-
-    let server_info = service
-        .peer_info()
-        .ok_or_else(|| anyhow!("Can't get MCP info"))?;
-    tracing::info!(
-        "Connected to MCP server '{}': ({}:{})",
-        config.name,
-        server_info.server_info.name,
-        server_info.server_info.version
-    );
-
-    let tools = service
-        .list_all_tools()
-        .await?
-        .into_iter()
-        .map(|tool| McpTool::from_mcp_server(tool, service.peer().clone()))
-        .collect::<Vec<_>>();
-
-    tracing::info!("MCP server '{}' has {} tools", config.name, tools.len());
-
-    // Store the service in our wrapper enum, keeping a clone for the tools
-    Ok(McpServerHandle {
-        name: config.name.clone(),
-        tools,
-        service: McpService::Http(Some(service)),
-    })
-}
-
-pub async fn load_mcp_servers(config: &Config) -> Result<Vec<McpServerHandle>> {
-    let mut handles = Vec::new();
-
-    let servers = &config.mcps;
-    if servers.is_empty() {
-        tracing::info!("No MCP servers configured");
-        return Ok(Vec::new());
-    }
-
-    for server_config in servers {
-        if !server_config.enabled {
-            continue;
-        }
-
-        tracing::info!("Connecting to MCP server: {}", server_config.name);
-        match connect_mcp_server(server_config).await {
-            Ok(handle) => {
-                handles.push(handle);
-            }
-            Err(e) => {
-                tracing::error!(
-                    "Failed to connect to MCP server '{}': {}",
-                    server_config.name,
-                    e
-                );
-            }
-        }
-    }
-
-    Ok(handles)
-}
+pub use mcp_client::*;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ui::app_state::MessageSource;
-    use std::collections::HashMap;
 
     /// One openrouter model + one profile: the replacement for the deleted
     /// `Config::default()`. Compaction is off so `AgentRunner::new` needs no
@@ -4204,6 +3939,7 @@ profiles:
     /// wire projection carries no token, URL or fingerprint. (Supersedes
     /// `ui_catalog_drops_remote_entries_until_t9`: the SPA routing that the
     /// filter waited for lands in the same commit, design §9 T9.)
+    #[cfg(feature = "host")]
     #[test]
     fn ui_catalog_includes_remote_entries_with_origin_color_and_no_secrets() {
         use crate::config::resolve::{ParseCtx, Source};
@@ -4252,6 +3988,7 @@ profiles:
 
     /// A remote entry's configured `ui.color` wins over the derived one in
     /// the UI catalogue (RP8: `ui.color`, else `derived(name)`).
+    #[cfg(feature = "host")]
     #[test]
     fn ui_catalog_remote_entry_carries_its_configured_color() {
         use crate::config::resolve::{ParseCtx, Source};
@@ -4533,6 +4270,7 @@ profiles:
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(feature = "host")]
     #[test]
     fn system_prompt_includes_memory_section_when_enabled() {
         // The `main` profile has memory on by default; a clean temp dir (no
@@ -5400,7 +5138,10 @@ profiles:
     #[cfg(feature = "mock")]
     fn rebuild_ctx_for(config: Config) -> RebuildContext {
         RebuildContext {
-            bound: config.catalog.default_bound(),
+            bound: config
+                .catalog
+                .default_bound()
+                .expect("the fixture has a local profile"),
             config: Arc::new(config),
             mcp_handles: Arc::new(Vec::new()),
             shell_kind: None,
@@ -6167,134 +5908,6 @@ profiles:
             source.tool_names().is_empty(),
             "an allowed server with no tools yields no tools, got: {:?}",
             source.tool_names()
-        );
-    }
-
-    // --- MCP tests (pre-existing) -------------------------------------------
-
-    #[tokio::test]
-    async fn test_connect_mcp_server_invalid_command() {
-        let mut env = HashMap::new();
-        env.insert("TEST_VAR".to_string(), "test_value".to_string());
-
-        let config = McpServerConfig {
-            name: "test_invalid".to_string(),
-            transport_type: McpTransportType::Stdio,
-            command: Some("nonexistent_command_xyz123".to_string()),
-            args: None,
-            env: Some(env),
-            url: None,
-            auth_token: None,
-            auth: None,
-            headers: None,
-            enabled: true,
-        };
-
-        let result = connect_mcp_server(&config).await;
-        assert!(result.is_err(), "Expected error for invalid command");
-    }
-
-    #[tokio::test]
-    #[ignore = "needs network + uvx (Python); run locally with --ignored"]
-    async fn test_connect_mcp_server_hello() {
-        let config = McpServerConfig {
-            name: "hello-mcp-server".to_string(),
-            transport_type: McpTransportType::Stdio,
-            command: Some("uvx".to_string()),
-            args: Some(vec![
-                "--from".to_string(),
-                "git+https://github.com/macsymwang/hello-mcp-server.git".to_string(),
-                "hello-mcp-server".to_string(),
-            ]),
-            env: None,
-            url: None,
-            auth_token: None,
-            auth: None,
-            headers: None,
-            enabled: true,
-        };
-
-        let result = connect_mcp_server(&config).await;
-        let handle = result.expect("Failed to connect to hello-mcp-server");
-        let tools = handle.tools();
-        assert!(!tools.is_empty(), "Expected at least one tool");
-
-        println!("Connected to hello-mcp-server with {} tools", tools.len());
-    }
-
-    #[tokio::test]
-    #[ignore = "needs network + uvx (Python); run locally with --ignored"]
-    async fn test_connect_mcp_server_with_env() {
-        let mut env = HashMap::new();
-        env.insert("TEST_ENV_VAR".to_string(), "test_value".to_string());
-
-        let config = McpServerConfig {
-            name: "hello-mcp-server-with-env".to_string(),
-            transport_type: McpTransportType::Stdio,
-            command: Some("uvx".to_string()),
-            args: Some(vec![
-                "--from".to_string(),
-                "git+https://github.com/macsymwang/hello-mcp-server.git".to_string(),
-                "hello-mcp-server".to_string(),
-            ]),
-            env: Some(env),
-            url: None,
-            auth_token: None,
-            auth: None,
-            headers: None,
-            enabled: true,
-        };
-
-        let result = connect_mcp_server(&config).await;
-        let handle = result.expect("Failed to connect to hello-mcp-server with env vars");
-        let tools = handle.tools();
-
-        assert!(
-            !tools.is_empty(),
-            "Expected at least one tool with custom env"
-        );
-    }
-
-    #[tokio::test]
-    #[ignore = "needs network + uvx (Python); run locally with --ignored"]
-    async fn test_connect_mcp_server_call_tool() {
-        let config = McpServerConfig {
-            name: "hello-mcp-server".to_string(),
-            transport_type: McpTransportType::Stdio,
-            command: Some("uvx".to_string()),
-            args: Some(vec![
-                "--from".to_string(),
-                "git+https://github.com/macsymwang/hello-mcp-server.git".to_string(),
-                "hello-mcp-server".to_string(),
-            ]),
-            env: None,
-            url: None,
-            auth_token: None,
-            auth: None,
-            headers: None,
-            enabled: true,
-        };
-
-        let handle = connect_mcp_server(&config)
-            .await
-            .expect("Failed to connect to hello-mcp-server");
-
-        let tools = handle.tools();
-        assert!(!tools.is_empty(), "Expected at least one tool");
-
-        let first_tool = &tools[0];
-        println!("Calling tool: {}", first_tool.name());
-
-        let result = first_tool
-            .call("{}".to_string())
-            .await
-            .expect("Failed to call tool");
-
-        println!("Tool call result: {:?}", result);
-
-        assert!(
-            !result.is_empty(),
-            "Expected non-empty result from tool call"
         );
     }
 
@@ -7477,6 +7090,7 @@ headers:
     /// hanging `bash sleep 30` is the in-flight tool, and the sub-agent's
     /// persisted work is emulated with a sourced assistant row.
     #[cfg(feature = "mock")]
+    #[cfg(feature = "host")]
     #[tokio::test(flavor = "multi_thread")]
     async fn stop_mid_tool_persists_interrupted_result() {
         use crate::storage::{ConversationStorage, InMemoryStorage};
@@ -8122,6 +7736,7 @@ headers:
     /// result. The next wire replay is Asst[Text "PARTIAL", TC bash] ·
     /// User[TR].
     #[cfg(feature = "mock")]
+    #[cfg(feature = "host")]
     #[tokio::test(flavor = "multi_thread")]
     async fn t9_stop_mid_tool_keeps_the_prose_row_before_the_call() {
         use crate::ui::app_state::MessageRole;
@@ -8523,6 +8138,7 @@ headers:
     /// covered by b3: teardown never reaches the cancel arm — it takes the
     /// abort branch, a different hook.
     #[cfg(feature = "mock")]
+    #[cfg(feature = "host")]
     #[tokio::test(flavor = "multi_thread")]
     async fn teardown_mid_tool_persists_interrupted_result() {
         use crate::storage::{ConversationStorage, InMemoryStorage};
@@ -9809,7 +9425,8 @@ headers:
     // observable: the turn can only end as Stopped if the summarize
     // future is dropped, which flips the hang's drop flag.
 
-    #[cfg(feature = "mock")]
+    // Memory compaction is inert in the Local edition (`memory_applies`).
+    #[cfg(all(feature = "mock", feature = "host"))]
     mod compaction_stop {
         use super::*;
         use crate::config::resolve::{ParseCtx, Source};
@@ -10315,7 +9932,10 @@ profiles:
 
             let sm = StateManager::new_arc();
             let ctx = RebuildContext {
-                bound: config.catalog.default_bound(),
+                bound: config
+                    .catalog
+                    .default_bound()
+                    .expect("the fixture has a local profile"),
                 config: Arc::new(config),
                 mcp_handles: Arc::new(Vec::new()),
                 shell_kind: None,
@@ -10756,4 +10376,234 @@ profiles:
     //   * Further / idle presses are no-ops.
     //   * Queued messages are discarded on both stops; exactly ONE system
     //     message is posted per stop; the next turn runs normally.
+}
+
+// ─── Local edition canary ────────────────────────────────────────────────
+//
+// The Local edition (no `host` feature) exposes EXACTLY the five
+// non-execution built-ins — a leaked `host` dependency widens the set and
+// this fails. CI runs
+// `cargo test --lib --no-default-features local_edition_canary -- --exact`
+// and requires `1 passed`; the fn sits at the crate root (no module prefix)
+// so the `--exact` filter matches its full name.
+#[cfg(all(test, not(feature = "host")))]
+#[test]
+fn local_edition_canary() {
+    let local: std::collections::BTreeSet<&str> =
+        crate::config::BUILTIN_TOOL_NAMES.iter().copied().collect();
+    let want: std::collections::BTreeSet<&str> =
+        ["fetch_url", "fetch_page", "web_search", "todo", "think"]
+            .into_iter()
+            .collect();
+    assert_eq!(
+        local, want,
+        "the Local edition exposes exactly the five non-execution built-ins"
+    );
+}
+
+// ─── dirs guard ──────────────────────────────────────────────────────────
+//
+// `src/paths.rs` is the ONLY module that may call the platform-dir
+// helpers (the `dirs` crate and the `directories` crate's project-dirs
+// type) — Android has no HOME and the `paths::Roots` seam must be
+// the single place platform roots are read. Text scan of every
+// `src/**/*.rs` file: any other file containing the strings fails. The
+// needles are built with `concat!` so this file itself never contains them.
+#[cfg(test)]
+fn walk_rs_files(path: &std::path::Path, visit: &mut dyn FnMut(&std::path::Path, &str)) {
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            walk_rs_files(&p, visit);
+        } else if p.extension().is_some_and(|e| e == "rs")
+            && let Ok(text) = std::fs::read_to_string(&p)
+        {
+            visit(&p, &text);
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn dirs_calls_appear_only_in_paths_module() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let src = manifest.join("src");
+    let allowed = src.join("paths.rs");
+    let needles: [&str; 2] = [concat!("dirs", "::"), concat!("Project", "Dirs")];
+    let mut offenders: Vec<String> = Vec::new();
+    let mut visit = |p: &std::path::Path, text: &str| {
+        if p == allowed {
+            return;
+        }
+        for needle in &needles {
+            if text.contains(needle) {
+                offenders.push(format!(
+                    "{} contains `{needle}`",
+                    p.strip_prefix(manifest).unwrap().display()
+                ));
+                break;
+            }
+        }
+    };
+    walk_rs_files(&src, &mut visit);
+    assert!(
+        offenders.is_empty(),
+        "{} calls outside src/paths.rs:\n{}",
+        concat!("dirs", "::/", "Project", "Dirs"),
+        offenders.join("\n")
+    );
+}
+
+// ─── Local persona ───────────────────────────────────────────────────────
+//
+// The Local edition (no `host` feature) ships its OWN built-in
+// persona/core guidance: it runs on the user's phone; it can fetch pages,
+// call HTTP APIs, search the web when configured, keep todos — and it must
+// claim NO filesystem access, NO code execution, NO writing code. The test
+// renders the full built-in prompt of a `Head::BuiltIn` agent (memory off,
+// no shell, no skills, no agents.md) and asserts the absence.
+//
+// RED today: the built-in persona (src/system_prompt_persona.txt) says
+// "You operate in the user's local filesystem and can read, write, and
+// execute code", and the core guidance names the file tools. The Local cut
+// replaces both with the Local text.
+#[cfg(all(test, not(feature = "host")))]
+mod local_persona_tests {
+    use super::*;
+
+    /// A built-in (`Head::BuiltIn`) agent with memory off, so the rendered
+    /// prompt is exactly persona + core guidance + env block.
+    const LOCAL_YAML: &str = "providers:\n  - name: openrouter\n    type: openrouter\n    api_key: sk-test\n    models:\n      - { name: anthropic/claude-3.7-sonnet, alias: sonnet }\nprofiles:\n  main:\n    memory:\n      enabled: false\n    agents:\n      solo:\n        model: sonnet\n";
+
+    fn local_prompt() -> String {
+        use crate::config::resolve::{ParseCtx, Source};
+        let cfg = Config::parse(
+            Source {
+                path: std::path::Path::new("/global/config.yaml"),
+                text: LOCAL_YAML,
+            },
+            None,
+            &ParseCtx { known_skills: &[] },
+        )
+        .expect("local persona fixture must parse");
+        let bound = cfg
+            .catalog
+            .resolve("main", "solo")
+            .expect("the built-in agent resolves");
+        let cwd = tempfile::tempdir().expect("tempdir");
+        build_agent_prompt(
+            bound.agent(),
+            &bound.profile,
+            &SkillRegistry::new(),
+            None,
+            cwd.path(),
+        )
+    }
+
+    fn contains_word(text: &str, word: &str) -> bool {
+        text.split(|c: char| !c.is_alphabetic())
+            .any(|tok| tok == word)
+    }
+
+    #[test]
+    fn local_persona_makes_no_file_or_execution_capability_claims() {
+        let prompt = local_prompt().to_lowercase();
+
+        for needle in ["filesystem", "file system", "execute", "write code"] {
+            assert!(
+                !prompt.contains(needle),
+                "the Local persona claims `{needle}` — the Local edition has no such capability"
+            );
+        }
+        for word in ["file", "files"] {
+            assert!(
+                !contains_word(&prompt, word),
+                "the Local persona uses the word `{word}` — state denials without it"
+            );
+        }
+    }
+}
+
+// ─── Local reload: no repo config, no skills ──────────
+//
+// The Local edition's session verbs (`/new`, `/cd`, `/model`, `/load`)
+// re-read the config and rescan skills on every reload. In the full edition
+// that means `<cwd>/.peakbot/config.yaml` and the skills dirs; in the Local
+// edition it must mean NOTHING — the global config only (`RepoMode::Ignore`)
+// and an empty `SkillRegistry`. The two edition switches the reload path
+// reads are pinned here directly.
+#[cfg(all(test, not(feature = "host")))]
+mod local_reload_tests {
+    use super::*;
+    use crate::config::resolve::{ParseCtx, Source};
+
+    /// One provider + one profile, so `default_bound()` resolves.
+    const GLOBAL_YAML: &str = "providers:\n  - name: p\n    type: openai\n    api_key: k\n    models:\n      - { name: m1, alias: a }\nprofiles:\n  dev:\n    agents:\n      main:\n        model: a\n";
+
+    fn parse_global() -> Config {
+        Config::parse(
+            Source {
+                path: std::path::Path::new("/global/config.yaml"),
+                text: GLOBAL_YAML,
+            },
+            None,
+            &ParseCtx { known_skills: &[] },
+        )
+        .expect("fixture global must parse")
+    }
+
+    /// A reload in the Local edition reads the repo file with
+    /// `RepoMode::Ignore`, so `<cwd>/.peakbot/config.yaml` is never merged —
+    /// whatever the `--profile` pin says.
+    #[test]
+    fn local_reload_ignores_repo_config() {
+        let config = parse_global();
+        let ctx = RebuildContext {
+            bound: config
+                .catalog
+                .default_bound()
+                .expect("the fixture has a local profile"),
+            config: Arc::new(config),
+            mcp_handles: Arc::new(Vec::new()),
+            shell_kind: None,
+            skills: SkillRegistry::new(),
+            todo_tool: None,
+            profile_pin: None,
+        };
+        assert_eq!(
+            ctx.repo_mode(),
+            RepoMode::Ignore,
+            "the Local edition never reads a repo file on reload"
+        );
+    }
+
+    /// A reload in the Local edition rescans skills with `load_default_skills`
+    /// — which must come back empty even when a valid skill sits in the
+    /// session's skills dir.
+    #[test]
+    fn local_reload_ignores_skills_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let skill = dir.path().join(".agents").join("skills").join("my-skill");
+        std::fs::create_dir_all(&skill).expect("skill dir");
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: my-skill\ndescription: A test skill\n---\n# My Skill\n",
+        )
+        .expect("SKILL.md");
+
+        let (registry, warnings) = load_default_skills(dir.path());
+        assert!(
+            registry.is_empty(),
+            "the Local edition must never discover skills; got: {:?}",
+            registry.names()
+        );
+        assert!(
+            warnings.is_empty(),
+            "an undiscovered skill dir yields no warnings; got: {warnings:?}"
+        );
+    }
 }

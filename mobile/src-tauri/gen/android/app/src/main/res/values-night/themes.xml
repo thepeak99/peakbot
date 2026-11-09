@@ -1,0 +1,13 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Base application theme. -->
+    <style name="Theme.peakbot_mobile" parent="Theme.Material3.DayNight.NoActionBar">
+        <!-- The page is the SPA's dark zinc-950 in every system theme:
+             light status/navigation bar icons, and (pre-Android-15) bars
+             matching the page; 15+ is edge-to-edge and transparent. -->
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:windowBackground">#FF09090B</item>
+        <item name="android:statusBarColor">#FF09090B</item>
+        <item name="android:navigationBarColor">#FF09090B</item>
+    </style>
+</resources>

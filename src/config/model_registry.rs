@@ -29,6 +29,17 @@ use crate::providers::{resolve_display_reasoning, resolve_preserve_reasoning};
 use serde::Deserialize;
 use std::collections::HashMap;
 
+/// Registry `base_url` overrides parse through the same trailing-slash
+/// normalization as the provider sub-configs (see
+/// [`crate::config::normalize_base_url`]).
+fn deserialize_optional_base_url<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    Ok(raw.as_deref().map(crate::config::normalize_base_url))
+}
+
 /// One entry in the top-level `providers:` list. Owns its credentials
 /// and its `models:` list.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -45,8 +56,9 @@ pub struct ProviderEntry {
     /// API key (when applicable for the kind).
     #[serde(default)]
     pub api_key: Option<String>,
-    /// Base URL override (when applicable for the kind).
-    #[serde(default)]
+    /// Base URL override (when applicable for the kind). Parsed through the
+    /// same trailing-slash normalization as the provider sub-configs.
+    #[serde(default, deserialize_with = "deserialize_optional_base_url")]
     pub base_url: Option<String>,
     /// Models exposed by this provider.
     #[serde(default)]
@@ -213,6 +225,14 @@ pub struct ModelRegistry {
 }
 
 impl ModelRegistry {
+    /// An empty registry — a relay-only config declares no local models.
+    pub fn empty() -> Self {
+        Self {
+            by_alias: HashMap::new(),
+            order: Vec::new(),
+        }
+    }
+
     /// Build and validate a registry from the providers list.
     ///
     /// # Errors
@@ -463,6 +483,8 @@ fn build_provider_config(prov: &ProviderEntry, model: &ModelEntry) -> ProviderCo
             temperature: model.temperature,
             vision: model.vision,
         }),
+        #[cfg(feature = "mock")]
+        ProviderType::Mock => ProviderConfig::Mock,
     }
 }
 
@@ -489,6 +511,20 @@ fn default_ollama_base_url() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_entry_base_url_trailing_slash_is_stripped() {
+        let e: ProviderEntry = serde_yaml::from_str(
+            "name: local-p
+type: openai
+base_url: http://10.0.2.2:18089/v1/
+models:
+  - name: m
+",
+        )
+        .expect("registry entry must parse");
+        assert_eq!(e.base_url.as_deref(), Some("http://10.0.2.2:18089/v1"));
+    }
 
     fn or_provider() -> ProviderEntry {
         ProviderEntry {

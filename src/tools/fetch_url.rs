@@ -3,8 +3,15 @@ use crate::utils::strings::truncate_with_suffix;
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
 use serde::Deserialize;
+use std::collections::HashMap;
 
 const MAX_RESPONSE_CHARS: usize = 50_000;
+
+// Header limits checked by `validate_headers`: at most 20 headers,
+// each name at most 64 bytes, each value at most 8192 bytes (8 KiB).
+const MAX_HEADERS: usize = 20;
+const MAX_NAME_BYTES: usize = 64;
+const MAX_VALUE_BYTES: usize = 8192;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FetchUrlError {
@@ -27,6 +34,8 @@ pub struct FetchUrlArgs {
     body: Option<String>,
     #[serde(default)]
     content_type: Option<String>,
+    #[serde(default)]
+    headers: Option<HashMap<String, String>>,
 }
 
 #[derive(Deserialize, Default, Debug, PartialEq)]
@@ -43,9 +52,61 @@ enum Request {
     Post { body: String, content_type: String },
 }
 
+/// Pure validation of the `headers` argument, checked in this order: count
+/// (≤ 20) → per-header name length (≤ 64 bytes) → forbidden name → value
+/// length (≤ 8192 bytes). The returned `Err(String)` **is** the tool-result
+/// text (no config-path prefix); `parse` maps it to
+/// `FetchUrlError::InvalidArgs`.
+const FORBIDDEN_NAMES: [&str; 5] = [
+    "host",
+    "content-length",
+    "cookie",
+    "transfer-encoding",
+    "connection",
+];
+pub fn validate_headers(headers: &HashMap<String, String>) -> Result<(), String> {
+    if headers.len() > MAX_HEADERS {
+        return Err(format!(
+            "headers: at most {} headers are allowed (got {})",
+            MAX_HEADERS,
+            headers.len(),
+        ));
+    }
+    for (name, value) in headers {
+        if name.len() > MAX_NAME_BYTES {
+            return Err(format!(
+                "headers: header name is {} bytes; the limit is {}",
+                name.len(),
+                MAX_NAME_BYTES,
+            ));
+        }
+        if FORBIDDEN_NAMES
+            .iter()
+            .any(|forbidden| name.eq_ignore_ascii_case(forbidden))
+        {
+            return Err(format!("headers: '{}' is a forbidden header name", name));
+        }
+        if value.len() > MAX_VALUE_BYTES {
+            return Err(format!(
+                "headers: header value for '{}' is {} bytes; the limit is {}",
+                name,
+                value.len(),
+                MAX_VALUE_BYTES,
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The single validation point: args + config → a concrete request, or a
 /// coachable error. `call` never re-validates.
 fn parse(args: FetchUrlArgs, allow_post: bool) -> Result<Request, FetchUrlError> {
+    // Headers are checked before the URL so a rejected header never touches
+    // a network. `validate_headers` returns the exact tool-result text; `?`
+    // maps it to `InvalidArgs`.
+    if let Some(headers) = &args.headers {
+        validate_headers(headers).map_err(FetchUrlError::InvalidArgs)?;
+    }
     if args.url.is_empty() {
         return Err(FetchUrlError::InvalidUrl("URL cannot be empty".to_string()));
     }
@@ -92,36 +153,36 @@ impl Tool for FetchUrlTool {
     type Output = String;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
-        // With POST disabled the schema and description stay byte-identical
-        // to the GET-only tool, so existing model behaviour cannot drift.
-        let (description, parameters) = if self.allow_post {
+        // The `headers` property is present in BOTH editions:
+        // an optional string→string map, validated in `parse`, never required.
+        // The two editions differ only in the POST-specific fields and the
+        // wording of the description.
+        let headers_prop = serde_json::json!({
+            "type": "object",
+            "additionalProperties": { "type": "string" },
+            "description": "Optional headers to send with the request (string to string, e.g. {\"Authorization\": \"Bearer x\"}). At most 20 headers, each name at most 64 bytes, each value at most 8192 bytes; Host, Content-Length, Cookie, Transfer-Encoding and Connection are forbidden."
+        });
+
+        let (description, other_props) = if self.allow_post {
             (
                 "Fetch the content of a URL and return it as text. \
                     Use this to retrieve web page content, API responses, or any HTTP GET or POST request. \
                     Returns the response body up to 50,000 characters (truncated if longer)."
                     .to_string(),
                 serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "url": {
-                            "type": "string",
-                            "description": "The URL to fetch"
-                        },
-                        "method": {
-                            "type": "string",
-                            "enum": ["GET", "POST"],
-                            "description": "HTTP method (default GET)"
-                        },
-                        "body": {
-                            "type": "string",
-                            "description": "Request body, POST only"
-                        },
-                        "content_type": {
-                            "type": "string",
-                            "description": "Content-Type for the POST body (default application/json)"
-                        }
+                    "method": {
+                        "type": "string",
+                        "enum": ["GET", "POST"],
+                        "description": "HTTP method (default GET)"
                     },
-                    "required": ["url"]
+                    "body": {
+                        "type": "string",
+                        "description": "Request body, POST only"
+                    },
+                    "content_type": {
+                        "type": "string",
+                        "description": "Content-Type for the POST body (default application/json)"
+                    }
                 }),
             )
         } else {
@@ -130,18 +191,28 @@ impl Tool for FetchUrlTool {
                     Use this to retrieve web page content, API responses, or any HTTP GET request. \
                     Returns the response body up to 50,000 characters (truncated if longer)."
                     .to_string(),
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "url": {
-                            "type": "string",
-                            "description": "The URL to fetch"
-                        }
-                    },
-                    "required": ["url"]
-                }),
+                serde_json::json!({}),
             )
         };
+
+        let mut properties = serde_json::json!({
+            "url": {
+                "type": "string",
+                "description": "The URL to fetch"
+            }
+        });
+        if let Some(obj) = other_props.as_object() {
+            for (k, v) in obj {
+                properties[k] = v.clone();
+            }
+        }
+        properties["headers"] = headers_prop;
+
+        let parameters = serde_json::json!({
+            "type": "object",
+            "properties": properties,
+            "required": ["url"]
+        });
         ToolDefinition {
             name: "fetch_url".to_string(),
             description,
@@ -151,6 +222,10 @@ impl Tool for FetchUrlTool {
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let url = args.url.clone();
+        // The model's `headers` are validated in `parse`; `parse` moves `args`,
+        // so take the validated map out first and attach it to the request below,
+        // before anything is sent.
+        let headers = args.headers.clone();
         let request = parse(args, self.allow_post)?;
 
         // Log before execution
@@ -173,13 +248,21 @@ impl Tool for FetchUrlTool {
             .build()?;
 
         // No retries: POST isn't idempotent, and reqwest turns a POST into a GET on 301/302/303.
-        let request = match &request {
+        let mut request = match &request {
             Request::Get => client.get(&url),
             Request::Post { body, content_type } => client
                 .post(&url)
                 .header("Content-Type", content_type)
                 .body(body.clone()),
         };
+        // The model's headers (validated in `parse`); applied to the builder so
+        // they ride along on the outgoing request. Applied before the fixed
+        // User-Agent so the model can override any of its own.
+        if let Some(headers) = &headers {
+            for (k, v) in headers {
+                request = request.header(k, v);
+            }
+        }
         let response = request.header("User-Agent", "PeakBot/1.0").send().await?;
 
         let status = response.status();
@@ -339,10 +422,11 @@ mod tests {
 
     // ── schema ─────────────────────────────────────────────────────────────
 
-    /// Pinned from the pre-POST `definition()`: with `allow_post: false` the
-    /// wire schema must stay byte-for-byte today's, so existing model
-    /// behaviour cannot drift. The description literal is copied verbatim
-    /// (same continuation style) from the current `definition()`.
+    /// Pinned from the pre-POST `definition()` and re-pinned after the
+    /// `headers` addition: with `allow_post: false` the schema must be
+    /// byte-for-byte stable, so existing model behaviour cannot drift. The
+    /// description literal is copied verbatim (same continuation style) from
+    /// `definition()`.
     #[tokio::test]
     async fn definition_without_allow_post_is_the_pinned_schema() {
         let def = FetchUrlTool::default().definition(String::new()).await;
@@ -361,6 +445,11 @@ mod tests {
                     "url": {
                         "type": "string",
                         "description": "The URL to fetch"
+                    },
+                    "headers": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" },
+                        "description": "Optional headers to send with the request (string to string, e.g. {\"Authorization\": \"Bearer x\"}). At most 20 headers, each name at most 64 bytes, each value at most 8192 bytes; Host, Content-Length, Cookie, Transfer-Encoding and Connection are forbidden."
                     }
                 },
                 "required": ["url"]

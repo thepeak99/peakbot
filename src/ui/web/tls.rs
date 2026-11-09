@@ -7,9 +7,9 @@
 //! operator-supplied `--tls-name` extras). The phone trusts the CA, so every
 //! leaf the CA signs gets a padlock — no phone action when the LAN IP changes.
 //!
-//! The CA lives in `dirs::cache_dir()/peakbot/tls/` (same home as the mcp-auth
-//! credential store); its private key is written `0600`. It is generated once
-//! and never silently regenerated — doing so would break every phone that
+//! The CA lives in the cache dir's `peakbot/tls/` (see `crate::paths`; same
+//! home as the mcp-auth credential store); its private key is written
+//! `0600`. It is generated once and never silently regenerated — doing so would break every phone that
 //! already trusts it. To rotate, delete the `tls/` directory.
 //! PeakBot Desktop reads `ca-cert.pem` from this same path
 //! (desktop/core/src/paths.rs) to verify the webview's TLS against it —
@@ -39,11 +39,10 @@ const CA_KEY_FILE: &str = "ca-key.pem";
 /// key alone (no cert parsing) and still chain to the persisted certificate.
 const CA_COMMON_NAME: &str = "PeakBot Local CA";
 
-/// The directory holding the CA material: `dirs::cache_dir()/peakbot/tls`.
+/// The directory holding the CA material: `<cache_dir>/peakbot/tls`
+/// (`<cache>/tls` under embedder roots) — see [`crate::paths::tls_dir`].
 pub fn default_tls_dir() -> Result<PathBuf> {
-    let cache =
-        dirs::cache_dir().context("no cache directory available to store the PeakBot CA")?;
-    Ok(cache.join("peakbot").join("tls"))
+    crate::paths::tls_dir()
 }
 
 /// The SANs a leaf must cover: loopback always, plus the machine's mDNS

@@ -16,6 +16,13 @@ use crate::commands::ActionTx;
 
 pub const MAIN_LABEL: &str = "main";
 
+/// The init script that tags this window's origin as the desktop shell. Byte-for-byte
+/// the mobile init-script's `peakbotShell` definition with `"desktop"` in place of
+/// `"mobile"`. Injected on every load, including the remote
+/// :7823 web UI, via `.initialization_script` on the main window builder.
+pub const SHELL_MARKER_SCRIPT: &str =
+    "Object.defineProperty(window,'peakbotShell',{value:'desktop'});";
+
 /// Create the `main` window on the bundled status page.
 pub fn create_main(app: &AppHandle, nav: Arc<RwLock<Option<String>>>) -> tauri::Result<()> {
     let win =
@@ -23,6 +30,9 @@ pub fn create_main(app: &AppHandle, nav: Arc<RwLock<Option<String>>>) -> tauri::
             .title("PeakBot")
             .inner_size(1200.0, 800.0)
             .min_inner_size(800.0, 500.0)
+            // Tauri re-runs init scripts on every load in this window, so one
+            // call covers the bundled page and the remote :7823 web UI alike.
+            .initialization_script(SHELL_MARKER_SCRIPT)
             .on_navigation({
                 let app = app.clone();
                 let nav = nav.clone();
@@ -112,5 +122,39 @@ pub fn focus_main(app: &AppHandle) {
         let _ = win.show();
         let _ = win.unminimize();
         let _ = win.set_focus();
+    }
+}
+
+// ─── shell marker ────────────────────────────
+//
+// The desktop webview gets the SAME init-script seam as the mobile shell:
+// `window.peakbotShell = 'desktop'`. The SPA's `shell()` (web/src/desktop.ts)
+// reads the marker and stops consulting `window.isTauri`; a Tauri window
+// without the marker must read as a plain browser.
+//
+// SHELL_MARKER_SCRIPT is injected on the main window via `.initialization_script(SHELL_MARKER_SCRIPT)`.
+
+#[cfg(test)]
+mod shell_marker_tests {
+    use super::SHELL_MARKER_SCRIPT;
+
+    /// The exact marker definition — byte-for-byte the mobile init script's
+    /// definition with 'desktop' in place of 'mobile'.
+    const MARKER_DEF: &str = "Object.defineProperty(window,'peakbotShell',{value:'desktop'});";
+
+    #[test]
+    fn desktop_init_script_defines_peakbot_shell_as_desktop() {
+        assert!(
+            SHELL_MARKER_SCRIPT.contains(MARKER_DEF),
+            "the init script must define peakbotShell as 'desktop'; got: {SHELL_MARKER_SCRIPT}"
+        );
+    }
+
+    #[test]
+    fn desktop_init_script_never_carries_the_mobile_marker() {
+        assert!(
+            !SHELL_MARKER_SCRIPT.contains("{value:'mobile'}"),
+            "desktop must not carry the mobile marker; got: {SHELL_MARKER_SCRIPT}"
+        );
     }
 }

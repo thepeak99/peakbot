@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
+    />
+    <meta name="theme-color" content="#09090b" />
+    <title>PeakBot</title>
+    <style>
+      /* The shell window's background (zinc-950) so no band of a different
+         colour shows behind the one message. */
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #09090b;
+        color: #f4f4f5;
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+        font-size: 16px;
+        line-height: 1.5;
+      }
+      main {
+        height: 100%;
+        box-sizing: border-box;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        /* safe-area insets: status bar on top, home indicator below. */
+        padding:
+          calc(env(safe-area-inset-top, 0px) + 24px) 24px
+          calc(env(safe-area-inset-bottom, 0px) + 24px);
+      }
+      p {
+        max-width: 42ch;
+        margin: 0;
+        text-align: center;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <p>Couldn't start PeakBot on this phone: <span id="reason"></span>. Close the app and open it again.</p>
+    </main>
+    <script>
+      // The reason is the percent-encoded URL fragment the shell set
+      // (index.html#<reason>); decode it back for display.
+      document.getElementById("reason").textContent = decodeURIComponent(
+        location.hash.replace(/^#/, ""),
+      );
+    </script>
+  </body>
+</html>

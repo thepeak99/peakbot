@@ -34,6 +34,7 @@ use thiserror::Error;
 use tokio::sync::OnceCell;
 
 use crate::config::resolve::{DbPathSpec, VectorSpec};
+use crate::utils::normalize_lexical;
 
 pub use embeddings::{EmbeddingsClient, EmbeddingsError};
 pub use parse::{ParseError, extension_of, is_supported};
@@ -419,38 +420,6 @@ impl VectorStore {
         .expect("vector delete task panicked")
     }
 }
-/// Lexically normalize a path: drop `.` components, pop on `..` (never past
-/// root for absolute paths). No filesystem access — the DB file may not exist.
-pub(crate) fn normalize_lexical(p: &Path) -> PathBuf {
-    let mut components = p.components().peekable();
-    let mut result = PathBuf::new();
-
-    // Preserve absolute prefix
-    if let Some(first) = components.peek() {
-        use std::path::Component;
-        if let Component::RootDir = first {
-            result.push("/");
-            components.next();
-        }
-    }
-
-    for component in components {
-        if component.as_os_str() == "." {
-            continue;
-        }
-        if component.as_os_str() == ".." {
-            // Never pop past the root for absolute paths
-            if result.components().count() > 1 || !p.is_absolute() {
-                result.pop();
-            }
-        } else {
-            result.push(component);
-        }
-    }
-
-    result
-}
-
 /// Capacity hint for the HNSW index: a no-op for 2.4.0's default FlatGraph
 /// index, kept bounded for older stored configs.
 const HNSW_MAX_ELEMENTS: usize = 100_000;
@@ -1062,21 +1031,6 @@ mod tests {
             store.db_path_for(second.path())
         );
         assert_eq!(store.db_path_for(first.path()).as_path(), db);
-    }
-
-    #[test]
-    fn normalize_lexical_removes_current_directory_components() {
-        assert_eq!(normalize_lexical(Path::new("./a/b")), PathBuf::from("a/b"));
-    }
-
-    #[test]
-    fn normalize_lexical_resolves_parent_components() {
-        assert_eq!(normalize_lexical(Path::new("a/../b")), PathBuf::from("b"));
-    }
-
-    #[test]
-    fn normalize_lexical_preserves_absolute_paths() {
-        assert_eq!(normalize_lexical(Path::new("/a/../b")), PathBuf::from("/b"));
     }
 
     #[tokio::test]

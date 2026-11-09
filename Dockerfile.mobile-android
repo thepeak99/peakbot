@@ -1,0 +1,84 @@
+# syntax=docker/dockerfile:1
+
+# PeakBot Mobile — Android toolchain image (M-IMG).
+#
+# Pure toolchain: NO COPY of the source. The worktree is bind-mounted at run
+# time, so any build context works (an empty one is fastest) and the image
+# stays edition-agnostic. Phase 2 appends the APK build stage below.
+#
+#   podman build --target toolchain -t localhost/peakbot-mobile-android:toolchain -f Dockerfile.mobile-android .
+#   docker build --target toolchain -t localhost/peakbot-mobile-android:toolchain -f Dockerfile.mobile-android .
+#
+# Pins (locked):
+#   base            eclipse-temurin:17-jdk
+#   cmdline-tools   13114758
+#   SDK platforms   android-36 + android-37.0 (compileSdk = targetSdk = 37; AGP pulls 36)
+#   build-tools     36.0.0 (AGP 9.3.1 wants it)
+#   NDK             28.2.13676358 (r28c: 16 KB page alignment by default, no cmake)
+#   Rust            1.95.0 + aarch64-linux-android + x86_64-linux-android (dev emulator APKs)
+#   cargo-ndk       4.1.2 (PR check)
+#   Node            22.23.4 (official tarball; no global @tauri-apps/cli — a global
+#                    CLI breaks the gradle callback; the APK build gets 2.12.4 via
+#                    `npm ci` in mobile/)
+#
+# No `COPY vendor/`: the root `[patch.crates-io]` (vendored termios) resolves
+# against the MOUNTED worktree, which carries vendor/ itself.
+
+FROM docker.io/library/eclipse-temurin:17-jdk AS toolchain
+
+ARG NODE_VERSION=22.23.4
+ARG RUST_VERSION=1.95.0
+ARG CARGO_NDK_VERSION=4.1.2
+ARG CMDLINE_TOOLS=13114758
+# NDK r28c — first NDK line whose default link flags produce 16 KB-aligned
+# ELF segments (Play requirement for targetSdk 35+).
+ARG NDK_PKG=28.2.13676358
+
+ENV DEBIAN_FRONTEND=noninteractive
+# cc/linker + python3: aws-lc-sys and friends compile for Android in this image
+# (proven by the Android check); unzip/curl/xz: the tarballs below.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        unzip curl ca-certificates git xz-utils build-essential pkg-config file python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
+      | tar -xJ -C /opt && ln -s /opt/node-v${NODE_VERSION}-linux-x64 /opt/node
+ENV PATH=/opt/node/bin:$PATH
+
+# Rust 1.95.0 (minimal profile) + both Android targets + cargo-ndk 4.1.2.
+# Cache mount on the registry only: downloads survive image rebuilds and CI
+# re-runs, while the toolchain and the cargo-ndk binary still land in the
+# image layer (a cache mount on /opt/cargo as a whole would keep them out).
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo
+ENV PATH=/opt/cargo/bin:$PATH
+RUN --mount=type=cache,target=/opt/cargo/registry \
+    curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain ${RUST_VERSION} \
+    && rustup target add aarch64-linux-android x86_64-linux-android \
+    && cargo install cargo-ndk@${CARGO_NDK_VERSION} --locked
+
+ENV ANDROID_HOME=/opt/android-sdk
+ENV ANDROID_SDK_ROOT=/opt/android-sdk
+RUN mkdir -p $ANDROID_HOME/cmdline-tools \
+    && curl -fsSL -o /tmp/clt.zip "https://dl.google.com/android/repository/commandlinetools-linux-${CMDLINE_TOOLS}_latest.zip" \
+    && unzip -q /tmp/clt.zip -d $ANDROID_HOME/cmdline-tools \
+    && mv $ANDROID_HOME/cmdline-tools/cmdline-tools $ANDROID_HOME/cmdline-tools/latest \
+    && rm /tmp/clt.zip
+ENV PATH=$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/build-tools/36.0.0:$PATH
+RUN yes | sdkmanager --licenses >/dev/null \
+    && sdkmanager "platforms;android-36" "platforms;android-37.0" "build-tools;36.0.0" "platform-tools" "ndk;${NDK_PKG}"
+ENV NDK_HOME=$ANDROID_HOME/ndk/${NDK_PKG}
+ENV ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_PKG}
+
+# Gradle caches live under /root/.gradle and the debug keystore under
+# /root/.android — the APK build mounts named volumes there.
+WORKDIR /w
+
+# Toolchain self-check: every line below must match
+RUN echo '== sdkmanager --list_installed ==' \
+    && sdkmanager --list_installed \
+    && echo '== rustc -V ==' \
+    && rustc -V \
+    && echo '== cargo ndk -V ==' \
+    && cargo ndk -V \
+    && echo '== node -v ==' \
+    && node -v

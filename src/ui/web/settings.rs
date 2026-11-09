@@ -181,7 +181,7 @@ pub fn pairing_links(
     }
     let links = hosts
         .iter()
-        .map(|host| entry_link(host, token, &fp))
+        .map(|host| entry_link(host, bind.port(), token, &fp))
         .collect();
     PairingWire::Available { links }
 }
@@ -193,18 +193,24 @@ fn is_loopback_name(name: &str) -> bool {
         || name.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
-/// One entry link: `https://<host>/?token=<token>&ca=<fp>` — IPv6 hosts
-/// bracketed, built with [`url::Url`] (design §8.4). The query goes in via
-/// `set_query` so it stays verbatim: `query_pairs_mut` would form-encode
-/// the fingerprint's `:` to `%3A`, and the token is formatted the same
-/// (raw) way as [`WebUi::entry_url`] in `super`.
-fn entry_link(host: &str, token: &str, fp: &str) -> String {
+/// One entry link: `https://<host>[:<port>]/?token=<token>&ca=<fp>` — the
+/// bind port rides the link (a dropped port would dial :443), omitted on
+/// 443; IPv6 hosts bracketed, built with [`url::Url`] (design §8.4). The
+/// query goes in via `set_query` so it stays verbatim: `query_pairs_mut`
+/// would form-encode the fingerprint's `:` to `%3A`, and the token is
+/// formatted the same (raw) way as [`WebUi::entry_url`] in `super`.
+fn entry_link(host: &str, port: u16, token: &str, fp: &str) -> String {
     let host = if host.contains(':') {
         format!("[{host}]")
     } else {
         host.to_string()
     };
-    let mut url = Url::parse(&format!("https://{host}/")).expect("a well-formed host");
+    let authority = if port == 443 {
+        host
+    } else {
+        format!("{host}:{port}")
+    };
+    let mut url = Url::parse(&format!("https://{authority}/")).expect("a well-formed host");
     url.set_query(Some(&format!("token={token}&ca={fp}")));
     url.to_string()
 }
@@ -355,8 +361,8 @@ fn facts() -> JsonValue {
     let exe_path: Option<String> = std::env::current_exe()
         .ok()
         .map(|p| p.to_string_lossy().into_owned());
-    let data_dir = dirs::data_dir()
-        .map(|p| p.join("peakbot").to_string_lossy().into_owned())
+    let data_dir = crate::paths::app_data_dir()
+        .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
     let install = install_info(&exe_path);
     json!({
@@ -369,9 +375,22 @@ fn facts() -> JsonValue {
     })
 }
 
+/// The Local edition installs nothing: same shape, every slot absent.
+#[cfg(not(feature = "host"))]
+fn install_info(_exe_path: &Option<String>) -> JsonValue {
+    json!({
+        "target": "",
+        "state": "absent",
+        "path": super::system::InstallPath::Absent {
+            hint: "installing isn't available in PeakBot on this phone".to_string(),
+        },
+    })
+}
+
 /// The `facts.install` object — the 0.23 `build_install_info` shape
 /// (`target`, `state`, `path`) built from `install::install_target()` +
 /// `current_exe()` + `path_state` over the process PATH.
+#[cfg(feature = "host")]
 fn install_info(exe_path: &Option<String>) -> JsonValue {
     let target = crate::install::install_target();
     let target_display = target
@@ -443,9 +462,12 @@ async fn get_settings(
             .collect::<Vec<_>>(),
         "tab_names": TAB_NAMES.to_vec(),
         "skills": crate::load_default_skills(&cwd).0.names(),
-        "builtin_persona": include_str!("../../system_prompt_persona.txt"),
+        "builtin_persona": crate::SYSTEM_PROMPT_PERSONA,
         "mcp_status": mcp_status(state.deps.as_ref()),
         "boot": {
+            // What this server can do: `full` with the
+            // `host` feature, `local` without. The SPA reads it from Boot.
+            "edition": if cfg!(feature = "host") { "full" } else { "local" },
             "bind": state.boot_web.bind.to_string(),
             "token_source": state.boot_web.token_source,
             "tls": state.boot_web.tls,
@@ -924,6 +946,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "host")]
     #[test]
     fn mcp_status_is_derived_per_z3() {
         let deps = parse(

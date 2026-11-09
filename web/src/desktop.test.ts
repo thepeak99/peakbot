@@ -28,33 +28,92 @@ afterEach(() => {
   delete g.isTauri;
 });
 
-describe("isDesktop", () => {
-  it("returns true when window.isTauri is exactly true", () => {
-    g.isTauri = true;
-    expect(isDesktop()).toBe(true);
+// ── shell seam ────────────────────────────────────────────────────────────
+// `shell()` reads `window.peakbotShell` — the marker the shell's init
+// script injects: exactly "desktop" or "mobile". Anything else — missing,
+// garbage, the wrong type — is "browser" (SH1 fail-safe). `isDesktop()`
+// becomes `shell() === "desktop"`, and `window.isTauri` is NO LONGER
+// consulted: old desktop apps still set `isTauri` without the marker, and
+// a Tauri window without the marker must read as "browser".
+//
+// RED today: desktop.ts does not export shell() yet. The dynamic
+// import (this file's existing module-surface pattern) keeps the rest of
+// this file green until the seam lands.
+
+type ShellModule = { shell?: unknown };
+
+async function loadShell(): Promise<() => string> {
+  const mod = (await import("./desktop")) as ShellModule;
+  if (typeof mod.shell !== "function") {
+    throw new Error("desktop.ts does not export shell() yet");
+  }
+  return mod.shell as () => string;
+}
+
+type WithShell = { peakbotShell?: unknown };
+const sg = globalThis as WithShell;
+
+describe("shell() seam", () => {
+  afterEach(() => {
+    delete sg.peakbotShell;
+    delete g.isTauri;
   });
 
-  it("returns false in a browser (isTauri absent)", () => {
-    // No property set at all — the normal browser case.
-    expect(isDesktop()).toBe(false);
+  it("returns 'desktop' when window.peakbotShell is exactly 'desktop'", async () => {
+    sg.peakbotShell = "desktop";
+    const shell = await loadShell();
+    expect(shell()).toBe("desktop");
   });
 
-  it("returns false when isTauri is false", () => {
-    g.isTauri = false;
-    expect(isDesktop()).toBe(false);
+  it("returns 'mobile' when window.peakbotShell is exactly 'mobile'", async () => {
+    sg.peakbotShell = "mobile";
+    const shell = await loadShell();
+    expect(shell()).toBe("mobile");
   });
 
-  // The comparison must be strict `=== true`, not truthiness: any other
-  // value (a string, a number, an object) is not Tauri's signal.
+  it("returns 'browser' when window.peakbotShell is missing", async () => {
+    const shell = await loadShell();
+    expect(shell()).toBe("browser");
+  });
+
   it.each([
+    ["the uppercase 'DESKTOP'", "DESKTOP"],
+    ["the mixed-case 'Desktop'", "Desktop"],
+    ["the empty string", ""],
+    ["the padded marker ' mobile '", " mobile "],
     ["the string 'true'", "true"],
     ["the number 1", 1],
-    ["an object", {}],
+    ["true", true],
     ["null", null],
-    ["undefined (explicit)", undefined],
-  ] as const)("returns false when isTauri is %s", (_label, value) => {
-    g.isTauri = value;
+    ["an object", {}],
+  ] as const)("returns 'browser' for the garbage marker %s", async (_label, value) => {
+    sg.peakbotShell = value;
+    const shell = await loadShell();
+    expect(shell()).toBe("browser");
+  });
+
+  it("isDesktop() is true exactly when shell() is 'desktop'", async () => {
+    const shell = await loadShell();
+    for (const marker of ["desktop", "mobile", undefined] as const) {
+      if (marker === undefined) delete sg.peakbotShell;
+      else sg.peakbotShell = marker;
+      expect(isDesktop()).toBe(shell() === "desktop");
+    }
+  });
+
+  it("a Tauri window WITHOUT the marker reads as 'browser' (isTauri not consulted)", async () => {
+    g.isTauri = true; // old desktop apps set this automatically
+    const shell = await loadShell();
+    expect(shell()).toBe("browser");
     expect(isDesktop()).toBe(false);
+  });
+
+  it("a Tauri window WITH the desktop marker stays desktop", async () => {
+    g.isTauri = true;
+    sg.peakbotShell = "desktop";
+    const shell = await loadShell();
+    expect(shell()).toBe("desktop");
+    expect(isDesktop()).toBe(true);
   });
 });
 
@@ -261,19 +320,25 @@ describe("clipboard image IPC seam", () => {
 
 // ── module surface (close-to-tray removal + auto-update) ─────────────────
 // The Desktop pane is gone: `DesktopView`, `getDesktopSettings` and
-// `toggleDesktopBackground` are no longer exported. The seam now carries
-// exactly five exports: detection, the theme command, the two update
-// commands, and the clipboard-image read.
+// `toggleDesktopBackground` are no longer exported. The seam carries
+// exactly eight exports: the shell detection pair, the edition pair,
+// the theme command, the two update commands, and the
+// clipboard-image read.
+//
+// RED today: `shell` is not exported yet.
 
 describe("module surface", () => {
-  it("exports exactly isDesktop, setDesktopTheme, getUpdateStatus, installUpdate, readClipboardImage", async () => {
-    const mod = await import("./desktop");
+  it("exports exactly isDesktop, shell, edition, setBootEdition, setDesktopTheme, getUpdateStatus, installUpdate, readClipboardImage", async () => {
+    const mod = (await import("./desktop")) as Record<string, unknown>;
     expect(Object.keys(mod).sort()).toEqual([
+      "edition",
       "getUpdateStatus",
       "installUpdate",
       "isDesktop",
       "readClipboardImage",
+      "setBootEdition",
       "setDesktopTheme",
+      "shell",
     ]);
   });
 });

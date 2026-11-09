@@ -75,6 +75,8 @@ All tools live in `src/tools/` and implement `rig::tool::Tool` (`NAME`, `Args`, 
 
 **The authoritative tool list is `BUILTIN_TOOL_NAMES` in `src/config/mod.rs`** — keep any table below in sync with it, never the other way round.
 
+**Editions.** The default `host` feature is everything that gives the agent hands: shell/PTY/bg, file + doc tools, MCP, the installer, the TUI and the CLI (`[[bin]]` and the TUI/shell/installer test targets require it). `--no-default-features` builds the **Local edition** — the core a phone embeds: built-ins are exactly `fetch_url`, `fetch_page`, `web_search`, `todo`, `think` (its own `BUILTIN_TOOL_NAMES`), its own persona/core prompt (`src/system_prompt_*_local.txt`), and `Config::parse` rejects host-only tools, `mcps:`, `vector_db:` with a "not available in PeakBot on this phone" error. Gate host-only code with `#[cfg(feature = "host")]`; shared pure helpers live in `utils`. CI's canary `local_edition_canary` exists only in the Local build.
+
 Exactly **one shell + bg tool pair** is registered per detected shell: Bash hosts get `bash` + `bash_bg`, PowerShell hosts get `powershell` + `powershell_bg`, never both. `tools:` filter names are **per-shell** — `disabled: [bash_bg]` does NOT disable `powershell_bg` (they are separate names in `BUILTIN_TOOL_NAMES`).
 
 | Tool | File | Notes |
@@ -130,7 +132,7 @@ Two exceptions, registered ungated: `think` (its `thought` *is* the payload) and
 
 Old 0.23-layout files are **auto-migrated**, with no command and no button: the global file once at boot (every mode), a repo file when a session first sees it (boot for the boot cwd, on `/cd`/`/new`/`/model`/`/load` for the target cwd). The original bytes are kept create-only as `config.yaml.pre-0.24` (mode `0600`, never overwritten), and every semantic change is reported as a note (YAML header comment in the new file, stderr, and system messages in the first session). The old `web-token` file is retired — its token becomes `general.web.token`. Migration is the only legacy-layout hard error: a file that fails to migrate stops boot (windowed web shows the reason in first-run instead).
 
-Defaults are positional: the **first** profile is the default, and inside a profile the **first** agent is the default. Env vars: `PEAKBOT_WEB_TOKEN` (web token), `RUST_LOG` (log verbosity).
+Defaults are positional: the **first local** profile is the default (the **first remote** profile when there is no local profile), and inside a profile the **first** agent is the default. Env vars: `PEAKBOT_WEB_TOKEN` (web token), `RUST_LOG` (log verbosity).
 
 `RUST_LOG` controls `tracing`-style log verbosity: unset → `peakbot` warnings and other crates' errors (`--tui`: errors only, since its logs share the stdout ratatui draws on — set `RUST_LOG` explicitly to override). Transient-retry warnings (main agent and sub-agent) are therefore recorded by default in web/stdio mode. For a service install consider `RUST_LOG=peakbot=info` (systemd: `systemctl --user edit peakbot` → `[Service]` / `Environment=RUST_LOG=peakbot=info`).
 
@@ -329,6 +331,8 @@ Prefer skills or MCP servers over baking tools into the binary. Skills: drop a d
 ```
 src/
 ├── main.rs / lib.rs        # entry, AgentRunner, system prompt building
+├── boot.rs                 # session_deps + web_boot: the boot shared by main and embed
+├── embed.rs                # LocalCore — the phone app's in-process core (Local edition only)
 ├── session.rs              # SessionDeps + create_session factory
 ├── config/                 # Config::parse (the one boundary), migration, BUILTIN_TOOL_NAMES
 ├── providers/              # DynAgent, create_provider, per-provider constructors, add_builtin_tools
@@ -339,11 +343,14 @@ src/
 ├── skills/                 # skill discovery + SKILL.md parsing
 ├── vector/                 # VectorStore, embeddings client, parse/chunk
 ├── ui/                     # app_state, wire types; repl/ (ratatui), web/ (axum+WS+TLS), stdio/
-├── bg_processes.rs         # BgRegistry (background-process PTY processes)
+├── bg_processes.rs         # BgRegistry (background-process PTY processes; spawner host-only)
+├── line_buffer.rs          # PTY output ring + liveness (shared by bash and the bg registry)
+├── utils/                  # pure helpers shared across editions (paths, /cd resolve, elapsed time)
 ├── context_manager.rs      # compaction
 ├── conversation*.rs        # conversation data + persistence + titles
 ├── vision.rs               # [img:…] parsing, model vision detection
-├── system_prompt_*.txt     # persona / core / memory prompt pieces
+├── system_prompt_*.txt     # persona / core / memory prompt pieces (`*_local.txt`: Local edition)
+├── mcp_client.rs           # MCP server connections (host only)
 └── mcp_auth.rs             # MCP OAuth flow + token cache
 tests/                      # integration harness (MockCompletionModel, scenarios), repl_tests (insta)
 web/                        # SPA frontend (state.ts wire mirror, adapt.ts, components)
@@ -695,7 +702,7 @@ profiles:
 - **The conversation list is merged** — local rows plus each remote's rows (fetched over token-gated `GET /api/conversations`, ≤ 2 s per remote; a down remote contributes none), tagged with the local profile name. Killing a remote row is routed to its server.
 - **Uploads and images** stream through the three allowlisted token-gated `/r/{profile}/…` routes; every root-relative image URL in remote state is re-rooted under `/r/<profile>/` so nothing auto-loads a local endpoint.
 - **Protocol versions must match exactly**: local and remote `ready.v` must both equal `PROTOCOL_VERSION` (`src/ui/wire.rs`) — older, newer, or missing is a hard error naming both versions (E-VERSION).
-- **Chaining is blocked** (a relay re-attaches with `relayed: true`; a remote-profile target is refused — E-CHAIN, which also makes loops impossible). **TUI/stdio refuse** remote profiles with a clear message — there is no web server there to relay through.
+- **Chaining is blocked** (a relay re-attaches with `relayed: true`; a remote-profile target is refused — E-CHAIN, which also makes loops impossible). **TUI/stdio refuse** remote profiles with a clear message — there is no web server there to relay through — and with a relay-only config they refuse the whole run: `every profile in config.yaml is a remote profile — remote profiles open in the web UI (run peakbot without --tui/--stdio)`.
 
 ### Security
 
@@ -704,7 +711,7 @@ profiles:
 
 ### Pairing
 
-- The TLS startup banner prints `🔑 CA fingerprint: sha256:…`; token-gated `GET /api/pairing` returns one `https://host:port/?token=…&ca=sha256:…` link per phone-reachable host (or `Unavailable` with `loopback_bind` / `no_tls`).
+- The TLS startup banner prints `🔑 CA fingerprint: sha256:…`; token-gated `GET /api/pairing` returns one link per phone-reachable host: `https://host:port/?token=…&ca=sha256:…`, with the port included unless the server is on 443 (or `Unavailable` with `loopback_bind` / `no_tls`).
 - **Settings → General → "Connect a phone or another PeakBot"** lists the links (host labels only — the token URL appears only behind Show QR) with a profile dropdown that appends `&profile=<name>` client-side, plus Copy link.
 - **Settings → Profiles → "+ Add remote profile"** pastes such a link: the SPA splits it into `url`/`token`/`ca`/`profile` (the split never judges — `Config::parse` is the validator) and creates the entry named `<profile> on <host>`.
 - Remote changes are **reload-safe, next attach** (live-reload table: `profiles.* (remote) | next attach / next list refresh`).
@@ -719,7 +726,7 @@ Where it lives: `src/config/remote.rs` (parse), `src/ui/web/remote/{mod,relay,pr
 
 Two workflows on runner `shinpachi` (label `dind`):
 
-- **`ci.yml`** — `rust:1.95` container. Job `ci` = release contract tests (`sh tests/release.sh`, hermetic — Makefile targets + `release.yml`) → Node 22 frontend gate (`web/`: `npm ci` + lint/typecheck/test/build) → `cargo fmt --all -- --check` → `cargo clippy --all-targets --locked -- -D warnings` → `cargo test --workspace --locked`. Job `desktop` = the full desktop workspace (`--manifest-path desktop/Cargo.toml --workspace`) with the same fmt/clippy/test trio — after apt-installing the Tauri webkit deps (same set as `Dockerfile.desktop-linux`) and `touch`ing a placeholder sidecar binary (tauri-build requires `bundle.externalBin` to exist) — plus the Windows portable-exe static tests (`desktop/scripts/test-build-desktop-windows.sh`) and the auto-updater + macOS tarball contract tests (`desktop/scripts/test-updater-manifest.sh`, `desktop/scripts/test-assemble-app-tarball.sh`, after apt-installing `jq` + `zip`). No node/web build there: `desktop/ui` is committed static files.
+- **`ci.yml`** — `rust:1.95` container. Job `ci` = release contract tests (`sh tests/release.sh`, hermetic — Makefile targets + `release.yml`) → Node 22 frontend gate (`web/`: `npm ci` + lint/typecheck/test/build) → `cargo fmt --all -- --check` → `cargo clippy --all-targets --locked -- -D warnings` → `cargo test --workspace --locked` → Local edition: `cargo clippy --locked --lib --no-default-features -- -D warnings`, `cargo test --locked --lib --no-default-features`, and the canary `cargo test --locked --lib --no-default-features local_edition_canary -- --exact` (must print `1 passed`). Job `desktop` = the full desktop workspace (`--manifest-path desktop/Cargo.toml --workspace`) with the same fmt/clippy/test trio — after apt-installing the Tauri webkit deps (same set as `Dockerfile.desktop-linux`) and `touch`ing a placeholder sidecar binary (tauri-build requires `bundle.externalBin` to exist) — plus the Windows portable-exe static tests (`desktop/scripts/test-build-desktop-windows.sh`) and the auto-updater + macOS tarball contract tests (`desktop/scripts/test-updater-manifest.sh`, `desktop/scripts/test-assemble-app-tarball.sh`, after apt-installing `jq` + `zip`). No node/web build there: `desktop/ui` is committed static files.
 - **`release.yml`** — on tag push (`push: tags: ['*']`), on the `dind` runner (Alpine host driving the host docker daemon, no job container, `timeout-minutes: 300`, secret `RELEASE_TOKEN` → env `GITEA_TOKEN`): pure-git checkout, tool check (incl. `rclone`, `apk add --no-cache rclone` before it), then `make release TAG=$GITHUB_REF_NAME PRUNE=1 CONTAINER_BUILDER=docker GITEA_URL=… OWNER=… REPO=…`.
 
 (Reproduce `ci` locally with exactly those commands; autofix with `cargo fmt --all` + `cargo clippy --fix --allow-dirty [--tests]`.)

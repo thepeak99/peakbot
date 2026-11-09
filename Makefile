@@ -2,6 +2,8 @@
         web dev \
         desktop-test desktop-test-windows desktop-fonttest desktop-dev desktop-linux desktop-macos desktop-windows desktop \
         desktop-updater \
+        mobile-android-image mobile-android \
+        mobile-ios \
         release release-check release-bump release-tag \
         release-build-linux release-build-windows release-build-macos release-build-android \
         release-publish release-publish-shifu release-publish-github
@@ -124,6 +126,95 @@ $(OUTPUT_DIR)/$(ANDROID_BIN): Dockerfile.android
 	@echo "✅ Built: $(OUTPUT_DIR)/$(ANDROID_BIN)"
 	@ls -lh $(OUTPUT_DIR)/$(ANDROID_BIN)
 
+## mobile-android-image: Build the PeakBot Mobile Android toolchain image
+##                       (Dockerfile.mobile-android, `toolchain` stage): JDK 17,
+##                       SDK platforms 36+37, build-tools 36.0.0, NDK r28c,
+##                       Rust 1.95 + both Android targets, cargo-ndk 4.1.2, Node 22.
+##                       The APK build stage is added on top of it.
+mobile-android-image:
+	@echo "📱 Building the PeakBot Mobile Android toolchain image..."
+	$(CONTAINER_BUILDER) build \
+		--target toolchain \
+		-t localhost/peakbot-mobile-android:toolchain \
+		-f Dockerfile.mobile-android \
+		.
+	@echo "✅ localhost/peakbot-mobile-android:toolchain"
+
+# Mobile Android (Tauri shell — mobile/). Named volumes:
+# peakbot-mobile-android-home holds /root/.android (the debug keystore, so
+# debug APKs upgrade over each other across builds); the rest are caches.
+# The dev pbm-* volumes are the manual dev-loop volumes — these are the
+# make/CI ones.
+MOBILE_ANDROID_IMAGE       := localhost/peakbot-mobile-android:toolchain
+MOBILE_ANDROID_HOME_VOL    := peakbot-mobile-android-home
+MOBILE_ANDROID_GRADLE_VOL  := peakbot-mobile-android-gradle
+MOBILE_ANDROID_CARGO_VOL   := peakbot-mobile-android-cargo
+MOBILE_ANDROID_TARGET_VOL  := peakbot-mobile-android-target
+
+## mobile-android: Build the PeakBot Mobile Android APK. Runs
+##                 mobile/scripts/build-android.sh INSIDE the toolchain
+##                 container (worktree at /w): web/dist (always rebuilt) →
+##                 npm ci → `npm run tauri -- android build --apk
+##                 --target aarch64 --ci -- --locked` → smoke.
+##                 Release signing: ANDROID_KEYSTORE_B64 +
+##                 ANDROID_KEYSTORE_PASSWORD + ANDROID_KEY_ALIAS +
+##                 ANDROID_KEY_PASSWORD in the environment cross the
+##                 container boundary as a tmpfs /run/secrets mount (a
+##                 0700 tmpdir in /tmp — tmpfs on Linux — bound to
+##                 /run/secrets; the container script decodes the keystore
+##                 and writes keystore.properties to that same tmpfs).
+##                 Never argv contents, never env, never echoed (same
+##                 discipline as the desktop-updater BuildKit secrets).
+##                 No secrets ⇒ debug-signed PeakBot-Mobile-<v>-android-
+##                 arm64-debug.apk (never released). Output: output/mobile/.
+mobile-android: mobile-android-image
+	@set -eu; \
+	builder="$(CONTAINER_BUILDER)"; \
+	image="$(MOBILE_ANDROID_IMAGE)"; \
+	for v in "$(MOBILE_ANDROID_HOME_VOL)" "$(MOBILE_ANDROID_GRADLE_VOL)" \
+	         "$(MOBILE_ANDROID_CARGO_VOL)" "$(MOBILE_ANDROID_TARGET_VOL)"; do \
+	  "$$builder" volume create "$$v" >/dev/null 2>&1 || true; \
+	done; \
+	secrets_mount=""; \
+	if [ -n "$${ANDROID_KEYSTORE_B64:-}" ] && [ -n "$${ANDROID_KEYSTORE_PASSWORD:-}" ] \
+	   && [ -n "$${ANDROID_KEY_ALIAS:-}" ] && [ -n "$${ANDROID_KEY_PASSWORD:-}" ]; then \
+	  secret_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/pbm-android-secrets.XXXXXX"); \
+	  chmod 700 "$$secret_dir"; \
+	  trap 'rm -rf "$$secret_dir"' EXIT; \
+	  { printf '%s' "$$ANDROID_KEYSTORE_B64";        } > "$$secret_dir/ANDROID_KEYSTORE_B64"; \
+	  { printf '%s' "$$ANDROID_KEYSTORE_PASSWORD";   } > "$$secret_dir/ANDROID_KEYSTORE_PASSWORD"; \
+	  { printf '%s' "$$ANDROID_KEY_ALIAS";           } > "$$secret_dir/ANDROID_KEY_ALIAS"; \
+	  { printf '%s' "$$ANDROID_KEY_PASSWORD";        } > "$$secret_dir/ANDROID_KEY_PASSWORD"; \
+	  chmod 600 "$$secret_dir"/*; \
+	  secrets_mount="-v $$secret_dir:/run/secrets:z"; \
+	  echo "🔏 Release signing: /run/secrets tmpfs mount prepared (4 secrets)"; \
+	else \
+	  echo "ℹ️  no ANDROID_KEYSTORE_* secrets — debug-signed -debug.apk (never released)"; \
+	fi; \
+	"$$builder" run --rm --memory=12g --memory-swap=12g \
+	  -v "$(CURDIR):/w:z" \
+	  -v "$(MOBILE_ANDROID_TARGET_VOL):/w/target:z" \
+	  -v "$(MOBILE_ANDROID_HOME_VOL):/root/.android:z" \
+	  -v "$(MOBILE_ANDROID_GRADLE_VOL):/root/.gradle:z" \
+	  -v "$(MOBILE_ANDROID_CARGO_VOL):/opt/cargo/registry:z" \
+	  $$secrets_mount \
+	  -w /w \
+	  "$$image" sh mobile/scripts/build-android.sh
+
+
+## mobile-ios: Build the PeakBot Mobile iOS .ipa. HOST SCRIPT on a
+##             Mac (Xcode 26.3 pinned — no container): asserts the
+##             Xcode, requires APPLE_DEVELOPMENT_TEAM from the environment
+##             (the human's team — never the repo; no secrets echoed),
+##             web/dist → npm ci → `npm run tauri -- ios build
+##             --target aarch64 --export-method app-store-connect` →
+##             output/mobile/PeakBot-Mobile-<v>-ios.ipa, which the human
+##             uploads (Transporter / xcrun altool). The simulator path is
+##             mobile/scripts/ios-sim.sh.
+mobile-ios:
+	@sh mobile/scripts/build-ios.sh
+
+
 ## web: Build the web UI (web/dist/) — required for bare `peakbot` to serve the real SPA.
 ##        CI and Docker builds run the Node stage automatically; this is for local dev.
 web:
@@ -232,8 +323,8 @@ export PRUNE
 PRUNE_STEP = if [ "$${PRUNE}" = "1" ]; then $(CONTAINER_BUILDER) builder prune -af; fi
 
 ## release-check: Verify TAG is set and equals the Cargo.toml version, desktop
-##                version is in sync, release-notes/<TAG>.md exists, and the
-##                tauri.conf.json updater endpoints are exactly the shifu
+##                + mobile versions are in sync, release-notes/<TAG>.md exists, and
+##                the tauri.conf.json updater endpoints are exactly the shifu
 ##                UPDATER_BASE_URL/latest.json
 release-check:
 	@set -eu; \
@@ -312,8 +403,12 @@ release-bump:
 	awk -v v="$$v" '/^\[package\]/{p=1} p && /^version[[:space:]]*=/ && !done {sub(/"[^"]*"/, "\"" v "\""); done=1} {print}' Cargo.toml > Cargo.toml.tmp && mv Cargo.toml.tmp Cargo.toml; \
 	echo "🖥️  Bumping desktop/Cargo.toml to $$v..."; \
 	awk -v v="$$v" '/^\[workspace.package\]/{p=1} p && /^version[[:space:]]*=/ && !done {sub(/"[^"]*"/, "\"" v "\""); done=1} {print}' desktop/Cargo.toml > desktop/Cargo.toml.tmp && mv desktop/Cargo.toml.tmp desktop/Cargo.toml; \
+	echo "📱 Bumping mobile/src-tauri/Cargo.toml + tauri.conf.json to $$v..."; \
+	awk -v v="$$v" '/^\[package\]/{p=1} p && /^version[[:space:]]*=/ && !done {sub(/"[^"]*"/, "\"" v "\""); done=1} {print}' mobile/src-tauri/Cargo.toml > mobile/src-tauri/Cargo.toml.tmp && mv mobile/src-tauri/Cargo.toml.tmp mobile/src-tauri/Cargo.toml; \
+	jq --arg v "$$v" '.version = $$v' mobile/src-tauri/tauri.conf.json > mobile/src-tauri/tauri.conf.json.tmp && mv mobile/src-tauri/tauri.conf.json.tmp mobile/src-tauri/tauri.conf.json; \
 	echo "🔒 Updating Cargo.lock..."; \
 	cargo update -p peakbot --precise "$$v" >/dev/null 2>&1 || cargo update -p peakbot >/dev/null; \
+	cargo update -p peakbot-mobile --precise "$$v" >/dev/null 2>&1 || cargo update -p peakbot-mobile >/dev/null; \
 	cargo update --workspace --manifest-path desktop/Cargo.toml >/dev/null 2>&1; \
 	if [ ! -f release-notes/current.md ]; then \
 	  echo "❌ release-notes/current.md not found"; exit 1; \
@@ -323,7 +418,7 @@ release-bump:
 	  # Prerelease (RC): snapshot the notes; the draft keeps accumulating for stable. \
 	  echo "📄 Snapshotting release notes (prerelease): release-notes/$$v.md ← release-notes/current.md"; \
 	  awk '/^## /{f=1} f' release-notes/current.md > release-notes/$$v.md; \
-	  git add Cargo.toml Cargo.lock desktop/Cargo.toml desktop/Cargo.lock release-notes/$$v.md; \
+	  git add Cargo.toml Cargo.lock desktop/Cargo.toml desktop/Cargo.lock mobile/src-tauri/Cargo.toml mobile/src-tauri/tauri.conf.json release-notes/$$v.md; \
 	  ;; \
 	*) \
 	  # Stable: promote — the draft becomes the versioned file, a fresh draft starts. \
@@ -332,7 +427,7 @@ release-bump:
 	  awk '/^## /{exit} {print}' release-notes/current.md > release-notes/current.md.tmp; \
 	  printf '## Changes\n' >> release-notes/current.md.tmp; \
 	  mv release-notes/current.md.tmp release-notes/current.md; \
-	  git add Cargo.toml Cargo.lock desktop/Cargo.toml desktop/Cargo.lock release-notes/$$v.md release-notes/current.md; \
+	  git add Cargo.toml Cargo.lock desktop/Cargo.toml desktop/Cargo.lock mobile/src-tauri/Cargo.toml mobile/src-tauri/tauri.conf.json release-notes/$$v.md release-notes/current.md; \
 	  ;; \
 	esac; \
 	git commit -m "chore: release $$v" -m "Co-authored by PeakBot!"; \

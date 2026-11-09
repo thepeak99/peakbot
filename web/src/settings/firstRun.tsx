@@ -7,7 +7,9 @@
 //  - deriveSetupPhase — the §6.9 pending-restart derivation: needs_setup +
 //    global file exists + !legacy_layout ⇒ "restart_pending". Derived on
 //    every load, never stored.
-//  - <FirstRun> — the wizard (Welcome → Provider → Agent → Web → Review).
+//  - <FirstRun> — the wizard. Welcome offers two paths: set up a provider on
+//    this device (Provider → Agent → Web → Review) or connect to a PeakBot
+//    server (Connect → Review; writes a relay-only config).
 //    Self-contained: it only talks to the server via ./api putConfig on
 //    Finish. Desktop Finish navigates to the `peakbot-desktop:restart`
 //    sentinel (no success screen); the browser gets the restart screen.
@@ -16,19 +18,32 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { stringify } from "yaml";
-import { isDesktop } from "../desktop";
-import { putConfig } from "./api";
+import { isDesktop, shell } from "../desktop";
+import { scanQrCode } from "../qrScan";
+import { ApiError, putConfig } from "./api";
 import { generateToken } from "./general";
 import { NEUTRAL_PERSONA, TERSE_PERSONA } from "./agent";
-import { BASE_URL_PRESETS, MODEL_PRESETS } from "./providerTypes";
+import { remoteEntryFromLink, type RemoteEntry } from "./pairingLink";
+import { BASE_URL_PRESETS, MODEL_PRESETS, PROVIDER_CONSENT } from "./providerTypes";
 import type { FirstRunAnswers, FirstRunProviderType, SetupPhase } from "./contract";
 import type { ConfigText, PutOk, SettingsMeta } from "./types";
 
 // ── pure: buildFirstRunYaml ───────────────────────────────────────────────
 
+/** The wizard's generated first profile: on the phone it reads against the
+ * remote entries ("On this phone" vs "dev on nas.lan"). */
+function firstProfileName(local: boolean): string {
+  return local ? "On this phone" : "default";
+}
+
+/** The relay-only global config: exactly one remote profile, nothing local. */
+function buildConnectYaml(r: RemoteEntry): string {
+  return stringify({ profiles: { [r.name]: r.entry } });
+}
+
 /** The generated global config for a fresh setup (spec §9.13 example).
  * PURE: same answers in, same bytes out; the input is never mutated. */
-export function buildFirstRunYaml(a: FirstRunAnswers): string {
+export function buildFirstRunYaml(a: FirstRunAnswers, opts: { local?: boolean } = {}): string {
   const p = a.provider;
   const provider: Record<string, unknown> = { name: p.name, type: p.type };
   const apiKey = (p.api_key ?? "").trim();
@@ -53,20 +68,23 @@ export function buildFirstRunYaml(a: FirstRunAnswers): string {
     main.subagents = { helper: { prompt: "Take focused sub-tasks and report back." } };
   }
 
-  // Local never writes a token, even a leftover one; LAN always does.
-  const web: Record<string, unknown> = {
-    bind: a.web.access === "lan" ? "0.0.0.0:7823" : "127.0.0.1:7823",
-  };
-  if (a.web.access === "lan" && (a.web.token ?? "").trim() !== "") {
-    web.token = a.web.token;
-  }
-
-  const doc = {
+  const doc: Record<string, unknown> = {
     providers: [provider],
     mcps: [] as unknown[],
-    profiles: { default: { agents: { main } } },
-    general: { web },
+    profiles: { [firstProfileName(opts.local === true)]: { agents: { main } } },
   };
+  // The Local (phone) core picks its own loopback port and token and never
+  // reads `general.web`, so the Local edition writes no `general` block.
+  if (!opts.local) {
+    // Local access never writes a token, even a leftover one; LAN always does.
+    const web: Record<string, unknown> = {
+      bind: a.web.access === "lan" ? "0.0.0.0:7823" : "127.0.0.1:7823",
+    };
+    if (a.web.access === "lan" && (a.web.token ?? "").trim() !== "") {
+      web.token = a.web.token;
+    }
+    doc.general = { web };
+  }
   return stringify(doc);
 }
 
@@ -89,7 +107,7 @@ export function deriveSetupPhase(
 
 // ── wizard ────────────────────────────────────────────────────────────────
 
-type StepName = "welcome" | "provider" | "agent" | "web" | "review";
+type StepName = "welcome" | "provider" | "connect" | "agent" | "web" | "review";
 
 const STEPS: { name: StepName; title: string }[] = [
   { name: "welcome", title: "Welcome" },
@@ -98,6 +116,32 @@ const STEPS: { name: StepName; title: string }[] = [
   { name: "web", title: "Web access" },
   { name: "review", title: "Review" },
 ];
+
+const CONNECT_STEPS: { name: StepName; title: string }[] = [
+  { name: "welcome", title: "Welcome" },
+  { name: "connect", title: "Connect to a server" },
+  { name: "review", title: "Review" },
+];
+
+type WizardPath = "provider" | "connect";
+
+// A 422's useful text is in `errors[]`; the top-level message alone
+// ("config is not valid") hides which field to fix.
+function putErrorText(e: unknown): string {
+  if (!(e instanceof ApiError)) return e instanceof Error ? e.message : String(e);
+  const details = (e.body.errors ?? []).map((x) => x.message);
+  return details.length > 0 ? `${e.message}: ${details.join("; ")}` : e.message;
+}
+
+type ParsedLink = { ok: true; remote: RemoteEntry } | { ok: false; message: string };
+
+function parseLink(text: string): ParsedLink {
+  try {
+    return { ok: true, remote: remoteEntryFromLink(text) };
+  } catch (e) {
+    return { ok: false, message: e instanceof Error ? e.message : String(e) };
+  }
+}
 
 // Hosted providers need an API key; the self-hosted ones (llama.cpp, Ollama)
 // don't.
@@ -161,16 +205,30 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
   const [step, setStep] = useState<StepName>("welcome");
   // Rail steps are disabled until VISITED (the wizard is forward-biased).
   const [visited, setVisited] = useState<Set<StepName>>(() => new Set(["welcome"]));
+  // The edition lives in the `boot` block on the wire (Boot passes the meta
+  // from the same read).
+  const local = meta.boot?.edition === "local";
   const [answers, setAnswers] = useState<FirstRunAnswers>({
     provider: { type: "openrouter", name: "openrouter", models: [] },
     agent: { model: "", persona: null, subagents: false },
     web: { access: "local", token: null },
   });
+  const [path, setPath] = useState<WizardPath>("provider");
+  const [link, setLink] = useState("");
+  const [connectError, setConnectError] = useState<string | null>(null);
   const [putting, setPutting] = useState(false);
   const [putError, setPutError] = useState<string | null>(null);
   const [putOk, setPutOk] = useState<PutOk | null>(null);
 
   const phase = deriveSetupPhase(meta, global.exists);
+  // The local edition (phone build) skips the "Web access" step — the server
+  // is loopback-only by construction — and the PATH fact (the binary runs
+  // from the APK; PATH has no meaning there).
+  const isMobileShell = shell() === "mobile";
+  const providerSteps = local ? STEPS.filter((s) => s.name !== "web") : STEPS;
+  const steps = path === "connect" ? CONNECT_STEPS : providerSteps;
+  const profileName = firstProfileName(local);
+  const parsedLink = useMemo(() => parseLink(link), [link]);
 
   // Esc closes the wizard (Boot shows the setup strip underneath).
   useEffect(() => {
@@ -227,6 +285,28 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
     webErrors.push("A LAN bind requires a token — generate one, or switch back to local only.");
   }
   const stepErrors = step === "provider" ? providerErrors : step === "web" ? webErrors : [];
+  const stepOk = (n: StepName) =>
+    n === "provider" ? providerErrors.length === 0 :
+    n === "web" ? webErrors.length === 0 :
+    n === "connect" ? parsedLink.ok : true;
+
+  // The scanned text lands in the same input as a pasted link; a cancelled
+  // scan is silent.
+  async function scanLink() {
+    setConnectError(null);
+    const outcome = await scanQrCode();
+    if (outcome.ok) setLink(outcome.text);
+    else if (!outcome.cancelled) setConnectError(outcome.message);
+  }
+
+  function continueConnect() {
+    if (!parsedLink.ok) {
+      setConnectError(parsedLink.message);
+      return;
+    }
+    setConnectError(null);
+    goTo("review");
+  }
 
   // The agent's model defaults to the first alias the wizard collected — and
   // falls back to it if the chosen alias was since renamed/removed. The
@@ -243,15 +323,19 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
   // Review preview: the EXACT text that will be PUT, with the secrets
   // (API key AND the LAN web token) masked VISUALLY only (the real values
   // are what get sent).
-  const yamlText = useMemo(() => buildFirstRunYaml(effective), [effective]);
+  const remoteToken = parsedLink.ok ? parsedLink.remote.entry.remote.token : "";
+  const yamlText = useMemo(() => {
+    if (path === "provider") return buildFirstRunYaml(effective, { local });
+    return parsedLink.ok ? buildConnectYaml(parsedLink.remote) : "";
+  }, [path, parsedLink, effective, local]);
   const maskedYaml = useMemo(() => {
     let t = yamlText;
-    for (const secret of [answers.provider.api_key, answers.web.token]) {
+    for (const secret of [answers.provider.api_key, answers.web.token, remoteToken]) {
       const s = (secret ?? "").trim();
       if (s !== "") t = t.split(s).join("••••••••");
     }
     return t;
-  }, [yamlText, answers.provider.api_key, answers.web.token]);
+  }, [yamlText, answers.provider.api_key, answers.web.token, remoteToken]);
 
   async function finish() {
     setPutting(true);
@@ -266,7 +350,7 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
       }
       setPutOk(ok);
     } catch (e) {
-      setPutError(e instanceof Error ? e.message : String(e));
+      setPutError(putErrorText(e));
     } finally {
       setPutting(false);
     }
@@ -291,6 +375,21 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
               </p>
             )}
             <p className="text-sm text-zinc-300">Restart PeakBot to start chatting.</p>
+            {/* Mobile + Local: without this the screen is a dead end — the
+                shell (not the user) restarts the in-process core. The anchor
+                navigates `peakbot-mobile:restart`, which the nav guard
+                classifies RestartLocal (gated to the Local page). */}
+            {isMobileShell && local && (
+              <div>
+                <a
+                  data-testid="firstrun-restart-now"
+                  href="peakbot-mobile:restart"
+                  className="inline-block cursor-pointer rounded-md bg-emerald-700 px-4 py-1.5 text-sm font-medium text-white hover:bg-emerald-600"
+                >
+                  Restart now
+                </a>
+              </div>
+            )}
             <div className="space-y-1 font-mono text-[11px] text-zinc-500">
               <div>Config: {global.path}</div>
               {finished && putOk.backup !== null && (
@@ -299,15 +398,18 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
               {/* §9.13 facts order: Config · Backup · Provider · Agent · Version.
                   Provider/Agent come from this session's answers, so the
                   derived restart_pending screen (after a reload) omits them. */}
-              {finished && (
+              {finished && path === "provider" && (
                 <>
                   <div data-testid="firstrun-restart-provider">
                     Provider: {effective.provider.name} ({effective.provider.type})
                   </div>
                   <div data-testid="firstrun-restart-agent">
-                    Agent: default › main — {effective.agent.model}
+                    Agent: {profileName} › main — {effective.agent.model}
                   </div>
                 </>
+              )}
+              {finished && path === "connect" && parsedLink.ok && (
+                <div data-testid="firstrun-restart-remote">Server: {parsedLink.remote.name}</div>
               )}
               <div>Version: {meta.facts.version}</div>
             </div>
@@ -317,30 +419,66 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
     );
   }
 
-  const idx = STEPS.findIndex((s) => s.name === step);
+  const idx = steps.findIndex((s) => s.name === step);
   const pType = answers.provider.type;
 
   return (
     <div data-testid="firstrun" className="flex h-dvh flex-col bg-zinc-950 text-zinc-100">
-      <header className="flex items-center justify-between border-b border-zinc-800 px-6 py-4">
+      <header className="flex items-center justify-between border-b border-zinc-800 px-6 pb-4 pt-[max(1rem,env(safe-area-inset-top))]">
         <div>
           <h1 className="text-lg font-semibold">Welcome to PeakBot</h1>
           <p className="text-xs text-zinc-500">let's get you set up</p>
         </div>
         <span className="text-[11px] text-zinc-600">Esc to close</span>
       </header>
+      {/* Below the sm breakpoint the side rail collapses to a top
+          stepper so the wizard fits ≤ 412 CSS px (360/412 phone frames)
+          with "Next"/"Finish" always in the footer and no horizontal
+          overflow. */}
+      <div
+        data-testid="firstrun-stepper"
+        className="flex flex-wrap items-center gap-1.5 border-b border-zinc-800 bg-zinc-900/40 px-4 py-1.5 sm:hidden"
+      >
+        {steps.map((s, i) => {
+          const isHere = s.name === step;
+          const isVisited = visited.has(s.name);
+          const ok = stepOk(s.name);
+          const dot = !isVisited
+            ? "border border-zinc-600"
+            : isHere
+              ? ok ? "bg-emerald-400" : "bg-red-400"
+              : ok ? "bg-emerald-600" : "bg-red-500";
+          return (
+            <button
+              key={s.name}
+              data-testid={`firstrun-stepper-${s.name}`}
+              type="button"
+              disabled={!isVisited}
+              onClick={() => goTo(s.name)}
+              className={`flex cursor-pointer items-center gap-1 rounded bg-zinc-900/60 px-2 py-0.5 text-[10px] text-zinc-300 transition-colors ${
+                isHere ? "bg-zinc-800 text-zinc-100" : "hover:bg-zinc-900"
+              } disabled:cursor-default disabled:opacity-40`}
+            >
+              <span
+                className={`h-1.5 w-1.5 shrink-0 rounded-full ${dot}`}
+                aria-hidden
+              />
+              {i + 1}. {s.title}
+            </button>
+          );
+        })}
+      </div>
 
       <div className="flex min-h-0 flex-1">
         {/* Left rail: numbered steps with status dots. Later steps are
-            disabled until visited. */}
-        <nav className="w-56 shrink-0 overflow-y-auto border-r border-zinc-800 p-4">
+            disabled until visited. Collapses to a top stepper below the
+            sm breakpoint (≤ 412 CSS px on phones). */}
+        <nav className="hidden w-56 shrink-0 overflow-y-auto border-r border-zinc-800 p-4 sm:block">
           <div className="mb-2 text-[10px] uppercase tracking-wide text-zinc-600">Setup</div>
-          {STEPS.map((s, i) => {
+          {steps.map((s, i) => {
             const isHere = s.name === step;
             const isVisited = visited.has(s.name);
-            const stepOk =
-              s.name === "provider" ? providerErrors.length === 0 :
-              s.name === "web" ? webErrors.length === 0 : true;
+            const ok = stepOk(s.name);
             return (
               <button
                 key={s.name}
@@ -357,8 +495,8 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
                     !isVisited
                       ? "border border-zinc-600"
                       : isHere
-                        ? (stepOk ? "bg-emerald-400" : "bg-red-400")
-                        : (stepOk ? "bg-emerald-600" : "bg-red-500")
+                        ? (ok ? "bg-emerald-400" : "bg-red-400")
+                        : (ok ? "bg-emerald-600" : "bg-red-500")
                   }`}
                 />
                 {i + 1}. {s.title}
@@ -377,8 +515,8 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
                 <div>
                   <h2 className="text-sm font-semibold">Welcome</h2>
                   <p className="mt-1 text-xs text-zinc-400">
-                    Point an agent at a provider and it is ready to work. Three steps and a review;
-                    one of them optional.
+                    Point an agent at a provider and it is ready to work — or connect to a PeakBot
+                    server you already run.
                   </p>
                 </div>
                 {meta.legacy_layout && (
@@ -403,18 +541,40 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
                   <div>Config · {meta.global_path}</div>
                   <div>Data dir · {meta.facts.data_dir}</div>
                   <div>Version · {meta.facts.version}</div>
-                  {pathFact(meta.facts.install) !== null && (
-                    <div data-testid="firstrun-fact-path">PATH · {pathFact(meta.facts.install)}</div>
+                  {/* The local edition omits the PATH fact (APK build —
+                      PATH has no meaning on the phone); the full edition
+                      keeps the line, reading "unknown" when the install
+                      probe is absent. */}
+                  {!local && (
+                    <div data-testid="firstrun-fact-path">
+                      PATH · {pathFact(meta.facts.install) ?? "unknown"}
+                    </div>
                   )}
                 </div>
-                <button
-                  data-testid="firstrun-start-fresh"
-                  type="button"
-                  onClick={() => goTo("provider")}
-                  className="cursor-pointer rounded-md bg-emerald-700 px-4 py-1.5 text-sm font-medium text-white hover:bg-emerald-600"
-                >
-                  Start fresh
-                </button>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    data-testid="firstrun-start-fresh"
+                    type="button"
+                    onClick={() => {
+                      setPath("provider");
+                      goTo("provider");
+                    }}
+                    className="cursor-pointer rounded-md bg-emerald-700 px-4 py-1.5 text-sm font-medium text-white hover:bg-emerald-600"
+                  >
+                    Set up an AI provider on this device
+                  </button>
+                  <button
+                    data-testid="firstrun-connect-server"
+                    type="button"
+                    onClick={() => {
+                      setPath("connect");
+                      goTo("connect");
+                    }}
+                    className="cursor-pointer rounded-md border border-emerald-700 px-4 py-1.5 text-sm font-medium text-emerald-300 hover:bg-emerald-900/40"
+                  >
+                    Connect to my PeakBot server
+                  </button>
+                </div>
               </div>
             )}
 
@@ -425,6 +585,11 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
                   <p className="mt-1 text-xs text-zinc-400">
                     Choose a provider, name at least one model, and add its API key.
                   </p>
+                  {local && (
+                    <p data-testid="fr-consent-notice" className="mt-2 text-xs text-amber-300/90">
+                      {PROVIDER_CONSENT}
+                    </p>
+                  )}
                 </div>
                 <div className="grid grid-cols-2 gap-3">
                   <Field testid="fr-provider-type" label="Provider type">
@@ -556,12 +721,61 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
               </div>
             )}
 
+            {step === "connect" && (
+              <div data-testid="firstrun-step-connect" className="max-w-lg space-y-3">
+                <div>
+                  <h2 className="text-sm font-semibold">Connect to my PeakBot server</h2>
+                  <p className="mt-1 text-xs text-zinc-400">
+                    No provider or API key is needed on this device — the server does the work.
+                  </p>
+                </div>
+                <div data-testid="firstrun-connect-paste">
+                  <span className="mb-1 block text-[11px] text-zinc-400">
+                    Paste a pairing link (Settings → General → Connect a phone, on the server).
+                  </span>
+                  <input
+                    data-testid="firstrun-connect-input"
+                    className={INPUT_CLS + " font-mono"}
+                    value={link}
+                    placeholder="https://host:port/?token=…&ca=sha256:…"
+                    onChange={(e) => setLink(e.target.value)}
+                  />
+                  <div className="mt-2 flex items-center gap-2">
+                    <button
+                      data-testid="firstrun-connect-continue"
+                      type="button"
+                      onClick={continueConnect}
+                      className={GHOST_BTN}
+                    >
+                      Continue
+                    </button>
+                    {isMobileShell && (
+                      // The camera capability is granted in the mobile shell only.
+                      <button
+                        data-testid="firstrun-scan-qr"
+                        type="button"
+                        onClick={() => void scanLink()}
+                        className={GHOST_BTN}
+                      >
+                        Scan QR
+                      </button>
+                    )}
+                  </div>
+                  {connectError !== null && (
+                    <span data-testid="firstrun-connect-error" className="mt-2 block text-[11px] text-red-400">
+                      {connectError}
+                    </span>
+                  )}
+                </div>
+              </div>
+            )}
+
             {step === "agent" && (
               <div data-testid="firstrun-step-agent" className="max-w-lg space-y-3">
                 <div>
                   <h2 className="text-sm font-semibold">Your first agent</h2>
                   <p className="mt-1 text-xs text-zinc-400">
-                    Every config has a profile and an agent. We generate profile &ldquo;default&rdquo;
+                    Every config has a profile and an agent. We generate profile &ldquo;{profileName}&rdquo;
                     with agent &ldquo;main&rdquo; for you.
                   </p>
                 </div>
@@ -569,7 +783,7 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
                   data-testid="firstrun-agent-banner"
                   className="rounded-md border border-sky-900/60 bg-sky-950/30 p-2.5 text-xs text-sky-300"
                 >
-                  Generated: profile default › agent main using model {modelValue}. You can add more
+                  Generated: profile {profileName} › agent main using model {modelValue}. You can add more
                   profiles and agents later in Settings → Profiles.
                 </div>
                 <Field testid="fr-agent-model" label="Model">
@@ -586,6 +800,12 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
                     ))}
                   </select>
                 </Field>
+                {/* The persona picker is full-edition only: Local has its
+                    own built-in persona, so the Code Crusader /
+                    engineer / reviewer choices don't apply there. The
+                    default answer (persona: null) writes no `persona` key —
+                    which on Local IS the Local built-in persona. */}
+                {!local && (
                 <div>
                   <span className="mb-1 block text-[11px] text-zinc-400">Persona</span>
                   <div className="flex flex-wrap gap-1.5">
@@ -628,6 +848,7 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
                     never drifts into your file.
                   </span>
                 </div>
+                )}
                 <div
                   data-testid="fr-agent-subagents"
                   className="flex items-start justify-between gap-3"
@@ -718,6 +939,14 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
                   <p className="mt-1 text-xs text-zinc-400">
                     This is the exact config that will be written.
                   </p>
+                  {path === "connect" && parsedLink.ok && (
+                    <p className="mt-1 text-xs text-zinc-300">
+                      Server:{" "}
+                      <span data-testid="firstrun-connect-name" className="font-mono">
+                        {parsedLink.remote.name}
+                      </span>
+                    </p>
+                  )}
                 </div>
                 <div
                   data-testid="firstrun-review-path"
@@ -761,24 +990,32 @@ export function FirstRun({ meta, global, onClose }: FirstRunProps) {
               data-testid="firstrun-back"
               type="button"
               disabled={idx === 0}
-              onClick={() => goTo(STEPS[idx - 1].name)}
+              onClick={() => goTo(steps[idx - 1].name)}
               className={FOOTER_BTN}
             >
               Back
             </button>
             <span className="flex-1" />
-            <button data-testid="firstrun-skip" type="button" onClick={() => goTo("review")} className={FOOTER_BTN}>
-              Skip to review
-            </button>
-            {step !== "review" ? (
+            {path === "provider" && (
+              <button data-testid="firstrun-skip" type="button" onClick={() => goTo("review")} className={FOOTER_BTN}>
+                Skip to review
+              </button>
+            )}
+            {step === "connect" ? null : step !== "review" ? (
               <button
                 data-testid="firstrun-next"
                 type="button"
                 disabled={stepErrors.length > 0}
-                onClick={() => goTo(STEPS[idx + 1].name)}
+                onClick={() => goTo(steps[idx + 1].name)}
                 className={FOOTER_BTN + " border-emerald-800 bg-emerald-900/40 text-emerald-200 hover:bg-emerald-900/70"}
               >
-                Next
+                {/* Local: continuing is the consent. The span carries the
+                    agree id; its click bubbles to this button. */}
+                {local && step === "provider" ? (
+                  <span data-testid="fr-agree-continue">Agree and continue</span>
+                ) : (
+                  "Next"
+                )}
               </button>
             ) : (
               <button

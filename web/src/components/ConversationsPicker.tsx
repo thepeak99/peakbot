@@ -76,6 +76,8 @@ export function ConversationsPicker({
   catalog?: CatalogProfile[];
 }) {
   const desktop = isDesktop();
+  // Mobile keeps the "+": its window.open is a top-level navigation
+  // (Back returns). Desktop loses it — the tab strip has its own.
   const [open, setOpen] = useState(false);
   // The list arrives async after onOpen(); show a loading hint until it does
   // instead of prematurely flashing "No saved conversations."
@@ -212,7 +214,8 @@ export function ConversationsPicker({
         <span className="text-zinc-600">▾</span>
       </button>
 
-      {/* Desktop: the "+" lives in the tab strip instead. */}
+      {/* Desktop: the tab strip has its own "+", so this one is hidden;
+          browser and mobile keep it (mobile's window.open is a top-level nav). */}
       {!desktop && (
         <button
           onClick={openNewTab}

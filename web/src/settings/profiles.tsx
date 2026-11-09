@@ -9,12 +9,14 @@
 // report intent through their optional `onOpen*` callbacks.
 
 import { useEffect, useRef, useState } from "react";
+import { shell } from "../desktop";
+import { scanQrCode } from "../qrScan";
 import { useSettingsCtx } from "./context";
 import { get, type Doc } from "./yamlDoc";
 import { errAt } from "./paths";
 import { parseFilter, serializeFilter, type FilterState } from "./filter";
 import { duplicateInsertIndex, duplicateName, makeDefault } from "./profileOps";
-import { defaultRemoteName, parsePairingLink } from "./pairingLink";
+import { remoteEntryFromLink } from "./pairingLink";
 import { useToast } from "./Toast";
 import { Badge, Field, FilterBlock, KvRows, SecretInput, Toggle, type KvRow } from "./widgets";
 import type { Seg } from "./types";
@@ -238,24 +240,27 @@ export function ProfilesPane({ onOpenProfile, otherScopeNames }: ProfilesPanePro
   }
 
   function applyRemoteLink() {
-    let fields;
+    let picked;
     try {
-      fields = parsePairingLink(remoteLink);
+      picked = remoteEntryFromLink(remoteLink);
     } catch (e) {
       setRemoteAddError(e instanceof Error ? e.message : String(e));
       return;
     }
-    const host = new URL(fields.url).hostname;
-    const name = defaultRemoteName(fields.profile, host);
-    // A `ca` key only when the link carries one — no silent system trust.
-    const remote: Record<string, unknown> = { url: fields.url, token: fields.token };
-    if (fields.ca !== null) remote.ca = fields.ca;
-    remote.profile = fields.profile ?? "";
-    edit(["profiles"], { ...profiles, [name]: { remote } });
+    edit(["profiles"], { ...profiles, [picked.name]: picked.entry });
     setAddingRemote(false);
     setRemoteLink("");
     setRemoteAddError(null);
-    onOpenProfile?.(name);
+    onOpenProfile?.(picked.name);
+  }
+
+  // The scanned text lands in the SAME input as a pasted link — one path,
+  // one validator. A cancelled scan (Back over the camera UI) is silent.
+  async function scanRemoteQr() {
+    setRemoteAddError(null);
+    const outcome = await scanQrCode();
+    if (outcome.ok) setRemoteLink(outcome.text);
+    else if (!outcome.cancelled) setRemoteAddError(outcome.message);
   }
 
   return (
@@ -383,6 +388,18 @@ export function ProfilesPane({ onOpenProfile, otherScopeNames }: ProfilesPanePro
             <button data-testid="remote-add-apply" type="button" onClick={applyRemoteLink} className={GHOST_BTN}>
               Add
             </button>
+            {shell() === "mobile" && (
+              // The camera capability is granted to the loopback origin only
+              // in the mobile shell — desktop/browser have no scan path.
+              <button
+                data-testid="remote-add-scan"
+                type="button"
+                onClick={() => void scanRemoteQr()}
+                className={GHOST_BTN}
+              >
+                Scan QR
+              </button>
+            )}
             <button
               type="button"
               onClick={() => {

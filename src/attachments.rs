@@ -58,10 +58,7 @@ impl UploadStore {
     /// `<data_local_dir>/peakbot/uploads` — the data dir, not the cache dir,
     /// because OS cache cleaners would silently break history.
     pub fn default_root() -> PathBuf {
-        dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("peakbot")
-            .join("uploads")
+        crate::paths::uploads_root()
     }
 
     /// Boot value — the single runtime source of truth for the limits.
@@ -357,10 +354,10 @@ async fn token_to_attachment(
 /// bug), `~/` against the home dir, absolute paths as-is.
 fn resolve_path(cwd: &Path, token: &str) -> PathBuf {
     if token == "~" {
-        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(token));
+        return crate::paths::home_dir().unwrap_or_else(|| PathBuf::from(token));
     }
     if let Some(rest) = token.strip_prefix("~/") {
-        return dirs::home_dir()
+        return crate::paths::home_dir()
             .map(|home| home.join(rest))
             .unwrap_or_else(|| PathBuf::from(token));
     }

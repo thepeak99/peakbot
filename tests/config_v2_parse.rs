@@ -37,7 +37,7 @@
 //!     pub fn parse(global: Source, repo: Option<Source>, ctx: &ParseCtx)
 //!         -> Result<Config, ConfigErrors>;
 //! }
-//! pub struct Catalog;   // default_bound() -> Bound, profile(&str) -> Option<&Arc<ResolvedProfile>>,
+//! pub struct Catalog;   // default_bound() -> Option<Bound>, profile(&str) -> Option<&Arc<ResolvedProfile>>,
 //!                       // resolve(&Selection) -> Option<Bound>, infos(), iter()
 //! pub struct ResolvedProfile { name, origin: Origin, tools: NameFilter,
 //!     mcps: NameFilter, fetch_url, env: Env, memory,
@@ -160,7 +160,11 @@ fn minimal_valid_global_gives_one_profile_one_agent_and_default_selection() {
     assert!(cfg.warnings.is_empty(), "a valid config has no warnings");
 
     // First = default, everywhere (I1): the [0]/[0] pair.
-    let sel = cfg.catalog.default_bound().selection();
+    let sel = cfg
+        .catalog
+        .default_bound()
+        .expect("a local profile ⇒ a default bound")
+        .selection();
     assert_eq!(
         sel,
         Selection {
@@ -944,7 +948,11 @@ fn repo_profiles_listed_first_and_become_default() {
     let names: Vec<&str> = cfg.catalog.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, ["r1", "r2", "p"], "repo profiles first, then global");
 
-    let sel = cfg.catalog.default_bound().selection();
+    let sel = cfg
+        .catalog
+        .default_bound()
+        .expect("a local profile ⇒ a default bound")
+        .selection();
     assert_eq!(
         sel,
         Selection {
@@ -1100,7 +1108,11 @@ fn spec_global_and_repo_examples_parse_to_the_effective_catalog() {
     // §3.2: peakbot-dev (📁, default) · dev (📁, overrides global) · research.
     let names: Vec<&str> = cfg.catalog.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, ["peakbot-dev", "dev", "research"]);
-    let sel = cfg.catalog.default_bound().selection();
+    let sel = cfg
+        .catalog
+        .default_bound()
+        .expect("a local profile ⇒ a default bound")
+        .selection();
     assert_eq!(
         sel,
         Selection {
@@ -1546,7 +1558,10 @@ fn shipped_examples_parse() {
             &ctx(),
         )
         .unwrap_or_else(|e| panic!("example {dir} must parse: {e:?}"));
-        let bound = cfg.catalog.default_bound();
+        let bound = cfg
+            .catalog
+            .default_bound()
+            .expect("a local profile ⇒ a default bound");
         assert_eq!(bound.profile.name, first_profile, "{dir}: default profile");
         assert_eq!(
             bound.agent().main.name,

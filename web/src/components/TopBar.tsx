@@ -12,6 +12,7 @@ import { NotifyToggle } from "./NotifyToggle";
 import { FocusToggle } from "./FocusToggle";
 import { ThemeToggle } from "./ThemeToggle";
 import type { NotifyPermission } from "../useTaskNotifications";
+import { edition } from "../desktop";
 
 // Top status bar. Sessions trio (conversations + model + cwd) live here on
 // lg+ and migrate to the BottomBar on smaller screens. Right side carries the
@@ -96,7 +97,9 @@ export function TopBar({
     // `backdrop-blur` makes this header a stacking context, which traps the
     // pickers' `z-20` panels inside it — so the header itself must outrank the
     // transcript's `relative` wrapper, or the dropdowns render but can't be clicked.
-    <header className="relative z-30 flex min-h-14 items-center gap-3 border-b border-zinc-800 bg-zinc-950/80 px-4 py-2 backdrop-blur">
+    // Top safe-area (notch / Dynamic Island) clearance; the
+    // BottomBar already insets its bottom (pb-[max(0.5rem,env(...))]).
+    <header className="relative z-30 flex min-h-14 items-center gap-3 border-b border-zinc-800 bg-zinc-950/80 px-4 py-2 pt-[env(safe-area-inset-top)] backdrop-blur">
       <div className="flex items-center gap-2">
         <img src="/logo_shifu.png" alt="" className="h-6 w-6 rounded-sm" />
         <span className="font-semibold text-zinc-100">Shifu</span>
@@ -129,7 +132,9 @@ export function TopBar({
           catalog={catalog}
         />
 
-        {cwd && (
+        {/* The local edition (phone build) has no cwd of its own to
+            pick — the shell owns the working directory. */}
+        {cwd && edition() !== "local" && (
           <CwdPicker
             cwd={cwd}
             hasTranscript={hasTranscript}

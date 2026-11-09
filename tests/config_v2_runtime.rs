@@ -390,6 +390,11 @@ const RELOAD_GLOBAL: &str = "providers:\n  - name: patchnotes\n    type: openai\
 /// The same global with the `dev` profile dropped (only `research` left).
 const RELOAD_GLOBAL_NO_DEV: &str = "providers:\n  - name: patchnotes\n    type: openai\n    base_url: https://ai.patchnotes.com/v1\n    api_key: pn-test\n    models:\n      - { name: anthropic/claude-sonnet-4.5, alias: sonnet }\nprofiles:\n  research:\n    agents:\n      scholar:\n        model: sonnet\n";
 
+/// A relay-only global (mobile relay): only a `remote:` profile, no
+/// providers, no local profile — valid on its own, but a session that
+/// booted with a local profile must refuse to switch onto it.
+const RELOAD_GLOBAL_RELAY_ONLY: &str = "profiles:\n  dev on nas:\n    remote:\n      url: https://nas.lan:7823\n      token: tok123\n      ca: sha256:3f9a0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab\n      profile: dev\n";
+
 /// A 0.24 global whose `dev` profile carries an env var and a tools
 /// blocklist the repo `dev` does not have.
 const SHADOW_GLOBAL: &str = "providers:\n  - name: patchnotes\n    type: openai\n    base_url: https://ai.patchnotes.com/v1\n    api_key: pn-test\n    models:\n      - { name: anthropic/claude-sonnet-4.5, alias: sonnet }\nprofiles:\n  dev:\n    env: { GLOBAL_ONLY: g }\n    tools: { disabled: [bash] }\n    agents:\n      main:\n        model: sonnet\n";
@@ -404,7 +409,10 @@ const SHADOW_REPO: &str = "profiles:\n  dev:\n    env: { REPO_ONLY: r }\n    age
 #[test]
 fn fresh_session_binds_first_profile_first_agent() {
     let cfg = parse_global(GLOBAL_TEAM);
-    let bound = cfg.catalog.default_bound();
+    let bound = cfg
+        .catalog
+        .default_bound()
+        .expect("a local profile ⇒ a default bound");
     assert_eq!(bound.profile.name, "dev", "the first profile");
     assert_eq!(bound.agent().main.name, "team", "its first agent");
     assert_eq!(bound.agent_index, 0);
@@ -434,7 +442,10 @@ fn fresh_session_in_repo_binds_first_repo_profile() {
         "repo profiles lead, in file order, then the globals"
     );
 
-    let bound = cfg.catalog.default_bound();
+    let bound = cfg
+        .catalog
+        .default_bound()
+        .expect("a local profile ⇒ a default bound");
     assert_eq!(
         bound.profile.name, "repo-dev",
         "the first repo profile is the default here"
@@ -769,6 +780,35 @@ fn reload_broken_global_keeps_previous_config() {
         warnings[0].ends_with("— keeping previous config."),
         "the warning says the previous config is kept: {}",
         warnings[0]
+    );
+    assert!(
+        Arc::ptr_eq(&prev_config, &rc.config),
+        "the previous config is kept"
+    );
+    assert_eq!(rc.bound.selection(), prev_sel, "the bound is kept");
+}
+
+/// Mobile relay: a reload to a file with NO local profile (relay-only)
+/// keeps the previous config and pushes the exact locked warning — a live
+/// session's `Bound` can never point at a remote profile.
+#[test]
+fn reload_to_relay_only_keeps_previous_config_with_exact_warning() {
+    let home = TempHome::new();
+    home.write_global(RELOAD_GLOBAL);
+    let boot = Config::load(home.cwd(), RepoMode::Include, &ctx()).expect("boot");
+    let bound = boot.catalog.start_bound(None).expect("the default bound");
+    let mut rc = rebuild_ctx(boot, bound, None);
+    let sm = StateManager::new_arc();
+
+    let prev_config = Arc::clone(&rc.config);
+    let prev_sel = rc.bound.selection();
+    home.write_global(RELOAD_GLOBAL_RELAY_ONLY);
+
+    let warnings = peakbot::reload_session_config(&mut rc, &sm, home.cwd());
+    assert_eq!(
+        warnings,
+        vec!["⚠ config.yaml has no local profile left — keeping the previous config."],
+        "the exact locked warning, and nothing else: {warnings:?}"
     );
     assert!(
         Arc::ptr_eq(&prev_config, &rc.config),

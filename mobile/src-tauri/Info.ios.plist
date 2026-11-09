@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Merged by Tauri into the generated Info.plist at every build, so a
+	     `tauri ios init` regen keeps these keys. -->
+
+	<!-- Local profile: the in-app core serves the SPA on http://127.0.0.1:47823
+	     Local networking only — plain https elsewhere. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+
+	<!-- QR pairing (barcode-scanner plugin). The App Store review string. -->
+	<key>NSCameraUsageDescription</key>
+	<string>Scan the pairing QR code shown by PeakBot.</string>
+
+	<!-- LAN providers / servers trigger the local-network prompt. -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>PeakBot connects to AI providers and servers on your local network.</string>
+</dict>
+</plist>

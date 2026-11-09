@@ -26,7 +26,9 @@ pub type Env = BTreeMap<String, String>;
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigFile {
-    /// REQUIRED, non-empty list; E1 is checked in `Config::parse`.
+    /// Needed only by local profiles; E1 is checked in `Config::parse` on
+    /// the file, so a relay-only file may omit it.
+    #[serde(default)]
     pub providers: Vec<ProviderEntry>,
     /// Renamed from `mcp_servers`; boot-only.
     #[serde(default)]
@@ -445,14 +447,11 @@ impl Default for ConversationConfig {
 
 impl ConversationConfig {
     /// `storage_dir`, else `<data_local_dir>/peakbot/conversations` (the
-    /// 0.23 default, unchanged).
+    /// 0.23 default, unchanged; `<data>/conversations` under embedder roots).
     pub fn storage_dir_or_default(&self) -> PathBuf {
-        self.storage_dir.clone().unwrap_or_else(|| {
-            dirs::data_local_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("peakbot")
-                .join("conversations")
-        })
+        self.storage_dir
+            .clone()
+            .unwrap_or_else(crate::paths::conversations_dir)
     }
 }
 

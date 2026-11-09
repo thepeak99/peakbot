@@ -56,9 +56,9 @@ use crate::ui::AppState;
 use crate::ui::Ui;
 use crate::ui::outbound::{OutboundRx, OutboundTx, outbound_channel};
 use crate::ui::ui_trait::builtin_commands;
-use crate::ui::wire::{
-    InboundMessage, ModelInfo, OutboundMessage, build_dir_listing, build_recent_dirs,
-};
+#[cfg(feature = "host")]
+use crate::ui::wire::build_dir_listing;
+use crate::ui::wire::{InboundMessage, ModelInfo, OutboundMessage, build_recent_dirs};
 use crate::{StateManager, UiAction};
 use anyhow::Result;
 use axum::{
@@ -88,6 +88,7 @@ pub mod registry;
 mod remote;
 pub mod settings;
 pub mod system;
+// Remote-profile E2E: `remote:` profiles parse in every edition.
 #[cfg(test)]
 mod t4_tests;
 pub mod tls;
@@ -259,7 +260,11 @@ impl WebUi {
         if local {
             // Detached because waiting on xdg-open can stall the runtime before
             // axum starts serving the already-bound port.
+            #[cfg(feature = "host")]
             let _ = open::that_detached(url);
+            // The Local edition's embedder owns the WebView: no browser to open.
+            #[cfg(not(feature = "host"))]
+            let _ = url;
         }
     }
 }
@@ -271,6 +276,28 @@ impl Ui for WebUi {
     }
 
     async fn run(&mut self) -> Result<()> {
+        let app = self.router();
+        // Detached: the reaper lives as long as the process.
+        let _ = self.spawn_reaper();
+        if self.tls {
+            self.serve_tls(app).await
+        } else {
+            self.serve_plain(app).await
+        }
+    }
+
+    async fn shutdown(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl WebUi {
+    /// The full route table — SPA, `/ws` (or its needs_setup guard), the
+    /// settings/system/upload/conversation/proxy APIs — behind the token
+    /// gate. No listener, TLS or banner: `run` adds those for the CLI, and
+    /// an embedder serves this on its own listener (`embed::LocalCore`).
+    /// State lives behind `Arc`s, so every clone serves the same sessions.
+    pub fn router(&self) -> Router {
         let mut app: Router = Router::new()
             .route("/commands", get(commands_handler))
             // Registered before `.fallback` (the SPA catch-all) and before
@@ -297,11 +324,15 @@ impl Ui for WebUi {
         // `/commands`. The seams point at the real install / service
         // dispatchers; tests inject their own fakes via `SystemState`,
         // production never sees `default_for_tests()`.
-        let system_state = system::SystemState {
-            install: system::InstallFn(system::install_op_adapter),
-            service: system::ServiceFn(system::service_op_adapter),
-        };
-        app = app.merge(system::router(system_state));
+        // The Local edition installs nothing, so it has no system routes.
+        #[cfg(feature = "host")]
+        {
+            let system_state = system::SystemState {
+                install: system::InstallFn(system::install_op_adapter),
+                service: system::ServiceFn(system::service_op_adapter),
+            };
+            app = app.merge(system::router(system_state));
+        }
 
         // The old `/api/setup*` surface is gone: tombstone 404s where the
         // SPA fallback would otherwise serve index.html.
@@ -364,32 +395,23 @@ impl Ui for WebUi {
         if self.tls {
             app = app.merge(Router::new().route("/peakbot-ca.crt", get(ca_cert_handler)));
         }
-
-        // Reaper: periodically expire sessions idle (no sockets) past the TTL.
-        // A detached task tied to the process lifetime — the registry it holds
-        // is the same one every connection shares. needs_setup mode has no
-        // registry (no sessions), so no reaper.
-        if let Some(registry) = self.ws_state.registry.clone() {
-            let ttl = self.ws_state.session_ttl;
-            let tick = self.reaper_tick;
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(tick);
-                loop {
-                    interval.tick().await;
-                    registry.reap(ttl);
-                }
-            });
-        }
-
-        if self.tls {
-            self.serve_tls(app).await
-        } else {
-            self.serve_plain(app).await
-        }
+        app
     }
 
-    async fn shutdown(&mut self) -> Result<()> {
-        Ok(())
+    /// Reaper: periodically expire sessions idle (no sockets) past the TTL.
+    /// The registry it holds is the one every connection shares. needs_setup
+    /// mode has no registry (no sessions), so no reaper (`None`).
+    pub fn spawn_reaper(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let registry = self.ws_state.registry.clone()?;
+        let ttl = self.ws_state.session_ttl;
+        let tick = self.reaper_tick;
+        Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tick);
+            loop {
+                interval.tick().await;
+                registry.reap(ttl);
+            }
+        }))
     }
 }
 
@@ -739,23 +761,34 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
     // from ONE fresh global-config parse, never the boot catalogue: a
     // remote added or edited after boot must route on the NEXT attach.
     // Only an attach naming a profile that is not LOCAL in the boot
-    // catalogue pays for the parse — a name has one kind per config, so a
-    // no-profile or boot-local attach can never be remote (local freshness
-    // is the session's own reload's job).
-    let (remote_profile, fresh_catalog) = match profile
+    // catalogue pays for the parse (a name has one kind per config; local
+    // freshness is the session's own reload's job), as does an unpinned
+    // attach on a relay-only boot catalogue.
+    let fresh = match profile
         .as_deref()
         .filter(|p| !boot_has_local(registry.boot_catalog(), p))
     {
-        Some(p) => match remote::fresh_attach(p) {
-            Ok(found) => found,
-            // E-CONFIG: exactly one locked error frame, then close. A
-            // broken global config disables remote attaches — it never
-            // falls back to a local session.
-            Err(e) => {
-                refuse(out_tx, writer_task, e.to_string()).await;
-                return;
-            }
-        },
+        Some(p) => Some(remote::fresh_attach(p)),
+        // A relay-only config has no local session to mint, so an unpinned
+        // attach takes the home remote's path. A relayed attach never does:
+        // it keeps the E-CHAIN / local behaviour.
+        None if profile.is_none()
+            && !relayed
+            && registry.boot_catalog().default_bound().is_none() =>
+        {
+            Some(remote::fresh_home_attach())
+        }
+        None => None,
+    };
+    let (remote_profile, fresh_catalog) = match fresh {
+        Some(Ok(found)) => found,
+        // E-CONFIG: exactly one locked error frame, then close. A
+        // broken global config disables remote attaches — it never
+        // falls back to a local session.
+        Some(Err(e)) => {
+            refuse(out_tx, writer_task, e.to_string()).await;
+            return;
+        }
         None => (None, Vec::new()),
     };
 
@@ -1043,7 +1076,18 @@ fn dispatch_inbound(
                 model,
             })
             .is_ok(),
+        #[cfg(feature = "host")]
         Ok(InboundMessage::ListDir { path }) => out_tx.send(build_dir_listing(&path)).is_ok(),
+        // No folders to pick on a phone; the Local SPA hides the cwd picker.
+        #[cfg(not(feature = "host"))]
+        Ok(InboundMessage::ListDir { path }) => out_tx
+            .send(OutboundMessage::DirListing {
+                path,
+                parent: None,
+                entries: Vec::new(),
+                error: Some("browsing folders isn't available in PeakBot on this phone".into()),
+            })
+            .is_ok(),
         // Spawned: the merged list fetches the remotes (≤ 2 s each, §5.6)
         // and the reader loop must not block on it.
         Ok(InboundMessage::RequestConversations) => {

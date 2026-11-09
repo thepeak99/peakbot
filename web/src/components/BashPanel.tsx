@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import type { BashPanel as BashPanelData } from "../types";
+import { edition } from "../desktop";
 
 // Foreground `bash` output for the drawer "Bash" tab. Mirrors BashPanelState
 // (src/ui/app_state.rs) — the running/last `bash` invocation. Green header
@@ -27,6 +28,10 @@ export function BashPanel({ panel }: { panel: BashPanelData }) {
     const el = preRef.current;
     if (el && followRef.current) el.scrollTop = el.scrollHeight;
   }, [body]);
+
+  // The local edition (phone build) has no shell to run bash in — the
+  // panel renders nothing (after the hooks: the hook order must stay stable).
+  if (edition() === "local") return null;
 
   return (
     <div className="overflow-hidden rounded-lg border border-zinc-800 bg-black/40">

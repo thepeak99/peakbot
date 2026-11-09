@@ -37,7 +37,7 @@
 // to `readClipboardImage()` (WebKit Bug 218519).
 
 import { useRef, useState, useLayoutEffect } from "react";
-import { isDesktop, readClipboardImage } from "../desktop";
+import { edition, isDesktop, readClipboardImage } from "../desktop";
 import type { SlashCommand } from "../state";
 import type { SubAgentRun } from "../types";
 import type { Attachments } from "../useAttachments";
@@ -347,6 +347,9 @@ export function Composer({
                 ref={fileInputRef}
                 type="file"
                 multiple
+                // The local edition (phone build) accepts images only —
+                // the Local server answers non-image uploads with 415.
+                accept={edition() === "local" ? "image/*" : undefined}
                 onChange={onPickFiles}
                 className="hidden"
               />

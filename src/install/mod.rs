@@ -112,7 +112,7 @@ pub const fn target_exe_name() -> &'static str {
 }
 
 // ===========================================================================
-// §E.3 — install target resolution (pure; depends only on `dirs`).
+// Install target resolution (pure; depends only on `crate::paths`).
 // ===========================================================================
 
 /// Resolve the per-user install target for the current build target.
@@ -124,11 +124,11 @@ pub const fn target_exe_name() -> &'static str {
 pub fn install_target() -> Option<PathBuf> {
     #[cfg(unix)]
     {
-        dirs::home_dir().map(|home| home.join(".local").join("bin").join(APP.bin))
+        crate::paths::home_dir().map(|home| home.join(".local").join("bin").join(APP.bin))
     }
     #[cfg(windows)]
     {
-        dirs::data_local_dir()
+        crate::paths::data_local_dir()
             .map(|local| local.join("Programs").join(APP.bin).join(target_exe_name()))
     }
 }

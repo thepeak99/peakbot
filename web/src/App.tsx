@@ -32,6 +32,7 @@ import { FilesPanel } from "./components/FilesPanel";
 import { AgentsPanel } from "./components/AgentsPanel";
 import { Settings, useSettingsToggle } from "./settings/Settings";
 import { useAgent } from "./useAgent";
+import { useBackDismiss } from "./useBackDismiss";
 import { useSessionVerbs } from "./useSessionVerbs";
 import { apiBase } from "./state";
 import { useConvoTabs } from "./useConvoTabs";
@@ -130,6 +131,10 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   // chat and its WebSocket stay mounted underneath. Gear + Ctrl+, / ⌘+, +
   // Esc are owned by the hook.
   const settingsView = useSettingsToggle();
+  // Back closes the overlay instead of leaving the page (on a phone the OS
+  // Back at the SPA root exits the app). `settingsView.close` is a stable
+  // useCallback, as the hook requires.
+  useBackDismiss(settingsView.open, settingsView.close);
 
   // Catalog and selection (0.24): `catalog` is the profiles/agents/sub-agents
   // this install declares; `selection` is the (profile, agent) this

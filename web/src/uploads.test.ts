@@ -129,6 +129,16 @@ describe("uploadFile", () => {
     await expect(done).rejects.toThrow("spec.pdf is larger than 50 MB");
   });
 
+  it("maps the local server's 415 images_only to a clear message", async () => {
+    const file = new File(["x".repeat(1024)], "notes.txt", { type: "text/plain" });
+    const { done } = uploadFile(CONVO, file, () => {});
+
+    FakeXHR.instances.at(-1)!.respond(415, JSON.stringify({ error: "images_only" }));
+    await expect(done).rejects.toThrow(
+      "PeakBot on this phone can only attach images.",
+    );
+  });
+
   it("rejects when abort() is called", async () => {
     const file = new File(["x"], "x.bin", { type: "application/octet-stream" });
     const { done, abort } = uploadFile(CONVO, file, () => {});

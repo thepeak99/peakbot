@@ -113,7 +113,7 @@ impl ImageLinks {
         }
 
         let abs = match target.strip_prefix('~') {
-            Some(rest) => dirs::home_dir()?.join(rest.trim_start_matches('/')),
+            Some(rest) => crate::paths::home_dir()?.join(rest.trim_start_matches('/')),
             None if FsPath::new(target).is_absolute() => PathBuf::from(target),
             None => cwd.join(target),
         };

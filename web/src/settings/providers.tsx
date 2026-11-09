@@ -12,6 +12,7 @@
 // `providers:` may only live in the global file.
 
 import { useState } from "react";
+import { edition } from "../desktop";
 import { useSettingsCtx } from "./context";
 import { get } from "./yamlDoc";
 import { errAt } from "./paths";
@@ -20,6 +21,7 @@ import type { ConfigErr, Seg } from "./types";
 import {
   BASE_URL_PRESETS,
   MODEL_PRESETS,
+  PROVIDER_CONSENT,
   PROVIDER_TYPES as TYPES,
   type ProviderType,
 } from "./providerTypes";
@@ -92,6 +94,15 @@ export function ProvidersPane() {
           alias; <code>/model</code> switches it per conversation.
         </p>
       </div>
+
+      {edition() === "local" && (
+        <p
+          data-testid="providers-consent-notice"
+          className="rounded-lg border border-amber-900/60 bg-amber-950/30 px-3 py-2 text-xs text-amber-300/90"
+        >
+          {PROVIDER_CONSENT}
+        </p>
+      )}
 
       {readOnly && (
         <div
