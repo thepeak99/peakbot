@@ -36,6 +36,7 @@
 //! {"type":"recent_dirs","dirs":[...]}
 //! {"type":"dir_listing","path":"…","parent":"…","entries":[...],"error":null}
 //! {"type":"error","message":"..."}
+//! {"type":"heartbeat"}                      // every 20 s, from the server that owns the session
 //! ```
 
 use crate::StateManager;
@@ -310,6 +311,9 @@ pub(crate) enum OutboundMessage {
     },
     /// A non-fatal protocol or parse error.
     Error { message: String },
+    /// Liveness beat: lets the client tell a dead upstream from a quiet one.
+    /// Carries no fields, so a client that predates it ignores it as an unknown type.
+    Heartbeat,
 }
 
 /// How many recent conversations define "recent". Bounds *relevance*, not

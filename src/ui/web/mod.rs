@@ -29,6 +29,10 @@
 //! that's the bit the inline version was missing, and is what keeps a
 //! torn-down socket from pinning `attached > 0` against the idle-TTL reaper.
 //!
+//! The forwarder also emits an app-level `heartbeat` text frame every 20 s
+//! (`HEARTBEAT_INTERVAL`) so the SPA can tell a dead upstream from a quiet
+//! one; a relayed socket gets the remote's beat forwarded, never its own.
+//!
 //! On close the session **detaches** — it survives for other sockets and
 //! for reconnect, and only expires via the reaper or a kill.
 //!
@@ -115,6 +119,10 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(120);
 /// dead idle peer; we do not track pongs (browsers auto-pong; the reader
 /// already ignores ping/pong, `:549-550`).
 const PING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Cadence of the app-level `heartbeat` frame the SPA's watchdog listens for;
+/// its stale window (`web/src/liveness.ts`) must stay above 2× this.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 
 fn windowed_from(ssh: bool, display: bool, wayland: bool, os: &str) -> bool {
     if ssh {
@@ -696,6 +704,14 @@ pub(crate) async fn forward_state(
     // One memo per connection (not per message): its resolve cache survives
     // across snapshots, and each snapshot is already a clone.
     let mut images = images::ImageLinks::default();
+    // Only the server that owns the session beats: a relayed socket never runs
+    // this loop, so the remote's beat is forwarded end to end and a dead upstream
+    // goes quiet for the client.
+    let mut beat = tokio::time::interval_at(
+        tokio::time::Instant::now() + HEARTBEAT_INTERVAL,
+        HEARTBEAT_INTERVAL,
+    );
+    beat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             maybe_state = state_rx.recv() => {
@@ -708,6 +724,11 @@ pub(crate) async fn forward_state(
                     return ForwardExit::WriterGone;
                 }
                 if exit { return ForwardExit::StateEnded }
+            }
+            _ = beat.tick() => {
+                if out.send(OutboundMessage::Heartbeat).is_err() {
+                    return ForwardExit::WriterGone;
+                }
             }
             _ = &mut *reader => return ForwardExit::ReaderGone,
             _ = &mut *writer => return ForwardExit::WriterGone,
