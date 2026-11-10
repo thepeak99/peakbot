@@ -5,7 +5,7 @@
 // local search query and the selected chip.
 
 import { useState } from "react";
-import type { ConversationSummary } from "../state";
+import type { ConversationSummary, TabColor } from "../state";
 import type { CatalogProfile } from "../types";
 import type { NotifyPermission } from "../useTaskNotifications";
 import { NotifyToggle } from "./NotifyToggle";
@@ -43,14 +43,18 @@ export function ChatList({
 }: ChatListProps) {
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState("");
-  void selected;
-  void setSelected;
   void conversations;
   void catalog;
   void loaded;
   void unread;
   void onOpen;
   void onNew;
+  // A chip the catalog no longer carries (a remote profile dropped, a rename)
+  // silently falls back to All — derived, not an effect, so the re-render
+  // itself is the fix.
+  const activeProfile =
+    selected !== "" && catalog.some((p) => p.name === selected) ? selected : "";
+  void activeProfile;
 
   return (
     <section
@@ -143,6 +147,29 @@ export function ChatList({
             </button>
           )}
         </div>
+        <div
+          className="flex gap-2 overflow-x-auto py-2.5"
+          role="group"
+          aria-label="Filter by profile"
+        >
+          <Chip
+            label="All"
+            profile=""
+            pressed={activeProfile === ""}
+            onSelect={setSelected}
+          />
+          {catalog.map((p) => (
+            <Chip
+              key={p.name}
+              label={p.name}
+              profile={p.name}
+              color={p.color}
+              remote={p.origin === "remote"}
+              pressed={activeProfile === p.name}
+              onSelect={setSelected}
+            />
+          ))}
+        </div>
         {error && (
           <div
             data-testid="chats-error"
@@ -154,5 +181,53 @@ export function ChatList({
         )}
       </header>
     </section>
+  );
+}
+
+// One profile filter chip. The pressed chip carries the emerald border
+// (mock: "All" and the picked profile); a remote profile shows its badge
+// inline, like the row badge.
+function Chip({
+  label,
+  profile,
+  color,
+  remote = false,
+  pressed,
+  onSelect,
+}: {
+  label: string;
+  profile: string;
+  color?: TabColor;
+  remote?: boolean;
+  pressed: boolean;
+  onSelect(profile: string): void;
+}) {
+  return (
+    <button
+      type="button"
+      data-testid="chat-filter"
+      data-profile={profile}
+      aria-pressed={pressed}
+      onClick={() => onSelect(profile)}
+      className={`flex h-9 shrink-0 cursor-pointer items-center gap-1.5 rounded-full border px-3 text-sm transition-colors ${
+        pressed
+          ? "border-emerald-700 bg-emerald-950/40 text-emerald-300"
+          : "border-zinc-800 bg-zinc-900/60 text-zinc-300 hover:border-zinc-700"
+      }`}
+    >
+      {color && (
+        <span
+          aria-hidden="true"
+          className="h-2 w-2 shrink-0 rounded-full"
+          style={{ backgroundColor: `var(--profile-${color})` }}
+        />
+      )}
+      <span className="whitespace-nowrap">{label}</span>
+      {remote && (
+        <span className="shrink-0 rounded bg-zinc-800 px-1 text-[10px] text-zinc-400">
+          remote
+        </span>
+      )}
+    </button>
   );
 }
