@@ -107,3 +107,66 @@ export function filterChats(
   }
   return rows;
 }
+
+// Section kind from the running/live flags first, then the local calendar day:
+// same day OR strictly after now -> "today"; the previous calendar day ->
+// "yesterday"; older or unparseable -> "earlier".
+type SectionKind = "running" | "live" | "today" | "yesterday" | "earlier";
+const kindOf = (c: ConversationSummary, now: Date): SectionKind => {
+  if (c.running === true) return "running";
+  if (c.active) return "live";
+  const t = when(c.updated_at);
+  if (t === undefined) return "earlier";
+  if (sameDay(new Date(t), now) || t > now.getTime()) return "today";
+  if (sameDay(new Date(t), yesterdayOf(now))) return "yesterday";
+  return "earlier";
+};
+// Section labels, literal per the design table.
+const LABELS: Record<SectionKind, string> = {
+  running: "RUNNING NOW",
+  live: "LIVE",
+  today: "TODAY",
+  yesterday: "YESTERDAY",
+  earlier: "EARLIER",
+};
+
+// In-section ordering: updated_at descending (unparseable counts as the
+// oldest), ties broken by id ascending.
+const ts = (c: ConversationSummary): number => when(c.updated_at) ?? -Infinity;
+const sortRows = (rows: readonly ChatRow[]): ChatRow[] =>
+  rows.slice().sort((a, b) => {
+    const ta = ts(a.chat);
+    const tb = ts(b.chat);
+    if (ta !== tb) return tb - ta;
+    if (a.chat.id < b.chat.id) return -1;
+    if (a.chat.id > b.chat.id) return 1;
+    return 0;
+  });
+
+export function groupChats(rows: readonly ChatRow[], now: Date, searching: boolean): ChatSection[] {
+  // One pass buckets rows by section kind; the fixed order below keeps
+  // running/live/today/yesterday/earlier precedence, and `searching`
+  // collapses the same buckets into running -> live -> combined rest.
+  const buckets: Record<SectionKind, ChatRow[]> = {
+    running: [],
+    live: [],
+    today: [],
+    yesterday: [],
+    earlier: [],
+  };
+  for (const r of rows) buckets[kindOf(r.chat, now)].push(r);
+  if (searching) {
+    // The matches section is the same buckets re-ordered: running, then live,
+    // then every other section joined and re-sorted by recency.
+    const rest = [...buckets.today, ...buckets.yesterday, ...buckets.earlier];
+    const all = [sortRows(buckets.running), sortRows(buckets.live), sortRows(rest)].flat();
+    if (all.length === 0) return [];
+    return [{ kind: "matches", label: all.length === 1 ? "1 MATCH" : `${all.length} MATCHES`, rows: all }];
+  }
+  const out: ChatSection[] = [];
+  for (const k of (["running", "live", "today", "yesterday", "earlier"] as const)) {
+    if (buckets[k].length === 0) continue;
+    out.push({ kind: k, label: LABELS[k], rows: sortRows(buckets[k]) });
+  }
+  return out;
+}
