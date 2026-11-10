@@ -1,7 +1,7 @@
 // Tests for `components/ChatHeader.tsx` — the mobile Conversation header
 // (design §4.2, H1–H6).
 //
-// Harness modeled on ConversationsPickerMobile.test.tsx (raw createRoot + act,
+// Harness modeled on BottomBar.test.tsx (raw createRoot + act,
 // querySelector). No shell marker is needed: the header is a plain presentational
 // component.
 //

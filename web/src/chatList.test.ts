@@ -178,7 +178,7 @@ describe("filterChats", () => {
   const C = row("c", { name: "ws ws" });
   const D = row("d", { name: "Clippy a.b", profile: "dev" });
 
-  const idsOf = (rows: ChatRow[]): [string, Range[]][] =>
+  const idsOf = (rows: ChatRow[]): [string, readonly Range[]][] =>
     rows.map((r) => [r.chat.id, r.titleMatches]);
 
   it("matches case-insensitively and reports every occurrence", () => {

@@ -1,7 +1,7 @@
 // Tests for `components/ChatList.tsx` — the mobile Chats screen (design
 // §4.1, L1–L9). Selectors and aria names are the §4.1 target table, verbatim.
 //
-// Harness modeled on ConversationsPickerMobile.test.tsx (raw createRoot + act,
+// Harness modeled on BottomBar.test.tsx (raw createRoot + act,
 // querySelector). The root is kept across renders so the component's internal
 // state (search query, selected chip) survives a prop re-render.
 //
