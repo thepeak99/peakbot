@@ -191,6 +191,28 @@ function waitForPopstate(): Promise<void> {
   });
 }
 
+/** Let the unmount's in-flight back() traversals land so the next test
+ *  starts from a quiescent arbiter (no owed marker push). Bounded, because
+ *  a stuck traversal must not hang the suite. */
+function settlePopstates(count: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (count === 0) {
+      resolve();
+      return;
+    }
+    let landed = 0;
+    const onPop = () => {
+      landed += 1;
+      if (landed < count) return;
+      window.removeEventListener("popstate", onPop);
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(onPop, 1000);
+    window.addEventListener("popstate", onPop);
+  });
+}
+
 /** Navigate from the conversation to the Chats list via the header back. */
 async function toList(): Promise<void> {
   const back = host.querySelector<HTMLElement>('[data-testid="chat-back"]');
@@ -236,11 +258,15 @@ beforeEach(() => {
   window.history.replaceState(null, "", "/");
 });
 
-afterEach(() => {
+afterEach(async () => {
+  const backSpy = vi.spyOn(window.history, "back");
   unmount();
-  setShell("browser");
+  const inFlight = backSpy.mock.calls.length;
+  backSpy.mockRestore();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  await settlePopstates(inFlight);
+  setShell("browser");
   window.history.replaceState(null, "", "/");
 });
 

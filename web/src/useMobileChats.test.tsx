@@ -159,6 +159,28 @@ function waitForPopstate(): Promise<void> {
   });
 }
 
+/** Let the unmount's in-flight back() traversals land so the next test
+ *  starts from a quiescent arbiter (no owed marker push). Bounded, because
+ *  a stuck traversal must not hang the suite. */
+function settlePopstates(count: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (count === 0) {
+      resolve();
+      return;
+    }
+    let landed = 0;
+    const onPop = () => {
+      landed += 1;
+      if (landed < count) return;
+      window.removeEventListener("popstate", onPop);
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(onPop, 1000);
+    window.addEventListener("popstate", onPop);
+  });
+}
+
 /** UI "‹ Chats": `showChats()` releases the marker with one back-traversal. */
 async function toChats(): Promise<void> {
   await act(async () => {
@@ -194,15 +216,31 @@ beforeEach(() => {
   settingsClose.mockClear();
 });
 
-afterEach(() => {
+afterEach(async () => {
+  const backSpy = vi.spyOn(window.history, "back");
   act(() => {
     root?.unmount();
   });
   root = null;
   container?.remove();
   container = null;
+  let inFlight = backSpy.mock.calls.length;
+  if (inFlight > 0 && vi.isFakeTimers()) {
+    // The traversal is queued on the fake clock and the restore below would
+    // discard it: land it now.
+    let landed = 0;
+    const onPop = () => {
+      landed += 1;
+    };
+    window.addEventListener("popstate", onPop);
+    vi.advanceTimersByTime(16);
+    window.removeEventListener("popstate", onPop);
+    inFlight = Math.max(0, inFlight - landed);
+  }
+  backSpy.mockRestore();
   vi.useRealTimers();
   vi.restoreAllMocks();
+  await settlePopstates(inFlight);
   delete (document as unknown as { hidden?: boolean }).hidden;
   setShell("browser");
   window.history.replaceState(null, "", "/");
