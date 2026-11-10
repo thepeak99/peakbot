@@ -1,4 +1,4 @@
-//! `ThoughtGate`: a tool decorator that owns the cross-cutting `thought`
+//! `PurposeGate`: a tool decorator that owns the cross-cutting `thought`
 //! concern for every wrapped tool (built-in and MCP).
 //!
 //! Tools no longer declare `thought` themselves. The gate:
@@ -26,11 +26,11 @@ const NUDGE: &str = "⚠️ Reminder: provide the 'thought' field — briefly ex
 const THOUGHT_DESC: &str = "Briefly explain what you're about to do and why, before acting.";
 
 /// Wraps any `Box<dyn ToolDyn>`, adding the `thought` field + nudge.
-pub struct ThoughtGate {
+pub struct PurposeGate {
     inner: Box<dyn ToolDyn>,
 }
 
-impl ThoughtGate {
+impl PurposeGate {
     pub fn wrap(inner: Box<dyn ToolDyn>) -> Self {
         Self { inner }
     }
@@ -75,7 +75,7 @@ fn inject_thought(mut def: ToolDefinition) -> ToolDefinition {
     def
 }
 
-impl ToolDyn for ThoughtGate {
+impl ToolDyn for PurposeGate {
     fn name(&self) -> String {
         self.inner.name()
     }
@@ -141,8 +141,8 @@ mod tests {
         }
     }
 
-    fn gate() -> ThoughtGate {
-        ThoughtGate::wrap(Box::new(Echo))
+    fn gate() -> PurposeGate {
+        PurposeGate::wrap(Box::new(Echo))
     }
 
     #[tokio::test]
@@ -226,7 +226,7 @@ mod tests {
             }
         }
 
-        let def = ThoughtGate::wrap(Box::new(HasThought))
+        let def = PurposeGate::wrap(Box::new(HasThought))
             .definition(String::new())
             .await;
         assert_eq!(

@@ -708,10 +708,10 @@ fn wire_bash_tool(
     }
 }
 
-/// Wrap a tool in [`ThoughtGate`] so it gains the cross-cutting `thought`
+/// Wrap a tool in [`PurposeGate`] so it gains the cross-cutting `thought`
 /// field + soft nudge. Applied to every built-in and MCP tool.
 fn gate(inner: Box<dyn ToolDyn>) -> Box<dyn ToolDyn> {
-    Box::new(crate::tools::ThoughtGate::wrap(inner))
+    Box::new(crate::tools::PurposeGate::wrap(inner))
 }
 
 /// Wrap every tool in a wall-clock budget and a panic boundary. Called at the
@@ -1795,7 +1795,7 @@ mod tests {
 
     /// `budget_all` must be a structural pass-through on the surface area
     /// `ToolDyn` exposes: name preserved verbatim, definition body preserved
-    /// verbatim (no `thought` injection — that's `ThoughtGate`'s job; if
+    /// verbatim (no `thought` injection — that's `PurposeGate`'s job; if
     /// `TimeBudget` injected it, the gate would double-inject).
     ///
     /// Updated for the configurable-budget surface: `budget_all` now
@@ -1932,10 +1932,10 @@ mod tests {
     }
 
     /// The MCP seam (`prepare_mcp_tools`) must produce tools with BOTH the
-    /// `thought` injection (from `ThoughtGate`) AND a budget (from
+    /// `thought` injection (from `PurposeGate`) AND a budget (from
     /// `TimeBudget`). The first is observable through `definition()`; the
     /// second is observable only as "the schema wasn't touched by TimeBudget
-    /// alone" — together, the schema is `ThoughtGate(InnerEcho)` with the
+    /// alone" — together, the schema is `PurposeGate(InnerEcho)` with the
     /// TimeBudget wrapper sitting around the gate.
     ///
     /// Updated for the configurable-budget surface: same threading as
