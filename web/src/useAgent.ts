@@ -121,6 +121,14 @@ export function useAgent(): AgentConnection {
     setConvoInUrl(id, profileRef.current);
   }, []);
 
+  // History entries keep the URL they were created with, so a back-traversal
+  // can show a conversation we no longer are bound to — re-sync to the binding.
+  useEffect(() => {
+    const onPopstate = () => setConvoInUrl(convoRef.current, profileRef.current);
+    window.addEventListener("popstate", onPopstate);
+    return () => window.removeEventListener("popstate", onPopstate);
+  }, []);
+
   const send = useCallback((msg: InboundMessage) => {
     const ws = wsRef.current;
     if (ws && ws.readyState === WebSocket.OPEN) {
