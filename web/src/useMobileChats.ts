@@ -33,6 +33,11 @@ export function useMobileChats(
     agentRef.current = agent;
   });
 
+  // One refresh per entry into the list, whether by "‹ Chats" or by OS Back.
+  useEffect(() => {
+    if (enabled && screen === "chats") agentRef.current.send({ type: "request_conversations" });
+  }, [enabled, screen]);
+
   const showChats = useCallback(() => setScreen("chats"), []);
   useBackDismiss(enabled && screen === "conversation", showChats);
 
