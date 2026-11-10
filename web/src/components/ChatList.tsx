@@ -4,10 +4,12 @@
 // (filter/group/meta) lives in chatList.ts; this component owns only the
 // local search query and the selected chip.
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import type { ConversationSummary, TabColor } from "../state";
 import type { CatalogProfile } from "../types";
 import type { NotifyPermission } from "../useTaskNotifications";
+import { filterChats, groupChats, metaLine } from "../chatList";
+import type { ChatRow } from "../chatList";
 import { NotifyToggle } from "./NotifyToggle";
 import { ThemeToggle } from "./ThemeToggle";
 
@@ -43,18 +45,27 @@ export function ChatList({
 }: ChatListProps) {
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState("");
-  void conversations;
-  void catalog;
-  void loaded;
-  void unread;
-  void onOpen;
-  void onNew;
   // A chip the catalog no longer carries (a remote profile dropped, a rename)
   // silently falls back to All — derived, not an effect, so the re-render
   // itself is the fix.
   const activeProfile =
     selected !== "" && catalog.some((p) => p.name === selected) ? selected : "";
-  void activeProfile;
+  // `now` is display-only (meta line, day buckets) and re-taken each render;
+  // the memo takes its own fresh clock so its deps stay data-stable.
+  const now = new Date();
+  const searching = query.trim() !== "";
+  const sections = useMemo(
+    () =>
+      groupChats(
+        filterChats(conversations, query, activeProfile === "" ? null : activeProfile),
+        new Date(),
+        searching,
+      ),
+    [conversations, query, activeProfile, searching],
+  );
+  void loaded;
+  void unread;
+  void onNew;
 
   return (
     <section
@@ -180,6 +191,24 @@ export function ChatList({
           </div>
         )}
       </header>
+      <div className="flex-1 overflow-y-auto overscroll-contain pb-24">
+        {sections.map((s) => (
+          <section key={s.kind} data-testid="chat-section" data-kind={s.kind}>
+            <h2 className="px-4 pb-1.5 pt-4 text-[11px] font-semibold uppercase tracking-[0.14em] text-zinc-500">
+              {s.label}
+            </h2>
+            {s.rows.map((r) => (
+              <Row
+                key={r.chat.id}
+                row={r}
+                now={now}
+                catalog={catalog}
+                onOpen={onOpen}
+              />
+            ))}
+          </section>
+        ))}
+      </div>
     </section>
   );
 }
@@ -229,5 +258,70 @@ function Chip({
         </span>
       )}
     </button>
+  );
+}
+
+// One chat row: a 4px profile-colour bar at the left edge, the title (+ a
+// remote badge when the catalog says so) over the muted meta line. The whole
+// row is the single 44px-minimum chat-open tap target.
+function Row({
+  row,
+  now,
+  catalog,
+  onOpen,
+}: {
+  row: ChatRow;
+  now: Date;
+  catalog: CatalogProfile[];
+  onOpen(convo: string, profile: string | null): void;
+}) {
+  const chat = row.chat;
+  // Colour and origin come from the catalog entry, never derived here; a
+  // legacy row (profile null) has neither a bar nor a badge.
+  const profile = chat.profile
+    ? catalog.find((p) => p.name === chat.profile)
+    : undefined;
+  const color = profile?.color;
+  const running = chat.running === true;
+  const live = chat.active && !running;
+  return (
+    <div
+      data-testid="chat-row"
+      data-convo={chat.id}
+      className={live ? "bg-emerald-950/40" : ""}
+    >
+      <button
+        type="button"
+        data-testid="chat-open"
+        onClick={() => onOpen(chat.id, chat.profile ?? null)}
+        className="relative flex min-h-11 w-full cursor-pointer flex-col items-start px-4 py-2.5 text-left transition-colors hover:bg-zinc-900/60"
+      >
+        {color && (
+          <span
+            data-testid="chat-bar"
+            aria-hidden="true"
+            className="absolute inset-y-0 left-0 w-1"
+            style={{ backgroundColor: `var(--profile-${color})` }}
+          />
+        )}
+        <span className="flex w-full items-center gap-2 pl-1.5">
+          <span
+            className={`min-w-0 truncate text-[15px] ${
+              live ? "font-semibold text-emerald-200" : "font-medium text-zinc-100"
+            }`}
+          >
+            {chat.name}
+          </span>
+          {profile?.origin === "remote" && (
+            <span className="shrink-0 rounded bg-zinc-800 px-1 text-[10px] text-zinc-400">
+              remote
+            </span>
+          )}
+        </span>
+        <span className="mt-0.5 w-full truncate pl-1.5 text-xs text-zinc-500">
+          {metaLine(chat, now)}
+        </span>
+      </button>
+    </div>
   );
 }
