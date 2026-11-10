@@ -212,6 +212,14 @@ grep_ok "ci: root job runs cargo test --locked" "cargo test --locked" "$CI"
 # contain this exact string.
 grep_bad "ci: no root 'cargo test --workspace'" "cargo test --workspace" "$CI"
 
+# ── resume nudge (T25) ───────────────────────────────────────────────────
+# The mobile shell re-arms the SPA from the window-level lifecycle event
+# (`WindowEvent::Resumed`, cfg(mobile)); the app-level `RunEvent::Resumed`
+# arm never fires on mobile in the locked tauri versions and is deleted.
+LIB_RS="$root/mobile/src-tauri/src/lib.rs"
+grep_ok "resume: lib.rs handles WindowEvent::Resumed" "WindowEvent::Resumed" "$LIB_RS"
+grep_bad "resume: no RunEvent::Resumed arm" "RunEvent::Resumed" "$LIB_RS"
+
 # ── lock policy (guard) ──────────────────────────────────────────────────
 
 if [ -e "$ML" ]; then
