@@ -5,11 +5,12 @@
 // local search query and the selected chip.
 
 import { useMemo, useState } from "react";
+import type { ReactNode } from "react";
 import type { ConversationSummary, TabColor } from "../state";
 import type { CatalogProfile } from "../types";
 import type { NotifyPermission } from "../useTaskNotifications";
 import { filterChats, groupChats, metaLine } from "../chatList";
-import type { ChatRow } from "../chatList";
+import type { ChatRow, Range } from "../chatList";
 import { NotifyToggle } from "./NotifyToggle";
 import { ThemeToggle } from "./ThemeToggle";
 
@@ -203,6 +204,7 @@ export function ChatList({
                 row={r}
                 now={now}
                 catalog={catalog}
+                isUnread={unread.has(r.chat.id)}
                 onOpen={onOpen}
               />
             ))}
@@ -268,11 +270,13 @@ function Row({
   row,
   now,
   catalog,
+  isUnread,
   onOpen,
 }: {
   row: ChatRow;
   now: Date;
   catalog: CatalogProfile[];
+  isUnread: boolean;
   onOpen(convo: string, profile: string | null): void;
 }) {
   const chat = row.chat;
@@ -310,13 +314,36 @@ function Row({
               live ? "font-semibold text-emerald-200" : "font-medium text-zinc-100"
             }`}
           >
-            {chat.name}
+            <Title name={chat.name} matches={row.titleMatches} />
           </span>
           {profile?.origin === "remote" && (
             <span className="shrink-0 rounded bg-zinc-800 px-1 text-[10px] text-zinc-400">
               remote
             </span>
           )}
+          <span className="ml-auto flex shrink-0 items-center gap-1.5 pl-1.5">
+            {running && (
+              <span
+                data-testid="chat-status-running"
+                aria-label="running"
+                className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-amber-400 border-t-transparent"
+              />
+            )}
+            {live && (
+              <span
+                data-testid="chat-status-live"
+                aria-label="live session"
+                className="h-2 w-2 rounded-full bg-emerald-400"
+              />
+            )}
+            {isUnread && (
+              <span
+                data-testid="chat-status-unread"
+                aria-label="unread"
+                className="h-2 w-2 rounded-full bg-sky-400"
+              />
+            )}
+          </span>
         </span>
         <span className="mt-0.5 w-full truncate pl-1.5 text-xs text-zinc-500">
           {metaLine(chat, now)}
@@ -324,4 +351,24 @@ function Row({
       </button>
     </div>
   );
+}
+
+// The row title with the search's matched ranges wrapped in <mark> (amber
+// tint, per the mock). Ranges index the raw name, so slicing the original
+// keeps case and Unicode intact.
+function Title({ name, matches }: { name: string; matches: readonly Range[] }) {
+  if (matches.length === 0) return <>{name}</>;
+  const parts: ReactNode[] = [];
+  let from = 0;
+  for (const [start, end] of matches) {
+    if (start > from) parts.push(name.slice(from, start));
+    parts.push(
+      <mark key={start} className="rounded-sm bg-amber-400/30 px-0.5 text-amber-100">
+        {name.slice(start, end)}
+      </mark>,
+    );
+    from = end;
+  }
+  if (from < name.length) parts.push(name.slice(from));
+  return <>{parts}</>;
 }
