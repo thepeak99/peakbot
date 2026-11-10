@@ -129,14 +129,26 @@ describe("uploadFile", () => {
     await expect(done).rejects.toThrow("spec.pdf is larger than 50 MB");
   });
 
-  it("maps the local server's 415 images_only to a clear message", async () => {
+  it("maps the 415 images_only to the update-your-server message", async () => {
     const file = new File(["x".repeat(1024)], "notes.txt", { type: "text/plain" });
     const { done } = uploadFile(CONVO, file, () => {});
 
     FakeXHR.instances.at(-1)!.respond(415, JSON.stringify({ error: "images_only" }));
+    // The images_only token is the OLD remotes' local image gate — the user
+    // can act on it (update that server), so it gets its own sentence.
     await expect(done).rejects.toThrow(
-      "PeakBot on this phone can only attach images.",
+      "This PeakBot server only accepts images. Update it to attach other files.",
     );
+  });
+
+  it("passes any OTHER 415 body's error text through verbatim", async () => {
+    const file = new File(["x".repeat(1024)], "notes.txt", { type: "text/plain" });
+    const { done } = uploadFile(CONVO, file, () => {});
+
+    FakeXHR.instances
+      .at(-1)!
+      .respond(415, JSON.stringify({ error: "file uploads are disabled on this server" }));
+    await expect(done).rejects.toThrow("file uploads are disabled on this server");
   });
 
   it("rejects when abort() is called", async () => {

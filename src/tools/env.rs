@@ -233,15 +233,27 @@ pub(crate) fn builtin_tool_names(
     names
 }
 
-/// The Local edition's whole built-in set: no shell, file, doc or image tool
-/// exists in this build, whatever `shell` and `view_image` say.
+/// The Local edition's whole built-in set: the six file tools (confined to
+/// the conversation's folder) plus the non-execution tools — no shell, doc
+/// or image tool exists in this build, whatever `shell` and `view_image` say.
 #[cfg(not(feature = "host"))]
 pub(crate) fn builtin_tool_names(
     env: &ToolEnv,
     _shell: Option<&ShellKind>,
     _view_image: bool,
 ) -> Vec<&'static str> {
-    let mut names = vec!["fetch_url", "fetch_page", "todo", "think"];
+    let mut names = vec![
+        "fetch_url",
+        "fetch_page",
+        "todo",
+        "think",
+        "file_create",
+        "file_str_replace",
+        "file_insert",
+        "file_read",
+        "pdf_read",
+        "list_directory",
+    ];
     if env.search.is_some() {
         names.push("web_search");
     }
@@ -257,10 +269,10 @@ pub fn delegate_enabled(agent: &ResolvedAgent) -> bool {
 
 /// `file_create` among the registered built-ins after the `profile.tools`
 /// filter: the full edition always lists it, so the filter alone decides;
-/// the Local edition never compiles the tool. The single source of truth the
-/// derived memory rule reads — it can never drift from
-/// `main_agent_tool_names`, which applies the same `allows` gate to the same
-/// base list.
+/// the Local edition registers the tool but memory stays off there. The
+/// single source of truth the derived memory rule reads — it can never
+/// drift from `main_agent_tool_names`, which applies the same `allows` gate
+/// to the same base list.
 pub fn file_create_registered(tools: &NameFilter) -> bool {
     cfg!(feature = "host") && tools.allows("file_create")
 }

@@ -447,6 +447,70 @@ async fn upload_post_forwards_the_body_and_returns_the_remote_json_verbatim() {
     assert_eq!(got, payload, "the user's bytes, untouched");
 }
 
+// Part 2 guard: a NON-IMAGE upload body — binary bytes with `0x00` and
+// `0xFF`, a percent-encoded name with a space — passes to the remote
+// byte-identical. The upstream query is EXACTLY `convo` + `name`, and the
+// upstream `Content-Type` is the locked `application/octet-stream`.
+// Content-Length is deliberately NOT asserted: the proxy streams chunked
+// and never forwards the browser's Content-Length (design part 2, D3).
+#[tokio::test]
+async fn upload_post_passes_a_non_image_body_through_untouched() {
+    let (a, env) = one().await;
+    a.can(
+        "POST",
+        "/api/uploads",
+        Canned::new(200, ATTACHMENT_JSON).header("content-type", "application/json"),
+    );
+
+    // PDF-like, not a real image: magic, NULs, and a 0xFF byte.
+    let mut pdf_like: Vec<u8> = b"%PDF-1.7\n".to_vec();
+    pdf_like.push(0x00);
+    pdf_like.extend((0..512u32).map(|i| (i % 251) as u8));
+    pdf_like.push(0xFF);
+
+    let resp = post_upload(
+        &env,
+        &upload_post_path(L, CONVO, "report%20final.pdf"),
+        pdf_like.clone(),
+    )
+    .await;
+
+    assert_eq!(resp.status(), 200);
+
+    let hits = a.hits_for("POST", "/api/uploads");
+    assert_eq!(hits.len(), 1, "one upstream POST: {:?}", a.rec.hits());
+    let (path_part, query) = hits[0].uri.split_once('?').expect("upstream query");
+    assert_eq!(path_part, "/api/uploads");
+    let mut pairs: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            ("convo".to_string(), CONVO.to_string()),
+            ("name".to_string(), "report final.pdf".to_string()),
+        ],
+        "the upstream query is exactly convo + name: {}",
+        hits[0].uri
+    );
+    assert_eq!(
+        upstream_header(&hits[0], "content-type"),
+        vec!["application/octet-stream".to_string()],
+        "the remote insists on octet-stream"
+    );
+
+    let (_, got) = a
+        .bodies()
+        .into_iter()
+        .find(|(k, _)| k.starts_with("POST /api/uploads"))
+        .expect("the remote saw a body");
+    assert_eq!(
+        got, pdf_like,
+        "the non-image bytes must arrive byte-identical"
+    );
+}
+
 // §6.2 "the remote URL is rebuilt from the parsed parts, never copied":
 // exactly `convo` + `name`, nothing else — in particular not the local token.
 #[tokio::test]

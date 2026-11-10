@@ -87,6 +87,21 @@ describe("uploadFile — the /r/<L>/ base (remote-profiles T9)", () => {
     );
   });
 
+  it("posts report.pdf to /r/home/api/uploads?… for a remote conversation (part-2 guard)", () => {
+    // Non-image bytes must ride the same remote path as images — the relay
+    // streams the raw body through, the client only routes it.
+    const file = new File(["pdf-bytes"], "report.pdf", { type: "application/pdf" });
+    uploadFile(CONVO, file, () => {}, "/r/home");
+
+    const xhr = FakeXHR.instances.at(-1)!;
+    expect(xhr.method).toBe("POST");
+    expect(xhr.url).toBe(
+      `/r/home/api/uploads?convo=${CONVO}&name=${encodeURIComponent("report.pdf")}`,
+    );
+    expect(xhr.headers["Content-Type"]).toBe("application/octet-stream");
+    expect(xhr.body).toBe(file);
+  });
+
   it("uses a URL-encoded base verbatim (apiBase pre-encodes the name)", () => {
     const file = new File(["bytes"], "a.png", { type: "image/png" });
     uploadFile(CONVO, file, () => {}, "/r/home%20dev");

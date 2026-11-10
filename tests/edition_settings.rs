@@ -1,12 +1,12 @@
-//! `boot.edition` + Local `415 images_only`.
+//! `boot.edition` + Local uploads: any file type.
 //!
-//! **RED today by BEHAVIOUR** (both compile fine in every edition):
+//! **RED today by BEHAVIOUR** (all compile fine in every edition):
 //!   - `GET /api/settings` has no `boot.edition` field yet (the `boot`
 //!     block gains `"edition": "full" | "local"`, in BOTH normal and
 //!     needs_setup modes, derived from `cfg!(feature = "host")`);
-//!   - the Local edition accepts a PDF upload today (the
-//!     `415 {"error":"images_only"}` gate lands — Local attachments are images
-//!     only).
+//!   - the Local edition's images-only gate (`415
+//!     {"error":"images_only"}`) is deleted: a PDF and a zip upload must be
+//!     accepted with 200 (mobile-attach part 1).
 //!
 //! **No `LocalCore` dependency:** the settings and uploads routers are driven
 //! directly on loopback (the `settings_api_tests` / `uploads_http_tests`
@@ -204,6 +204,24 @@ fn png_bytes() -> Vec<u8> {
         .expect("PNG fixture base64 must decode")
 }
 
+/// PDF-like fixture: the magic, some NULs, a 0xFF byte — nothing an image
+/// sniffer can claim.
+#[cfg(not(feature = "host"))]
+fn pdf_bytes() -> Vec<u8> {
+    let mut v = b"%PDF-1.4\n".to_vec();
+    v.extend(std::iter::repeat_n(0x00u8, 512));
+    v.push(0xFF);
+    v
+}
+
+/// A valid (empty) zip: the 22-byte End of Central Directory record.
+#[cfg(not(feature = "host"))]
+fn zip_bytes() -> Vec<u8> {
+    let mut v = vec![0x50, 0x4B, 0x05, 0x06];
+    v.extend(std::iter::repeat_n(0u8, 18));
+    v
+}
+
 async fn spawn_uploads() -> SocketAddr {
     let dir = tempfile::tempdir().expect("uploads tempdir");
     let store = UploadStore::new(dir.path().to_path_buf(), UploadsConfig::default());
@@ -231,23 +249,33 @@ async fn post_upload(addr: SocketAddr, name: &str, body: Vec<u8>) -> reqwest::Re
         .unwrap()
 }
 
-/// Local edition: a PDF (non-image) upload is a `415` with the EXACT body
-/// `{"error":"images_only"}`.
+/// Local edition: the images-only gate is DELETED — a PDF (non-image)
+/// upload is accepted with 200 (RED today: the gate answers 415).
 #[cfg(not(feature = "host"))]
 #[tokio::test]
-async fn local_pdf_upload_is_415_images_only() {
+async fn local_pdf_upload_is_ok() {
     let addr = spawn_uploads().await;
-    let resp = post_upload(addr, "spec.pdf", vec![b'%'; 1024]).await;
+    let resp = post_upload(addr, "spec.pdf", pdf_bytes()).await;
     assert_eq!(
         resp.status(),
-        415,
-        "a PDF upload in the Local edition must be a 415"
+        200,
+        "a PDF upload in the Local edition must be accepted; body: {}",
+        resp.text().await.unwrap()
     );
-    // The exact body — no prose, no extra keys (the SPA matches it verbatim).
-    let text = resp.text().await.unwrap();
+}
+
+/// Local edition: a zip (non-image, non-PDF) upload is accepted with 200 —
+/// the sniffed-content rule is gone, within the size limit.
+#[cfg(not(feature = "host"))]
+#[tokio::test]
+async fn local_zip_upload_is_ok() {
+    let addr = spawn_uploads().await;
+    let resp = post_upload(addr, "bundle.zip", zip_bytes()).await;
     assert_eq!(
-        text, r#"{"error":"images_only"}"#,
-        "the 415 body must be exactly {{\"error\":\"images_only\"}}; got: {text}"
+        resp.status(),
+        200,
+        "a zip upload in the Local edition must be accepted; body: {}",
+        resp.text().await.unwrap()
     );
 }
 

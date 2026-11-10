@@ -300,6 +300,17 @@ impl StateManager {
         &self.uploads
     }
 
+    /// The current conversation's upload folder, `<uploads_root>/<convo>`:
+    /// the root the Local edition's file tools are confined to. `None` when
+    /// no conversation is current.
+    ///
+    /// Read per call, never cached at tool build: `/new`, `/model`, `/cd`
+    /// and `/load` mint or switch the conversation after the agent is built.
+    pub fn conversation_dir(&self) -> Option<std::path::PathBuf> {
+        let convo = self.get_current_conversation_id()?;
+        Some(self.uploads.conversation_dir(convo))
+    }
+
     /// Stamp whether the active model accepts image input. Set from
     /// `ProviderInfo.supports_vision` at the same two sites as
     /// `set_wire_reasoning` (boot + rebuild). The turn builder reads it to

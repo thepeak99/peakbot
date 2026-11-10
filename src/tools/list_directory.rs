@@ -1,9 +1,9 @@
-use crate::tools::file_edit::resolve_against;
+use crate::tools::workspace::Workspace;
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ListDirectoryError {
@@ -19,18 +19,17 @@ pub struct ListDirectoryArgs {
     recursive: Option<bool>,
 }
 
-/// List-directory tool. `session_cwd` is the base for relative path resolution;
-/// the `Default` empty path leaves relatives anchored at the process cwd
-/// (tests / no state manager).
+/// List-directory tool. Paths resolve through the injected [`Workspace`]
+/// (host: the session cwd; Local: the conversation's folder).
 #[derive(Serialize, Deserialize, Default)]
 pub struct ListDirectoryTool {
     #[serde(skip)]
-    session_cwd: PathBuf,
+    workspace: Workspace,
 }
 
 impl ListDirectoryTool {
-    pub fn new(session_cwd: PathBuf) -> Self {
-        Self { session_cwd }
+    pub fn new(workspace: Workspace) -> Self {
+        Self { workspace }
     }
 }
 
@@ -75,7 +74,10 @@ impl Tool for ListDirectoryTool {
         );
 
         let start_time = std::time::Instant::now();
-        let resolved = resolve_against(&self.session_cwd, &args.path);
+        let resolved = self
+            .workspace
+            .read(&args.path)
+            .map_err(|e| ListDirectoryError::Validation(e.to_string()))?;
         let path = resolved.as_path();
 
         if !path.exists() {
@@ -160,7 +162,7 @@ fn collect_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    use crate::tools::workspace::test_support;
 
     // Contract: an empty directory must NOT yield an empty tool result —
     // an empty tool-result string crashes some LLM providers. The exact
@@ -168,11 +170,11 @@ mod tests {
     // asserts non-emptiness only, never a specific string.
     #[tokio::test]
     async fn empty_directory_returns_non_empty_placeholder() {
-        let dir = tempdir().unwrap();
+        let (_root, _base, workspace) = test_support::rooted();
 
-        let tool = ListDirectoryTool::new(dir.path().to_path_buf());
+        let tool = ListDirectoryTool::new(workspace);
         let args: ListDirectoryArgs = serde_json::from_value(json!({
-            "path": dir.path().to_string_lossy().to_string()
+            "path": "."
         }))
         .unwrap();
 

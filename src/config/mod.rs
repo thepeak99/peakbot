@@ -857,10 +857,23 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "web_search",
 ];
 
-/// The Local edition's built-ins: no tool that touches the device's files
-/// or runs code exists in this build. Naming any other tool is a parse error.
+/// The Local edition's built-ins: the six file tools are confined to the
+/// conversation's upload folder; no tool runs code or touches the device's
+/// other files. Naming any other tool is a parse error.
 #[cfg(not(feature = "host"))]
-pub const BUILTIN_TOOL_NAMES: &[&str] = &["fetch_page", "fetch_url", "think", "todo", "web_search"];
+pub const BUILTIN_TOOL_NAMES: &[&str] = &[
+    "fetch_page",
+    "fetch_url",
+    "think",
+    "todo",
+    "web_search",
+    "file_create",
+    "file_str_replace",
+    "file_insert",
+    "file_read",
+    "pdf_read",
+    "list_directory",
+];
 
 /// One name filter for every allow/deny list (`tools:`, `mcps:`, `skills:`,
 /// `ui.tabs:`). `enabled: false` allows nothing; a non-empty

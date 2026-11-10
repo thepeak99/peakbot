@@ -690,6 +690,11 @@ describe("bash panel per edition", () => {
 });
 
 // ─── composer attach input per edition ────────────────────────────────────
+//
+// Mobile-attach part 2: the main picker accepts ANY file in EVERY edition —
+// the `accept="image/*"` gate is gone (the Local server's 415 is the real
+// enforcement, now surfaced with an actionable message). Both tests below
+// assert the main input (the FIRST `input[type=file]`) carries no `accept`.
 
 describe("composer attach input per edition", () => {
   const composerProps = {
@@ -706,12 +711,15 @@ describe("composer attach input per edition", () => {
     pendingInput: 0,
   };
 
-  it("local: the attach input accepts images only", () => {
+  it("local: the main attach input has NO accept (any file, like full)", () => {
     setBootEdition("local");
     mount(<Composer {...composerProps} />);
     const input = host.querySelector('input[type="file"]') as HTMLInputElement | null;
     expect(input, "the attach input must render").not.toBeNull();
-    expect(input?.getAttribute("accept")).toBe("image/*");
+    expect(
+      input?.getAttribute("accept"),
+      "the local picker must accept any file type now",
+    ).toBeNull();
   });
 
   it("full: the attach input stays unrestricted (unchanged)", () => {

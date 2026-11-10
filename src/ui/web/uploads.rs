@@ -79,29 +79,6 @@ async fn upload_handler(
         );
     }
 
-    // Local edition: images only. Buffer the bounded
-    // body so the magic can be sniffed before anything is written; a
-    // non-image is a 415 with the exact body the SPA matches verbatim. The
-    // full edition streams straight to the store and accepts any file.
-    #[cfg(not(feature = "host"))]
-    let body = match read_bounded(body, max_bytes).await {
-        Some(bytes) if is_image_bytes(&bytes) => Body::from(bytes),
-        Some(_) => {
-            return json_error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "images_only");
-        }
-        None => {
-            return json_error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                &AttachError::TooLarge {
-                    name,
-                    size: None,
-                    max_mb: limits.max_file_mb,
-                }
-                .to_string(),
-            );
-        }
-    };
-
     // Stream straight into the store: `take(max+1)` bounds the copy, and a
     // mid-stream failure leaves no id dir behind.
     let stream = body
@@ -130,41 +107,6 @@ async fn upload_handler(
 struct UploadQuery {
     convo: Uuid,
     name: String,
-}
-
-/// Read a body into memory, bounded by `max_bytes` (the same limit the store
-/// enforces): `Some(bytes)` when the whole body fits, `None` when it
-/// overruns. The Local edition only — it must buffer to sniff the magic.
-#[cfg(not(feature = "host"))]
-async fn read_bounded(body: Body, max_bytes: u64) -> Option<Vec<u8>> {
-    let mut bytes = Vec::new();
-    let mut stream = body.into_data_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.ok()?;
-        bytes.extend_from_slice(&chunk);
-        if bytes.len() as u64 > max_bytes {
-            return None;
-        }
-    }
-    Some(bytes)
-}
-
-/// The Local edition's whole upload rule: images only. Sniff the
-/// body's magic — the SAME four formats `describe` accepts as an `Image` —
-/// and return `true` iff it is one of them. Size is enforced separately: a
-/// sniffed-but-oversized image is still an image and gets the 413, not the
-/// 415.
-#[cfg(not(feature = "host"))]
-fn is_image_bytes(bytes: &[u8]) -> bool {
-    matches!(
-        image::guess_format(bytes).ok(),
-        Some(
-            image::ImageFormat::Png
-                | image::ImageFormat::Jpeg
-                | image::ImageFormat::Gif
-                | image::ImageFormat::WebP
-        )
-    )
 }
 
 /// `GET /api/uploads/{convo}/{id}` — serves the single stored file.

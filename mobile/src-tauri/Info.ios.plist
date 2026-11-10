@@ -13,9 +13,9 @@
 		<true/>
 	</dict>
 
-	<!-- QR pairing (barcode-scanner plugin). The App Store review string. -->
+	<!-- QR pairing (barcode-scanner plugin) and Take Photo in the composer's attach sheet. The App Store review string. -->
 	<key>NSCameraUsageDescription</key>
-	<string>Scan the pairing QR code shown by PeakBot.</string>
+	<string>Scan a pairing QR code, or take a photo to attach to a conversation.</string>
 
 	<!-- LAN providers / servers trigger the local-network prompt. -->
 	<key>NSLocalNetworkUsageDescription</key>
