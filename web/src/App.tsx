@@ -40,6 +40,9 @@ import type { TabsState } from "./convoTabs";
 import { useTaskNotifications } from "./useTaskNotifications";
 import { useFavicon } from "./useFavicon";
 import { useFocusMode } from "./useFocusMode";
+import { useMobileChats } from "./useMobileChats";
+import { ChatHeader } from "./components/ChatHeader";
+import { ChatList } from "./components/ChatList";
 import { focusView } from "./focus";
 import { epochKey, nextEpoch, type EpochState } from "./transcriptEpoch";
 import { filterTabs, resolveActiveTab, settingsGearEnabled } from "./tabs";
@@ -107,14 +110,13 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   const selectionLocked = conversationHasTurns(state?.chat.messages ?? []);
   // Desktop conversation tabs (null in a browser). The title is only offered
   // once `state` describes the conversation the socket is bound to — right
-  // after a switch it still describes the previous one.
-  const convoTabs = useConvoTabs(
-    agent,
-    initialTabs,
+  // after a switch it still describes the previous one. The phone header
+  // shares the condition and falls back to `New chat` where tabs get `null`.
+  const convoTitle =
     hasTranscript && state?.conversation?.id === agent.convo
       ? (state?.conversation?.name ?? null)
-      : null,
-  );
+      : null;
+  const convoTabs = useConvoTabs(agent, initialTabs, convoTitle);
   // A picker row opens under ITS profile (null = local), so a remote row
   // reattaches as a relay rather than a local session (design §6.4).
   const loadConversation = convoTabs ? convoTabs.open : switchConvo;
@@ -312,6 +314,10 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
     if (toastTimer.current) clearTimeout(toastTimer.current);
   }, []);
 
+  // The phone's two screens: the list overlay plus the always-mounted
+  // conversation. `showToast` is stable; `null` outside the mobile shell.
+  const chats = useMobileChats(agent, showToast);
+
   // Keep an open drawer pointed at a tab the server still shows. When the
   // visible set changes (e.g. the bound profile's `tabs` drops a tab out
   // from under an open drawer), relocate the active tab to the first
@@ -357,7 +363,28 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
 
   return (
     <div className="flex h-dvh w-full flex-col overflow-hidden bg-zinc-950 text-zinc-100">
-    <TopBar
+      {/* While the Chats list covers the conversation, the composer blurs
+          (keyboard closes) and the screen is hidden from screen readers. */}
+      <div className="contents" inert={chats?.screen === "chats"}>
+      {chats ? (
+        <ChatHeader
+          title={convoTitle ?? "New chat"}
+          profile={selection?.profile ?? null}
+          profileColor={
+            selection
+              ? catalog.find((p) => p.name === selection.profile)?.color
+              : undefined
+          }
+          model={stats?.modelAlias || activeAlias}
+          badge={chats.backBadge}
+          onBack={chats.showChats}
+          connected={connected}
+          isRunning={isRunning}
+          focusMode={focusMode.focus}
+          onToggleFocus={focusMode.toggle}
+        />
+      ) : (
+        <TopBar
         isRunning={isRunning}
         connected={connected}
         statusMessage={state?.status_message ?? null}
@@ -387,6 +414,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
         onToast={showToast}
         stopPending={state?.stop_pending ?? false}
       />
+      )}
       <UpdateBanner />
       {convoTabs && (
         <ConvoTabBar
@@ -489,6 +517,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
         selectionLocked={selectionLocked}
         profilePinned={state?.profile_pinned ?? false}
         onToast={showToast}
+        mobileChats={chats !== null}
       />
    
 
@@ -497,6 +526,24 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
         active={drawerTab}
         onActiveChange={setDrawerTab}
       />
+      </div>
+
+      {chats?.screen === "chats" && (
+        <ChatList
+          conversations={conversations}
+          catalog={catalog}
+          loaded={chats.loaded}
+          unread={chats.unread}
+          connected={connected}
+          error={error}
+          onOpen={chats.open}
+          onNew={chats.newChat}
+          onOpenSettings={settingsEnabled ? settingsView.toggle : undefined}
+          notifyEnabled={notify.enabled}
+          notifyPermission={notify.permission}
+          onToggleNotify={notify.toggle}
+        />
+      )}
 
       {settingsView.open && settingsEnabled && (
         <Settings
