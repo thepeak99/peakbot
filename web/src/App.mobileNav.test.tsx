@@ -95,7 +95,11 @@ function stateFor(id: string | null, over: Partial<AppState> = {}): AppState {
   } as unknown as AppState;
 }
 
-function makeAgent(state: AppState | null, error: string | null = null): FakeAgent {
+function makeAgent(
+  state: AppState | null,
+  error: string | null = null,
+  over: Partial<FakeAgent> = {},
+): FakeAgent {
   return {
     connected: true,
     state,
@@ -110,6 +114,7 @@ function makeAgent(state: AppState | null, error: string | null = null): FakeAge
     send: vi.fn(),
     convo: state?.conversation?.id ?? null,
     switchConvo: vi.fn(),
+    ...over,
   };
 }
 
@@ -147,13 +152,33 @@ function settingsOpen(): boolean {
   return (host.textContent ?? "").includes(SETTINGS_MARKER);
 }
 
-/** Click the gear (the overlay's opener). */
-function openSettings() {
+/** Navigate from the conversation to the Chats list (the gear now lives there). */
+async function toChatsScreen(): Promise<void> {
+  const back = host.querySelector<HTMLElement>('[data-testid="chat-back"]');
+  expect(back, "chat-back must render on the conversation").not.toBeNull();
+  const popped = waitForPopstate();
+  act(() => {
+    back!.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+  });
+  await act(async () => {
+    await popped;
+  });
+  await flush();
+}
+
+/** Click the Settings gear (now on the Chats screen). */
+function clickGear(): void {
   const gear = host.querySelector<HTMLElement>(GEAR);
-  expect(gear, "the Settings gear must render").not.toBeNull();
+  expect(gear, "the Settings gear must render on the list").not.toBeNull();
   act(() => {
     gear!.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
   });
+}
+
+/** Open Settings: go to the Chats screen first, then click the gear. */
+async function openSettings(): Promise<void> {
+  await toChatsScreen();
+  clickGear();
 }
 
 /** Close the overlay via its own UI ("← Back to chat"). */
@@ -246,8 +271,8 @@ describe("refused first attach — the error shows and the gear stays reachable"
 
       // The gear stays reachable: with no state frame, the gate's absent
       // fields read as available, and the user's only fix (Settings →
-      // Profiles) must be openable.
-      openSettings();
+      // Profiles) must be openable — now from the Chats screen.
+      await openSettings();
       await flush();
       expect(settingsOpen(), "the Settings overlay must open from the gear").toBe(true);
     },
@@ -260,7 +285,26 @@ describe("refused first attach — the error shows and the gear stays reachable"
     mount();
     await flush();
     expect(host.textContent).toContain("boom");
-    openSettings();
+    await openSettings();
+    await flush();
+    expect(settingsOpen()).toBe(true);
+  });
+
+  it("a refused resume (bound convo, no state) falls back to a fresh chat once", async () => {
+    // A stored last chat the server refuses: `state` is null, an `error` is
+    // set, and the socket is still bound to the (now unknown) convo. The hook
+    // must re-attach to a fresh chat exactly once (P5) and keep the gear up.
+    const message = "Remote profile 'dev on host': connection refused (10.2.0.48:7899)";
+    hoisted.agent = makeAgent(null, message, { convo: "c9" });
+    mount();
+    await flush();
+
+    const agent = hoisted.agent as FakeAgent;
+    expect(host.textContent).toContain(message);
+    expect(agent.switchConvo, "the fallback re-attaches once").toHaveBeenCalledTimes(1);
+    expect(agent.switchConvo).toHaveBeenCalledWith(null, null);
+
+    await openSettings();
     await flush();
     expect(settingsOpen()).toBe(true);
   });
@@ -287,10 +331,11 @@ describe("Settings overlay — Back navigation (mobile shell)", () => {
     hoisted.agent = makeAgent(stateFor("c1"));
     mount();
     await flush();
-    const h = spyHistory();
+    await toChatsScreen();
+    const h = spyHistory(); // after the list navigation: count only the gear
     expect(settingsOpen()).toBe(false);
 
-    openSettings(); // the click handler must do the push
+    clickGear(); // the click handler must do the push
     expect(settingsOpen(), "the overlay opens").toBe(true);
     expect(h.push, "the gear's click handler must push exactly one history entry").toHaveBeenCalledTimes(1);
   });
@@ -299,7 +344,7 @@ describe("Settings overlay — Back navigation (mobile shell)", () => {
     hoisted.agent = makeAgent(stateFor("c1"));
     mount();
     await flush();
-    openSettings();
+    await openSettings();
     expect(settingsOpen()).toBe(true);
 
     // The OS Back: a genuine traversal of the entry the gear pushed.
@@ -311,8 +356,8 @@ describe("Settings overlay — Back navigation (mobile shell)", () => {
     await flush();
 
     expect(settingsOpen(), "the overlay must close on Back").toBe(false);
-    // The app stayed: the chat shell is still mounted underneath.
-    expect(host.querySelector(GEAR), "the top bar (and gear) are still there").not.toBeNull();
+    // The app stayed: the gear (on the list) and the composer are still there.
+    expect(host.querySelector(GEAR), "the gear is still on the list").not.toBeNull();
     expect(host.querySelector("textarea"), "the composer is still mounted").not.toBeNull();
   });
 
@@ -320,7 +365,7 @@ describe("Settings overlay — Back navigation (mobile shell)", () => {
     hoisted.agent = makeAgent(stateFor("c1"));
     mount();
     await flush();
-    openSettings();
+    await openSettings();
     const h = spyHistory(); // spy AFTER the open: count only the close
 
     const popped = waitForPopstate();
@@ -340,7 +385,7 @@ describe("Settings overlay — Back navigation (mobile shell)", () => {
     hoisted.agent = makeAgent(stateFor("c1"));
     mount();
     await flush();
-    openSettings();
+    await openSettings();
     const h = spyHistory(); // count only the close
 
     const popped = waitForPopstate();
@@ -360,9 +405,10 @@ describe("Settings overlay — Back navigation (mobile shell)", () => {
     hoisted.agent = makeAgent(stateFor("c1"));
     mount();
     await flush();
-    const h = spyHistory();
+    await toChatsScreen();
+    const h = spyHistory(); // after the list navigation: count only the gear
 
-    openSettings();
+    clickGear();
     const popped = waitForPopstate();
     closeSettingsViaUi();
     await act(async () => {
@@ -370,7 +416,7 @@ describe("Settings overlay — Back navigation (mobile shell)", () => {
     });
     await flush();
 
-    openSettings();
+    clickGear(); // already on the list: the gear opens a fresh entry
     expect(settingsOpen()).toBe(true);
     expect(h.push, "each open pushes its own entry").toHaveBeenCalledTimes(2);
   });

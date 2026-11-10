@@ -53,6 +53,43 @@ async function loadShell(): Promise<() => string> {
 type WithShell = { peakbotShell?: unknown };
 const sg = globalThis as WithShell;
 
+// `isMobile()` is a new seam (mobile-chats design §2): `shell() === "mobile"`.
+// Loaded dynamically (the file's existing module-surface pattern) so the new
+// cases fail on the absent export, not on a broken import of the whole file.
+type MobileModule = { isMobile?: unknown };
+
+async function loadIsMobile(): Promise<() => boolean> {
+  const mod = (await import("./desktop")) as MobileModule;
+  if (typeof mod.isMobile !== "function") {
+    throw new Error("desktop.ts does not export isMobile() yet");
+  }
+  return mod.isMobile as () => boolean;
+}
+
+describe("isMobile() seam", () => {
+  afterEach(() => {
+    delete sg.peakbotShell;
+  });
+
+  it("is true when window.peakbotShell is exactly 'mobile'", async () => {
+    sg.peakbotShell = "mobile";
+    const isMobile = await loadIsMobile();
+    expect(isMobile()).toBe(true);
+  });
+
+  it("is false when window.peakbotShell is 'desktop'", async () => {
+    sg.peakbotShell = "desktop";
+    const isMobile = await loadIsMobile();
+    expect(isMobile()).toBe(false);
+  });
+
+  it("is false when the marker is missing (browser)", async () => {
+    delete sg.peakbotShell;
+    const isMobile = await loadIsMobile();
+    expect(isMobile()).toBe(false);
+  });
+});
+
 describe("shell() seam", () => {
   afterEach(() => {
     delete sg.peakbotShell;
@@ -328,13 +365,14 @@ describe("clipboard image IPC seam", () => {
 // RED today: `shell` is not exported yet.
 
 describe("module surface", () => {
-  it("exports exactly isDesktop, shell, edition, setBootEdition, setDesktopTheme, getUpdateStatus, installUpdate, readClipboardImage", async () => {
+  it("exports exactly isDesktop, isMobile, shell, edition, setBootEdition, setDesktopTheme, getUpdateStatus, installUpdate, readClipboardImage", async () => {
     const mod = (await import("./desktop")) as Record<string, unknown>;
     expect(Object.keys(mod).sort()).toEqual([
       "edition",
       "getUpdateStatus",
       "installUpdate",
       "isDesktop",
+      "isMobile",
       "readClipboardImage",
       "setBootEdition",
       "setDesktopTheme",
