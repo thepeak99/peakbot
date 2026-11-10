@@ -64,9 +64,6 @@ export function ChatList({
       ),
     [conversations, query, activeProfile, searching],
   );
-  void loaded;
-  void unread;
-  void onNew;
 
   return (
     <section
@@ -193,7 +190,26 @@ export function ChatList({
         )}
       </header>
       <div className="flex-1 overflow-y-auto overscroll-contain pb-24">
-        {sections.map((s) => (
+        {!loaded ? (
+          <div
+            data-testid="chat-loading"
+            className="flex items-center gap-2 px-4 py-6 text-sm text-zinc-500"
+          >
+            <span
+              aria-label="Loading chats"
+              className="h-4 w-4 animate-spin rounded-full border-2 border-zinc-600 border-t-zinc-300"
+            />
+            Loading chats…
+          </div>
+        ) : sections.length === 0 ? (
+          <div
+            data-testid="chat-empty"
+            className="px-4 py-8 text-center text-sm text-zinc-500"
+          >
+            {searching ? `No chats match “${query.trim()}”` : "No chats yet"}
+          </div>
+        ) : (
+          sections.map((s) => (
           <section key={s.kind} data-testid="chat-section" data-kind={s.kind}>
             <h2 className="px-4 pb-1.5 pt-4 text-[11px] font-semibold uppercase tracking-[0.14em] text-zinc-500">
               {s.label}
@@ -209,8 +225,17 @@ export function ChatList({
               />
             ))}
           </section>
-        ))}
+          ))
+        )}
       </div>
+      <button
+        type="button"
+        aria-label="New chat"
+        onClick={onNew}
+        className="absolute bottom-[calc(1.25rem+env(safe-area-inset-bottom))] right-4 z-10 flex h-14 w-14 cursor-pointer items-center justify-center rounded-2xl bg-emerald-600 pb-1 text-3xl font-light text-white shadow-lg transition-colors hover:bg-emerald-500"
+      >
+        +
+      </button>
     </section>
   );
 }
