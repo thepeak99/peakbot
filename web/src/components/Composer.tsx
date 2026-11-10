@@ -34,9 +34,11 @@
 // per tab) and shows as a chip above the input; submit sends only the uploaded
 // ids, never bytes. Send is blocked until every chip is done and none is in
 // error. Linux desktop app: an image-only paste with no file data falls back
-// to `readClipboardImage()` (WebKit Bug 218519).
+// to `readClipboardImage()` (WebKit Bug 218519). On Android 📎 opens a menu
+// (camera / gallery / file); elsewhere it opens the OS dialog.
 
-import { useRef, useState, useLayoutEffect } from "react";
+import { useEffect, useRef, useState, useLayoutEffect } from "react";
+import { isAndroid } from "../platform";
 import { isDesktop, readClipboardImage } from "../desktop";
 import type { SlashCommand } from "../state";
 import type { SubAgentRun } from "../types";
@@ -129,12 +131,19 @@ export function Composer({
   const [text, setText] = useState("");
   const [selected, setSelected] = useState(0);
   const [dismissed, setDismissed] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
   // True when the primary input is a touch device (phone, tablet, laptop in
   // tablet mode). Gates Enter-to-send so an accidental tap on the on-screen
   // return key never fires a half-typed message.
   const touchInput = useMediaQuery("(pointer: coarse)");
+  // The attach menu exists only where the OS has no attach sheet of its own;
+  // the UA is the one signal shared by the Android WebView and browsers.
+  const android = isAndroid();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cameraInputRef = useRef<HTMLInputElement>(null);
+  const galleryInputRef = useRef<HTMLInputElement>(null);
+  const attachButtonRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   // Grow the textarea with its content between `MIN_H` (one row) and `MAX_H`;
@@ -158,13 +167,40 @@ export function Composer({
   // command list — it must NOT depend on the live socket, or it blinks out
   // during the reconnect that `switchConvo` deliberately triggers (sticky
   // sessions). Sending is still gated on `connected` in `submit()`.
-  const showPalette = !isRunning && !dismissed && matches.length > 0;
+  const showPalette = !isRunning && !dismissed && matches.length > 0 && !menuOpen;
   const sel = Math.min(selected, matches.length - 1);
 
   const onPickFiles = (e: React.ChangeEvent<HTMLInputElement>) => {
     attachments.add(Array.from(e.target.files ?? []));
     e.target.value = ""; // reset so re-picking the same file fires onChange again
   };
+
+  // The menu unmounts on pick, so the input click must stay synchronous inside
+  // the tap for the OS to honour it as user activation.
+  const pick = (ref: React.RefObject<HTMLInputElement | null>) => {
+    setMenuOpen(false);
+    ref.current?.click();
+  };
+
+  // Close the menu on a press outside it or on Escape. The 📎 button is
+  // excluded from the pointerdown check so it keeps toggling.
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onPointerDown = (e: Event) => {
+      const t = e.target;
+      if (t instanceof Node && (menuRef.current?.contains(t) || attachButtonRef.current?.contains(t))) return;
+      setMenuOpen(false);
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [menuOpen]);
 
   const submit = () => {
     const trimmed = text.trim();
@@ -311,6 +347,47 @@ export function Composer({
             </div>
           )}
 
+          {menuOpen && (
+            <div
+              ref={menuRef}
+              role="menu"
+              aria-label="Attach"
+              data-testid="attach-menu"
+              className="absolute bottom-full left-0 z-20 mb-2 w-56 rounded-lg border border-zinc-800 bg-zinc-900 py-1 shadow-xl"
+            >
+              <button
+                type="button"
+                role="menuitem"
+                data-testid="attach-menu-camera"
+                {...keepTextareaFocus}
+                onClick={() => pick(cameraInputRef)}
+                className="block w-full px-4 py-3 text-left text-sm text-zinc-200 hover:bg-zinc-800"
+              >
+                Take a photo
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                data-testid="attach-menu-gallery"
+                {...keepTextareaFocus}
+                onClick={() => pick(galleryInputRef)}
+                className="block w-full px-4 py-3 text-left text-sm text-zinc-200 hover:bg-zinc-800"
+              >
+                Choose from gallery
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                data-testid="attach-menu-file"
+                {...keepTextareaFocus}
+                onClick={() => pick(fileInputRef)}
+                className="block w-full px-4 py-3 text-left text-sm text-zinc-200 hover:bg-zinc-800"
+              >
+                Pick a file
+              </button>
+            </div>
+          )}
+
           <div className="flex flex-col gap-2 rounded-xl border border-zinc-800 bg-zinc-900 p-2 focus-within:border-zinc-700">
             {/* Inside the box (not the desktop-only hint row below) so it also
                 shows on touch: selecting a role filters the transcript, it does
@@ -363,7 +440,7 @@ export function Composer({
                 onChange={onPickFiles}
                 className="hidden"
               />
-              {touchInput && (
+              {android && (
                 <input
                   ref={cameraInputRef}
                   type="file"
@@ -373,10 +450,24 @@ export function Composer({
                   className="hidden"
                 />
               )}
+              {android && (
+                <input
+                  ref={galleryInputRef}
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  onChange={onPickFiles}
+                  className="hidden"
+                />
+              )}
               <button
                 type="button"
+                ref={attachButtonRef}
                 disabled={!connected}
-                onClick={() => fileInputRef.current?.click()}
+                onClick={() => (android ? setMenuOpen((o) => !o) : fileInputRef.current?.click())}
+                aria-haspopup={android ? "menu" : undefined}
+                aria-expanded={android ? menuOpen : undefined}
+                {...(android ? keepTextareaFocus : {})}
                 title="Attach files"
                 aria-label="Attach files"
                 className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 disabled:cursor-not-allowed disabled:opacity-40"
@@ -393,20 +484,6 @@ export function Composer({
                   <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
                 </svg>
               </button>
-              {touchInput && (
-                <button
-                  type="button"
-                  disabled={!connected}
-                  onClick={() => cameraInputRef.current?.click()}
-                  title="Take photo"
-                  aria-label="Take photo"
-                  className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 disabled:cursor-not-allowed disabled:opacity-40"
-                >
-                  <span className="text-base leading-none" aria-hidden>
-                    📷
-                  </span>
-                </button>
-              )}
               <textarea
                 ref={textareaRef}
                 rows={1}

@@ -13,7 +13,7 @@
 		<true/>
 	</dict>
 
-	<!-- QR pairing (barcode-scanner plugin) and the composer's camera button. The App Store review string. -->
+	<!-- QR pairing (barcode-scanner plugin) and Take Photo in the composer's attach sheet. The App Store review string. -->
 	<key>NSCameraUsageDescription</key>
 	<string>Scan a pairing QR code, or take a photo to attach to a conversation.</string>
 

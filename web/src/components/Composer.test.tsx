@@ -84,6 +84,16 @@ beforeEach(() => {
   };
 });
 
+// ─── navigator.userAgent stub ─────────────────────────────────────────────
+
+// The attach-menu platform gate is the UA (design-attach-menu §2), so the
+// Android/iOS/Windows cases pin a UA string before mount. Same precedent as
+// ComposerPaste.test.tsx: spy on the getter, restore in afterEach.
+let uaSpy: ReturnType<typeof vi.spyOn> | undefined;
+const mockUA = (ua: string): void => {
+  uaSpy = vi.spyOn(navigator, "userAgent", "get").mockReturnValue(ua);
+};
+
 // ─── fixture ──────────────────────────────────────────────────────────────
 
 interface ComposerProps {
@@ -162,6 +172,9 @@ afterEach(() => {
   } else {
     window.matchMedia = originalMatchMedia;
   }
+  // Restore the UA spy from the attach-menu tests (the platform gate is the UA).
+  uaSpy?.mockRestore();
+  uaSpy = undefined;
 });
 
 // ─── DOM query helpers ────────────────────────────────────────────────────
@@ -1006,19 +1019,23 @@ describe("Composer — attachments (T12)", () => {
   });
 });
 
-// ─── Mobile attach part 2: any-file picker, camera, non-vision notice ─────
+// ─── Mobile attach: one 📎 button, Android attach menu ─────────────────────
 //
-// RED until the Composer implements design-mobile-attach-part2:
+// RED until the Composer implements design-attach-menu (PR #443):
 //   1. The main hidden file input keeps `multiple` and loses `accept` in
 //      EVERY edition (the server's 415 is the real gate, now with an
 //      actionable message).
-//   2. A SECOND hidden input `type="file" accept="image/*"
-//      capture="environment"` (NO `multiple`) wired to the same pick
-//      handler, plus a 📷 button with title/aria-label EXACTLY "Take
-//      photo", `disabled` when not connected. BOTH render only when the
-//      existing `(pointer: coarse)` query matches (`touchInput`), and the
-//      camera input sits AFTER the main one so the first
-//      `input[type=file]` stays the main picker.
+//   2. `isAndroid()` (web/src/platform.ts: UA contains "Android") — NOT
+//      `(pointer: coarse)` — gates the menu: on Android (app WebView and
+//      browsers alike) 📎 toggles a role="menu" with three menuitems
+//      ("Take a photo" / "Choose from gallery" / "Pick a file") that click
+//      the camera (`accept="image/*" capture="environment"`, NO multiple),
+//      gallery (`accept="image/*" multiple`, NO capture) and plain inputs.
+//      Camera + gallery sit AFTER the plain one so the first
+//      `input[type=file]` stays the plain picker; the old 📷 "Take photo"
+//      button is deleted everywhere. Every other platform (desktop, iPhone,
+//      iPad-reporting-as-Mac, Windows touch laptops, unknown UAs) keeps
+//      master's exact DOM: one input, no menu, no extra aria attributes.
 //   3. Non-vision notice: when any DONE image chip's visionWarning is the
 //      NO_VISION sentence, the Composer renders it ONCE under the chip row
 //      with role="status". Sending stays enabled; it is hidden for vision
@@ -1040,15 +1057,143 @@ const cameraInput = (el: HTMLElement): HTMLInputElement | null =>
 const statusEls = (el: HTMLElement): HTMLElement[] =>
   Array.from(el.querySelectorAll('[role="status"]'));
 
-describe("Composer — camera input + Take photo button (coarse pointer only)", () => {
-  it("coarse pointer: a camera input exists with accept='image/*', capture='environment' and no multiple", async () => {
+// Realistic full UA strings per platform (the gate is the UA, not the pointer).
+const ANDROID_UA =
+  "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36";
+const IPHONE_UA =
+  "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1";
+const IPAD_AS_MAC_UA =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
+const WINDOWS_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
+
+/** The 📎 attach button (accessible name "Attach files"). */
+const attachButtonOf = (el: HTMLElement): HTMLButtonElement | null =>
+  controlByName(el, "Attach");
+
+/** The Android attach menu, if open. */
+const menuOf = (el: HTMLElement): HTMLElement | null =>
+  el.querySelector('[data-testid="attach-menu"]');
+
+/** The menu's role="menuitem" buttons in DOM order. */
+const menuItemsOf = (el: HTMLElement): HTMLButtonElement[] =>
+  Array.from(el.querySelectorAll('[role="menuitem"]'));
+
+/** The gallery input: image-only picker WITHOUT capture (the camera has it). */
+const galleryInputOf = (el: HTMLElement): HTMLInputElement | null =>
+  el.querySelector('input[type="file"][accept="image/*"]:not([capture])');
+
+/** Case 1's shared contract: master's plain-picker DOM, no menu extras. */
+const expectPlainOnlyDom = async (el: HTMLElement): Promise<void> => {
+  const inputs = fileInputs(el);
+  expect(inputs, "exactly one file input (the plain picker)").toHaveLength(1);
+  expect(inputs[0].hasAttribute("multiple"), "the plain picker is multiple").toBe(true);
+  expect(inputs[0].hasAttribute("accept"), "no accept: the server's 415 is the gate").toBe(false);
+  expect(inputs[0].hasAttribute("capture"), "no capture on the plain picker").toBe(false);
+
+  const btn = attachButtonOf(el);
+  expect(btn, "the 📎 button must exist").not.toBeNull();
+  expect(btn!.hasAttribute("aria-haspopup"), "no aria-haspopup without a menu").toBe(false);
+  expect(btn!.hasAttribute("aria-expanded"), "no aria-expanded without a menu").toBe(false);
+
+  const plainClick = vi.spyOn(inputs[0], "click");
+  await click(btn!);
+  expect(plainClick, "📎 clicks the plain input exactly once").toHaveBeenCalledTimes(1);
+  expect(menuOf(el), "no attach-menu in the DOM").toBeNull();
+};
+
+/** Case 3's shared contract: the three Android inputs, in DOM order. */
+const expectAndroidInputs = (el: HTMLElement): void => {
+  const inputs = fileInputs(el);
+  expect(inputs, "expected plain, camera and gallery inputs").toHaveLength(3);
+  const [plain, camera, gallery] = inputs;
+  expect(plain.hasAttribute("multiple")).toBe(true);
+  expect(plain.hasAttribute("accept")).toBe(false);
+  expect(plain.hasAttribute("capture")).toBe(false);
+  expect(camera.getAttribute("accept")).toBe("image/*");
+  expect(camera.getAttribute("capture")).toBe("environment");
+  expect(camera.hasAttribute("multiple"), "the camera picks ONE photo").toBe(false);
+  expect(gallery.getAttribute("accept")).toBe("image/*");
+  expect(gallery.hasAttribute("multiple")).toBe(true);
+  expect(gallery.hasAttribute("capture"), "the gallery has no capture").toBe(false);
+};
+
+describe("Composer — non-Android: plain picker only (master DOM)", () => {
+  it("default UA: one plain input, no menu attributes on 📎, 📎 clicks the plain input, no menu", async () => {
+    const el = await mount(makeProps());
+    await expectPlainOnlyDom(el);
+  });
+
+  it("iPhone (coarse pointer): still the plain picker only — pointer type is not the gate", async () => {
+    mockUA(IPHONE_UA);
     touchMatches = true;
+    const el = await mount(makeProps());
+    await expectPlainOnlyDom(el);
+  });
+
+  it("iPad reporting as Macintosh (coarse pointer): plain picker only", async () => {
+    mockUA(IPAD_AS_MAC_UA);
+    touchMatches = true;
+    const el = await mount(makeProps());
+    await expectPlainOnlyDom(el);
+  });
+
+  it("Windows (coarse pointer, touch laptop): plain picker only", async () => {
+    mockUA(WINDOWS_UA);
+    touchMatches = true;
+    const el = await mount(makeProps());
+    await expectPlainOnlyDom(el);
+  });
+
+  it("the button row starts input[type=file] → 📎 button → textarea, and 📎 keeps exactly master's attributes (type, title, aria-label, class)", async () => {
+    const el = await mount(makeProps());
+
+    const plain = fileInputs(el)[0];
+    expect(plain, "the row must start with the plain file input").not.toBeNull();
+    const btn = plain.nextElementSibling as HTMLButtonElement | null;
+    expect(btn?.getAttribute("aria-label"), "the input's next sibling is the 📎 button").toBe("Attach files");
+    expect(btn?.nextElementSibling?.tagName, "the 📎 button's next sibling is the textarea").toBe("TEXTAREA");
+
+    expect(
+      Array.from(btn!.attributes).map((a) => a.name).sort(),
+      "the 📎 button keeps exactly master's attribute set (connected: no disabled, no menu extras)",
+    ).toEqual(["aria-label", "class", "title", "type"]);
+  });
+});
+
+describe("Composer — Android: three inputs, 📎 menu attributes", () => {
+  it("coarse pointer: plain, camera, gallery in order with the spec attributes; 📎 has aria-haspopup=menu, aria-expanded=false; no menu", async () => {
+    mockUA(ANDROID_UA);
+    touchMatches = true;
+    const el = await mount(makeProps());
+
+    expectAndroidInputs(el);
+    const btn = attachButtonOf(el)!;
+    expect(btn.getAttribute("aria-haspopup")).toBe("menu");
+    expect(btn.getAttribute("aria-expanded"), "the menu starts closed").toBe("false");
+    expect(menuOf(el), "no menu while closed").toBeNull();
+  });
+
+  it("fine pointer: the same three inputs and menu attributes (the UA is the gate, not the pointer)", async () => {
+    mockUA(ANDROID_UA);
+    const el = await mount(makeProps());
+
+    expectAndroidInputs(el);
+    const btn = attachButtonOf(el)!;
+    expect(btn.getAttribute("aria-haspopup")).toBe("menu");
+    expect(btn.getAttribute("aria-expanded")).toBe("false");
+    expect(menuOf(el)).toBeNull();
+  });
+
+  // Re-gated from the old coarse-pointer block onto the Android UA:
+  it("a camera input exists with accept='image/*', capture='environment' and no multiple", async () => {
+    mockUA(ANDROID_UA);
     const el = await mount(makeProps());
 
     const camera = cameraInput(el);
     expect(
       camera,
-      "expected a camera file input on a coarse-pointer device",
+      "expected a camera file input on an Android device",
     ).not.toBeNull();
     expect(camera!.getAttribute("accept")).toBe("image/*");
     expect(camera!.getAttribute("capture")).toBe("environment");
@@ -1058,34 +1203,8 @@ describe("Composer — camera input + Take photo button (coarse pointer only)", 
     ).toBe(false);
   });
 
-  it("coarse pointer: a button named 'Take photo' is present (title and aria-label)", async () => {
-    touchMatches = true;
-    const el = await mount(makeProps());
-
-    const btn = controlByName(el, "Take photo");
-    expect(
-      btn,
-      "expected a 'Take photo' button on a coarse-pointer device",
-    ).not.toBeNull();
-    expect(btn!.getAttribute("title")).toBe("Take photo");
-    expect(btn!.getAttribute("aria-label")).toBe("Take photo");
-  });
-
-  it("fine pointer: neither the camera input nor the Take photo button is rendered", async () => {
-    const el = await mount(makeProps());
-
-    expect(
-      cameraInput(el),
-      "no camera input on a fine-pointer device",
-    ).toBeNull();
-    expect(
-      controlByName(el, "Take photo"),
-      "no camera button on a fine-pointer device",
-    ).toBeNull();
-  });
-
   it("the main input is still the FIRST input[type=file] and has no accept", async () => {
-    touchMatches = true;
+    mockUA(ANDROID_UA);
     const el = await mount(makeProps());
 
     const inputs = fileInputs(el);
@@ -1101,20 +1220,8 @@ describe("Composer — camera input + Take photo button (coarse pointer only)", 
     ).toBe(false);
   });
 
-  it("the Take photo button is disabled when not connected", async () => {
-    touchMatches = true;
-    const el = await mount(makeProps({ connected: false }));
-
-    const btn = controlByName(el, "Take photo");
-    expect(
-      btn,
-      "the camera button renders (disabled) even while not connected",
-    ).not.toBeNull();
-    expect(btn!.disabled).toBe(true);
-  });
-
   it("firing change on the camera input with one file calls attachments.add with [file]", async () => {
-    touchMatches = true;
+    mockUA(ANDROID_UA);
     const add = vi.fn();
     const api = attachmentsApi({ add });
     const el = await t12Mount(makeProps(), api, true);
@@ -1132,6 +1239,197 @@ describe("Composer — camera input + Take photo button (coarse pointer only)", 
       "the camera input rides the same pick handler as the main input",
     ).toHaveBeenCalledTimes(1);
     expect(add).toHaveBeenCalledWith([photo]);
+  });
+});
+
+describe("Composer — the 📷 'Take photo' button is gone", () => {
+  it.each([
+    ["desktop", WINDOWS_UA],
+    ["iPhone", IPHONE_UA],
+    ["Android", ANDROID_UA],
+  ])("%s: no button named 'Take photo' (even on a coarse pointer)", async (_platform, ua) => {
+    mockUA(ua);
+    touchMatches = true; // the old 📷 button rendered on every coarse pointer
+    const el = await mount(makeProps());
+
+    expect(controlByName(el, "Take photo"), "the Take photo button is deleted").toBeNull();
+  });
+});
+
+describe("Composer — Android attach menu: open, close, pick", () => {
+  // Android mount with all three inputs click-spied and the menu opened.
+  // The input-count check runs BEFORE the spies so a missing input fails for
+  // the right reason (menu absent) instead of crashing on an undefined node.
+  const openAttachMenu = async (): Promise<{
+    el: HTMLElement;
+    clicks: { plain: ReturnType<typeof vi.spyOn>; camera: ReturnType<typeof vi.spyOn>; gallery: ReturnType<typeof vi.spyOn> };
+  }> => {
+    mockUA(ANDROID_UA);
+    const el = await mount(makeProps());
+    const [plain, camera, gallery] = fileInputs(el);
+    expect(
+      fileInputs(el),
+      "Android renders the plain, camera and gallery inputs",
+    ).toHaveLength(3);
+    const clicks = {
+      plain: vi.spyOn(plain, "click"),
+      camera: vi.spyOn(camera, "click"),
+      gallery: vi.spyOn(gallery, "click"),
+    };
+    await click(attachButtonOf(el)!);
+    return { el, clicks };
+  };
+
+  it("clicking 📎 opens the menu: role=menu aria-label=Attach, three items in order with exact text, aria-expanded=true, NO input clicked; clicking 📎 again closes it", async () => {
+    const { el, clicks } = await openAttachMenu();
+
+    const menu = menuOf(el);
+    expect(menu, "the menu must be open after clicking 📎").not.toBeNull();
+    expect(menu!.getAttribute("role")).toBe("menu");
+    expect(menu!.getAttribute("aria-label")).toBe("Attach");
+    const items = menuItemsOf(el);
+    expect(
+      items.map((b) => (b.textContent ?? "").trim()),
+      "three menuitems in the spec order with exact text",
+    ).toEqual(["Take a photo", "Choose from gallery", "Pick a file"]);
+    expect(
+      items.every((b) => b.getAttribute("role") === "menuitem"),
+      "each item carries role=menuitem",
+    ).toBe(true);
+    expect(
+      attachButtonOf(el)!.getAttribute("aria-expanded"),
+      "📎 reports the menu as expanded",
+    ).toBe("true");
+    for (const spy of Object.values(clicks))
+      expect(spy, "opening the menu must not click any input").not.toHaveBeenCalled();
+
+    await click(attachButtonOf(el)!);
+    expect(menuOf(el), "clicking 📎 again closes the menu").toBeNull();
+    expect(attachButtonOf(el)!.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("pointerdown on document.body closes the open menu", async () => {
+    const { el } = await openAttachMenu();
+    expect(menuOf(el), "menu open before the outside press").not.toBeNull();
+
+    await act(async () => {
+      document.body.dispatchEvent(new Event("pointerdown", { bubbles: true, cancelable: true }));
+    });
+
+    expect(menuOf(el), "a pointerdown outside menu and 📎 closes the menu").toBeNull();
+  });
+
+  it("pointerdown inside the menu does NOT close it", async () => {
+    const { el } = await openAttachMenu();
+    const item = menuItemsOf(el)[0];
+    expect(item, "the menu has items to press").not.toBeNull();
+
+    await act(async () => {
+      item!.dispatchEvent(new Event("pointerdown", { bubbles: true, cancelable: true }));
+    });
+
+    expect(menuOf(el), "a pointerdown inside the menu keeps it open").not.toBeNull();
+  });
+
+  it("Escape keydown on document closes the open menu", async () => {
+    const { el } = await openAttachMenu();
+
+    await act(async () => {
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    });
+
+    expect(menuOf(el), "Escape closes the menu").toBeNull();
+  });
+
+  it("picking 'Take a photo' clicks ONLY the camera input once and closes the menu", async () => {
+    const { el, clicks } = await openAttachMenu();
+    const [camItem] = menuItemsOf(el);
+    expect(camItem, "the camera item is first").not.toBeNull();
+
+    await click(camItem!);
+
+    expect(clicks.camera, "the camera input is clicked once").toHaveBeenCalledTimes(1);
+    expect(clicks.plain, "the plain input is not clicked").not.toHaveBeenCalled();
+    expect(clicks.gallery, "the gallery input is not clicked").not.toHaveBeenCalled();
+    expect(menuOf(el), "the menu closes after picking").toBeNull();
+  });
+
+  it("picking 'Choose from gallery' clicks ONLY the gallery input once and closes the menu", async () => {
+    const { el, clicks } = await openAttachMenu();
+    const [, galItem] = menuItemsOf(el);
+    expect(galItem, "the gallery item is second").not.toBeNull();
+
+    await click(galItem!);
+
+    expect(clicks.gallery, "the gallery input is clicked once").toHaveBeenCalledTimes(1);
+    expect(clicks.plain, "the plain input is not clicked").not.toHaveBeenCalled();
+    expect(clicks.camera, "the camera input is not clicked").not.toHaveBeenCalled();
+    expect(menuOf(el), "the menu closes after picking").toBeNull();
+  });
+
+  it("picking 'Pick a file' clicks ONLY the plain input once and closes the menu", async () => {
+    const { el, clicks } = await openAttachMenu();
+    const [, , fileItem] = menuItemsOf(el);
+    expect(fileItem, "the file item is third").not.toBeNull();
+
+    await click(fileItem!);
+
+    expect(clicks.plain, "the plain input is clicked once").toHaveBeenCalledTimes(1);
+    expect(clicks.camera, "the camera input is not clicked").not.toHaveBeenCalled();
+    expect(clicks.gallery, "the gallery input is not clicked").not.toHaveBeenCalled();
+    expect(menuOf(el), "the menu closes after picking").toBeNull();
+  });
+});
+
+describe("Composer — Android attach menu: pick handler and gating", () => {
+  it("firing change on the gallery input with two files calls attachments.add with both and resets the value to ''", async () => {
+    mockUA(ANDROID_UA);
+    const add = vi.fn();
+    const api = attachmentsApi({ add });
+    const el = await t12Mount(makeProps(), api, true);
+
+    const gallery = galleryInputOf(el);
+    expect(gallery, "the gallery input must exist on Android").not.toBeNull();
+    const a = new File(["a-bytes"], "a.jpg", { type: "image/jpeg" });
+    const b = new File(["b-bytes"], "b.png", { type: "image/png" });
+    await act(async () => {
+      Object.defineProperty(gallery!, "files", { value: [a, b], configurable: true });
+      gallery!.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+
+    expect(
+      add,
+      "the gallery input rides the same pick handler as the main input",
+    ).toHaveBeenCalledTimes(1);
+    expect(add).toHaveBeenCalledWith([a, b]);
+    expect(gallery!.value, "the input resets so re-picking fires change again").toBe("");
+  });
+
+  it("not connected: 📎 is disabled and clicking it opens no menu", async () => {
+    mockUA(ANDROID_UA);
+    const el = await mount(makeProps({ connected: false }));
+
+    const btn = attachButtonOf(el);
+    expect(btn, "the 📎 button renders (disabled) while not connected").not.toBeNull();
+    expect(btn!.disabled, "connected is the only gate, as today").toBe(true);
+    await click(btn!);
+    expect(menuOf(el), "a disabled 📎 opens nothing").toBeNull();
+  });
+
+  it("with the slash palette showing, clicking 📎 hides the palette while the menu is open", async () => {
+    mockUA(ANDROID_UA);
+    const el = await mount(
+      makeProps({ commands: [{ name: "help", description: "Show help", takes_args: false }] }),
+    );
+    await typeInto(el.querySelector("textarea")!, "/h");
+    const slashRows = allButtons(el).filter((b) => (b.textContent ?? "").trim().startsWith("/"));
+    expect(slashRows, "the palette shows for a bare /prefix").toHaveLength(1);
+
+    await click(attachButtonOf(el)!);
+
+    expect(menuOf(el), "the menu is open").not.toBeNull();
+    const rowsAfter = allButtons(el).filter((b) => (b.textContent ?? "").trim().startsWith("/"));
+    expect(rowsAfter, "the two popups never show together").toHaveLength(0);
   });
 });
 
