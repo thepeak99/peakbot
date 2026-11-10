@@ -884,6 +884,12 @@ const t12Mount = (
 ): Promise<HTMLDivElement> =>
   mount({ ...base, attachments, supportsVision } as unknown as ComposerProps);
 
+// Mobile-attach part 2 rewords the non-vision warning (design decision 4).
+// `NO_VISION` / `visionWarning` are not exported from AttachmentChip yet, so
+// the tests pin the LITERAL sentence the spec locks in.
+const NO_VISION_NOTICE =
+  "This model can't view images — the picture is sent as a file it cannot see.";
+
 describe("Composer — attachments (T12)", () => {
   it("renders a done image attachment as a thumbnail chip (img with the preview src)", async () => {
     const api = attachmentsApi({ pending: [doneImageChip("id-img", "blob:preview-1")] });
@@ -979,12 +985,12 @@ describe("Composer — attachments (T12)", () => {
     expect(add).toHaveBeenCalledWith(files);
   });
 
-  it("shows a ⚠ with a 'Model can't view images' title for an image when supports_vision=false", async () => {
+  it("shows a ⚠ with the non-vision title for an image when supports_vision=false", async () => {
     const api = attachmentsApi({ pending: [doneImageChip("id-img")] });
     const el = await t12Mount(makeProps(), api, false);
 
     const warn = Array.from(el.querySelectorAll("[title]")).find((n) =>
-      (n.getAttribute("title") ?? "").includes("Model can't view images"),
+      (n.getAttribute("title") ?? "").includes(NO_VISION_NOTICE),
     );
     expect(warn, "expected a ⚠ title for an image on a non-vision model").toBeDefined();
   });
@@ -994,9 +1000,201 @@ describe("Composer — attachments (T12)", () => {
     const el = await t12Mount(makeProps(), api, true);
 
     const warn = Array.from(el.querySelectorAll("[title]")).find((n) =>
-      (n.getAttribute("title") ?? "").includes("Model can't view images"),
+      (n.getAttribute("title") ?? "").includes(NO_VISION_NOTICE),
     );
     expect(warn ?? null).toBeNull();
+  });
+});
+
+// ─── Mobile attach part 2: any-file picker, camera, non-vision notice ─────
+//
+// RED until the Composer implements design-mobile-attach-part2:
+//   1. The main hidden file input keeps `multiple` and loses `accept` in
+//      EVERY edition (the server's 415 is the real gate, now with an
+//      actionable message).
+//   2. A SECOND hidden input `type="file" accept="image/*"
+//      capture="environment"` (NO `multiple`) wired to the same pick
+//      handler, plus a 📷 button with title/aria-label EXACTLY "Take
+//      photo", `disabled` when not connected. BOTH render only when the
+//      existing `(pointer: coarse)` query matches (`touchInput`), and the
+//      camera input sits AFTER the main one so the first
+//      `input[type=file]` stays the main picker.
+//   3. Non-vision notice: when any DONE image chip's visionWarning is the
+//      NO_VISION sentence, the Composer renders it ONCE under the chip row
+//      with role="status". Sending stays enabled; it is hidden for vision
+//      models and when only non-image files are attached — on a remote
+//      base too.
+//
+// `NO_VISION` / `visionWarning` are not exported yet, so the notice is
+// pinned by its literal text (see NO_VISION_NOTICE above).
+
+/** All `input[type=file]` in DOM order — the first must be the main picker. */
+const fileInputs = (el: HTMLElement): HTMLInputElement[] =>
+  Array.from(el.querySelectorAll('input[type="file"]'));
+
+/** The camera input, if any: the file input carrying a `capture` attribute. */
+const cameraInput = (el: HTMLElement): HTMLInputElement | null =>
+  fileInputs(el).find((i) => i.getAttribute("capture") !== null) ?? null;
+
+/** Every role="status" element in the subtree. */
+const statusEls = (el: HTMLElement): HTMLElement[] =>
+  Array.from(el.querySelectorAll('[role="status"]'));
+
+describe("Composer — camera input + Take photo button (coarse pointer only)", () => {
+  it("coarse pointer: a camera input exists with accept='image/*', capture='environment' and no multiple", async () => {
+    touchMatches = true;
+    const el = await mount(makeProps());
+
+    const camera = cameraInput(el);
+    expect(
+      camera,
+      "expected a camera file input on a coarse-pointer device",
+    ).not.toBeNull();
+    expect(camera!.getAttribute("accept")).toBe("image/*");
+    expect(camera!.getAttribute("capture")).toBe("environment");
+    expect(
+      camera!.hasAttribute("multiple"),
+      "the camera input picks ONE photo, not a file list",
+    ).toBe(false);
+  });
+
+  it("coarse pointer: a button named 'Take photo' is present (title and aria-label)", async () => {
+    touchMatches = true;
+    const el = await mount(makeProps());
+
+    const btn = controlByName(el, "Take photo");
+    expect(
+      btn,
+      "expected a 'Take photo' button on a coarse-pointer device",
+    ).not.toBeNull();
+    expect(btn!.getAttribute("title")).toBe("Take photo");
+    expect(btn!.getAttribute("aria-label")).toBe("Take photo");
+  });
+
+  it("fine pointer: neither the camera input nor the Take photo button is rendered", async () => {
+    const el = await mount(makeProps());
+
+    expect(
+      cameraInput(el),
+      "no camera input on a fine-pointer device",
+    ).toBeNull();
+    expect(
+      controlByName(el, "Take photo"),
+      "no camera button on a fine-pointer device",
+    ).toBeNull();
+  });
+
+  it("the main input is still the FIRST input[type=file] and has no accept", async () => {
+    touchMatches = true;
+    const el = await mount(makeProps());
+
+    const inputs = fileInputs(el);
+    expect(inputs.length, "expected at least one file input").toBeGreaterThanOrEqual(1);
+    const main = inputs[0];
+    expect(
+      main.getAttribute("capture"),
+      "the first file input must be the main picker, not the camera",
+    ).toBeNull();
+    expect(
+      main.hasAttribute("accept"),
+      "the main picker accepts any file type (the server's 415 is the gate)",
+    ).toBe(false);
+  });
+
+  it("the Take photo button is disabled when not connected", async () => {
+    touchMatches = true;
+    const el = await mount(makeProps({ connected: false }));
+
+    const btn = controlByName(el, "Take photo");
+    expect(
+      btn,
+      "the camera button renders (disabled) even while not connected",
+    ).not.toBeNull();
+    expect(btn!.disabled).toBe(true);
+  });
+
+  it("firing change on the camera input with one file calls attachments.add with [file]", async () => {
+    touchMatches = true;
+    const add = vi.fn();
+    const api = attachmentsApi({ add });
+    const el = await t12Mount(makeProps(), api, true);
+
+    const camera = cameraInput(el);
+    expect(camera, "the camera input must exist to fire change on it").not.toBeNull();
+    const photo = new File(["jpeg-bytes"], "photo.jpg", { type: "image/jpeg" });
+    await act(async () => {
+      Object.defineProperty(camera!, "files", { value: [photo], configurable: true });
+      camera!.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+
+    expect(
+      add,
+      "the camera input rides the same pick handler as the main input",
+    ).toHaveBeenCalledTimes(1);
+    expect(add).toHaveBeenCalledWith([photo]);
+  });
+});
+
+describe("Composer — non-vision notice (role=status under the chip row)", () => {
+  it("shows the notice (exact text, role=status) for a done image chip with supportsVision=false", async () => {
+    const api = attachmentsApi({
+      pending: [doneImageChip("id-img")],
+      ids: ["id-img"],
+      ready: true,
+    });
+    const el = await t12Mount(makeProps(), api, false);
+
+    const notices = statusEls(el);
+    expect(notices.length, "expected exactly one status notice").toBe(1);
+    expect(
+      notices[0].textContent,
+      "the notice must be the NO_VISION sentence verbatim",
+    ).toBe(NO_VISION_NOTICE);
+    // Informational, not a gate: sending stays enabled.
+    expect(buttonWithText(el, "Send")!.disabled).toBe(false);
+  });
+
+  it("shows the notice with a remote base (/r/home) too", async () => {
+    const api = attachmentsApi({
+      pending: [doneImageChip("id-img")],
+      ids: ["id-img"],
+      ready: true,
+    });
+    const el = await mount({
+      ...makeProps(),
+      attachments: api,
+      supportsVision: false,
+      base: "/r/home",
+    } as unknown as ComposerProps);
+
+    const notices = statusEls(el);
+    expect(notices.length, "expected exactly one status notice on a remote base").toBe(1);
+    expect(notices[0].textContent).toBe(NO_VISION_NOTICE);
+  });
+
+  it("shows no notice when supportsVision=true", async () => {
+    const api = attachmentsApi({
+      pending: [doneImageChip("id-img")],
+      ids: ["id-img"],
+      ready: true,
+    });
+    const el = await t12Mount(makeProps(), api, true);
+
+    expect(statusEls(el), "no status notice for a vision model").toHaveLength(0);
+  });
+
+  it("shows no notice when the only chip is a PDF", async () => {
+    const api = attachmentsApi({
+      pending: [donePdfChip("id-pdf")],
+      ids: ["id-pdf"],
+      ready: true,
+    });
+    const el = await t12Mount(makeProps(), api, false);
+
+    expect(
+      statusEls(el),
+      "non-image files never trigger the vision notice",
+    ).toHaveLength(0);
   });
 });
 

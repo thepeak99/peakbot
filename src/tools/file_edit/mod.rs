@@ -280,6 +280,7 @@ fn exact_ambiguous_with_fuzzy_superset_fixture() -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::workspace::{Workspace, test_support};
     use rig_core::tool::Tool;
     use tempfile::tempdir;
 
@@ -314,7 +315,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_create_description_is_shell_neutral() {
-        let tool = FileCreateTool::new(PathBuf::from("/tmp"));
+        let tool = FileCreateTool::new(Workspace::default());
         let def = tool.definition(String::new()).await;
         assert!(
             !def.description.to_lowercase().contains("bash"),
@@ -330,7 +331,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_insert_description_is_shell_neutral() {
-        let tool = FileInsertTool::new(PathBuf::from("/tmp"));
+        let tool = FileInsertTool::new(Workspace::default());
         let def = tool.definition(String::new()).await;
         assert!(
             !def.description.to_lowercase().contains("bash"),
@@ -346,7 +347,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_str_replace_description_is_shell_neutral() {
-        let tool = FileStrReplaceTool::new(PathBuf::from("/tmp"));
+        let tool = FileStrReplaceTool::new(Workspace::default());
         let def = tool.definition(String::new()).await;
         assert!(
             !def.description.to_lowercase().contains("bash"),
@@ -880,7 +881,7 @@ mod tests {
         // Spec item 1 — the schema is the first line of defence: a model
         // that reads the schema must see new_str as required and learn
         // that "" is the deletion path.
-        let tool = FileStrReplaceTool::new(PathBuf::from("/tmp"));
+        let tool = FileStrReplaceTool::new(Workspace::default());
         let def = tool.definition(String::new()).await;
         let params = &def.parameters;
 
@@ -942,7 +943,7 @@ mod tests {
         .to_string();
         let args = parse_rig_args(&args_json);
 
-        let tool = FileStrReplaceTool::new(dir.path().to_path_buf());
+        let tool = FileStrReplaceTool::new(Workspace::default());
         let result = tool.call(args).await;
         match result {
             Err(e) => {
@@ -981,7 +982,7 @@ mod tests {
         .to_string();
         let args = parse_rig_args(&args_json);
 
-        let tool = FileStrReplaceTool::new(dir.path().to_path_buf());
+        let tool = FileStrReplaceTool::new(Workspace::default());
         let result = tool.call(args).await;
         match result {
             Err(e) => {
@@ -1009,19 +1010,19 @@ mod tests {
         // deletion path, and the success wording must say DELETED, never
         // Replaced. (Today the deletion mechanics already work; only the
         // wording is wrong — this test is RED on the wording assertions.)
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("empty_new_str.txt");
+        let (_root, base, workspace) = test_support::rooted();
+        let path = base.join("empty_new_str.txt");
         std::fs::write(&path, "alpha beta gamma\n").unwrap();
 
         let args_json = serde_json::json!({
-            "path": path.to_string_lossy(),
+            "path": "empty_new_str.txt",
             "old_str": "beta",
             "new_str": ""
         })
         .to_string();
         let args = parse_rig_args(&args_json);
 
-        let tool = FileStrReplaceTool::new(dir.path().to_path_buf());
+        let tool = FileStrReplaceTool::new(workspace);
         let out = tool
             .call(args)
             .await
@@ -1045,19 +1046,19 @@ mod tests {
     async fn str_replace_call_nonempty_new_str_still_reports_replaced() {
         // Spec item 5 — regression guard: a real replacement keeps the
         // existing "Replaced" wording and behaviour. Expected GREEN today.
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("nonempty_new_str.txt");
+        let (_root, base, workspace) = test_support::rooted();
+        let path = base.join("nonempty_new_str.txt");
         std::fs::write(&path, "alpha beta gamma\n").unwrap();
 
         let args_json = serde_json::json!({
-            "path": path.to_string_lossy(),
+            "path": "nonempty_new_str.txt",
             "old_str": "beta",
             "new_str": "BETA"
         })
         .to_string();
         let args = parse_rig_args(&args_json);
 
-        let tool = FileStrReplaceTool::new(dir.path().to_path_buf());
+        let tool = FileStrReplaceTool::new(workspace);
         let out = tool
             .call(args)
             .await
@@ -1076,20 +1077,20 @@ mod tests {
         // including the extra `thought` key, which the Args struct must
         // ignore, not choke on. Expected GREEN today (non-empty
         // replacement is unchanged behaviour).
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("e2e_thought.txt");
+        let (_root, base, workspace) = test_support::rooted();
+        let path = base.join("e2e_thought.txt");
         std::fs::write(&path, "alpha beta gamma\n").unwrap();
 
         let args_json = serde_json::json!({
             "thought": "swap beta for BETA",
-            "path": path.to_string_lossy(),
+            "path": "e2e_thought.txt",
             "old_str": "beta",
             "new_str": "BETA"
         })
         .to_string();
         let args = parse_rig_args(&args_json);
 
-        let tool = FileStrReplaceTool::new(dir.path().to_path_buf());
+        let tool = FileStrReplaceTool::new(workspace);
         let out = tool
             .call(args)
             .await
@@ -1108,19 +1109,19 @@ mod tests {
         // in the success message ("Match required whitespace_normalized")
         // must survive the wording change: Deleted messages keep the same
         // format conventions as Replaced ones.
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("deleted_normalized.txt");
+        let (_root, base, workspace) = test_support::rooted();
+        let path = base.join("deleted_normalized.txt");
         std::fs::write(&path, "alpha\nTARGET   \nbeta\n").unwrap();
 
         let args_json = serde_json::json!({
-            "path": path.to_string_lossy(),
+            "path": "deleted_normalized.txt",
             "old_str": "TARGET\n",
             "new_str": ""
         })
         .to_string();
         let args = parse_rig_args(&args_json);
 
-        let tool = FileStrReplaceTool::new(dir.path().to_path_buf());
+        let tool = FileStrReplaceTool::new(workspace);
         let out = tool
             .call(args)
             .await
@@ -1142,12 +1143,12 @@ mod tests {
         // Spec item 4, plural form — replace_all deletion must also be
         // reported as a deletion. The exact plural wording is NOT pinned
         // beyond "Deleted"/not-"Replaced" (the spec leaves it open).
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("deleted_all.txt");
+        let (_root, base, workspace) = test_support::rooted();
+        let path = base.join("deleted_all.txt");
         std::fs::write(&path, "x x x\n").unwrap();
 
         let args_json = serde_json::json!({
-            "path": path.to_string_lossy(),
+            "path": "deleted_all.txt",
             "old_str": "x",
             "new_str": "",
             "replace_all": true
@@ -1155,7 +1156,7 @@ mod tests {
         .to_string();
         let args = parse_rig_args(&args_json);
 
-        let tool = FileStrReplaceTool::new(dir.path().to_path_buf());
+        let tool = FileStrReplaceTool::new(workspace);
         let out = tool
             .call(args)
             .await

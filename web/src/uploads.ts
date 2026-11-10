@@ -14,10 +14,10 @@ function errorMessage(status: number, body: string): string {
   try {
     const parsed = JSON.parse(body) as { error?: unknown };
     if (typeof parsed.error === "string" && parsed.error) {
-      // The Local server rejects non-image uploads (415) — say what the
-      // phone can do instead of surfacing the wire token.
+      // Older servers (Local edition included) reject non-image uploads
+      // with 415; a remote profile may still be one. Say so, not the token.
       if (status === 415 && parsed.error === "images_only") {
-        return "PeakBot on this phone can only attach images.";
+        return "This PeakBot server only accepts images. Update it to attach other files.";
       }
       return parsed.error;
     }

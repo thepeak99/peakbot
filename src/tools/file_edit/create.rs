@@ -1,13 +1,14 @@
 //! `file_create`: create a new file (fails if it already exists).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{FileEditError, resolve_against, write_file};
+use super::{FileEditError, write_file};
+use crate::tools::workspace::Workspace;
 
 #[derive(Deserialize)]
 pub struct FileCreateArgs {
@@ -15,17 +16,16 @@ pub struct FileCreateArgs {
     file_text: Option<String>,
 }
 
-/// Create-a-file tool. `session_cwd` is the directory relative paths resolve
-/// against; the `Default` empty path leaves relatives anchored at the process
-/// cwd (tests / no state manager).
+/// Create-a-file tool. Paths resolve through the injected [`Workspace`]
+/// (host: the session cwd; Local: the conversation's `work/` folder).
 #[derive(Default)]
 pub struct FileCreateTool {
-    session_cwd: PathBuf,
+    workspace: Workspace,
 }
 
 impl FileCreateTool {
-    pub fn new(session_cwd: PathBuf) -> Self {
-        Self { session_cwd }
+    pub fn new(workspace: Workspace) -> Self {
+        Self { workspace }
     }
 }
 
@@ -75,7 +75,10 @@ and editing it later."
         );
 
         let start_time = std::time::Instant::now();
-        let resolved = resolve_against(&self.session_cwd, &args.path);
+        let resolved = self
+            .workspace
+            .write(&args.path)
+            .map_err(|e| FileEditError::Validation(e.to_string()))?;
         let result = run(&resolved.to_string_lossy(), args.file_text.as_deref());
 
         match &result {

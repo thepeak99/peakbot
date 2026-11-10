@@ -23,7 +23,6 @@ host = [
     "dep:rmcp",
     "rig-core/rmcp",
     "dep:ruvector-core",
-    "dep:pdf_oxide",
     "dep:docx-lite",
     "dep:ratatui",
     "dep:crossterm",
@@ -206,7 +205,7 @@ ruvector-core = { version = "=2.4.0", optional = true, default-features = false,
 # PDF text + markdown extraction (pure-Rust). `legacy-crypto` keeps R<=4 RC4/MD5
 # decrypt; all C-dep features (icc/lcms2/aws-lc/OCR/pdfium) stay off so it
 # cross-compiles clean.
-pdf_oxide = { version = "0.3", optional = true, default-features = false, features = ["legacy-crypto"] }
+pdf_oxide = { version = "0.3", default-features = false, features = ["legacy-crypto"] }
 # DOCX text extraction (pure-Rust; quick-xml + zip + thiserror).
 docx-lite = { version = "0.2", optional = true }
 # Already linked via `pdf_oxide` (Cargo.lock:2206) with exactly these codecs

@@ -13,7 +13,8 @@ import {
 } from "../fileTypes";
 import { Lightbox } from "./Lightbox";
 
-const NO_VISION = "Model can't view images — sent as file";
+export const NO_VISION =
+  "This model can't view images — the picture is sent as a file it cannot see.";
 const TOO_BIG_FOR_MODEL =
   "Too large or unsupported for the model to view — sent as a file";
 
@@ -63,7 +64,7 @@ function RemoveButton({ name, onClick }: { name: string; onClick: () => void }) 
 }
 
 /** The ⚠ explanation for an image the model will receive as a file, if any. */
-function visionWarning(chip: Pending, supportsVision: boolean): string | null {
+export function visionWarning(chip: Pending, supportsVision: boolean): string | null {
   if (chip.state !== "done" || !isThumbnailable(chip.attachment.mime)) return null;
   if (chip.attachment.kind === "file") return TOO_BIG_FOR_MODEL;
   return supportsVision ? null : NO_VISION;

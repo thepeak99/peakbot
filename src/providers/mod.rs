@@ -24,13 +24,15 @@ use crate::mock::MockCompletionModel;
 use crate::pipeline::SubAgentDeps;
 use crate::state::StateManager;
 use crate::tools::env::{ToolEnv, builtin_tool_names};
+use crate::tools::workspace::Workspace;
 #[cfg(feature = "host")]
-use crate::tools::{
-    BashTool, FileCreateTool, FileInsertTool, FileReadTool, FileStrReplaceTool, ListDirectoryTool,
-    PdfReadTool, PowerShellTool, ShellBgTool,
-};
+use crate::tools::{BashTool, PowerShellTool, ShellBgTool};
 use crate::tools::{
     FetchPageTool, FetchUrlTool, SearchTool, ShellKind, ThinkTool, TodoTool, ViewImageTool,
+};
+use crate::tools::{
+    FileCreateTool, FileInsertTool, FileReadTool, FileStrReplaceTool, ListDirectoryTool,
+    PdfReadTool,
 };
 use anyhow::{Context, Result};
 use rig_core::agent::{Agent, AgentBuilder};
@@ -540,11 +542,18 @@ where
         Some(sm) => sm.session_cwd(),
         None => std::env::current_dir().unwrap_or_default(),
     };
+    // One root for all six file tools, shared by main agents and sub-agents
+    // (they receive the same `StateManager`). Local: confined to the
+    // conversation's upload folder, read per call.
+    #[cfg(feature = "host")]
+    let workspace: Workspace = Workspace::Open(session_cwd.clone());
+    #[cfg(not(feature = "host"))]
+    let workspace: Workspace = Workspace::Confined(state_manager.clone());
     #[cfg(feature = "host")]
     let shell_env = shell_env(&bash_env);
     // The Local edition plans no tool that touches the session cwd or a shell.
     #[cfg(not(feature = "host"))]
-    let _ = (bash_env, state_manager, wire_bash_panel);
+    let _ = (bash_env, wire_bash_panel);
 
     // The delegate tool's outer TimeBudget must not expire while the
     // sub-agent is parked — it awaits the same session gate as the hook and
@@ -557,18 +566,12 @@ where
     let mut tools: Vec<Box<dyn ToolDyn>> = Vec::with_capacity(planned.len() + 1);
     for name in planned {
         let tool: Box<dyn ToolDyn> = match name {
-            #[cfg(feature = "host")]
-            "file_create" => gate(Box::new(FileCreateTool::new(session_cwd.clone()))),
-            #[cfg(feature = "host")]
-            "file_str_replace" => gate(Box::new(FileStrReplaceTool::new(session_cwd.clone()))),
-            #[cfg(feature = "host")]
-            "file_insert" => gate(Box::new(FileInsertTool::new(session_cwd.clone()))),
-            #[cfg(feature = "host")]
-            "file_read" => gate(Box::new(FileReadTool::new(session_cwd.clone()))),
-            #[cfg(feature = "host")]
-            "pdf_read" => gate(Box::new(PdfReadTool::new(session_cwd.clone()))),
-            #[cfg(feature = "host")]
-            "list_directory" => gate(Box::new(ListDirectoryTool::new(session_cwd.clone()))),
+            "file_create" => gate(Box::new(FileCreateTool::new(workspace.clone()))),
+            "file_str_replace" => gate(Box::new(FileStrReplaceTool::new(workspace.clone()))),
+            "file_insert" => gate(Box::new(FileInsertTool::new(workspace.clone()))),
+            "file_read" => gate(Box::new(FileReadTool::new(workspace.clone()))),
+            "pdf_read" => gate(Box::new(PdfReadTool::new(workspace.clone()))),
+            "list_directory" => gate(Box::new(ListDirectoryTool::new(workspace.clone()))),
             "fetch_url" => gate(Box::new(FetchUrlTool::new(&tool_env.fetch_url))),
             "fetch_page" => gate(Box::new(FetchPageTool)),
             // `todo` is ungated: the task text already carries the plan, so a
@@ -2485,6 +2488,785 @@ mod tests {
         assert!(
             names.contains(&"bash_bg".to_string()),
             "disabled: [powershell_bg] must NOT drop bash_bg (separate names); got {names:?}"
+        );
+    }
+}
+
+// ─── Local edition file tools (mobile-attach part 1, RED) ────────────────
+//
+// TDD tests written BEFORE the implementation; Local + mock builds only.
+// The contract (design part 1): the Local edition registers the EXISTING
+// six file tools — `file_create`, `file_str_replace`, `file_insert`,
+// `file_read`, `pdf_read`, `list_directory` — confined to the
+// conversation's upload folder, while bash and doc tools stay absent.
+//
+// They drive the REAL rig seam (`add_builtin_tools` +
+// `tool_server_handle.call_tool`) and name no tool constructors, so they
+// COMPILE before the tools are un-gated in Local: today
+// `call_tool("file_read")` fails at runtime with "tool not found" — the
+// right RED (feature absent, not a typo). The design's test plan puts the
+// first two in `src/state/state_manager.rs`; they live here instead
+// because `add_builtin_tools` (the registration seam under test) is
+// private to this module.
+
+#[cfg(all(test, not(feature = "host"), feature = "mock"))]
+mod local_file_tools_tests {
+    use super::*;
+    use crate::attachments::{AttachmentKind, UploadStore, model_note};
+    use crate::config::{NameFilter, UploadsConfig};
+
+    const FILE_TOOLS: [&str; 6] = [
+        "file_create",
+        "file_str_replace",
+        "file_insert",
+        "file_read",
+        "pdf_read",
+        "list_directory",
+    ];
+
+    /// A `ToolEnv` with no optional extras (no search, no vector store,
+    /// no MCP servers) — the Local edition has no vector store at all.
+    fn local_tool_env() -> ToolEnv {
+        ToolEnv {
+            tools: NameFilter::default(),
+            fetch_url: crate::config::FetchUrlConfig::default(),
+            search: None,
+            vector: None,
+            mcp: crate::tools::env::McpSource::for_test(&[], NameFilter::default()),
+            base_env: Env::new(),
+            timeouts: TimeoutsConfig::default(),
+            max_turns: 0,
+        }
+    }
+
+    type LocalAgent = rig_core::agent::Agent<MockCompletionModel, ()>;
+
+    /// The real Local build: `add_builtin_tools` with the given env and
+    /// state manager (the confinement root is read from it per call).
+    fn local_agent(tool_env: &ToolEnv, sm: Option<Arc<StateManager>>) -> LocalAgent {
+        add_builtin_tools(
+            AgentBuilder::new(MockCompletionModel::new()),
+            tool_env,
+            Env::new(),
+            None, // todo
+            None, // delegate
+            sm,
+            None,  // shell kind
+            None,  // view_image
+            false, // wire bash panel
+        )
+        .build()
+    }
+
+    async fn tool_names(handle: &rig_core::tool::server::ToolServerHandle) -> Vec<String> {
+        handle
+            .get_tool_defs(None)
+            .await
+            .expect("tool defs")
+            .into_iter()
+            .map(|d| d.name)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn local_build_registers_the_six_file_tools() {
+        let env = local_tool_env();
+        let agent = local_agent(&env, None);
+        let names = tool_names(&agent.tool_server_handle).await;
+        for tool in FILE_TOOLS {
+            assert!(
+                names.iter().any(|n| n == tool),
+                "the Local build must register `{tool}`; registered: {names:?}"
+            );
+        }
+        // The five existing Local built-ins stay.
+        for tool in ["fetch_url", "fetch_page", "todo", "think"] {
+            assert!(
+                names.iter().any(|n| n == tool),
+                "the Local build keeps `{tool}`; registered: {names:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn local_build_tools_only_filter_drops_the_file_tools() {
+        let mut env = local_tool_env();
+        env.tools = NameFilter {
+            only: vec!["think".into()],
+            ..Default::default()
+        };
+        let agent = local_agent(&env, None);
+        let names = tool_names(&agent.tool_server_handle).await;
+        for tool in FILE_TOOLS {
+            assert!(
+                !names.iter().any(|n| n == tool),
+                "`tools: {{ only: [think] }}` must drop `{tool}`; registered: {names:?}"
+            );
+        }
+        assert!(
+            names.iter().any(|n| n == "think"),
+            "the allowlisted tool stays; registered: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_build_keeps_shell_and_doc_tools_absent() {
+        let env = local_tool_env();
+        let agent = local_agent(&env, None);
+        let names = tool_names(&agent.tool_server_handle).await;
+        for tool in [
+            "bash",
+            "bash_bg",
+            "powershell",
+            "powershell_bg",
+            "doc_index",
+            "doc_search",
+            "view_image",
+        ] {
+            assert!(
+                !names.iter().any(|n| n == tool),
+                "the Local build must NOT register `{tool}`; registered: {names:?}"
+            );
+        }
+    }
+
+    /// The model-facing contract end to end: the path printed by
+    /// `attachments::model_note` for a stored NON-IMAGE attachment is
+    /// readable by the Local build's `file_read`.
+    #[tokio::test]
+    async fn local_file_read_reads_a_model_note_path_of_a_stored_attachment() {
+        let root = tempfile::tempdir().unwrap();
+        let store = UploadStore::new(root.path().to_path_buf(), UploadsConfig::default());
+        let sm = StateManager::new_arc_for_session(None, store.clone());
+        let env = local_tool_env();
+        let agent = local_agent(&env, Some(sm.clone()));
+        let handle = agent.tool_server_handle.clone();
+
+        sm.create_conversation("c".into(), "p".into(), "m".into(), String::new());
+        let convo = sm.get_current_conversation_id().expect("minted");
+        let att = store
+            .store(convo, "invoice.txt", &b"invoice contents"[..])
+            .await
+            .expect("store the attachment");
+        assert_eq!(
+            att.kind,
+            AttachmentKind::File,
+            "the fixture must be a non-image attachment"
+        );
+
+        // The absolute path the model is told to read.
+        let note = model_note(&store, std::slice::from_ref(&att));
+        let path = note
+            .lines()
+            .nth(1)
+            .expect("one attachment line")
+            .rsplit_once(": ")
+            .expect("path after ': '")
+            .1
+            .to_string();
+        assert!(
+            path.starts_with(root.path().to_string_lossy().as_ref()),
+            "model_note points into the store: {path}"
+        );
+
+        let out = handle
+            .call_tool(
+                "file_read",
+                &format!(
+                    "{{\"path\":{}}}",
+                    serde_json::to_string(&path).expect("json")
+                ),
+            )
+            .await
+            .expect("the Local build registers file_read and reads the model_note path");
+        assert!(
+            out.contains("invoice contents"),
+            "file_read must return the attachment content, got: {out}"
+        );
+    }
+
+    /// Confinement root is read PER CALL: a conversation minted AFTER the
+    /// tools were built (the `/new` + `/model` rebuild shape) is the one
+    /// the tools resolve against.
+    #[tokio::test]
+    async fn a_conversation_minted_after_the_tools_were_built_is_the_one_resolved_against() {
+        let root = tempfile::tempdir().unwrap();
+        let store = UploadStore::new(root.path().to_path_buf(), UploadsConfig::default());
+        let sm = StateManager::new_arc_for_session(None, store);
+        let env = local_tool_env();
+        // The tools are built while NO conversation exists…
+        let agent = local_agent(&env, Some(sm.clone()));
+        let handle = agent.tool_server_handle.clone();
+        assert!(sm.get_current_conversation_id().is_none(), "fixture");
+
+        // …and only then is the conversation minted.
+        sm.create_conversation("c".into(), "p".into(), "m".into(), String::new());
+        let convo = sm.get_current_conversation_id().expect("minted");
+        let work = root.path().join(convo.to_string()).join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("late.txt"), "late file").unwrap();
+
+        let out = handle
+            .call_tool("file_read", r#"{"path":"late.txt"}"#)
+            .await
+            .expect("a relative path must resolve against the post-build conversation");
+        assert!(
+            out.contains("late file"),
+            "the post-build conversation must be the one resolved against, got: {out}"
+        );
+    }
+
+    /// Main agent and sub-agent share the confinement root: a file the
+    /// main agent `file_create`s is the one the sub-agent's `file_read`
+    /// sees (design part 1 §5: `build_sub_agent` passes the same
+    /// `StateManager`).
+    #[tokio::test]
+    async fn main_agent_file_create_is_visible_to_the_sub_agent_file_read() {
+        let root = tempfile::tempdir().unwrap();
+        let store = UploadStore::new(root.path().to_path_buf(), UploadsConfig::default());
+        let sm = StateManager::new_arc_for_session(None, store);
+        sm.create_conversation("c".into(), "p".into(), "m".into(), String::new());
+
+        let model = ResolvedModel {
+            alias: "mock".to_string(),
+            model_name: "mock-model".to_string(),
+            provider_name: "mock".to_string(),
+            provider_kind: crate::config::ProviderType::Mock,
+            provider_config: crate::config::ProviderConfig::Mock,
+            context_size: 100_000,
+        };
+        let env = local_tool_env();
+        let member = Member {
+            name: "main".to_string(),
+            model: model.clone(),
+            skills: NameFilter::default(),
+            agents_md: false,
+            env: Default::default(),
+        };
+        let (main, _info, _events, _hook) =
+            create_provider(&model, "p", &env, &member, None, None, sm.clone(), None)
+                .expect("main agent builds");
+        let sub = Subagent {
+            member: Member {
+                name: "worker".to_string(),
+                model: model.clone(),
+                skills: NameFilter::default(),
+                agents_md: false,
+                env: Default::default(),
+            },
+            prompt: "you are a worker".to_string(),
+        };
+        let (sub_agent, _hook) = build_sub_agent(&env, &sub, &model, "p", None, sm.clone(), None)
+            .expect("sub agent builds");
+
+        let main_handle = match &main {
+            DynAgent::Mock(a) => a.tool_server_handle.clone(),
+            _ => panic!("expected the mock main agent"),
+        };
+        let sub_handle = match &sub_agent {
+            DynAgent::Mock(a) => a.tool_server_handle.clone(),
+            _ => panic!("expected the mock sub agent"),
+        };
+
+        let names = tool_names(&main_handle).await;
+        assert!(
+            names.iter().any(|n| n == "file_create"),
+            "the main agent must have file_create; registered: {names:?}"
+        );
+        main_handle
+            .call_tool("file_create", r#"{"path":"a.txt","file_text":"shared"}"#)
+            .await
+            .expect("main agent file_create");
+
+        let out = sub_handle
+            .call_tool("file_read", r#"{"path":"a.txt"}"#)
+            .await
+            .expect("the sub agent's file_read must see the main agent's file (same root)");
+        assert!(out.contains("shared"), "got: {out}");
+        let _ = root;
+    }
+    // ─── End-to-end confinement: real tools through the tool server ──────
+    //
+    // Refusals surface as `Err(ToolServerError)` from `call_tool` (rig maps
+    // a tool's `Err` into `ToolSetError::ToolCallError`); the message the
+    // model sees is carried inside that error's Display.
+
+    /// A fresh uploads root + state manager with one minted conversation.
+    fn confinement_layout() -> (
+        tempfile::TempDir,
+        crate::attachments::UploadStore,
+        Arc<StateManager>,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let store = UploadStore::new(root.path().to_path_buf(), UploadsConfig::default());
+        let sm = StateManager::new_arc_for_session(None, store.clone());
+        sm.create_conversation("c".into(), "p".into(), "m".into(), String::new());
+        (root, store, sm)
+    }
+
+    /// The absolute attachment path the attached-files note prints.
+    fn attachment_path(store: &UploadStore, att: &crate::attachments::Attachment) -> String {
+        let note = model_note(store, std::slice::from_ref(att));
+        note.lines()
+            .nth(1)
+            .expect("one attachment line")
+            .rsplit_once(": ")
+            .expect("path after ': '")
+            .1
+            .to_string()
+    }
+
+    /// The file `store` puts `name` at inside conversation `convo`.
+    fn stored_file(
+        root: &tempfile::TempDir,
+        convo: &str,
+        att: &crate::attachments::Attachment,
+    ) -> std::path::PathBuf {
+        root.path()
+            .join(convo)
+            .join(att.id.to_string())
+            .join(&att.name)
+    }
+
+    /// `file_create` with `../../escape.txt`, an absolute path outside the
+    /// uploads root, and `../<upload-id>/new.txt` beside an attachment are
+    /// each refused with the locked outside message, and nothing is created
+    /// at the target.
+    #[tokio::test]
+    async fn file_create_refuses_every_escape_and_writes_nothing() {
+        let (root, store, sm) = confinement_layout();
+        let convo = sm.get_current_conversation_id().expect("minted");
+        let convo_s = convo.to_string();
+        let agent = local_agent(&local_tool_env(), Some(sm.clone()));
+        let handle = agent.tool_server_handle.clone();
+
+        let att = store
+            .store(convo, "doc.txt", &b"attachment"[..])
+            .await
+            .expect("store");
+        let beside = root
+            .path()
+            .join(&convo_s)
+            .join(att.id.to_string())
+            .join("new.txt");
+
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("escape-abs.txt");
+
+        // (path, fragment of the refusal the model must see). Beside an
+        // attachment is inside the read boundary, so it is read-only.
+        for (raw, want) in [
+            (
+                "../../escape.txt".to_string(),
+                "is outside this conversation's folder",
+            ),
+            (
+                outside_file.to_str().unwrap().to_string(),
+                "is outside this conversation's folder",
+            ),
+            (
+                format!("../{}/new.txt", att.id),
+                "is read-only: attached files cannot be changed",
+            ),
+        ] {
+            let args = format!(
+                "{{\"path\":{},\"file_text\":\"pwned\"}}",
+                serde_json::to_string(&raw).expect("json")
+            );
+            let err = handle
+                .call_tool("file_create", &args)
+                .await
+                .expect_err("the escape must be refused")
+                .to_string();
+            assert!(
+                err.contains(want),
+                "file_create({raw:?}) must be refused with `{want}`, got: {err}"
+            );
+        }
+        assert!(
+            !root.path().join("escape.txt").exists(),
+            "no file at the uploads root"
+        );
+        assert!(!outside_file.exists(), "no file outside the uploads root");
+        assert!(!beside.exists(), "no file beside the attachment");
+        let _ = root;
+    }
+
+    /// `file_str_replace` and `file_insert` on an attachment's absolute
+    /// path are refused as read-only, and the attachment's bytes are
+    /// unchanged.
+    #[tokio::test]
+    async fn attachment_is_read_only_for_the_edit_tools() {
+        let (root, store, sm) = confinement_layout();
+        let convo = sm.get_current_conversation_id().expect("minted");
+        let agent = local_agent(&local_tool_env(), Some(sm.clone()));
+        let handle = agent.tool_server_handle.clone();
+
+        let att = store
+            .store(convo, "note.txt", &b"original bytes"[..])
+            .await
+            .expect("store");
+        let path = attachment_path(&store, &att);
+        let file = stored_file(&root, &convo.to_string(), &att);
+        assert_eq!(std::fs::read(&file).unwrap(), b"original bytes", "fixture");
+
+        let args = format!(
+            "{{\"path\":{},\"old_str\":\"original\",\"new_str\":\"tampered\"}}",
+            serde_json::to_string(&path).expect("json")
+        );
+        let err = handle
+            .call_tool("file_str_replace", &args)
+            .await
+            .expect_err("editing an attachment must be refused")
+            .to_string();
+        assert!(
+            err.contains("is read-only: attached files cannot be changed"),
+            "file_str_replace on the attachment must be the read-only refusal, got: {err}"
+        );
+
+        let args = format!(
+            "{{\"path\":{},\"insert_line\":0,\"insert_text\":\"tampered\"}}",
+            serde_json::to_string(&path).expect("json")
+        );
+        let err = handle
+            .call_tool("file_insert", &args)
+            .await
+            .expect_err("editing an attachment must be refused")
+            .to_string();
+        assert!(
+            err.contains("is read-only: attached files cannot be changed"),
+            "file_insert on the attachment must be the read-only refusal, got: {err}"
+        );
+
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            b"original bytes",
+            "the attachment's bytes must be unchanged"
+        );
+        let _ = root;
+    }
+
+    /// `file_read` and `list_directory` on another conversation's folder
+    /// (relative and absolute) and on a real outside file are refused, and
+    /// none of the outside content appears in the result.
+    #[tokio::test]
+    async fn other_conversation_and_real_files_are_unreadable() {
+        let (root, _store, sm) = confinement_layout();
+        let agent = local_agent(&local_tool_env(), Some(sm.clone()));
+        let handle = agent.tool_server_handle.clone();
+
+        // The conversation minted by the fixture becomes the OTHER one (it
+        // holds a secret); a second one is minted and is the current one.
+        let other = sm
+            .get_current_conversation_id()
+            .expect("minted")
+            .to_string();
+        sm.create_conversation("current".into(), "p".into(), "m".into(), String::new());
+        assert_ne!(
+            sm.get_current_conversation_id()
+                .expect("minted")
+                .to_string(),
+            other,
+            "fixture: the current conversation is a different one"
+        );
+        let other_file = root.path().join(&other).join("work").join("secret.txt");
+        std::fs::create_dir_all(other_file.parent().unwrap()).unwrap();
+        std::fs::write(&other_file, "their-convo-secret").unwrap();
+
+        // A real file outside the uploads root, with distinctive content.
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("hostname-like.txt");
+        std::fs::write(&outside_file, "real-outside-content").unwrap();
+
+        let want = "is outside this conversation's folder";
+        for raw in [
+            format!("../../{other}/work/secret.txt"),
+            other_file.to_str().unwrap().to_string(),
+            format!("../../{other}"),
+            root.path().join(&other).to_str().unwrap().to_string(),
+            outside_file.to_str().unwrap().to_string(),
+            "/etc/hostname".to_string(),
+            "/etc".to_string(),
+        ] {
+            let args = format!(
+                "{{\"path\":{}}}",
+                serde_json::to_string(&raw).expect("json")
+            );
+            for tool in ["file_read", "list_directory"] {
+                let msg = match handle.call_tool(tool, &args).await {
+                    Ok(body) => panic!("{tool}({raw:?}) must be refused, got: {body}"),
+                    Err(e) => e.to_string(),
+                };
+                assert!(
+                    msg.contains(want),
+                    "{tool}({raw:?}) must be the outside refusal, got: {msg}"
+                );
+                for leaked in ["their-convo-secret", "real-outside-content"] {
+                    assert!(
+                        !msg.contains(leaked),
+                        "{tool}({raw:?}) leaked `{leaked}`: {msg}"
+                    );
+                }
+            }
+        }
+        let _ = root;
+    }
+
+    /// The tool server reports a refusal as `Err`, and the exact
+    /// model-facing message is carried inside it.
+    #[tokio::test]
+    async fn refusal_surfaces_as_an_error_carrying_the_locked_message() {
+        let (_root, _store, sm) = confinement_layout();
+        let agent = local_agent(&local_tool_env(), Some(sm.clone()));
+        let handle = agent.tool_server_handle.clone();
+        let raw = "../../escape.txt";
+        let err = handle
+            .call_tool(
+                "file_read",
+                &format!("{{\"path\":{}}}", serde_json::to_string(raw).unwrap()),
+            )
+            .await
+            .expect_err("a refusal is an error, not a result string")
+            .to_string();
+        let expected = format!(
+            "Path '{raw}' is outside this conversation's folder. Use a relative path, or a path from the attached-files list."
+        );
+        assert!(
+            err.contains(&expected),
+            "the exact outside message must reach the caller, got: {err}"
+        );
+    }
+
+    /// Positive cases: `file_create notes.md` then `file_read notes.md`
+    /// round-trips; `list_directory .` shows it.
+    #[tokio::test]
+    async fn work_folder_round_trips_create_read_and_list() {
+        let (_root, _store, sm) = confinement_layout();
+        let agent = local_agent(&local_tool_env(), Some(sm.clone()));
+        let handle = agent.tool_server_handle.clone();
+
+        handle
+            .call_tool(
+                "file_create",
+                r#"{"path":"notes.md","file_text":"round-trip content"}"#,
+            )
+            .await
+            .expect("creating in work/ must succeed");
+
+        let out = handle
+            .call_tool("file_read", r#"{"path":"notes.md"}"#)
+            .await
+            .expect("reading the created file must succeed");
+        assert!(
+            out.contains("round-trip content"),
+            "file_read must return the created content, got: {out}"
+        );
+
+        let out = handle
+            .call_tool("list_directory", r#"{"path":"."}"#)
+            .await
+            .expect("listing work/ must succeed");
+        assert!(
+            out.contains("notes.md"),
+            "list_directory . must show notes.md, got: {out}"
+        );
+    }
+
+    /// A stored attachment read by the absolute path that
+    /// `attachments::model_note` prints returns its content, and a stored
+    /// PDF read with `pdf_read` returns its text.
+    #[tokio::test]
+    async fn stored_attachments_are_readable_by_their_model_note_paths() {
+        let (_root, store, sm) = confinement_layout();
+        let convo = sm.get_current_conversation_id().expect("minted");
+        let agent = local_agent(&local_tool_env(), Some(sm.clone()));
+        let handle = agent.tool_server_handle.clone();
+
+        let txt = store
+            .store(convo, "plain.txt", &b"attachment body 123"[..])
+            .await
+            .expect("store");
+        let path = attachment_path(&store, &txt);
+        let out = handle
+            .call_tool(
+                "file_read",
+                &format!("{{\"path\":{}}}", serde_json::to_string(&path).unwrap()),
+            )
+            .await
+            .expect("reading a stored attachment must succeed");
+        assert!(
+            out.contains("attachment body 123"),
+            "file_read must return the attachment content, got: {out}"
+        );
+
+        let pdf = store
+            .store(convo, "hello.pdf", HELLO_PDF)
+            .await
+            .expect("store");
+        let path = attachment_path(&store, &pdf);
+        let out = handle
+            .call_tool(
+                "pdf_read",
+                &format!("{{\"path\":{}}}", serde_json::to_string(&path).unwrap()),
+            )
+            .await
+            .expect("pdf_read of a stored PDF must succeed");
+        assert!(
+            out.contains("Hello PDF"),
+            "pdf_read must return the PDF text, got: {out}"
+        );
+    }
+
+    /// A minimal valid single-page PDF whose only text is "Hello PDF" —
+    /// the same hand-built fixture the `pdf_read` unit tests use.
+    const HELLO_PDF: &[u8] = b"%PDF-1.4\n\
+1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n\
+3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n\
+4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n\
+5 0 obj\n<< /Length 40 >>\nstream\nBT /F1 24 Tf 72 700 Td (Hello PDF) Tj ET\nendstream\nendobj\n\
+xref\n0 6\n\
+0000000000 65535 f \n\
+0000000009 00000 n \n\
+0000000058 00000 n \n\
+0000000115 00000 n \n\
+0000000241 00000 n \n\
+0000000311 00000 n \n\
+trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n401\n%%EOF\n";
+
+    /// A symlink planted in `work/` pointing outside the uploads root:
+    /// `file_read` through it is refused, and `file_create` through it is
+    /// refused with the outside target never created.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_in_work_pointing_outside_is_refused() {
+        let (root, _store, sm) = confinement_layout();
+        let agent = local_agent(&local_tool_env(), Some(sm.clone()));
+        let handle = agent.tool_server_handle.clone();
+
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("leak.txt");
+        std::fs::write(&outside_file, "outside secret").unwrap();
+
+        let convo = sm
+            .get_current_conversation_id()
+            .expect("minted")
+            .to_string();
+        let work = root.path().join(&convo).join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::os::unix::fs::symlink(&outside_file, work.join("link")).unwrap();
+
+        let err = handle
+            .call_tool("file_read", r#"{"path":"link"}"#)
+            .await
+            .expect_err("reading through the symlink must be refused")
+            .to_string();
+        assert!(
+            err.contains("is outside this conversation's folder"),
+            "file_read through the symlink must be the outside refusal, got: {err}"
+        );
+        assert!(
+            !err.contains("outside secret"),
+            "the refusal must not leak the target content: {err}"
+        );
+
+        let err = handle
+            .call_tool(
+                "file_create",
+                r#"{"path":"link/new.txt","file_text":"pwned"}"#,
+            )
+            .await
+            .expect_err("creating through the symlink must be refused")
+            .to_string();
+        assert!(
+            err.contains("is outside this conversation's folder"),
+            "file_create through the symlink must be the outside refusal, got: {err}"
+        );
+        assert!(
+            !outside_file.join("new.txt").exists(),
+            "no file created outside"
+        );
+        let _ = (root, outside);
+    }
+
+    /// A symlinked DIRECTORY in `work/` pointing outside: reading and
+    /// listing through it are refused (plain and recursive), the recursive
+    /// listing of `.` never descends into it, and an in-place edit through
+    /// a symlink to an outside FILE leaves that file's bytes unchanged.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_dir_and_file_in_work_never_expose_or_change_outside_content() {
+        let (root, _store, sm) = confinement_layout();
+        let convo = sm
+            .get_current_conversation_id()
+            .expect("minted")
+            .to_string();
+        let agent = local_agent(&local_tool_env(), Some(sm.clone()));
+        let handle = agent.tool_server_handle.clone();
+
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("deep")).unwrap();
+        std::fs::write(
+            outside.path().join("deep").join("leaked-name.txt"),
+            "dir-secret",
+        )
+        .unwrap();
+        let outside_file = outside.path().join("edit-me.txt");
+        std::fs::write(&outside_file, "line one\n").unwrap();
+
+        let work = root.path().join(&convo).join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::os::unix::fs::symlink(outside.path(), work.join("dirlink")).unwrap();
+        std::os::unix::fs::symlink(&outside_file, work.join("filelink")).unwrap();
+        std::fs::write(work.join("inside.txt"), "inside").unwrap();
+
+        let want = "is outside this conversation's folder";
+        for (tool, args) in [
+            ("list_directory", r#"{"path":"dirlink"}"#),
+            ("list_directory", r#"{"path":"dirlink","recursive":true}"#),
+            ("file_read", r#"{"path":"dirlink/deep/leaked-name.txt"}"#),
+            ("file_read", r#"{"path":"filelink"}"#),
+            (
+                "file_create",
+                r#"{"path":"dirlink/deep/new.txt","file_text":"x"}"#,
+            ),
+            (
+                "file_str_replace",
+                r#"{"path":"filelink","old_str":"one","new_str":"PWNED"}"#,
+            ),
+            (
+                "file_insert",
+                r#"{"path":"filelink","insert_line":0,"insert_text":"PWNED"}"#,
+            ),
+        ] {
+            let msg = match handle.call_tool(tool, args).await {
+                Ok(body) => panic!("{tool} {args} must be refused, got: {body}"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                msg.contains(want),
+                "{tool} {args}: expected outside refusal, got: {msg}"
+            );
+            assert!(
+                !msg.contains("dir-secret"),
+                "{tool} {args} leaked content: {msg}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&outside_file).unwrap(),
+            "line one\n"
+        );
+        assert!(!outside.path().join("deep").join("new.txt").exists());
+
+        // Recursive listing of `.` must not walk through the dir symlink.
+        let listing = handle
+            .call_tool("list_directory", r#"{"path":".","recursive":true}"#)
+            .await
+            .expect("listing work/ must succeed");
+        assert!(listing.contains("inside.txt"), "got: {listing}");
+        assert!(
+            !listing.contains("leaked-name.txt") && !listing.contains("edit-me.txt"),
+            "recursive list_directory followed a symlink out of the folder: {listing}"
         );
     }
 }

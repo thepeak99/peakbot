@@ -2,23 +2,17 @@
 //!
 //! The locked rule: **the memory.md prompt section (and the compaction
 //! memory flush, which shares the same gate) is present iff
-//! `memory.enabled ∧ file_create is registered`** — always false in the
-//! Local edition, and false in the full edition when a `tools:` filter
-//! disables `file_create`.
+//! `memory.enabled ∧ file_create is registered`** in the full edition, and
+//! false in the full edition when a `tools:` filter disables `file_create`.
+//! In the Local edition `file_create` IS registered (confined to the
+//! conversation folder) but the memory section is always absent: the
+//! memory-driving predicate (`tools::env::file_create_registered`) is
+//! host-only on purpose.
 //!
-//! **RED today by BEHAVIOUR (full edition only):** the current gate is
-//! `memory.enabled && cfg!(feature = "host")` (the private `memory_applies`
-//! in `src/lib.rs`), which does NOT consult the `tools:` filter. Row
-//! (enabled, `file_create` disabled) fails: the prompt carries the memory
-//! section although `file_create` is not registered. Every other row is
-//! green today and stays a guard.
-//!
-//! **The seam to implement:** `build_agent_prompt`
-//! decides the memory section by the SAME registration check the tool build
-//! uses — `file_create` in `main_agent_tool_names` for the bound agent
-//! (i.e. `profile.tools.allows("file_create")` in the full edition, never in
-//! Local). The compaction flush call site in `agent_loop` must stay on the
-//! same derived rule (same predicate, not a copy of `cfg!(feature = "host")`).
+//! **Seam:** `build_agent_prompt` decides the memory section through the
+//! derived predicate `memory_applies` (`src/lib.rs`), which reads
+//! `tools::env::file_create_registered`; the compaction flush call site uses
+//! the same predicate.
 //!
 //! **Oracle:** `main_agent_tool_names(env, agent)` (pure, public) is the
 //! single source of truth for "which built-ins a build registers" — the test
@@ -51,8 +45,8 @@ const MEMORY_MARKER: &str = "# Memory.md";
 /// filter per row (absent = allow all).
 fn global_yaml(memory_enabled: bool, disable_file_create: bool) -> String {
     let tools = if disable_file_create {
-        // Host-only row: in Local `file_create` is not a known tool and the
-        // parse would (correctly) reject the name.
+        // `file_create` is a known tool name in both editions (the Local
+        // edition registers it too), so the filter parses everywhere.
         "    tools:\n      disabled: [file_create]\n"
     } else {
         ""
@@ -83,42 +77,33 @@ struct Row {
 }
 
 impl Row {
-    /// `file_create` is registered in the full edition iff the filter
-    /// allows it; in Local it is never registered (not a Local tool name).
+    /// `file_create` is registered in BOTH editions iff the `tools:` filter
+    /// allows it (the Local edition registers it as a confined file tool).
     fn file_create_registered(&self) -> bool {
-        cfg!(feature = "host") && !self.disable_file_create
+        !self.disable_file_create
     }
 
-    /// The locked rule: section present iff `memory.enabled ∧ file_create
-    /// registered`.
+    /// The memory.md prompt section: present iff `memory.enabled ∧
+    /// file_create registered` in the host edition; NEVER present in the
+    /// Local edition (the memory rule is host-only on purpose, even though
+    /// `file_create` is registered there).
     fn expect_present(&self) -> bool {
-        self.memory_enabled && self.file_create_registered()
+        cfg!(feature = "host") && self.memory_enabled && self.file_create_registered()
     }
 }
 
 fn rows() -> Vec<Row> {
-    let mut out = vec![
-        Row {
-            memory_enabled: true,
-            disable_file_create: false,
-        },
-        Row {
-            memory_enabled: false,
-            disable_file_create: false,
-        },
-    ];
-    if cfg!(feature = "host") {
-        // The RED row: enabled memory + `file_create` filtered out ⇒ no
-        // section, even in the full edition.
-        out.push(Row {
-            memory_enabled: true,
-            disable_file_create: true,
-        });
+    // Full 2x2 table in both editions. In Local, the (memory enabled,
+    // file_create registered) row pins "registered but memory stays off".
+    let mut out = Vec::new();
+    for memory_enabled in [true, false] {
+        for disable_file_create in [false, true] {
+            out.push(Row {
+                memory_enabled,
+                disable_file_create,
+            });
+        }
     }
-    // Local: the first row IS the "enabled memory, no file tools" row —
-    // expect_present() is false there, so Local pins "never present, even
-    // with memory.enabled: true" on that row. No filter row: `file_create`
-    // is not a Local tool name at all (the parse would reject it).
     out
 }
 

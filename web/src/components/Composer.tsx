@@ -37,12 +37,12 @@
 // to `readClipboardImage()` (WebKit Bug 218519).
 
 import { useRef, useState, useLayoutEffect } from "react";
-import { edition, isDesktop, readClipboardImage } from "../desktop";
+import { isDesktop, readClipboardImage } from "../desktop";
 import type { SlashCommand } from "../state";
 import type { SubAgentRun } from "../types";
 import type { Attachments } from "../useAttachments";
 import { useMediaQuery } from "../useMediaQuery";
-import { AttachmentChip } from "./AttachmentChip";
+import { AttachmentChip, NO_VISION, visionWarning } from "./AttachmentChip";
 
 // Composer height budget. The textarea rests at a single row and grows with
 // its content up to a hard cap, past which it scrolls internally. Values are px.
@@ -134,6 +134,7 @@ export function Composer({
   // return key never fires a half-typed message.
   const touchInput = useMediaQuery("(pointer: coarse)");
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const cameraInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   // Grow the textarea with its content between `MIN_H` (one row) and `MAX_H`;
@@ -346,18 +347,32 @@ export function Composer({
                 ))}
               </div>
             )}
+            {attachments.pending.some(
+              (chip) => visionWarning(chip, supportsVision) === NO_VISION,
+            ) && (
+              <p role="status" className="px-1 pt-1 text-xs text-amber-400">
+                {NO_VISION}
+              </p>
+            )}
 
             <div className="flex items-end gap-2">
               <input
                 ref={fileInputRef}
                 type="file"
                 multiple
-                // The local edition (phone build) accepts images only —
-                // the Local server answers non-image uploads with 415.
-                accept={edition() === "local" ? "image/*" : undefined}
                 onChange={onPickFiles}
                 className="hidden"
               />
+              {touchInput && (
+                <input
+                  ref={cameraInputRef}
+                  type="file"
+                  accept="image/*"
+                  capture="environment"
+                  onChange={onPickFiles}
+                  className="hidden"
+                />
+              )}
               <button
                 type="button"
                 disabled={!connected}
@@ -378,6 +393,20 @@ export function Composer({
                   <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
                 </svg>
               </button>
+              {touchInput && (
+                <button
+                  type="button"
+                  disabled={!connected}
+                  onClick={() => cameraInputRef.current?.click()}
+                  title="Take photo"
+                  aria-label="Take photo"
+                  className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <span className="text-base leading-none" aria-hidden>
+                    📷
+                  </span>
+                </button>
+              )}
               <textarea
                 ref={textareaRef}
                 rows={1}
