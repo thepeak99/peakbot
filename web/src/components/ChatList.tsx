@@ -43,9 +43,7 @@ export function ChatList({
 }: ChatListProps) {
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState("");
-  void query;
   void selected;
-  void setQuery;
   void setSelected;
   void conversations;
   void catalog;
@@ -111,6 +109,39 @@ export function ChatList({
               </span>
             </span>
           </div>
+        </div>
+        <div className="relative mt-1">
+          <svg
+            aria-hidden="true"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500"
+          >
+            <circle cx="11" cy="11" r="7" />
+            <path d="m21 21-4.35-4.35" />
+          </svg>
+          <input
+            type="text"
+            aria-label="Search chats"
+            placeholder="Search chats"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            className="h-11 w-full rounded-lg border border-zinc-800 bg-zinc-900 pl-9 pr-9 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-zinc-600"
+          />
+          {query !== "" && (
+            <button
+              type="button"
+              aria-label="Clear search"
+              onClick={() => setQuery("")}
+              className="absolute right-2 top-1/2 flex h-6 w-6 -translate-y-1/2 cursor-pointer items-center justify-center rounded-full bg-zinc-800 text-xs text-zinc-300 transition-colors hover:bg-zinc-700"
+            >
+              ✕
+            </button>
+          )}
         </div>
         {error && (
           <div
