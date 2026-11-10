@@ -9,8 +9,15 @@
 // live session instead of starting a fresh transcript. The URL is kept in
 // sync with the session's current conversation so refresh/bookmark/share all
 // land on the same session.
+//
+// Liveness: the server beats a `heartbeat` frame every 20 s. Once a socket
+// has produced one, a watchdog (liveness.ts) restarts it after > 45 s of
+// silence; resume signals (tab visible, bfcache restore, network back,
+// mobile `peakbot-resume`) restart it at once when it is not provably
+// healthy. A server that never beats never arms the watchdog.
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { WATCHDOG_TICK_MS, heard, shouldReconnect } from "./liveness";
 import { profileFromUrl, setConvoInUrl } from "./state";
 import type {
   AppState,
@@ -91,9 +98,11 @@ export function useAgent(): AgentConnection {
   const [error, setError] = useState<string | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
-  const connectRef = useRef<() => void>(() => {});
+  const restartRef = useRef<() => void>(() => {});
   const backoffRef = useRef(500); // ms, capped below
-  const closedByUs = useRef(false);
+  // Per-socket liveness clock (liveness.ts): null until this socket's first
+  // `heartbeat`, so a server that never beats never trips the watchdog.
+  const lastHeardRef = useRef<number | null>(null);
   // The conversation this client is bound to. Seeded from the URL (the only
   // binding), updated by `attached`/state, re-sent verbatim on reconnect.
   const convoRef = useRef<string | null>(convoFromUrl());
@@ -145,11 +154,11 @@ export function useAgent(): AgentConnection {
   }, []);
 
   useEffect(() => {
-    closedByUs.current = false;
-
     const connect = () => {
       const ws = new WebSocket(wsUrl());
       wsRef.current = ws;
+      // A replacement socket starts disarmed: its own first heartbeat arms it.
+      lastHeardRef.current = null;
 
       ws.onopen = () => {
         setConnected(true);
@@ -178,6 +187,8 @@ export function useAgent(): AgentConnection {
         } catch {
           return;
         }
+        // Any frame proves the pipe is live; only a `heartbeat` arms the clock.
+        lastHeardRef.current = heard(lastHeardRef.current, msg.type, Date.now());
         switch (msg.type) {
           case "ready":
             break;
@@ -224,16 +235,16 @@ export function useAgent(): AgentConnection {
           case "error":
             setError(msg.message);
             break;
+          case "heartbeat":
+            break;
         }
       };
 
       ws.onclose = () => {
+        // Only unasked closes reach here: every intentional close goes
+        // through drop(), which detaches the handlers before closing.
         setConnected(false);
-        if (closedByUs.current) return;
-        // Reconnect with capped exponential backoff.
-        const delay = backoffRef.current;
-        backoffRef.current = Math.min(delay * 2, 8000);
-        reconnectTimerRef.current = window.setTimeout(connect, delay);
+        scheduleReconnect();
       };
 
       ws.onerror = () => {
@@ -241,22 +252,95 @@ export function useAgent(): AgentConnection {
       };
     };
 
-    connectRef.current = connect;
+    const scheduleReconnect = () => {
+      // Reconnect with capped exponential backoff.
+      const delay = backoffRef.current;
+      backoffRef.current = Math.min(delay * 2, 8000);
+      reconnectTimerRef.current = window.setTimeout(connect, delay);
+    };
+
+    const drop = () => {
+      window.clearTimeout(reconnectTimerRef.current);
+      const ws = wsRef.current;
+      if (ws) {
+        // Detach before close: the queued close event must not reach a
+        // replaced socket's handlers and schedule a duplicate dial.
+        ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
+        ws.close();
+      }
+      setConnected(false);
+    };
+
+    const restart = () => {
+      backoffRef.current = 500;
+      drop();
+      connect();
+    };
+
+    restartRef.current = restart;
+
+    const kick = () => {
+      // A "we are back" signal: any non-OPEN socket (or a stale OPEN one)
+      // is suspect — a suspended browser's socket is usually dead in place.
+      if (
+        shouldReconnect("kick", wsRef.current?.readyState ?? null, lastHeardRef.current, Date.now())
+      ) {
+        restart();
+      }
+    };
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") kick();
+    };
+    const onPageshow = (ev: PageTransitionEvent) => {
+      // A bfcache restore: the socket survived neither the navigation nor the cache.
+      if (ev.persisted) kick();
+    };
+    const onOnline = () => kick();
+    const onResume = () => kick();
+    const onOffline = () => {
+      drop();
+      scheduleReconnect();
+    };
+
+    // Wall-clock staleness, not a tick count: a suspended tab wakes with a
+    // large Date.now() gap and the first tick after it sees a dead socket.
+    const tick = () => {
+      if (
+        document.visibilityState === "visible" &&
+        shouldReconnect("tick", wsRef.current?.readyState ?? null, lastHeardRef.current, Date.now())
+      ) {
+        restart();
+      }
+    };
+    const watchdog = window.setInterval(tick, WATCHDOG_TICK_MS);
+
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("pageshow", onPageshow);
+    window.addEventListener("online", onOnline);
+    window.addEventListener("peakbot-resume", onResume);
+    window.addEventListener("offline", onOffline);
+
     connect();
 
     return () => {
-      closedByUs.current = true;
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener("pageshow", onPageshow);
+      window.removeEventListener("online", onOnline);
+      window.removeEventListener("peakbot-resume", onResume);
+      window.removeEventListener("offline", onOffline);
+      window.clearInterval(watchdog);
       window.clearTimeout(reconnectTimerRef.current);
-      wsRef.current?.close();
+      drop();
     };
   }, [bindConvo]);
 
-  // Re-attach to another conversation: bind the id, then reconnect at once.
+  // Re-attach to another conversation: bind the id, then restart at once.
   // Closing the old socket detaches from (but does not kill) its session; the
   // fresh connect's `attach` frame joins the target — sharing it if live,
-  // resuming it from disk if not. A pending backoff reconnect is cancelled
-  // and the old socket's handlers are detached first, so a switch can never
-  // leave two sockets (or a stale `onclose` scheduling a third).
+  // resuming it from disk if not. restart() cancels the pending backoff
+  // reconnect and detaches the old socket's handlers first, so a switch can
+  // never leave two sockets (or a stale `onclose` scheduling a third).
   // `profile`/`agent` are the chip's reattach (design §6.4): same convo with
   // a new profile still re-attaches, and the agent rides that one attach.
   const switchConvo = useCallback(
@@ -273,15 +357,7 @@ export function useAgent(): AgentConnection {
       // Every switch overwrites the held frame, so a verb can never ride
       // into a conversation the user did not ask for.
       pendingFrameRef.current = firstFrame ?? null;
-      backoffRef.current = 500;
-      window.clearTimeout(reconnectTimerRef.current);
-      const ws = wsRef.current;
-      if (ws) {
-        ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
-        ws.close();
-      }
-      setConnected(false);
-      connectRef.current();
+      restartRef.current();
     },
     [bindConvo],
   );

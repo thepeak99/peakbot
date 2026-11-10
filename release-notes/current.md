@@ -36,3 +36,5 @@ This file is the working draft for the next release. When a version is tagged, t
 - Web UI: changing directory (picker or typed `/cd <path>`), typing `/new`, or `/load <id>` while a turn is running no longer gets silently queued until the turn ends (and lost on Stop). It now opens a fresh conversation in the same tab, and the running turn keeps going in the background. Typed `/cd <path>` now works in the web UI (it previously always failed with "not supported"). `/load <index>` mid-turn is refused with "press Stop first".
 
 - On the phone, the folder picker is now available when working on a remote profile.
+
+- Web UI: a dead chat connection is now noticed and fixed on its own — the server sends a quiet liveness beat every 20 s, and a page that hears nothing for over 45 s drops the socket and dials again. It reconnects at once when the tab or app returns to the foreground or the network comes back, and on the phone the page is also told to reconnect when the app resumes.

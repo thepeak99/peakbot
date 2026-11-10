@@ -29,6 +29,10 @@
 //! that's the bit the inline version was missing, and is what keeps a
 //! torn-down socket from pinning `attached > 0` against the idle-TTL reaper.
 //!
+//! The forwarder also emits an app-level `heartbeat` text frame every 20 s
+//! (`HEARTBEAT_INTERVAL`) so the SPA can tell a dead upstream from a quiet
+//! one; a relayed socket gets the remote's beat forwarded, never its own.
+//!
 //! On close the session **detaches** — it survives for other sockets and
 //! for reconnect, and only expires via the reaper or a kill.
 //!
@@ -115,6 +119,10 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(120);
 /// dead idle peer; we do not track pongs (browsers auto-pong; the reader
 /// already ignores ping/pong, `:549-550`).
 const PING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Cadence of the app-level `heartbeat` frame the SPA's watchdog listens for;
+/// its stale window (`web/src/liveness.ts`) must stay above 2× this.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 
 fn windowed_from(ssh: bool, display: bool, wayland: bool, os: &str) -> bool {
     if ssh {
@@ -696,6 +704,14 @@ pub(crate) async fn forward_state(
     // One memo per connection (not per message): its resolve cache survives
     // across snapshots, and each snapshot is already a clone.
     let mut images = images::ImageLinks::default();
+    // Only the server that owns the session beats: a relayed socket never runs
+    // this loop, so the remote's beat is forwarded end to end and a dead upstream
+    // goes quiet for the client.
+    let mut beat = tokio::time::interval_at(
+        tokio::time::Instant::now() + HEARTBEAT_INTERVAL,
+        HEARTBEAT_INTERVAL,
+    );
+    beat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             maybe_state = state_rx.recv() => {
@@ -708,6 +724,11 @@ pub(crate) async fn forward_state(
                     return ForwardExit::WriterGone;
                 }
                 if exit { return ForwardExit::StateEnded }
+            }
+            _ = beat.tick() => {
+                if out.send(OutboundMessage::Heartbeat).is_err() {
+                    return ForwardExit::WriterGone;
+                }
             }
             _ = &mut *reader => return ForwardExit::ReaderGone,
             _ = &mut *writer => return ForwardExit::WriterGone,
@@ -2448,6 +2469,115 @@ mod tests {
             "writer must emit ≥ 3 ping frames during idleness; got {pings}"
         );
         assert_eq!(texts, 0, "idle writer must not emit text frames");
+    }
+
+    /// T2 (emitter): `forward_state` — not `writer_loop` — paces the 20 s
+    /// text beats: the first one full interval after attach, then one per
+    /// interval, in order and nothing else. A relayed socket never runs
+    /// `forward_state`, so it never gets a locally generated beat.
+    #[tokio::test(start_paused = true)]
+    async fn forward_state_emits_a_heartbeat_every_20s_and_nothing_else() {
+        let (_state_tx, mut state_rx) = mpsc::channel::<AppState>(1);
+        let mut reader: tokio::task::JoinHandle<()> =
+            tokio::spawn(async { futures::future::pending::<()>().await });
+        let mut writer: tokio::task::JoinHandle<()> =
+            tokio::spawn(async { futures::future::pending::<()>().await });
+        let (out, mut rx): (OutboundTx, OutboundRx) = outbound_channel();
+        let sm = StateManager::new();
+
+        let mut fwd = std::pin::pin!(forward_state(
+            &mut state_rx,
+            &out,
+            &sm,
+            &mut reader,
+            &mut writer
+        ));
+
+        // Drive the forwarder for `secs` of paused time in 1 s steps; it must
+        // not exit on its own (reader, writer and state never end).
+        macro_rules! run_for {
+            ($secs:expr) => {
+                for _ in 0..$secs {
+                    tokio::select! {
+                        exit = &mut fwd => panic!("forwarder exited early: {exit:?}"),
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    }
+                }
+            };
+        }
+        // Everything queued so far; the forwarder is not polled while draining.
+        async fn drain(rx: &mut OutboundRx) -> Vec<OutboundMessage> {
+            let mut frames = Vec::new();
+            while let Ok(Some(m)) = tokio::time::timeout(Duration::from_millis(1), rx.next()).await
+            {
+                frames.push(m);
+            }
+            frames
+        }
+
+        run_for!(19);
+        let early = drain(&mut rx).await;
+        assert!(
+            early.is_empty(),
+            "no beat before one full interval has elapsed; got {early:?}"
+        );
+
+        run_for!(42); // 61 s after attach: beats at 20, 40 and 60
+        let frames = drain(&mut rx).await;
+        assert_eq!(
+            frames.len(),
+            3,
+            "exactly three beats at t+20/40/60 s and nothing else; got {frames:?}"
+        );
+        assert!(
+            frames
+                .iter()
+                .all(|f| matches!(f, OutboundMessage::Heartbeat)),
+            "every frame must be a Heartbeat; got {frames:?}"
+        );
+    }
+
+    /// T2 (teardown): a beat the writer can no longer accept ends the
+    /// forwarder as `WriterGone` — the same teardown a dead socket gets.
+    #[tokio::test(start_paused = true)]
+    async fn forward_state_exits_writer_gone_when_a_heartbeat_cannot_be_sent() {
+        let (_state_tx, mut state_rx) = mpsc::channel::<AppState>(1);
+        let mut reader: tokio::task::JoinHandle<()> =
+            tokio::spawn(async { futures::future::pending::<()>().await });
+        let mut writer: tokio::task::JoinHandle<()> =
+            tokio::spawn(async { futures::future::pending::<()>().await });
+        let (out, rx): (OutboundTx, OutboundRx) = outbound_channel();
+        drop(rx); // every send now fails
+        let sm = StateManager::new();
+
+        let exit = tokio::time::timeout(
+            Duration::from_secs(120),
+            forward_state(&mut state_rx, &out, &sm, &mut reader, &mut writer),
+        )
+        .await
+        .expect("a failing heartbeat send must end the forwarder");
+        assert!(
+            matches!(exit, ForwardExit::WriterGone),
+            "a heartbeat that cannot be sent must report WriterGone; got {exit:?}"
+        );
+    }
+
+    /// T5 (cross-side pin): the SPA's stale window must stay strictly above
+    /// 2× the server's beat interval, or a healthy peer that drops one beat
+    /// trips the watchdog. The SPA constant lives in TypeScript; pinning it
+    /// here keeps the two sides from drifting independently.
+    #[test]
+    fn client_stale_window_pins_the_server_heartbeat_interval() {
+        let spa = include_str!("../../../web/src/liveness.ts");
+        assert!(
+            spa.contains("export const HEARTBEAT_STALE_MS = 45_000;"),
+            "the SPA must pin HEARTBEAT_STALE_MS to 45_000"
+        );
+        assert!(
+            45_000 > 2 * HEARTBEAT_INTERVAL.as_millis(),
+            "the SPA's stale window must be > 2× the server's beat interval, \
+             or a single dropped beat kills a healthy socket"
+        );
     }
 
     /// T11 — healthy sink: the handshake trio is delivered in send order

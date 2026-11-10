@@ -348,7 +348,9 @@ export type OutboundMessage =
   /** Reply to `request_recent_dirs`: most-recently-used directories,
    * newest-first, deduped, existing dirs only, current cwd excluded, max 8. */
   | { type: "recent_dirs"; dirs: string[] }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string }
+  /** Server liveness beat; arms the SPA watchdog (see liveness.ts). */
+  | { type: "heartbeat" };
 
 export type InboundMessage =
   | {

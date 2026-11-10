@@ -36,6 +36,7 @@
 //! {"type":"recent_dirs","dirs":[...]}
 //! {"type":"dir_listing","path":"…","parent":"…","entries":[...],"error":null}
 //! {"type":"error","message":"..."}
+//! {"type":"heartbeat"}                      // every 20 s, from the server that owns the session
 //! ```
 
 use crate::StateManager;
@@ -310,6 +311,9 @@ pub(crate) enum OutboundMessage {
     },
     /// A non-fatal protocol or parse error.
     Error { message: String },
+    /// Liveness beat: lets the client tell a dead upstream from a quiet one.
+    /// Carries no fields, so a client that predates it ignores it as an unknown type.
+    Heartbeat,
 }
 
 /// How many recent conversations define "recent". Bounds *relevance*, not
@@ -1227,6 +1231,42 @@ mod tests {
     #[test]
     fn protocol_version_is_one() {
         assert_eq!(PROTOCOL_VERSION, 1, "the locked protocol version is 1");
+    }
+
+    /// T1 (wire): the server→client liveness beat is exactly
+    /// `{"type":"heartbeat"}` — no fields, so an old client's unknown-type
+    /// branch ignores it and the SPA's watchdog arms on `type` alone.
+    #[test]
+    fn heartbeat_serialises_to_the_locked_shape() {
+        let json =
+            serde_json::to_string(&OutboundMessage::Heartbeat).expect("heartbeat serialises");
+        assert_eq!(
+            json, r#"{"type":"heartbeat"}"#,
+            "the heartbeat frame must be exactly {{\"type\":\"heartbeat\"}} with no other fields"
+        );
+    }
+
+    /// T1 (wire): the beat round-trips — the relay's parse gate must accept
+    /// it, so a remote's beat can be forwarded to the local client through
+    /// the relay's catch-all.
+    #[test]
+    fn heartbeat_deserialises_to_the_unit_variant() {
+        let m: OutboundMessage =
+            serde_json::from_str(r#"{"type":"heartbeat"}"#).expect("the locked frame must parse");
+        assert!(
+            matches!(m, OutboundMessage::Heartbeat),
+            "the frame must round-trip to the Heartbeat variant, got {m:?}"
+        );
+    }
+
+    /// Additive-change pin: the beat is a new variant, not a new protocol —
+    /// the relay's exact-match gate keeps accepting same-version remotes.
+    #[test]
+    fn heartbeat_keeps_protocol_version_one() {
+        assert_eq!(
+            PROTOCOL_VERSION, 1,
+            "the heartbeat must not bump the protocol version"
+        );
     }
 
     #[test]

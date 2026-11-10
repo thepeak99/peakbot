@@ -383,6 +383,7 @@ fn outbound(text: &str, view: &LocalView, out_tx: &OutboundTx) -> Result<(), Dis
         }
         // Never solicited (§6.3 rows 11/12), and `ready` is the handshake's.
         OutboundMessage::ConversationsList { .. } | OutboundMessage::Ready { .. } => Ok(()),
+        // The remote's heartbeat rides this arm end to end; the relay never originates one.
         other => out_tx.send(other),
     }
 }

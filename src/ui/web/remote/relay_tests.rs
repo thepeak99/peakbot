@@ -1723,6 +1723,31 @@ async fn outbound_unknown_type_is_dropped() {
     let _ = wait_remote_frame(&env, |f| f == r#"{"type":"pause"}"#).await;
 }
 
+// Outbound row (T4): the remote's liveness beat is a KNOWN type once the
+// Heartbeat variant lands, so the relay's catch-all forwards it to the local
+// client unchanged — today it is dropped as unparseable. The frame reaches
+// the tab with no fields added or rewritten.
+#[tokio::test]
+async fn outbound_heartbeat_from_the_remote_is_forwarded_to_the_local_client() {
+    let _guard = env_guard();
+    let env = env_replies_to("stop", vec![json!({ "type": "heartbeat" })]).await;
+    let (mut ws, frames) = drive_and_collect(&env, json!({ "type": "stop" })).await;
+    let beat = frames
+        .iter()
+        .find(|f| f["type"] == "heartbeat")
+        .unwrap_or_else(|| {
+            panic!("the remote's heartbeat must reach the local client: {frames:?}")
+        });
+    assert_eq!(
+        beat,
+        &json!({ "type": "heartbeat" }),
+        "the beat is forwarded verbatim, no fields added"
+    );
+    // The same socket is still live.
+    ws_send(&mut ws, &json!({ "type": "pause" })).await;
+    let _ = wait_remote_frame(&env, |f| f == r#"{"type":"pause"}"#).await;
+}
+
 // Inbound row 11 (E2E): `request_conversations` is never forwarded to the
 // remote (it is answered locally — T7's merged list) and the socket stays
 // open.
