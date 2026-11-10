@@ -170,3 +170,41 @@ export function groupChats(rows: readonly ChatRow[], now: Date, searching: boole
   }
   return out;
 }
+
+// Two sets are equal iff they hold the same ids — this is what tells the
+// caller "nothing changed" apart from a fresh structurally-identical set,
+// so unchanged activity keeps the same object references.
+const sameSet = (a: ReadonlySet<string>, b: ReadonlySet<string>): boolean =>
+  a.size === b.size && [...a].every((id) => b.has(id));
+
+// Fold previous activity into the fresh list: running is the union of listed
+// chats currently running and previously-running chats no longer listed
+// ("unknown is not finished"); unread is previous unread plus each
+// running->idle edge, minus the chat being viewed. Returns `prev` when
+// nothing changed so callers can reuse the same references.
+export function foldActivity(
+  prev: Activity,
+  list: readonly ConversationSummary[],
+  viewing: string | null,
+): Activity {
+  const listed = new Set<string>(list.map((c) => c.id));
+  const byId = new Map<string, boolean>(list.map((c) => [c.id, c.running === true]));
+  const running = new Set<string>(list.filter((c) => c.running === true).map((c) => c.id));
+  for (const id of prev.running) if (!listed.has(id)) running.add(id);
+  const unread = new Set<string>(prev.unread);
+  for (const id of prev.running) if (listed.has(id) && !byId.get(id)) unread.add(id);
+  if (viewing !== null) unread.delete(viewing);
+  if (sameSet(prev.running, running) && sameSet(prev.unread, unread)) return prev;
+  return { running, unread };
+}
+
+// The back-nav badge is true only when some chat OTHER than the one we're
+// leaving still looks active; the bound chat is exempt so leaving it doesn't
+// flag itself.
+export function backBadge(
+  list: readonly ConversationSummary[],
+  unread: ReadonlySet<string>,
+  bound: string | null,
+): boolean {
+  return list.some((c) => c.id !== bound && (c.running === true || unread.has(c.id)));
+}
