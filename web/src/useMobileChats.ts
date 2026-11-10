@@ -5,6 +5,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { isMobile } from "./desktop";
 import { useBackDismiss } from "./useBackDismiss";
+import { backBadge, foldActivity, NO_ACTIVITY, type Activity } from "./chatList";
+import { saveLastChat } from "./mobileStorage";
+import { profileFromUrl } from "./state";
 import type { AgentConnection } from "./useAgent";
 
 export type Screen = "chats" | "conversation";
@@ -37,6 +40,13 @@ export function useMobileChats(
   useEffect(() => {
     if (enabled && screen === "chats") agentRef.current.send({ type: "request_conversations" });
   }, [enabled, screen]);
+
+  // A bound conversation is the one to resume next boot; a null binding saves
+  // nothing so a fresh chat never overwrites the stored last chat.
+  useEffect(() => {
+    if (!enabled || agent.convo === null) return;
+    saveLastChat(window.localStorage, { convo: agent.convo, profile: profileFromUrl() });
+  }, [enabled, agent.convo]);
 
   const showChats = useCallback(() => setScreen("chats"), []);
   useBackDismiss(enabled && screen === "conversation", showChats);
