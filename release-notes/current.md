@@ -9,7 +9,7 @@ This file is the working draft for the next release. When a version is tagged, t
   PeakBot core; remote servers are `remote:` profiles relayed exactly like desktop,
   so there is one conversation list. The native Profiles page is gone.
   - **On this phone** — a built-in PeakBot core with no code execution: fetch/search,
-    todo, think, image-only attachments, your own API key, consent on the provider
+    todo, think, file attachments, your own API key, consent on the provider
     step; config and data stay on the phone and are excluded from backups.
   - **Connect a server** — Settings → Profiles → "+ Add remote profile", then paste
     the pairing link or scan its QR (phone only). No CA install: the pairing
@@ -22,6 +22,8 @@ This file is the working draft for the next release. When a version is tagged, t
   Core changes this release: `fetch_url` gains a `headers` argument; provider
   `base_url` values with a trailing slash are now tolerated; and the web SPA gains
   a `window.peakbotShell` marker (desktop / mobile / plain browser).
+
+- **PeakBot Mobile: attach any file.** The phone app now accepts any file type, not just images. On Android, 📎 opens a short menu — take a photo, choose from the gallery, or pick a file (also in the web UI on Android browsers); on iPhone and iPad, 📎 opens the system's own sheet. On this phone, the agent can read the files you attach and keep notes in the conversation's own folder (nothing else on the device). Remote profiles accept files too; size and count limits are the server's. Old servers that only take images now say so clearly.
 
 ### Fixes
 

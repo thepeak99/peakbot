@@ -42,6 +42,10 @@ pub enum AttachmentKind {
     File,
 }
 
+/// The agent-writable subfolder of a conversation dir. Not a UUID, so it can
+/// never collide with an upload id dir.
+pub const WORK_DIR: &str = "work";
+
 /// Per-conversation upload store. The root is created lazily on the first
 /// store, so a session that never attaches touches no disk.
 #[derive(Clone)]
@@ -66,9 +70,14 @@ impl UploadStore {
         self.limits
     }
 
+    /// `<root>/<convo>`: holds the upload id dirs and [`WORK_DIR`]. May not
+    /// exist yet (nothing uploaded, nothing written).
+    pub fn conversation_dir(&self, convo: Uuid) -> PathBuf {
+        self.root.join(convo.to_string())
+    }
+
     pub fn path(&self, a: &Attachment) -> PathBuf {
-        self.root
-            .join(a.convo.to_string())
+        self.conversation_dir(a.convo)
             .join(a.id.to_string())
             .join(&a.name)
     }
@@ -84,7 +93,7 @@ impl UploadStore {
     ) -> Result<Attachment, AttachError> {
         let name = sanitize_name(name);
         let id = Uuid::new_v4();
-        let id_dir = self.root.join(convo.to_string()).join(id.to_string());
+        let id_dir = self.conversation_dir(convo).join(id.to_string());
         tokio::fs::create_dir_all(&id_dir).await?;
         let file_path = id_dir.join(&name);
         let max_bytes = self.limits.max_file_mb as u64 * 1024 * 1024;
@@ -108,7 +117,7 @@ impl UploadStore {
     /// The single regular file in `root/convo/id`, described. `None` if the
     /// dir is absent or malformed (zero or two+ entries, a non-file).
     pub fn find(&self, convo: Uuid, id: Uuid) -> Option<Attachment> {
-        let id_dir = self.root.join(convo.to_string()).join(id.to_string());
+        let id_dir = self.conversation_dir(convo).join(id.to_string());
         let mut files = Vec::new();
         for entry in std::fs::read_dir(&id_dir).ok()? {
             let entry = entry.ok()?;
@@ -125,7 +134,7 @@ impl UploadStore {
 
     /// Best-effort removal of a conversation's upload dir; logs on error.
     pub fn remove_conversation(&self, convo: Uuid) {
-        let dir = self.root.join(convo.to_string());
+        let dir = self.conversation_dir(convo);
         match std::fs::remove_dir_all(&dir) {
             Ok(()) => {}
             // Never uploaded to — nothing to remove, not worth a log line.

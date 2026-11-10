@@ -1,10 +1,9 @@
-use crate::tools::file_edit::resolve_against;
+use crate::tools::workspace::Workspace;
 use crate::utils::strings::truncate_with_suffix;
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::path::PathBuf;
 
 const MAX_OUTPUT_CHARS: usize = 50_000;
 const TRUNCATION_NOTICE: &str =
@@ -39,18 +38,17 @@ pub struct PdfReadArgs {
     format: Format,
 }
 
-/// PDF-read tool. `session_cwd` is the base for relative path resolution;
-/// the `Default` empty path leaves relatives anchored at the process cwd
-/// (tests / no state manager).
+/// PDF-read tool. Paths resolve through the injected [`Workspace`]
+/// (host: the session cwd; Local: the conversation's folder).
 #[derive(Serialize, Deserialize, Default)]
 pub struct PdfReadTool {
     #[serde(skip)]
-    session_cwd: PathBuf,
+    workspace: Workspace,
 }
 
 impl PdfReadTool {
-    pub fn new(session_cwd: PathBuf) -> Self {
-        Self { session_cwd }
+    pub fn new(workspace: Workspace) -> Self {
+        Self { workspace }
     }
 }
 
@@ -105,7 +103,10 @@ impl Tool for PdfReadTool {
         );
 
         let start_time = std::time::Instant::now();
-        let resolved = resolve_against(&self.session_cwd, &args.path);
+        let resolved = self
+            .workspace
+            .read(&args.path)
+            .map_err(|e| PdfReadError::Validation(e.to_string()))?;
         let path = resolved.as_path();
 
         if !path.exists() {
@@ -176,7 +177,7 @@ impl Tool for PdfReadTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use crate::tools::workspace::test_support;
 
     /// Minimal valid single-page PDF whose only text is "Hello PDF".
     /// Hand-built (ASCII, byte-exact xref offsets) so the test needs no
@@ -196,26 +197,30 @@ xref\n0 6\n\
 0000000311 00000 n \n\
 trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n401\n%%EOF\n";
 
-    fn write_pdf() -> tempfile::NamedTempFile {
-        let mut f = tempfile::Builder::new().suffix(".pdf").tempfile().unwrap();
-        f.write_all(HELLO_PDF).unwrap();
-        f.flush().unwrap();
-        f
+    /// A fresh workspace with `doc.pdf` (the HELLO_PDF bytes) in its base,
+    /// so the tests address it by a relative path in both editions.
+    fn pdf_workspace() -> (tempfile::TempDir, Workspace) {
+        let (root, base, workspace) = test_support::rooted();
+        std::fs::write(base.join("doc.pdf"), HELLO_PDF).unwrap();
+        (root, workspace)
     }
 
-    async fn run(args: PdfReadArgs) -> Result<String, PdfReadError> {
-        PdfReadTool::default().call(args).await
+    async fn run(workspace: Workspace, args: PdfReadArgs) -> Result<String, PdfReadError> {
+        PdfReadTool::new(workspace).call(args).await
     }
 
     #[tokio::test]
     async fn extracts_text() {
-        let f = write_pdf();
-        let out = run(PdfReadArgs {
-            path: f.path().display().to_string(),
-            start_page: None,
-            end_page: None,
-            format: Format::Text,
-        })
+        let (_root, workspace) = pdf_workspace();
+        let out = run(
+            workspace,
+            PdfReadArgs {
+                path: "doc.pdf".to_string(),
+                start_page: None,
+                end_page: None,
+                format: Format::Text,
+            },
+        )
         .await
         .unwrap();
         assert!(out.contains("Hello PDF"), "got: {out:?}");
@@ -223,13 +228,16 @@ trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n401\n%%EOF\n";
 
     #[tokio::test]
     async fn markdown_format_works() {
-        let f = write_pdf();
-        let out = run(PdfReadArgs {
-            path: f.path().display().to_string(),
-            start_page: None,
-            end_page: None,
-            format: Format::Markdown,
-        })
+        let (_root, workspace) = pdf_workspace();
+        let out = run(
+            workspace,
+            PdfReadArgs {
+                path: "doc.pdf".to_string(),
+                start_page: None,
+                end_page: None,
+                format: Format::Markdown,
+            },
+        )
         .await
         .unwrap();
         assert!(out.contains("Hello PDF"), "got: {out:?}");
@@ -237,12 +245,16 @@ trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n401\n%%EOF\n";
 
     #[tokio::test]
     async fn rejects_relative_path() {
-        let err = run(PdfReadArgs {
-            path: "relative.pdf".to_string(),
-            start_page: None,
-            end_page: None,
-            format: Format::Text,
-        })
+        let (_root, workspace) = pdf_workspace();
+        let err = run(
+            workspace,
+            PdfReadArgs {
+                path: "relative.pdf".to_string(),
+                start_page: None,
+                end_page: None,
+                format: Format::Text,
+            },
+        )
         .await
         .unwrap_err();
         assert!(matches!(err, PdfReadError::Validation(_)));
@@ -250,13 +262,16 @@ trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n401\n%%EOF\n";
 
     #[tokio::test]
     async fn rejects_start_page_past_end() {
-        let f = write_pdf();
-        let err = run(PdfReadArgs {
-            path: f.path().display().to_string(),
-            start_page: Some(5),
-            end_page: None,
-            format: Format::Text,
-        })
+        let (_root, workspace) = pdf_workspace();
+        let err = run(
+            workspace,
+            PdfReadArgs {
+                path: "doc.pdf".to_string(),
+                start_page: Some(5),
+                end_page: None,
+                format: Format::Text,
+            },
+        )
         .await
         .unwrap_err();
         assert!(matches!(err, PdfReadError::Validation(_)));

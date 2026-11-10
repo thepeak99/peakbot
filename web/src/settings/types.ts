@@ -26,7 +26,7 @@ export interface SettingsMeta {
   mcp_status: { name: string; state: "connected" | "failed" | "disabled" }[];
   boot: {
     /** What THIS server can do: `"full"` (host build) or `"local"` (phone
-     *  build — no MCP/profile/system panes, images-only uploads). Optional:
+     *  build — no MCP/profile/system panes). Optional:
      *  old servers omit it ⇒ the SPA treats it as `"full"`. Lives in the
      *  `boot` block on the wire (pinned cross-side by
      *  tests/fixtures/settings_boot_local.json via editionFixture.test.ts

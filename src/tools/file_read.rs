@@ -1,10 +1,9 @@
-use crate::tools::file_edit::resolve_against;
+use crate::tools::workspace::Workspace;
 use crate::utils::strings::truncate_with_suffix;
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::path::PathBuf;
 
 const MAX_OUTPUT_CHARS: usize = 50_000;
 const TRUNCATION_NOTICE: &str =
@@ -25,18 +24,17 @@ pub struct FileReadArgs {
     end_line: Option<usize>,
 }
 
-/// Read-a-file tool. `session_cwd` is the base for relative path resolution;
-/// the `Default` empty path leaves relatives anchored at the process cwd
-/// (tests / no state manager).
+/// Read-a-file tool. Paths resolve through the injected [`Workspace`]
+/// (host: the session cwd; Local: the conversation's folder).
 #[derive(Serialize, Deserialize, Default)]
 pub struct FileReadTool {
     #[serde(skip)]
-    session_cwd: PathBuf,
+    workspace: Workspace,
 }
 
 impl FileReadTool {
-    pub fn new(session_cwd: PathBuf) -> Self {
-        Self { session_cwd }
+    pub fn new(workspace: Workspace) -> Self {
+        Self { workspace }
     }
 }
 
@@ -84,7 +82,10 @@ impl Tool for FileReadTool {
         );
 
         let start_time = std::time::Instant::now();
-        let path = resolve_against(&self.session_cwd, &args.path);
+        let path = self
+            .workspace
+            .read(&args.path)
+            .map_err(|e| FileReadError::Validation(e.to_string()))?;
         let path = path.as_path();
 
         if !path.exists() {
@@ -156,16 +157,16 @@ fn maybe_truncate(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    use crate::tools::workspace::test_support;
 
-    // A relative path resolves against the injected session_cwd, NOT the
-    // process cwd — the core Phase-1 guarantee.
+    // A relative path resolves against the injected workspace base, NOT
+    // the process cwd — the core Phase-1 guarantee.
     #[tokio::test]
     async fn resolves_relative_against_session_cwd() {
-        let dir = tempdir().unwrap();
-        std::fs::write(dir.path().join("note.txt"), "hello from session dir").unwrap();
+        let (_root, base, workspace) = test_support::rooted();
+        std::fs::write(base.join("note.txt"), "hello from session dir").unwrap();
 
-        let tool = FileReadTool::new(dir.path().to_path_buf());
+        let tool = FileReadTool::new(workspace);
         let args: FileReadArgs = serde_json::from_value(serde_json::json!({
             "path": "note.txt"
         }))
@@ -175,8 +176,9 @@ mod tests {
         assert!(out.contains("hello from session dir"), "got: {out}");
     }
 
-    // With the default empty base, a relative path resolves against the
-    // process cwd (std default) — the test/no-state-manager fallback.
+    // Host-only: `Workspace::Open`'s empty base resolves relatives against
+    // the process cwd (std default) — the test/no-state-manager fallback.
+    #[cfg(feature = "host")]
     #[tokio::test]
     async fn default_base_uses_process_cwd() {
         let tool = FileReadTool::default();

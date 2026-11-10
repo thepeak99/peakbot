@@ -323,8 +323,9 @@ pub(crate) fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
 pub(crate) const SYSTEM_PROMPT_PERSONA: &str = include_str!("system_prompt_persona.txt");
 #[cfg(feature = "host")]
 const SYSTEM_PROMPT_CORE: &str = include_str!("system_prompt_core.txt");
-// The Local edition has no file or code tools, so the host persona's
-// capability claims would be false there: it carries its own text.
+// The Local edition has no shell or code tools and its file tools are
+// confined to the conversation's folder, so the host persona's capability
+// claims would be false there: it carries its own text.
 #[cfg(not(feature = "host"))]
 pub(crate) const SYSTEM_PROMPT_PERSONA: &str = include_str!("system_prompt_persona_local.txt");
 #[cfg(not(feature = "host"))]
@@ -10380,9 +10381,10 @@ profiles:
 
 // ─── Local edition canary ────────────────────────────────────────────────
 //
-// The Local edition (no `host` feature) exposes EXACTLY the five
-// non-execution built-ins — a leaked `host` dependency widens the set and
-// this fails. CI runs
+// The Local edition (no `host` feature) exposes EXACTLY the eleven built-ins
+// — the five non-execution tools plus the six file tools confined to the
+// conversation's upload folder (mobile-attach part 1). A leaked `host`
+// dependency widens the set and this fails. CI runs
 // `cargo test --lib --no-default-features local_edition_canary -- --exact`
 // and requires `1 passed`; the fn sits at the crate root (no module prefix)
 // so the `--exact` filter matches its full name.
@@ -10391,13 +10393,25 @@ profiles:
 fn local_edition_canary() {
     let local: std::collections::BTreeSet<&str> =
         crate::config::BUILTIN_TOOL_NAMES.iter().copied().collect();
-    let want: std::collections::BTreeSet<&str> =
-        ["fetch_url", "fetch_page", "web_search", "todo", "think"]
-            .into_iter()
-            .collect();
+    let want: std::collections::BTreeSet<&str> = [
+        "fetch_url",
+        "fetch_page",
+        "web_search",
+        "todo",
+        "think",
+        "file_create",
+        "file_str_replace",
+        "file_insert",
+        "file_read",
+        "pdf_read",
+        "list_directory",
+    ]
+    .into_iter()
+    .collect();
     assert_eq!(
         local, want,
-        "the Local edition exposes exactly the five non-execution built-ins"
+        "the Local edition exposes exactly the five non-execution built-ins \
+         plus the six confined file tools"
     );
 }
 
@@ -10509,20 +10523,44 @@ mod local_persona_tests {
             .any(|tok| tok == word)
     }
 
+    /// The Local prompt states the file-confinement rule (the Local edition
+    /// HAS file tools, and they live ONLY inside the conversation's folder)
+    /// and makes no claim of shell, command execution, bash, or
+    /// whole-device/filesystem access.
+    ///
+    /// Supersedes the old blanket ban on the words "file"/"files": the
+    /// confinement sentence needs the word, so the guard is on capability
+    /// claims, not on vocabulary. The whole-word checks keep the persona's
+    /// denial ("…scripts or commands", plural) and the confinement's own
+    /// "you cannot … run code" from tripping the absence asserts.
     #[test]
-    fn local_persona_makes_no_file_or_execution_capability_claims() {
+    fn local_persona_states_file_confinement_and_makes_no_execution_claims() {
         let prompt = local_prompt().to_lowercase();
 
+        // The approved confinement sentence, verbatim (lowercased to match
+        // `prompt`).
+        assert!(
+            prompt.contains(
+                "your file tools work only inside this conversation's folder. read \
+                 attached files at the listed paths and write new files with relative \
+                 paths; you cannot delete files or run code."
+            ),
+            "the Local prompt must state the conversation-folder file confinement"
+        );
+
+        // No whole-filesystem access and no execution capability (kept from
+        // the old test).
         for needle in ["filesystem", "file system", "execute", "write code"] {
             assert!(
                 !prompt.contains(needle),
-                "the Local persona claims `{needle}` — the Local edition has no such capability"
+                "the Local prompt claims `{needle}` — the Local edition has no such capability"
             );
         }
-        for word in ["file", "files"] {
+        // No shell, no command execution, no bash — whole-word.
+        for word in ["shell", "bash", "command"] {
             assert!(
                 !contains_word(&prompt, word),
-                "the Local persona uses the word `{word}` — state denials without it"
+                "the Local prompt claims the word `{word}` — the Local edition has no shell or command execution"
             );
         }
     }

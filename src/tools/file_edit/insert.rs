@@ -1,6 +1,6 @@
 //! `file_insert`: insert text at a specific line in an existing file.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
@@ -8,9 +8,10 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::{
-    FileEditError, SNIPPET_CONTEXT_LINES, format_lines_numbered, read_file, resolve_against,
-    validate_path_exists, write_file,
+    FileEditError, SNIPPET_CONTEXT_LINES, format_lines_numbered, read_file, validate_path_exists,
+    write_file,
 };
+use crate::tools::workspace::Workspace;
 
 #[derive(Deserialize)]
 pub struct FileInsertArgs {
@@ -19,15 +20,16 @@ pub struct FileInsertArgs {
     insert_text: String,
 }
 
-/// Insert-at-line tool. `session_cwd` is the base for relative path resolution.
+/// Insert-at-line tool. Paths resolve through the injected [`Workspace`]
+/// (host: the session cwd; Local: the conversation's `work/` folder).
 #[derive(Default)]
 pub struct FileInsertTool {
-    session_cwd: PathBuf,
+    workspace: Workspace,
 }
 
 impl FileInsertTool {
-    pub fn new(session_cwd: PathBuf) -> Self {
-        Self { session_cwd }
+    pub fn new(workspace: Workspace) -> Self {
+        Self { workspace }
     }
 }
 
@@ -79,7 +81,10 @@ after line N. Returns an error if `insert_line` exceeds the file's line count."
         );
 
         let start_time = std::time::Instant::now();
-        let resolved = resolve_against(&self.session_cwd, &args.path);
+        let resolved = self
+            .workspace
+            .write(&args.path)
+            .map_err(|e| FileEditError::Validation(e.to_string()))?;
         let result = run(
             &resolved.to_string_lossy(),
             args.insert_line,

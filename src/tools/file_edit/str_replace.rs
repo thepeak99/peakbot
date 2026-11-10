@@ -1,7 +1,7 @@
 //! `file_str_replace`: replace exact text in an existing file.
 
 use std::ops::Range;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
@@ -10,8 +10,9 @@ use serde_json::json;
 
 use super::{
     FileEditError, MatchLevel, MatchResult, SNIPPET_CONTEXT_LINES, format_lines_numbered,
-    progressive_match, read_file, resolve_against, validate_path_exists, write_file,
+    progressive_match, read_file, validate_path_exists, write_file,
 };
+use crate::tools::workspace::Workspace;
 
 #[derive(Deserialize)]
 pub struct FileStrReplaceArgs {
@@ -21,15 +22,16 @@ pub struct FileStrReplaceArgs {
     replace_all: Option<bool>,
 }
 
-/// Replace-text tool. `session_cwd` is the base for relative path resolution.
+/// Replace-text tool. Paths resolve through the injected [`Workspace`]
+/// (host: the session cwd; Local: the conversation's `work/` folder).
 #[derive(Default)]
 pub struct FileStrReplaceTool {
-    session_cwd: PathBuf,
+    workspace: Workspace,
 }
 
 impl FileStrReplaceTool {
-    pub fn new(session_cwd: PathBuf) -> Self {
-        Self { session_cwd }
+    pub fn new(workspace: Workspace) -> Self {
+        Self { workspace }
     }
 }
 
@@ -96,7 +98,10 @@ If editing fails, read the file first with `file_read` to get exact content, the
                 "new_str is required; pass \"\" to delete old_str".into(),
             ))
         } else {
-            let resolved = resolve_against(&self.session_cwd, &args.path);
+            let resolved = self
+                .workspace
+                .write(&args.path)
+                .map_err(|e| FileEditError::Validation(e.to_string()))?;
             run(
                 &resolved.to_string_lossy(),
                 &args.old_str,

@@ -25,9 +25,11 @@ the app.
 **On this phone** (the local profile's default name) runs a PeakBot core built into
 the app, in-process, with no code execution. It gets the read-only tools
 `fetch_url`, `fetch_page`, `web_search` (only when SearXNG is configured), `todo`,
-and `think`; takes image-only attachments; and uses **your own API key** — your
-messages go to your configured provider with that key. A consent notice appears on
-the provider step ("Agree and continue"). It never runs commands or edits files.
+and `think`, plus six file tools confined to the conversation's own folder
+(reads the attached files, writes only into its `work/` subfolder, never
+deletes); it accepts attachments of any file type, and uses **your own API key**
+— your messages go to your configured provider with that key. A consent notice
+appears on the provider step ("Agree and continue"). It never runs commands.
 Your config and data stay on the phone and are excluded from backups.
 
 On first launch the wizard offers either "Set up an AI provider on this device" or
@@ -55,7 +57,7 @@ involved.
 
 ## Not supported
 
-Push notifications from the app, running code or editing files on the phone, and
+Push notifications from the app, running code on the phone, and
 pairing with plain-HTTP servers (HTTPS only).
 
 ## Repo layout

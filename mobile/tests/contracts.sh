@@ -201,6 +201,10 @@ grep_ok "lnp: manifest declares ACCESS_LOCAL_NETWORK" '<uses-permission android:
 grep_ok "lnp: MainActivity gates on SDK_INT >= 37" 'Build.VERSION.SDK_INT >= 37' "$root/$MAIN_ACTIVITY"
 grep_ok "lnp: MainActivity calls requestPermissions(arrayOf(LOCAL_NETWORK)" 'requestPermissions(arrayOf(LOCAL_NETWORK)' "$root/$MAIN_ACTIVITY"
 grep_ok "lnp: MainActivity names android.permission.ACCESS_LOCAL_NETWORK" '"android.permission.ACCESS_LOCAL_NETWORK"' "$root/$MAIN_ACTIVITY"
+# The camera path (Take a photo) must find a camera app: Android 11+ package
+# visibility requires the manifest to declare the <queries> intent.
+grep_ok "camera: manifest has <queries>" '<queries>' "$root/$MANIFEST"
+grep_ok "camera: manifest queries IMAGE_CAPTURE" '<action android:name="android.media.action.IMAGE_CAPTURE" />' "$root/$MANIFEST"
 
 # ── ci.yml (guard) ───────────────────────────────────────────────────────
 
