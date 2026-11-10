@@ -76,7 +76,7 @@ export function ConversationsPicker({
   catalog?: CatalogProfile[];
 }) {
   const desktop = isDesktop();
-  // Mobile keeps the "+": its window.open is a top-level navigation
+  // Browser keeps the "+": its window.open is a top-level navigation
   // (Back returns). Desktop loses it — the tab strip has its own.
   const [open, setOpen] = useState(false);
   // The list arrives async after onOpen(); show a loading hint until it does
@@ -215,7 +215,7 @@ export function ConversationsPicker({
       </button>
 
       {/* Desktop: the tab strip has its own "+", so this one is hidden;
-          browser and mobile keep it (mobile's window.open is a top-level nav). */}
+          the browser keeps it (window.open is a top-level nav there). */}
       {!desktop && (
         <button
           onClick={openNewTab}
