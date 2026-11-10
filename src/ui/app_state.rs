@@ -1766,6 +1766,37 @@ mod tests {
     use crate::config::file::TabColor;
     use crate::config::resolve::{AgentInfo, SubagentInfo};
 
+    // ── format_tool_call: intent line ─────────────────────────────────────
+
+    #[test]
+    fn tool_call_shows_purpose_as_the_intent_line() {
+        let out = format_tool_call("bash", r#"{"purpose":"list files","command":"ls"}"#);
+        assert_eq!(out, "💭 list files\n🔧 bash(command=ls)");
+    }
+
+    #[test]
+    fn tool_call_still_shows_legacy_thought() {
+        let out = format_tool_call("bash", r#"{"thought":"list files","command":"ls"}"#);
+        assert_eq!(out, "💭 list files\n🔧 bash(command=ls)");
+    }
+
+    #[test]
+    fn tool_call_prefers_purpose_over_legacy_thought() {
+        let out = format_tool_call(
+            "bash",
+            r#"{"purpose":"new","thought":"old","command":"ls"}"#,
+        );
+        assert_eq!(out, "💭 new\n🔧 bash(command=ls)");
+    }
+
+    #[test]
+    fn think_call_is_unchanged() {
+        assert_eq!(
+            format_tool_call("think", r#"{"thought":"x"}"#),
+            "🤔 Thinking..."
+        );
+    }
+
     // ── Phase 1: sub-agent lane plumbing ────────────────────────────────
 
     #[test]

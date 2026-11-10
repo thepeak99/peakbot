@@ -145,16 +145,41 @@ mod tests {
         PurposeGate::wrap(Box::new(Echo))
     }
 
+    #[test]
+    fn nudge_text_is_locked() {
+        assert_eq!(
+            NUDGE,
+            "⚠️ Reminder: fill in the 'purpose' field — a one-line statement of \
+             what this call is for. (Tool ran anyway.)"
+        );
+    }
+
     #[tokio::test]
-    async fn definition_injects_thought_as_required_property() {
+    async fn definition_injects_required_purpose() {
         let def = gate().definition(String::new()).await;
         let props = def.parameters["properties"].as_object().unwrap();
-        assert!(props.contains_key("thought"), "thought property injected");
+        assert_eq!(
+            props["purpose"],
+            json!({ "type": "string", "description": "One-line statement of what this call is for." }),
+            "injected property is exact: {props:?}"
+        );
         assert!(props.contains_key("path"), "inner property preserved");
+        assert!(
+            !props.contains_key("thought"),
+            "no `thought` in properties: {props:?}"
+        );
 
         let required = def.parameters["required"].as_array().unwrap();
-        assert!(required.iter().any(|v| v == "thought"), "thought required");
+        assert_eq!(
+            required[0],
+            json!("purpose"),
+            "purpose first in required: {required:?}"
+        );
         assert!(required.iter().any(|v| v == "path"), "inner required kept");
+        assert!(
+            !required.iter().any(|v| v == "thought"),
+            "no `thought` in required: {required:?}"
+        );
     }
 
     #[tokio::test]
@@ -163,35 +188,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_thought_runs_and_appends_nudge() {
+    async fn missing_purpose_runs_and_appends_nudge() {
         let out = gate()
             .call(json!({ "path": "/tmp/x" }).to_string())
             .await
-            .expect("runs despite missing thought");
+            .expect("runs despite missing purpose");
         assert!(out.ends_with(NUDGE), "nudge appended: {out}");
         assert!(out.contains("\"path\":\"/tmp/x\""), "inner ran");
-        assert!(!out.contains("thought\":"), "thought stripped before inner");
     }
 
     #[tokio::test]
-    async fn present_thought_is_clean_passthrough() {
+    async fn present_purpose_is_stripped_without_nudge() {
         let out = gate()
-            .call(json!({ "thought": "doing X", "path": "/tmp/x" }).to_string())
+            .call(json!({ "purpose": "doing X", "path": "/tmp/x" }).to_string())
             .await
             .unwrap();
-        assert!(!out.contains(NUDGE), "no nudge when thought present");
-        assert!(!out.contains("thought"), "thought stripped before inner");
+        assert!(!out.contains(NUDGE), "no nudge when purpose present: {out}");
+        assert!(
+            !out.contains("purpose"),
+            "purpose stripped before inner: {out}"
+        );
         assert!(out.contains("\"path\":\"/tmp/x\""));
     }
 
     #[tokio::test]
-    async fn blank_and_null_thought_count_as_missing() {
+    async fn blank_and_null_purpose_count_as_missing() {
         for bad in [json!("   "), json!(""), Value::Null] {
             let out = gate()
-                .call(json!({ "thought": bad, "path": "/p" }).to_string())
+                .call(json!({ "purpose": bad, "path": "/p" }).to_string())
                 .await
                 .unwrap();
-            assert!(out.ends_with(NUDGE), "blank/null thought nudges: {bad:?}");
+            assert!(out.ends_with(NUDGE), "blank/null purpose nudges: {bad:?}");
         }
     }
 
@@ -202,42 +229,89 @@ mod tests {
         assert_eq!(out, "null");
     }
 
-    #[tokio::test]
-    async fn idempotent_when_inner_already_has_thought() {
-        struct HasThought;
-        impl Tool for HasThought {
-            const NAME: &'static str = "ht";
-            type Error = std::convert::Infallible;
-            type Args = Value;
-            type Output = String;
-            async fn definition(&self, _p: String) -> ToolDefinition {
-                ToolDefinition {
-                    name: "ht".to_string(),
-                    description: "ht".to_string(),
-                    parameters: json!({
-                        "type": "object",
-                        "properties": { "thought": { "type": "string", "description": "own" } },
-                        "required": ["thought"]
-                    }),
-                }
-            }
-            async fn call(&self, args: Value) -> Result<String, Self::Error> {
-                Ok(args.to_string())
+    /// Inner tool that declares its own `purpose` parameter: a real
+    /// argument, so the gate must never strip, demand, or nudge it.
+    struct OwnsPurpose;
+
+    impl Tool for OwnsPurpose {
+        const NAME: &'static str = "owns";
+        type Error = std::convert::Infallible;
+        type Args = Value;
+        type Output = String;
+        async fn definition(&self, _p: String) -> ToolDefinition {
+            ToolDefinition {
+                name: "owns".to_string(),
+                description: "owns".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "purpose": { "type": "string", "description": "own" },
+                        "x": { "type": "integer" }
+                    },
+                    "required": ["x"]
+                }),
             }
         }
+        async fn call(&self, args: Value) -> Result<String, Self::Error> {
+            Ok(args.to_string())
+        }
+    }
 
-        let def = PurposeGate::wrap(Box::new(HasThought))
-            .definition(String::new())
-            .await;
+    #[tokio::test]
+    async fn tool_that_owns_purpose_is_left_untouched() {
+        let gated = PurposeGate::wrap(Box::new(OwnsPurpose));
+
+        let def = gated.definition(String::new()).await;
+        let inner = rig_core::tool::Tool::definition(&OwnsPurpose, String::new()).await;
         assert_eq!(
-            def.parameters["properties"]["thought"]["description"],
-            "own"
+            def.parameters, inner.parameters,
+            "gate is transparent for a tool that owns `purpose` (description, required): {def:?}"
         );
-        let required = def.parameters["required"].as_array().unwrap();
-        assert_eq!(
-            required.iter().filter(|v| *v == "thought").count(),
-            1,
-            "thought not duplicated in required"
+
+        let out = gated
+            .call(json!({ "purpose": "real", "x": 1 }).to_string())
+            .await
+            .unwrap();
+        assert!(
+            out.contains("\"purpose\":\"real\""),
+            "args forwarded verbatim: {out}"
+        );
+        assert!(!out.contains(NUDGE), "never nudges an owning tool: {out}");
+
+        let out = gated.call(json!({ "x": 1 }).to_string()).await.unwrap();
+        assert!(
+            !out.contains(NUDGE),
+            "the gate's nudge is not about the tool's own `purpose`: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_thought_is_forwarded_and_does_not_satisfy_the_gate() {
+        let out = gate()
+            .call(json!({ "thought": "old habit", "path": "/p" }).to_string())
+            .await
+            .unwrap();
+        assert!(
+            out.contains("\"thought\":\"old habit\""),
+            "legacy `thought` forwarded untouched: {out}"
+        );
+        assert!(
+            out.ends_with(NUDGE),
+            "`purpose` is missing, so nudge: {out}"
+        );
+
+        let out = gate()
+            .call(json!({ "thought": "t", "purpose": "p", "path": "/p" }).to_string())
+            .await
+            .unwrap();
+        assert!(
+            out.contains("\"thought\":\"t\""),
+            "`thought` forwarded: {out}"
+        );
+        assert!(!out.contains("purpose"), "`purpose` stripped: {out}");
+        assert!(
+            !out.contains(NUDGE),
+            "`purpose` present, so no nudge: {out}"
         );
     }
 }

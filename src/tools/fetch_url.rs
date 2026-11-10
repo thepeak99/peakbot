@@ -481,7 +481,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thought_gate_injects_thought_into_allow_post_schema() {
+    async fn purpose_gate_injects_purpose_into_allow_post_schema() {
         let gate = PurposeGate::wrap(Box::new(FetchUrlTool::new(&FetchUrlConfig {
             allow_post: true,
         })));
@@ -492,8 +492,8 @@ mod tests {
             .as_array()
             .expect("required array");
         assert!(
-            required.iter().any(|v| v == "thought"),
-            "thought must be injected as required: {required:?}"
+            required.iter().any(|v| v == "purpose"),
+            "purpose must be injected as required: {required:?}"
         );
     }
 
