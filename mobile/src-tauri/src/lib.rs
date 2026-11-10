@@ -24,6 +24,10 @@ use nav::Nav;
 /// navigation the nav guard can classify. Locked bytes — no trailing newline.
 pub const INIT_SCRIPT: &str = "Object.defineProperty(window,'peakbotShell',{value:'mobile'});\nwindow.open=function(u){if(u){location.href=new URL(String(u),location.href).href}return null};";
 
+/// The page's resume nudge: the SPA re-dials (or confirms) its socket when
+/// it hears this event (`useAgent.ts` registers the listener). Locked bytes.
+pub const RESUME_SCRIPT: &str = "window.dispatchEvent(new Event('peakbot-resume'));";
+
 /// The SPA's dark app background (Tailwind zinc-950); the bundled error page
 /// uses the same colour so no band of a different colour shows.
 const BACKGROUND: Color = Color(9, 9, 11, 255);
@@ -75,6 +79,29 @@ fn launch_url(core: Result<Url, String>) -> WebviewUrl {
             let hash = utf8_percent_encode(&reason, NON_ALPHANUMERIC);
             WebviewUrl::App(format!("index.html#{hash}").into())
         }
+    }
+}
+
+/// What to do with the window when the app comes back to the foreground:
+/// follow a port move, nudge the SPA to re-dial its socket, or leave the page.
+#[derive(Debug, PartialEq)]
+enum ResumeAction {
+    /// The Local core moved ports and the page sits on the old origin.
+    Follow(Url),
+    /// Nothing moved: the SPA re-dials (or confirms its live socket) itself.
+    Nudge,
+    /// The page is on another origin (or unreadable): neither helps.
+    Nothing,
+}
+
+/// The resume decision, pure. `moved` is exactly what `Local::resume()`
+/// returns: the old origin and the new URL when the port moved, `None` when
+/// nothing moved. `page` is the window's current URL, if any.
+fn resume_action(moved: Option<(url::Origin, Url)>, page: Option<&Url>) -> ResumeAction {
+    match (moved, page) {
+        (None, _) => ResumeAction::Nudge,
+        (Some((old, url)), Some(page)) if page.origin() == old => ResumeAction::Follow(url),
+        _ => ResumeAction::Nothing,
     }
 }
 
@@ -144,17 +171,31 @@ async fn restart_local(app: &AppHandle) {
     }
 }
 
-/// Back in the foreground, re-serve the Local core if its listener
-/// was reclaimed; if that moved the port, follow it from the Local page.
+/// Back in the foreground, re-serve the Local core if its listener was
+/// reclaimed, then act on the decision: follow a port move from the Local
+/// page, or nudge the SPA to re-dial its socket. Only the action name is
+/// logged — the URLs carry tokens.
 async fn resume_local(app: &AppHandle) {
-    let Some((old, url)) = app.state::<Local>().resume().await else {
+    let moved = app.state::<Local>().resume().await;
+    let Some(window) = app.get_webview_window("main") else {
         return;
     };
-    if let Some(window) = app.get_webview_window("main")
-        && window.url().is_ok_and(|u| u.origin() == old)
-        && let Err(e) = window.navigate(url)
-    {
-        log::warn!("navigate after re-serve: {e}");
+    match resume_action(moved, window.url().ok().as_ref()) {
+        ResumeAction::Follow(url) => {
+            log::info!("resume: follow");
+            if let Err(e) = window.navigate(url) {
+                log::warn!("navigate after re-serve: {e}");
+            }
+        }
+        ResumeAction::Nudge => {
+            log::info!("resume: nudge");
+            if let Err(e) = window.eval(RESUME_SCRIPT) {
+                log::warn!("nudge: {e}");
+            }
+        }
+        ResumeAction::Nothing => {
+            log::info!("resume: nothing");
+        }
     }
 }
 
@@ -205,6 +246,24 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// The one resume signal the runtime actually delivers on mobile: the
+/// window event. The app-level Resumed is only produced under
+/// ControlFlow::Poll, which the runtime never uses.
+#[cfg(mobile)]
+fn is_foreground_resume(event: &RunEvent) -> bool {
+    matches!(
+        event,
+        RunEvent::WindowEvent {
+            event: tauri::WindowEvent::Resumed,
+            ..
+        }
+    )
+}
+#[cfg(not(mobile))]
+fn is_foreground_resume(_event: &RunEvent) -> bool {
+    false
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default()
@@ -234,7 +293,7 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building PeakBot Mobile")
         .run(|app, event| {
-            if let RunEvent::Resumed = event {
+            if is_foreground_resume(&event) {
                 let app = app.clone();
                 tauri::async_runtime::spawn(async move { resume_local(&app).await });
             }
