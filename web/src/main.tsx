@@ -3,12 +3,17 @@ import { createRoot } from "react-dom/client";
 import "./index.css";
 import { App } from "./App";
 import { Boot } from "./Boot";
-import { isDesktop } from "./desktop";
+import { isDesktop, isMobile } from "./desktop";
 import { bootDesktopTabs } from "./useConvoTabs";
+import { bootMobileChats } from "./mobileStorage";
 
 // Desktop app only: restore the conversation tabs (and point the URL at the
 // active one) before `useAgent` reads it on first render. `null` in a browser.
 const initialTabs = isDesktop() ? bootDesktopTabs() : null;
+
+// Mobile shell: seed ?convo=&profile= from the stored last chat when the URL
+// has neither, before `useAgent` reads it on first render.
+if (isMobile()) bootMobileChats();
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
