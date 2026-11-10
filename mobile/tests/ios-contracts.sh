@@ -22,7 +22,7 @@
 # Info.ios.plist (structural awk — no plutil on Linux):
 #   * NSAppTransportSecurity dict CONTAINING NSAllowsLocalNetworking=<true/>
 #   * NSCameraUsageDescription string EXACTLY
-#     "Scan the pairing QR code shown by PeakBot."
+#     "Scan a pairing QR code, or take a photo to attach to a conversation."
 #   * NSLocalNetworkUsageDescription string NON-EMPTY
 #   * no NSAllowsArbitraryLoads anywhere
 #
@@ -184,14 +184,14 @@ else
             s = $0
             sub(/^[[:space:]]*<string>/, "", s)
             sub(/<\/string>[[:space:]]*$/, "", s)
-            if (s == "Scan the pairing QR code shown by PeakBot.") ok = 1
+            if (s == "Scan a pairing QR code, or take a photo to attach to a conversation.") ok = 1
             exit
         }
         END { exit ok ? 0 : 1 }
     ' "$PL"; then
-        ok "plist: NSCameraUsageDescription = \"Scan the pairing QR code shown by PeakBot.\""
+        ok "plist: NSCameraUsageDescription = \"Scan a pairing QR code, or take a photo to attach to a conversation.\""
     else
-        bad "plist: NSCameraUsageDescription = \"Scan the pairing QR code shown by PeakBot.\""
+        bad "plist: NSCameraUsageDescription = \"Scan a pairing QR code, or take a photo to attach to a conversation.\""
     fi
 
     # LAN providers need the local-network prompt string (non-empty).
