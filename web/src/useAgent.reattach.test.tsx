@@ -117,3 +117,53 @@ describe("useAgent — reattach target: a remote profile without an agent", () =
     expect(url.searchParams.has("convo")).toBe(false);
   });
 });
+
+// ─── URL follows the binding across popstate (mobile-chats design §3.4) ──
+// After any popstate the entry we land on must show the BOUND conversation,
+// not the one it was created with — otherwise a Back from the Chats layer
+// would re-attach the wrong chat.
+describe("useAgent — the URL follows the binding across popstate", () => {
+  it("a marker entry shows the bound convo after a back-traversal", async () => {
+    window.history.replaceState(null, "", "/");
+    await mountAgent();
+
+    // Bind c1: the base entry's URL.
+    await act(async () => {
+      conn!.switchConvo("c1", null);
+      await Promise.resolve();
+    });
+    expect(new URL(window.location.href).searchParams.get("convo")).toBe("c1");
+
+    // A marker entry (the mobile Chats layer's pushState, URL unchanged).
+    window.history.pushState(window.history.state, "");
+
+    // Rebind to c2: the top entry now carries c2.
+    await act(async () => {
+      conn!.switchConvo("c2", null);
+      await Promise.resolve();
+    });
+    expect(new URL(window.location.href).searchParams.get("convo")).toBe("c2");
+
+    // Back to the marker entry: it must show the bound convo (c2), not c1.
+    const popped = new Promise<void>((resolve) => {
+      const t = setTimeout(resolve, 250);
+      window.addEventListener(
+        "popstate",
+        () => {
+          clearTimeout(t);
+          resolve();
+        },
+        { once: true },
+      );
+    });
+    window.history.back();
+    await act(async () => {
+      await popped;
+    });
+
+    expect(
+      new URL(window.location.href).searchParams.get("convo"),
+      "the URL reflects the bound convo, not the entry's original",
+    ).toBe("c2");
+  });
+});

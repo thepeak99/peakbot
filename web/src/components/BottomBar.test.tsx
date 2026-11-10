@@ -61,7 +61,7 @@ const CONVERSATIONS: ConversationSummary[] = [
 let container: HTMLDivElement | null = null;
 let root: Root | null = null;
 
-async function mount(cwd: string | null): Promise<HTMLDivElement> {
+async function mount(cwd: string | null, mobileChats?: boolean): Promise<HTMLDivElement> {
   container = document.createElement("div");
   document.body.appendChild(container);
   await act(async () => {
@@ -83,6 +83,7 @@ async function mount(cwd: string | null): Promise<HTMLDivElement> {
         selectionLocked={true}
         profilePinned={false}
         onToast={vi.fn()}
+        mobileChats={mobileChats}
       />,
     );
   });
@@ -154,5 +155,26 @@ describe("bottom bar mobile overflow (T34b)", () => {
     ]) {
       expect(el.querySelector(sel), `chip ${sel} must be gone`).toBeNull();
     }
+  });
+});
+
+// The mobile Chats home shell (design §2 / A8): `mobileChats` drops the
+// ConversationsPicker (the Chats list replaces it) and the `lg:hidden` gate
+// (the shell renders no TopBar, so tablets keep the bar). Default false.
+describe("BottomBar — mobileChats (the Chats home shell)", () => {
+  it("mobileChats=true drops the ConversationsPicker and the lg:hidden gate", async () => {
+    const el = await mount(null, true);
+    expect(el.querySelector('[data-testid="bottom-bar"]')).not.toBeNull();
+    expect(
+      el.querySelector('button[title="Load a saved conversation"]'),
+      "no ConversationsPicker in the Chats shell",
+    ).toBeNull();
+    expect(el.querySelector("footer")!.classList.contains("lg:hidden")).toBe(false);
+  });
+
+  it("mobileChats defaults to false: the picker and lg:hidden stay", async () => {
+    const el = await mount(null);
+    expect(el.querySelector('button[title="Load a saved conversation"]')).not.toBeNull();
+    expect(el.querySelector("footer")!.classList.contains("lg:hidden")).toBe(true);
   });
 });

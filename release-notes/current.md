@@ -25,6 +25,8 @@ This file is the working draft for the next release. When a version is tagged, t
 
 - **PeakBot Mobile: attach any file.** The phone app now accepts any file type, not just images. On Android, 📎 opens a short menu — take a photo, choose from the gallery, or pick a file (also in the web UI on Android browsers); on iPhone and iPad, 📎 opens the system's own sheet. On this phone, the agent can read the files you attach and keep notes in the conversation's own folder (nothing else on the device). Remote profiles accept files too; size and count limits are the server's. Old servers that only take images now say so clearly.
 
+- **PeakBot Mobile: a Chats home screen** — every conversation in one list (running, live, then by date) with search and profile filters; Back or ‹ Chats returns to it; + starts a new chat in place.
+
 ### Fixes
 
 - Web UI: images now display on remote profiles, including `view_image` tool results, which previously showed only a `🖼 alt` text stub. Uploaded-file thumbnails that fall back to the served file now use the remote profile's route too.

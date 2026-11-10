@@ -4,6 +4,7 @@
 // one path, one validator. Mobile shell only (the camera capability is
 // granted there and nowhere else).
 
+import { pushBackEntry } from "./backStack";
 import { shell } from "./desktop";
 
 type Invoke = (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
@@ -48,14 +49,13 @@ export async function scanQrCode(): Promise<ScanOutcome> {
   if (!granted) return { ok: false, cancelled: false, message: CAMERA_DENIED };
 
   // The OS Back over the camera UI is a popstate (at the SPA root it would
-  // exit the app): swallow it with a pushed entry, and cancel the scan.
+  // exit the app): a back-layer absorbs it and cancels the scan.
   let backCancelled = false;
-  const onPop = () => {
+  const onBack = () => {
     backCancelled = true;
     void invoke(CANCEL).catch(() => {});
   };
-  window.history.pushState(window.history.state, "");
-  window.addEventListener("popstate", onPop);
+  const release = pushBackEntry(onBack);
   try {
     const text = await invoke(SCAN, { formats: ["QR_CODE"] });
     return typeof text === "string" && text !== ""
@@ -64,10 +64,7 @@ export async function scanQrCode(): Promise<ScanOutcome> {
   } catch (e) {
     return scanFailure(e, backCancelled);
   } finally {
-    window.removeEventListener("popstate", onPop);
-    // The scan settled without the Back gesture: the pushed entry is
-    // dangling — consume it so a later Back lands on the baseline.
-    if (!backCancelled) window.history.back();
+    release();
   }
 }
 

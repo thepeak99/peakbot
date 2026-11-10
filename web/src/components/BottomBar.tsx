@@ -11,11 +11,9 @@ import { ConversationsPicker } from "./ConversationsPicker";
 import { SelectionChip } from "./SelectionChip";
 import { edition } from "../desktop";
 
-// Bottom status bar — mobile-only (hidden on lg+). Houses the selection chip
-// (profile, agent and team-model setup), conversations picker, and cwd picker
-// so all session-affecting controls are reachable without opening a drawer.
-// Menus open upward (`dropUp`) so they don't clip off the bottom of the
-// viewport.
+// Bottom status bar — mobile-only (hidden on lg+), except in the Chats home
+// shell (`mobileChats`), where the bar shows at every width and the Chats list
+// replaces the conversations picker. Menus open upward (`dropUp`).
 export function BottomBar({
   conversations,
   conversationsError,
@@ -34,6 +32,7 @@ export function BottomBar({
   selectionLocked = false,
   profilePinned = false,
   onToast,
+  mobileChats = false,
 }: {
   conversations: ConversationSummary[];
   conversationsError: string | null;
@@ -59,6 +58,10 @@ export function BottomBar({
   profilePinned?: boolean;
   /** Toast sink for `Next conversation: …`. */
   onToast?(message: string): void;
+  /** Chats home shell: drop the conversations picker and the `lg:hidden`
+   * gate — the Chats list replaces the picker and the shell renders no
+   * TopBar, so the bar must survive at tablet width. */
+  mobileChats?: boolean;
 }) {
   return (
     // flex-wrap (T34b): at ≤800 px the chips must not overflow the bar
@@ -66,7 +69,9 @@ export function BottomBar({
     // fixed tab rail on the right (see TabbedDrawer).
     <footer
       data-testid="bottom-bar"
-      className="flex min-h-14 flex-wrap items-center gap-2 border-t border-zinc-800 bg-zinc-950/80 pl-3 pr-12 py-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] backdrop-blur lg:hidden"
+      className={`flex min-h-14 flex-wrap items-center gap-2 border-t border-zinc-800 bg-zinc-950/80 pl-3 pr-12 py-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] backdrop-blur${
+        mobileChats ? "" : " lg:hidden"
+      }`}
     >
       <SelectionChip
         catalog={catalog ?? []}
@@ -80,18 +85,21 @@ export function BottomBar({
         onReattach={onReattach}
         dropUp
       />
-      <ConversationsPicker
-        conversations={conversations}
-        error={conversationsError}
-        hasTranscript={hasTranscript}
-        onOpen={() => send({ type: "request_conversations" })}
-        onLoad={onLoadConversation}
-        onKill={(id, profile) =>
-          send({ type: "kill_session", convo: id, ...(profile ? { profile } : {}) })
-        }
-        dropUp
-        catalog={catalog}
-      />
+      {/* The Chats home shell renders the Chats list instead of the picker. */}
+      {!mobileChats && (
+        <ConversationsPicker
+          conversations={conversations}
+          error={conversationsError}
+          hasTranscript={hasTranscript}
+          onOpen={() => send({ type: "request_conversations" })}
+          onLoad={onLoadConversation}
+          onKill={(id, profile) =>
+            send({ type: "kill_session", convo: id, ...(profile ? { profile } : {}) })
+          }
+          dropUp
+          catalog={catalog}
+        />
+      )}
 
       {/* The Local edition has no cwd of its own (the shell owns it); a
           remote profile's cwd lives on the remote, reached via the relay. */}
