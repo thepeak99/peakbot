@@ -37,6 +37,7 @@ FROM ghcr.io/rust-lang/rust:1.91-trixie AS build
 # crates/tauri-cli/src/interface/rust.rs:1702:17: Can't detect any
 # appindicator library` (Tauri CLI 2.12.3, 2026-10-28). Nothing in the
 # Windows-target build links it; the probe is a Linux-host artifact.
+# jq: check-version.sh reads the mobile version with it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         clang \
         lld \
@@ -45,6 +46,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         nsis \
         7zip \
         libayatana-appindicator3-dev \
+        jq \
     && rm -rf /var/lib/apt/lists/*
 
 # Fail fast (right after the layer that installs them) if the toolchain is

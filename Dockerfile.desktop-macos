@@ -37,12 +37,14 @@ RUN rustup target add aarch64-apple-darwin x86_64-apple-darwin \
     && rustup target list --installed
 
 # zip: bundle assembly; unzip + file: the smoke checks need them.
+# jq: check-version.sh reads the mobile version with it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         ca-certificates \
         zip \
         unzip \
         file \
+        jq \
     && rm -rf /var/lib/apt/lists/*
 
 # rcodesign (apple-codesign) — the ad-hoc signer. Pinned version + sha256
