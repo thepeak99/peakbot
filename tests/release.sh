@@ -1784,7 +1784,7 @@ else
     bad "T60 release-publish-shifu: copy-only ($why)"
 fi
 
-# ── L: server Dockerfiles vs workspace members ─────────────────────────────
+# ── L: Dockerfiles vs workspace members + check-version.sh inputs ───────────
 
 # T72: subset-COPY Dockerfiles break when the workspace grows; every member
 # manifest must be copied before the first workspace-loading cargo step.
@@ -1827,6 +1827,59 @@ for df in Dockerfile.linux Dockerfile.windows Dockerfile.macos Dockerfile.androi
     else
         for m in $t72_miss; do
             bad "T72 $df: workspace member $m manifest is not copied before the first cargo step"
+        done
+    fi
+done
+
+# T73: check-version.sh (5700a53) also reads the mobile app's manifest and
+# tauri.conf.json; a Dockerfile that RUNs it must COPY every file the script
+# reads (it resolves the repo root from its own path, <root>/desktop/scripts/).
+t73_files=$(grep -oE '\$root/[A-Za-z0-9._/-]+' desktop/scripts/check-version.sh 2>/dev/null \
+    | sed 's#^\$root/##' | sort -u)
+[ -n "$t73_files" ] || bad "T73 check-version.sh: no \$root/ file references found (empty list)"
+# Guard: every Cargo.toml / tauri.conf.json the script mentions must be in the
+# derived list, else the list silently drifts from the script.
+t73_guard=$(grep -oE '[$A-Za-z0-9._/-]*(Cargo\.toml|tauri\.conf\.json)' desktop/scripts/check-version.sh 2>/dev/null \
+    | sed 's#^\$root/##' | sort -u)
+for g in $t73_guard; do
+    printf '%s\n' "$t73_files" | grep -qx "$g" \
+        || bad "T73 check-version.sh mentions $g which is not in the derived file list"
+done
+t73_dfs=""
+for df in Dockerfile*; do
+    [ -f "$df" ] || continue
+    grep -qE '^[[:space:]]*RUN[[:space:]].*check-version\.sh' "$df" 2>/dev/null && t73_dfs="$t73_dfs $df"
+done
+[ -n "$t73_dfs" ] || bad "T73 no Dockerfile RUNs check-version.sh (expected at least one)"
+for df in $t73_dfs; do
+    t73_run=$(grep -nE '^[[:space:]]*RUN[[:space:]].*check-version\.sh' "$df" | head -n1 | cut -d: -f1)
+    t73_path=$(grep -E '^[[:space:]]*RUN[[:space:]].*check-version\.sh' "$df" | head -n1 \
+        | grep -oE '[^ ]*check-version\.sh' | head -n1)
+    # image root = the script's grandparent dir in the image ($root in the script)
+    t73_root=$(printf '%s\n' "$t73_path" | sed 's#/desktop/scripts/check-version\.sh$##')
+    [ -n "$t73_root" ] || { bad "T73 $df: cannot derive image root from RUN path: $t73_path"; continue; }
+    t73_miss=""
+    for f in $t73_files; do
+        awk -v f="$f" -v run="$t73_run" -v rootimg="$t73_root" '
+            function covers(p, x) {  # does COPYing p bring in file x?
+                if (p == x) return 1
+                if (p ~ /\/$/) return index(x, p) == 1
+                return index(x, p "/") == 1
+            }
+            NR < run && $1 == "COPY" {
+                n = 0
+                for (i = 2; i <= NF; i++) if ($i !~ /^--/) a[++n] = $i
+                if (n >= 2)
+                    for (i = 1; i < n; i++)
+                        if (covers(a[i], f) && covers(a[n], rootimg "/" f)) { fnd = 1; exit }
+            }
+            END { exit fnd ? 0 : 1 }' "$df" || t73_miss="$t73_miss $f"
+    done
+    if [ -z "$t73_miss" ]; then
+        ok "T73 $df: every file check-version.sh reads is copied before the version check"
+    else
+        for f in $t73_miss; do
+            bad "T73 $df: $f (read by check-version.sh) is not copied before the version check"
         done
     fi
 done
