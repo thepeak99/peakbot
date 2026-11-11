@@ -1784,6 +1784,53 @@ else
     bad "T60 release-publish-shifu: copy-only ($why)"
 fi
 
+# ── L: server Dockerfiles vs workspace members ─────────────────────────────
+
+# T72: subset-COPY Dockerfiles break when the workspace grows; every member
+# manifest must be copied before the first workspace-loading cargo step.
+t72_members=$(awk '
+    /^[ \t]*\[/ { ws = ($0 ~ /^[ \t]*\[workspace\][ \t]*$/) }
+    ws && /^[ \t]*members[ \t]*=/ { on = 1 }
+    on { print }
+    on && /\]/ { exit }' Cargo.toml \
+    | tr '\n' ' ' | sed -e 's/^[^[]*\[//' -e 's/\].*//' \
+    | grep -o '"[^"]*"' | tr -d '"' | grep -vx '\.')
+if [ -z "$t72_members" ]; then
+    bad "T72 Cargo.toml: could not parse any workspace member besides \".\""
+fi
+# `cargo install` runs before WORKDIR/COPY and never loads the workspace: skipped.
+for df in Dockerfile.linux Dockerfile.windows Dockerfile.macos Dockerfile.android; do
+    [ -n "$t72_members" ] || break
+    t72_cargo=$(awk '
+        /^[ \t]*#/ { next }
+        { s = $0
+          while (match(s, /(^|[ \t&;(])cargo[ \t]+[^ \t]+/)) {
+              if (substr(s, RSTART, RLENGTH) !~ /install$/) { print NR; exit }
+              s = substr(s, RSTART + RLENGTH) } }' "$df" 2>/dev/null)
+    if [ -z "$t72_cargo" ]; then
+        bad "T72 $df: no cargo step found to anchor the workspace manifest COPY check"
+        continue
+    fi
+    t72_miss=""
+    for m in $t72_members; do
+        awk -v m="$m" -v cl="$t72_cargo" '
+            function ok(p) { return p == m "/Cargo.toml" || p == m "/" || p == m }
+            NR < cl && $1 == "COPY" {
+                n = 0
+                for (i = 2; i <= NF; i++) if ($i !~ /^--/) a[++n] = $i
+                if (n >= 2 && ok(a[1]) && ok(a[n])) f = 1
+            }
+            END { exit f ? 0 : 1 }' "$df" || t72_miss="$t72_miss $m"
+    done
+    if [ -z "$t72_miss" ]; then
+        ok "T72 $df: every workspace member manifest is copied before the first cargo step"
+    else
+        for m in $t72_miss; do
+            bad "T72 $df: workspace member $m manifest is not copied before the first cargo step"
+        done
+    fi
+done
+
 # ── Summary ────────────────────────────────────────────────────────────────
 
 echo ""
