@@ -92,6 +92,9 @@ ARG VERSION
 # Root Cargo.toml is the version source for scripts/check-version.sh (it
 # compares root [package].version against desktop [workspace.package].version).
 COPY Cargo.toml /src/Cargo.toml
+# check-version.sh also verifies the mobile workspace member version.
+COPY mobile/src-tauri/Cargo.toml /src/mobile/src-tauri/Cargo.toml
+COPY mobile/src-tauri/tauri.conf.json /src/mobile/src-tauri/tauri.conf.json
 COPY desktop/ /src/desktop
 
 # The peakbot sidecar from the Dockerfile.windows msvc build (unversioned
