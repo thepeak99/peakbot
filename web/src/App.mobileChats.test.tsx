@@ -452,20 +452,6 @@ describe("App mobile Chats wiring (A1–A9)", () => {
     mount();
     await flush();
     expect(host.querySelector('[data-testid="chat-title"]')!.textContent).toBe("New chat");
-    unmount();
-
-    // Transcript, but the state describes a different conversation than the binding.
-    hoisted.agent = makeAgent(
-      stateFor("c2", {
-        conversation: { id: "c2", name: "Other" },
-        chat: { messages: [msg("hello")], auto_scroll: true, scroll_offset: 0 },
-      }),
-      null,
-      { convo: "c1" },
-    );
-    mount();
-    await flush();
-    expect(host.querySelector('[data-testid="chat-title"]')!.textContent).toBe("New chat");
   });
 
   it("A8: the bottom bar drops lg:hidden in the mobile shell, keeps it in a browser", async () => {

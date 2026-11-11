@@ -83,12 +83,9 @@ export function useConvoTabs(
   const [status, setStatus] = useState<StatusMap>({});
   const tabsRef = useRef<TabsState | null>(initial);
 
-  // The active tab's running state comes live from the socket. Until the new
-  // conversation's first `state` frame lands, `agent.state` still describes
-  // the previous one — don't attribute its spinner to the new tab.
-  const stateId = agent.state?.conversation?.id;
-  const stateIsLive = stateId === undefined || stateId === agent.convo;
-  const activeRunning = stateIsLive && (agent.state?.is_running ?? false);
+  // The active tab's running state comes live from the socket (`state` always
+  // describes the bound conversation — useAgent).
+  const activeRunning = agent.state?.is_running ?? false;
 
   // Latest values for handlers/timers that must not re-subscribe every render.
   const agentRef = useRef(agent);
@@ -142,10 +139,12 @@ export function useConvoTabs(
   }, [convo, activeTitle, apply]);
 
   // The active tab's profile follows the socket's selection (design T2,
-  // §6.4). Absent selection (fresh conversation / old server) = null.
-  const selProfile = agent.state?.selection?.profile || null;
+  // §6.4). No state yet (boot, or a switch whose first frame hasn't landed)
+  // says nothing about the selection, so the tab keeps its profile; a state
+  // without `selection` (fresh conversation / old server) is local.
+  const selProfile = agent.state ? agent.state.selection?.profile || null : undefined;
   useEffect(() => {
-    if (!tabsRef.current) return;
+    if (selProfile === undefined || !tabsRef.current) return;
     apply(activeProfile(tabsRef.current, selProfile));
   }, [selProfile, apply]);
 

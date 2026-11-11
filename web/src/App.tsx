@@ -109,14 +109,9 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   const notify = useTaskNotifications(isRunning);
   const hasTranscript = messageCount > 0;
   const selectionLocked = conversationHasTurns(state?.chat.messages ?? []);
-  // Desktop conversation tabs (null in a browser). The title is only offered
-  // once `state` describes the conversation the socket is bound to — right
-  // after a switch it still describes the previous one. The phone header
-  // shares the condition and falls back to `New chat` where tabs get `null`.
-  const convoTitle =
-    hasTranscript && state?.conversation?.id === agent.convo
-      ? (state?.conversation?.name ?? null)
-      : null;
+  // Offered once the conversation has a transcript; `state` always describes
+  // the bound conversation (useAgent), so its name is the title.
+  const convoTitle = hasTranscript ? (state?.conversation?.name ?? null) : null;
   const convoTabs = useConvoTabs(agent, initialTabs, convoTitle);
   // A picker row opens under ITS profile (null = local), so a remote row
   // reattaches as a relay rather than a local session (design §6.4).

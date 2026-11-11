@@ -18,6 +18,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { WATCHDOG_TICK_MS, heard, shouldReconnect } from "./liveness";
+import { createLastSeen } from "./lastSeen";
 import { profileFromUrl, setConvoInUrl } from "./state";
 import type {
   AppState,
@@ -30,6 +31,11 @@ import type {
 
 export interface AgentConnection {
   connected: boolean;
+  /** Always describes `convo` (or is null). Live once this socket's first
+   *  `state` frame lands; before that, right after a binding move, it is the
+   *  conversation's last-seen snapshot with in-flight-turn fields quiesced
+   *  (lastSeen.ts), or null if none is held. A reconnect of the same
+   *  conversation keeps the live snapshot. */
   state: AppState | null;
   models: ModelInfo[];
   activeAlias: string;
@@ -96,6 +102,9 @@ export function useAgent(): AgentConnection {
   const [dirListing, setDirListing] = useState<DirListing | null>(null);
   const [recentDirs, setRecentDirs] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
+  // One per hook instance (lazy): the last-seen cache behind the invariant
+  // "`state` always describes `convo`" (design §3).
+  const [lastSeen] = useState(createLastSeen);
 
   const wsRef = useRef<WebSocket | null>(null);
   const restartRef = useRef<() => void>(() => {});
@@ -129,6 +138,17 @@ export function useAgent(): AgentConnection {
     setConvo(id);
     setConvoInUrl(id, profileRef.current);
   }, []);
+
+  // Move the binding to a conversation this socket has no live frame for:
+  // swap `state` to its last-seen snapshot (or null) so it can never
+  // describe the previous conversation (design §4.1).
+  const rebind = useCallback((id: string | null, profile?: string | null) => {
+    bindConvo(id, profile);
+    setState(lastSeen.recall(profileRef.current, id));
+    // The previous socket's error / model alias are not this convo's.
+    setError(null);
+    setActiveAlias("");
+  }, [bindConvo, lastSeen]);
 
   // History entries keep the URL they were created with, so a back-traversal
   // can show a conversation we no longer are bound to — re-sync to the binding.
@@ -201,7 +221,10 @@ export function useAgent(): AgentConnection {
           case "ready":
             break;
           case "attached":
-            bindConvo(msg.convo);
+            // A reply with a different id (fresh-fallback, a null attach's
+            // mint) means nothing we hold describes it: a rebind.
+            if (msg.convo === convoRef.current) bindConvo(msg.convo);
+            else rebind(msg.convo);
             {
               // The held frame rides the attach that succeeds; clearing it
               // first makes a second `attached` a no-op.
@@ -218,6 +241,8 @@ export function useAgent(): AgentConnection {
             break;
           case "state":
             setState(msg.state);
+            // Cache the live snapshot for a later switch-back (design §4.2).
+            lastSeen.remember(profileRef.current, msg.state);
             // Keep the URL on the session's current conversation, which
             // `/model` / `/new` move under us.
             {
@@ -341,7 +366,7 @@ export function useAgent(): AgentConnection {
       window.clearTimeout(reconnectTimerRef.current);
       drop();
     };
-  }, [bindConvo]);
+  }, [bindConvo, rebind]);
 
   // Re-attach to another conversation: bind the id, then restart at once.
   // Closing the old socket detaches from (but does not kill) its session; the
@@ -360,14 +385,14 @@ export function useAgent(): AgentConnection {
     ) => {
       const profileChanged = profile !== undefined && profile !== profileRef.current;
       if (id === convoRef.current && !profileChanged && agent === undefined) return;
-      bindConvo(id, profile);
+      rebind(id, profile);
       attachAgentRef.current = agent ?? null;
       // Every switch overwrites the held frame, so a verb can never ride
       // into a conversation the user did not ask for.
       pendingFrameRef.current = firstFrame ?? null;
       restartRef.current();
     },
-    [bindConvo],
+    [rebind],
   );
 
   return {

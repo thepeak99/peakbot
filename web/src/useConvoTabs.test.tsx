@@ -859,3 +859,27 @@ describe("useConvoTabs — state mirror and id stability", () => {
     for (const t of raw.tabs) expect(Object.keys(t).sort()).toEqual(["convo", "profile", "title"]);
   });
 });
+
+// ─── a switch in flight (convo-state-cache design §5.4, T1) ──────────────
+// After a switch to an uncached conversation `useAgent.state` is `null` until
+// the first frame lands. "No state" says nothing about the selection, so the
+// active tab must keep its profile instead of being reset to local.
+
+describe("useConvoTabs — a state-less agent (switch in flight)", () => {
+  it("T1: a state-less agent (switch in flight) does not clear the active tab's profile", async () => {
+    const agent = makeAgent({ convo: "b", state: null });
+    const initial = state(
+      [tab("a", "A"), { ...tab("b", "B"), profile: "home" }],
+      1,
+    );
+
+    await renderHook(agent, initial);
+
+    const tabsNow = storeState().tabs as unknown as { convo: string | null; profile: string | null }[];
+    expect(tabsNow[1], "the active tab is still b").toMatchObject({ convo: "b" });
+    expect(tabsNow[1].profile, "the tab keeps its remote profile").toBe("home");
+    // The persisted store must not be rewritten to local either.
+    const raw = JSON.parse(localStorage.getItem("peakbot.desktop.tabs")!);
+    expect(raw.tabs[1].profile).toBe("home");
+  });
+});
