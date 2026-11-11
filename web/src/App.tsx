@@ -489,11 +489,16 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
               );
             })
           ) : (
+            // One composer for every conversation: the draftKey parks each
+            // conversation's half-typed text (see Composer). Mobile shell only
+            // — a plain browser keeps the keep-alive contract, where a
+            // server-side conversation move (e.g. /new) keeps the typed text.
             <ComposerSlot
               ref={activeSlot}
               convo={state?.conversation?.id ?? null}
               base={base}
               live={live}
+              draftKey={chats ? agent.convo : undefined}
             />
           )}
         </DropOverlay>

@@ -37,7 +37,7 @@
 // to `readClipboardImage()` (WebKit Bug 218519). On Android 📎 opens a menu
 // (camera / gallery / file); elsewhere it opens the OS dialog.
 
-import { useEffect, useRef, useState, useLayoutEffect } from "react";
+import { useCallback, useEffect, useRef, useState, useLayoutEffect } from "react";
 import { isAndroid } from "../platform";
 import { isDesktop, readClipboardImage } from "../desktop";
 import type { SlashCommand } from "../state";
@@ -107,6 +107,11 @@ export interface ComposerProps {
   stopPending?: boolean;
   /** Parked tab: stay mounted (keeps text and palette state) but not shown. */
   hidden?: boolean;
+  /** Single-composer shells (mobile + plain browser) only: park the
+   * half-typed text per bound conversation — `null` = a fresh, not-yet-named
+   * chat, a later `null` → id is that chat getting its server id (not a
+   * switch). `undefined` = feature off (desktop keep-alive tabs). */
+  draftKey?: string | null;
 }
 
 export function Composer({
@@ -127,6 +132,7 @@ export function Composer({
   settingsEnabled = true,
   stopPending = false,
   hidden = false,
+  draftKey,
 }: ComposerProps) {
   const [text, setText] = useState("");
   const [selected, setSelected] = useState(0);
@@ -216,11 +222,36 @@ export function Composer({
     setDismissed(true); // hide until the field is edited again
   };
 
-  const onChange = (v: string) => {
+  // The one text-change path (typing, and draft restore below): the palette
+  // selection/dismissal must reset whenever the field's content changes.
+  const onChange = useCallback((v: string) => {
     setText(v);
     setSelected(0);
     setDismissed(false);
-  };
+  }, []);
+
+  // Per-conversation drafts (single-composer shells: one Composer serves
+  // every conversation, so a switch swaps text in place). Half-typed text is
+  // parked in memory under its `draftKey`; an empty box deletes the entry,
+  // which is also why a sent message (already cleared) is never restored.
+  const drafts = useRef(new Map<string | null, string>());
+  const prevDraftKey = useRef(draftKey);
+  useLayoutEffect(() => {
+    const prev = prevDraftKey.current;
+    prevDraftKey.current = draftKey;
+    // off, first key (feature just turned on: keep the text), mount, or no
+    // switch — nothing to park or restore.
+    if (draftKey === undefined || prev === undefined || prev === draftKey) return;
+    // null → id is the server naming the fresh chat — not a switch — but only
+    // while that chat holds text: an empty fresh chat moving to an existing
+    // one is a plain switch (there is nothing to keep). `prevDraftKey` above
+    // already remembers the minted id.
+    if (prev === null && typeof draftKey === "string" && text !== "") return;
+    const map = drafts.current;
+    if (text) map.set(prev, text);
+    else map.delete(prev);
+    onChange(map.get(draftKey) ?? "");
+  }, [draftKey, text, onChange]);
 
   const onPaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
     const cd = e.clipboardData;

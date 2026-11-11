@@ -37,6 +37,7 @@ export const ComposerSlot = memo(function ComposerSlot({
   base = "",
   live,
   ref,
+  draftKey,
 }: {
   convo: string | null;
   /** `/r/<L>` proxy prefix of this tab's profile ("" = local); uploads use it. */
@@ -44,11 +45,20 @@ export const ComposerSlot = memo(function ComposerSlot({
   /** `null` = inactive tab: parked and hidden. */
   live: ComposerLive | null;
   ref?: Ref<ComposerSlotHandle>;
+  /** Single-composer shells only: per-conversation draft key for the
+   * composer's text (see `Composer.draftKey`). Omitted (desktop tabs) = off. */
+  draftKey?: string | null;
 }) {
   const { uploadLimits, ...props } = live ?? PARKED;
   const attachments = useAttachments(convo, uploadLimits, base);
   useImperativeHandle(ref, () => ({ add: attachments.add }), [attachments.add]);
   return (
-    <Composer {...props} base={base} hidden={live === null} attachments={attachments} />
+    <Composer
+      {...props}
+      base={base}
+      draftKey={draftKey}
+      hidden={live === null}
+      attachments={attachments}
+    />
   );
 });

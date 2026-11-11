@@ -161,14 +161,7 @@ type SlotProps = {
 };
 
 const element = ({ convo, live, handle, draftKey }: SlotProps) => (
-  <ComposerSlot
-    convo={convo}
-    live={live}
-    ref={handle}
-    // `draftKey` is not on ComposerSlot's props until the fix lands; spread it
-    // past the type system so the RED tests compile (vitest doesn't typecheck).
-    {...(draftKey === undefined ? {} : ({ draftKey } as object))}
-  />
+  <ComposerSlot convo={convo} live={live} ref={handle} draftKey={draftKey} />
 );
 
 async function mount(props: SlotProps): Promise<HTMLDivElement> {
