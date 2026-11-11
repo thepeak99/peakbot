@@ -395,3 +395,183 @@ describe("ConversationsPicker — per-profile row colour dot (remote-profiles T2
     expect(el.querySelectorAll('[data-testid="picker-row-color"]')).toHaveLength(0);
   });
 });
+
+// ─── conversation-row states (consistent with the mobile ChatList) ─────────
+//
+// The approved row-state contract:
+//   • RUNNING rows (`running === true`; a running chat is also active) get
+//     the AMBER language: wrapper `bg-amber-950/40 hover:bg-amber-900/40`,
+//     title `font-semibold text-amber-200`, and the amber spinner marker
+//     (`data-testid="picker-status-running"`, aria-label "running", the same
+//     classes as the mobile `chat-status-running` spinner).
+//   • LIVE rows (`active && !running`) keep the emerald tint
+//     (`bg-emerald-950/40 hover:bg-emerald-900/40`) and the
+//     `font-semibold text-emerald-200` title, but the VISIBLE green dot is
+//     removed: no `bg-emerald-400` element, and a visually hidden (sr-only)
+//     "Live session" label stays for accessibility. The " · live" meta text
+//     and the kill ✕ are kept.
+//   • Plain rows: no tint, `font-medium` title, no markers.
+//   • The keyboard-highlighted (selected) row keeps its precedence over the
+//     active tint (selected wins) — that is today's behaviour and must stay.
+//
+// The picker has NO unread concept today (no unread prop, no sky dot), so —
+// per the spec — no unread assertions are invented here.
+//
+// RED before implementation: the component knows only `active` — there is no
+// `running` branch, no `picker-status-running` marker, no amber classes and
+// no sr-only label, while the visible `bg-emerald-400` dot still renders.
+
+describe("ConversationsPicker — row states (running amber / live emerald / plain)", () => {
+  const rowConvo = (over: Partial<ConversationSummary>): ConversationSummary => ({
+    id: "x1",
+    name: "row convo",
+    updated_at: "2026-10-04T00:00:00Z",
+    message_count: 2,
+    model: "sonnet",
+    active: false,
+    ...over,
+  });
+
+  // The dropdown panel is the `.absolute` div; rows live in it. A row's load
+  // button is the button whose text carries the conversation name, and the
+  // row itself is that button's parent.
+  const rowButton = (el: HTMLElement, name: string): HTMLElement | undefined =>
+    [...el.querySelectorAll<HTMLElement>(".absolute button")].find((b) =>
+      b.textContent?.includes(name),
+    );
+
+  const rowDiv = (el: HTMLElement, name: string): HTMLElement => {
+    const btn = rowButton(el, name);
+    expect(btn, `a row button for "${name}" must render`).not.toBeUndefined();
+    return btn!.parentElement!;
+  };
+
+  // The row's title span (the only `truncate` span inside the row button).
+  const rowTitle = (rowEl: HTMLElement): HTMLElement => {
+    const t = rowEl.querySelector<HTMLElement>("span.truncate");
+    expect(t, "a title span must render in the row").not.toBeNull();
+    return t!;
+  };
+
+  // The hidden "Live session" label: by aria-label or text, per the
+  // text/aria-label contract.
+  const liveLabel = (rowEl: HTMLElement): HTMLElement | null =>
+    [
+      ...rowEl.querySelectorAll<HTMLElement>('[aria-label="Live session"]'),
+    ].find(Boolean) ??
+    [...rowEl.querySelectorAll<HTMLElement>("*")].find(
+      (n) => n.textContent === "Live session",
+    ) ??
+    null;
+
+  // Open the picker, then land a fresh list (new reference) so the loading
+  // state clears — the established pattern in this file.
+  async function openWith(convs: ConversationSummary[]): Promise<HTMLElement> {
+    const el = await render({ ...baseProps, error: null, conversations: convs });
+    await openPicker(el);
+    await render({ ...baseProps, error: null, conversations: [...convs] });
+    return el;
+  }
+
+  const SPINNER_CLASSES = [
+    "h-3.5",
+    "w-3.5",
+    "animate-spin",
+    "rounded-full",
+    "border-2",
+    "border-amber-400",
+    "border-t-transparent",
+  ];
+
+  it("running rows get the amber tint, an amber title and the amber spinner marker", async () => {
+    const convs = [
+      rowConvo({ id: "r1", name: "Running convo", active: true, running: true }),
+      rowConvo({ id: "p1", name: "Plain convo" }),
+    ];
+    const el = await openWith(convs);
+    const d = rowDiv(el, "Running convo");
+
+    // Amber tint on the wrapper (desktop adds the hover variant).
+    expect(d.classList.contains("bg-amber-950/40"), "the running row tint").toBe(true);
+    expect(d.classList.contains("hover:bg-amber-900/40"), "the running row hover tint").toBe(true);
+    // Amber semibold title.
+    const t = rowTitle(d);
+    expect(t.classList.contains("font-semibold")).toBe(true);
+    expect(t.classList.contains("text-amber-200")).toBe(true);
+    // A running row is not emerald, even though a running chat is also active.
+    expect(d.classList.contains("bg-emerald-950/40")).toBe(false);
+    expect(t.classList.contains("text-emerald-200")).toBe(false);
+
+    // The amber spinner is the running marker, matching the mobile classes.
+    const spin = d.querySelector<HTMLElement>('[data-testid="picker-status-running"]');
+    expect(spin, "the running spinner marker").not.toBeNull();
+    expect(spin!.getAttribute("aria-label")).toBe("running");
+    for (const cls of SPINNER_CLASSES) {
+      expect(spin!.classList.contains(cls), `spinner class ${cls}`).toBe(true);
+    }
+
+    // Running is not live: no live label, no " · live" text.
+    expect(liveLabel(d), "a running row is not live").toBeNull();
+    expect(d.textContent).not.toContain("· live");
+  });
+
+  it("live rows keep the emerald tint and title; the visible green dot is gone", async () => {
+    // The live row sits at index 1 so the initial keyboard highlight (row 0)
+    // does not shadow its tint.
+    const convs = [
+      rowConvo({ id: "p1", name: "Plain convo" }),
+      rowConvo({ id: "l1", name: "Live convo", active: true }),
+    ];
+    const el = await openWith(convs);
+    const d = rowDiv(el, "Live convo");
+
+    expect(d.classList.contains("bg-emerald-950/40"), "the live row tint").toBe(true);
+    expect(d.classList.contains("hover:bg-emerald-900/40"), "the live row hover tint").toBe(true);
+    const t = rowTitle(d);
+    expect(t.classList.contains("font-semibold")).toBe(true);
+    expect(t.classList.contains("text-emerald-200")).toBe(true);
+
+    // No visible green dot anywhere in the row.
+    expect(d.querySelector(".bg-emerald-400"), "no visible green dot").toBeNull();
+    // The hidden "Live session" label stays, visually hidden.
+    const label = liveLabel(d);
+    expect(label, "the hidden Live session label").not.toBeNull();
+    expect(label!.classList.contains("sr-only"), "the label must be sr-only").toBe(true);
+    expect(label!.classList.contains("bg-emerald-400"), "the label is not a dot").toBe(false);
+    // The " · live" meta text and the kill ✕ are kept.
+    expect(d.textContent).toContain("· live");
+    expect(d.querySelector('button[title="Kill this live session"]')).not.toBeNull();
+    // No running marker.
+    expect(d.querySelector('[data-testid="picker-status-running"]')).toBeNull();
+  });
+
+  it("plain rows get no tint, a medium title and no status markers", async () => {
+    const convs = [rowConvo({ id: "p1", name: "Plain convo" })];
+    const el = await openWith(convs);
+    const d = rowDiv(el, "Plain convo");
+
+    expect(d.classList.contains("bg-amber-950/40")).toBe(false);
+    expect(d.classList.contains("bg-emerald-950/40")).toBe(false);
+    const t = rowTitle(d);
+    expect(t.classList.contains("font-medium")).toBe(true);
+    expect(t.classList.contains("font-semibold")).toBe(false);
+    expect(d.querySelector('[data-testid="picker-status-running"]')).toBeNull();
+    expect(liveLabel(d)).toBeNull();
+    expect(d.querySelector(".bg-emerald-400")).toBeNull();
+    expect(d.querySelector('button[title="Kill this live session"]')).toBeNull();
+    expect(d.textContent).not.toContain("· live");
+  });
+
+  it("the keyboard-highlighted (selected) row wins over the active tint", async () => {
+    // highlightedIndex starts at 0 on open, so the first (active) row is the
+    // highlighted one: its `bg-zinc-800` highlight must beat the emerald tint.
+    const convs = [
+      rowConvo({ id: "l1", name: "Live convo", active: true }),
+      rowConvo({ id: "p1", name: "Plain convo" }),
+    ];
+    const el = await openWith(convs);
+    const d = rowDiv(el, "Live convo");
+    expect(d.classList.contains("bg-zinc-800"), "the highlighted row keeps its highlight").toBe(true);
+    expect(d.classList.contains("bg-emerald-950/40"), "selected wins over the active tint").toBe(false);
+  });
+});

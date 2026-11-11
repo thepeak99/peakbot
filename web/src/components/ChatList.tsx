@@ -325,7 +325,7 @@ function Row({
     <div
       data-testid="chat-row"
       data-convo={chat.id}
-      className={live ? "bg-emerald-950/40" : ""}
+      className={running ? "bg-amber-950/40" : live ? "bg-emerald-950/40" : ""}
     >
       <button
         type="button"
@@ -344,7 +344,11 @@ function Row({
         <span className="flex w-full items-center gap-2 pl-1.5">
           <span
             className={`min-w-0 truncate text-[15px] ${
-              live ? "font-semibold text-emerald-200" : "font-medium text-zinc-100"
+              running
+                ? "font-semibold text-amber-200"
+                : live
+                  ? "font-semibold text-emerald-200"
+                  : "font-medium text-zinc-100"
             }`}
           >
             <Title name={chat.name} matches={row.titleMatches} />
@@ -363,11 +367,10 @@ function Row({
               />
             )}
             {live && (
-              <span
-                data-testid="chat-status-live"
-                aria-label="live session"
-                className="h-2 w-2 rounded-full bg-emerald-400"
-              />
+              // sr-only: the emerald tint is the visible state; this is for screen readers.
+              <span data-testid="chat-status-live" aria-label="live session" className="sr-only">
+                live session
+              </span>
             )}
             {isUnread && (
               <span
