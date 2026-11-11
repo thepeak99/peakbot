@@ -33,9 +33,14 @@ COPY Cargo.toml Cargo.lock* ./
 # vendor/ must land before the dep-cache build: [patch.crates-io] in
 # Cargo.toml resolves termios from this vendored path (see vendor/README.md).
 COPY vendor/ vendor/
+# cargo loads every workspace member manifest (mobile/src-tauri included), and
+# its [lib] needs the default src/lib.rs — an empty stub, created below.
+COPY mobile/src-tauri/Cargo.toml mobile/src-tauri/Cargo.toml
 
 RUN mkdir -p src && \
-    echo "fn main() {}" > src/main.rs
+    echo "fn main() {}" > src/main.rs && \
+    mkdir -p mobile/src-tauri/src && \
+    touch mobile/src-tauri/src/lib.rs
 
 RUN cargo build --target ${TARGET} --release && \
     rm -rf target/${TARGET}/deps/*.rlib target/${TARGET}/deps/*.d
