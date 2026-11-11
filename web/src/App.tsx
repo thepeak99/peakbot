@@ -41,6 +41,7 @@ import { useTaskNotifications } from "./useTaskNotifications";
 import { useFavicon } from "./useFavicon";
 import { useFocusMode } from "./useFocusMode";
 import { useMobileChats } from "./useMobileChats";
+import { useScreenSlide } from "./useScreenSlide";
 import { ChatHeader } from "./components/ChatHeader";
 import { ChatList } from "./components/ChatList";
 import { focusView } from "./focus";
@@ -318,6 +319,17 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   // conversation. `showToast` is stable; `null` outside the mobile shell.
   const chats = useMobileChats(agent, showToast);
 
+  // Each overlay stays mounted (inert) through its WAAPI exit and unmounts
+  // once its state is `gone`.
+  const chatListRef = useRef<HTMLElement>(null);
+  const chatListSlide = useScreenSlide(chats?.screen === "chats", chatListRef, "left");
+  const settingsRef = useRef<HTMLDivElement>(null);
+  const settingsSlide = useScreenSlide(
+    settingsView.open && settingsEnabled,
+    settingsRef,
+    "right",
+  );
+
   // Keep an open drawer pointed at a tab the server still shows. When the
   // visible set changes (e.g. the bound profile's `tabs` drops a tab out
   // from under an open drawer), relocate the active tab to the first
@@ -533,8 +545,10 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
       />
       </div>
 
-      {chats?.screen === "chats" && (
+      {chats && chatListSlide !== "gone" && (
         <ChatList
+          ref={chatListRef}
+          leaving={chatListSlide === "leaving"}
           conversations={conversations}
           catalog={catalog}
           loaded={chats.loaded}
@@ -550,8 +564,10 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
         />
       )}
 
-      {settingsView.open && settingsEnabled && (
+      {settingsSlide !== "gone" && (
         <Settings
+          ref={settingsRef}
+          leaving={settingsSlide === "leaving"}
           convo={state?.conversation?.id ?? null}
           activeProfile={selection?.profile ?? null}
           onClose={settingsView.close}
