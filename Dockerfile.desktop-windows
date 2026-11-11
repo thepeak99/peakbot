@@ -37,6 +37,7 @@ FROM ghcr.io/rust-lang/rust:1.91-trixie AS build
 # crates/tauri-cli/src/interface/rust.rs:1702:17: Can't detect any
 # appindicator library` (Tauri CLI 2.12.3, 2026-10-28). Nothing in the
 # Windows-target build links it; the probe is a Linux-host artifact.
+# jq: check-version.sh reads the mobile version with it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         clang \
         lld \
@@ -45,6 +46,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         nsis \
         7zip \
         libayatana-appindicator3-dev \
+        jq \
     && rm -rf /var/lib/apt/lists/*
 
 # Fail fast (right after the layer that installs them) if the toolchain is
@@ -92,6 +94,9 @@ ARG VERSION
 # Root Cargo.toml is the version source for scripts/check-version.sh (it
 # compares root [package].version against desktop [workspace.package].version).
 COPY Cargo.toml /src/Cargo.toml
+# check-version.sh also verifies the mobile workspace member version.
+COPY mobile/src-tauri/Cargo.toml /src/mobile/src-tauri/Cargo.toml
+COPY mobile/src-tauri/tauri.conf.json /src/mobile/src-tauri/tauri.conf.json
 COPY desktop/ /src/desktop
 
 # The peakbot sidecar from the Dockerfile.windows msvc build (unversioned

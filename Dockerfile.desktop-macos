@@ -37,12 +37,14 @@ RUN rustup target add aarch64-apple-darwin x86_64-apple-darwin \
     && rustup target list --installed
 
 # zip: bundle assembly; unzip + file: the smoke checks need them.
+# jq: check-version.sh reads the mobile version with it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         ca-certificates \
         zip \
         unzip \
         file \
+        jq \
     && rm -rf /var/lib/apt/lists/*
 
 # rcodesign (apple-codesign) — the ad-hoc signer. Pinned version + sha256
@@ -67,6 +69,9 @@ ARG VERSION
 # Root Cargo.toml is the version source for scripts/check-version.sh (it
 # compares root [package].version against desktop [workspace.package].version).
 COPY Cargo.toml /src/Cargo.toml
+# check-version.sh also verifies the mobile workspace member version.
+COPY mobile/src-tauri/Cargo.toml /src/mobile/src-tauri/Cargo.toml
+COPY mobile/src-tauri/tauri.conf.json /src/mobile/src-tauri/tauri.conf.json
 COPY desktop/ /src/desktop
 
 # The peakbot sidecar from the existing Dockerfile.macos build (unversioned

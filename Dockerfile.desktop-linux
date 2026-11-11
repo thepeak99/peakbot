@@ -22,7 +22,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 # check pins), appindicator/rsvg (tray + icons), plus the tools the smoke
 # check itself needs (file, binutils → objdump/readelf, xz). fontconfig +
 # fonts-dejavu-core back the DESIGN §4.12 host fontconfig tests (h1–h8:
-# fc-match/fc-list, and a /usr/share/fonts sans-serif for h8).
+# fc-match/fc-list, and a /usr/share/fonts sans-serif for h8). jq:
+# check-version.sh reads the mobile version with it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         pkg-config \
@@ -40,6 +41,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         ca-certificates \
         binutils \
+        jq \
     && rm -rf /var/lib/apt/lists/*
 
 # Node 22 (nodesource) — runs the pinned Tauri CLI via npx.
@@ -60,6 +62,9 @@ ARG VERSION
 # Root Cargo.toml is the version source for scripts/check-version.sh (it
 # compares root [package].version against desktop [workspace.package].version).
 COPY Cargo.toml /src/Cargo.toml
+# check-version.sh also verifies the mobile workspace member version.
+COPY mobile/src-tauri/Cargo.toml /src/mobile/src-tauri/Cargo.toml
+COPY mobile/src-tauri/tauri.conf.json /src/mobile/src-tauri/tauri.conf.json
 COPY desktop/ /src/desktop
 
 # The peakbot sidecar from the existing Dockerfile.linux build (unversioned
