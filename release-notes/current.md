@@ -29,6 +29,8 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ### Fixes
 
+- Anthropic provider: when the model refuses a request, PeakBot now says so and shows the provider's category and explanation, for example `❌ The model refused this request (reasoning_extraction): …`, instead of `Response contained no message or tool call (empty)`. A refusal is not retried.
+
 - Web UI: images now display on remote profiles, including `view_image` tool results, which previously showed only a `🖼 alt` text stub. Uploaded-file thumbnails that fall back to the served file now use the remote profile's route too.
 
 - Desktop: "Check for updates…" (macOS app menu and tray) now only checks — it no longer downloads and installs an already-known update immediately. When an update is found you get a dialog, and installing happens from the update banner.

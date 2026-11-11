@@ -49,6 +49,10 @@ use rig_core::tool::ToolDyn;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
+/// Anthropic completion model over the refusal-aware client: a refusal is a
+/// typed `Refusal` error, never rig's generic empty-response error.
+pub type AnthropicModel = anthropic::completion::CompletionModel<refusal::RefusalAwareHttp>;
+
 /// Provider info - metadata about the current provider
 #[derive(Debug, Clone)]
 pub struct ProviderInfo {
@@ -124,7 +128,7 @@ pub fn resolve_display_reasoning(
 pub enum CompactionModel {
     OpenRouter(Agent<<openrouter::Client as CompletionClient>::CompletionModel, ()>),
     OpenAI(Agent<rig_core::providers::openai::responses_api::ResponsesCompletionModel, ()>),
-    Anthropic(Agent<rig_core::providers::anthropic::completion::CompletionModel, ()>),
+    Anthropic(Agent<AnthropicModel, ()>),
     LlamaCpp(Agent<rig_core::providers::openai::completion::CompletionModel, ()>),
     Ollama(Agent<<ollama::Client as CompletionClient>::CompletionModel, ()>),
     #[cfg(feature = "mock")]
@@ -156,7 +160,7 @@ pub enum DynAgent {
     ),
     /// Anthropic agent (Messages API — carries images in tool results;
     /// works against Claude or a local Anthropic-compatible server)
-    Anthropic(Agent<rig_core::providers::anthropic::completion::CompletionModel, SessionHook>),
+    Anthropic(Agent<AnthropicModel, SessionHook>),
     /// LlamaCpp agent (uses completions API for compatibility with llama.cpp)
     LlamaCpp(Agent<rig_core::providers::openai::completion::CompletionModel, SessionHook>),
     /// Ollama agent (no hook for local models)
@@ -395,7 +399,7 @@ pub fn create_compaction_model(
         ProviderConfig::Anthropic(c) => {
             let api_key = c.api_key.clone().unwrap_or_default();
             let client = anthropic::Client::builder()
-                .http_client(crate::http::client())
+                .http_client(refusal::RefusalAwareHttp::default())
                 .api_key(&api_key)
                 .base_url(&c.base_url)
                 .build()
@@ -877,7 +881,7 @@ fn create_anthropic_agent(
     state_manager: Arc<StateManager>,
     shell_kind: Option<&ShellKind>,
 ) -> Result<(
-    Agent<rig_core::providers::anthropic::completion::CompletionModel, SessionHook>,
+    Agent<AnthropicModel, SessionHook>,
     ProviderInfo,
     mpsc::UnboundedReceiver<SourcedEvent>,
     SessionHook,
@@ -890,7 +894,7 @@ fn create_anthropic_agent(
     }
 
     let client = anthropic::Client::builder()
-        .http_client(crate::http::client())
+        .http_client(refusal::RefusalAwareHttp::default())
         .api_key(&api_key)
         .base_url(&config.base_url)
         .build()
@@ -1403,7 +1407,7 @@ pub(crate) fn build_sub_agent(
         ProviderConfig::Anthropic(c) => {
             let api_key = c.api_key.clone().unwrap_or_default();
             let client = anthropic::Client::builder()
-                .http_client(crate::http::client())
+                .http_client(refusal::RefusalAwareHttp::default())
                 .api_key(&api_key)
                 .base_url(&c.base_url)
                 .build()

@@ -11,8 +11,12 @@
 //! Substring matching is fragile — a localized or reworded rate-limit that
 //! omits every marker classifies as *permanent* and the turn is lost. That
 //! fallback is out of scope here; it needs provider-by-provider evidence.
+//!
+//! An `Instance` error is a transport fault and transient, except a `Refusal`
+//! — the provider's verdict on the payload, identical on every retry.
 
 use crate::config::RetryConfig;
+use crate::providers::refusal::Refusal;
 use rig_core::completion::{CompletionError, PromptError};
 use std::time::Duration;
 
@@ -50,8 +54,10 @@ fn is_transient_http_error(err: &rig_core::http_client::Error) -> bool {
     match err {
         // A real response with a real status — ask the status.
         E::InvalidStatusCode(s) | E::InvalidStatusCodeWithMessage(s, _) => is_retryable_status(*s),
+        // A refusal is the provider's verdict on this payload, not a transport fault: identical on every retry.
+        E::Instance(e) => !e.is::<Refusal>(),
         // Transport: connection reset, TLS, DNS, timeout, truncated body.
-        E::Instance(_) | E::StreamEnded => true,
+        E::StreamEnded => true,
         // We built or read the request/response wrong. Deterministic.
         E::Protocol(_) | E::InvalidHeaderValue(_) | E::NoHeaders | E::InvalidContentType(_) => {
             false

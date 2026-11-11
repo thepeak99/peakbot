@@ -2,6 +2,128 @@
 //! surfaced as a readable, never-retried error instead of rig's generic
 //! empty-response error.
 
+use bytes::Bytes;
+use rig_core::completion::{CompletionError, PromptError};
+use rig_core::http_client::{
+    self, HttpClientExt, LazyBody, MultipartForm, Request, Response, StreamingResponse,
+};
+use rig_core::wasm_compat::WasmCompatSend;
+use serde::Deserialize;
+use std::future::Future;
+
+/// An Anthropic `stop_reason: "refusal"` response. `Display` is the user-facing sentence.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct Refusal(String);
+
+/// Lenient envelope for `Refusal::parse`: everything a refusal may lack is
+/// optional, and `content`'s elements are ignored — only its emptiness matters.
+#[derive(Deserialize)]
+struct Envelope {
+    stop_reason: Option<String>,
+    #[serde(default)]
+    content: Vec<serde::de::IgnoredAny>,
+    stop_details: Option<StopDetails>,
+}
+
+#[derive(Deserialize)]
+struct StopDetails {
+    category: Option<String>,
+    explanation: Option<String>,
+}
+
+impl Refusal {
+    /// `Some` only for a JSON body with `stop_reason == "refusal"` and empty `content`.
+    pub(crate) fn parse(body: &[u8]) -> Option<Self> {
+        let env: Envelope = serde_json::from_slice(body).ok()?;
+        if env.stop_reason.as_deref() != Some("refusal") || !env.content.is_empty() {
+            return None;
+        }
+        // A blank string is the provider's way of saying "absent".
+        let present = |s: Option<String>| s.filter(|s| !s.trim().is_empty());
+        let (category, explanation) = match env.stop_details {
+            Some(d) => (present(d.category), present(d.explanation)),
+            None => (None, None),
+        };
+        let mut text = String::from("The model refused this request");
+        if let Some(c) = category {
+            text.push_str(&format!(" ({c})"));
+        }
+        match explanation {
+            Some(e) => text.push_str(&format!(": {e}")),
+            None => text.push_str(" — the provider gave no explanation."),
+        }
+        Some(Self(text))
+    }
+
+    /// The refusal behind a prompt error, if that is what it is.
+    pub fn of(err: &PromptError) -> Option<&Refusal> {
+        match err {
+            PromptError::CompletionError(CompletionError::HttpError(
+                http_client::Error::Instance(e),
+            )) => e.downcast_ref(),
+            _ => None,
+        }
+    }
+}
+
+/// reqwest client for Anthropic that reports a refusal as an error instead of an empty reply.
+#[derive(Clone, Debug)]
+pub struct RefusalAwareHttp(reqwest::Client);
+
+/// The only constructor — `crate::http::client()` keeps the shared TLS and
+/// timeout policy from being bypassed.
+impl Default for RefusalAwareHttp {
+    fn default() -> Self {
+        Self(crate::http::client())
+    }
+}
+
+impl HttpClientExt for RefusalAwareHttp {
+    fn send<T, U>(
+        &self,
+        req: Request<T>,
+    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + WasmCompatSend + 'static
+    where
+        T: Into<Bytes>,
+        T: WasmCompatSend,
+        U: From<Bytes>,
+        U: WasmCompatSend + 'static,
+    {
+        let sent = self.0.send::<T, Bytes>(req);
+        async move {
+            let (parts, body) = sent.await?.into_parts();
+            let bytes = body.await?;
+            if let Some(refusal) = Refusal::parse(&bytes) {
+                return Err(http_client::Error::Instance(Box::new(refusal)));
+            }
+            let body: LazyBody<U> = Box::pin(async move { Ok(U::from(bytes)) });
+            Ok(Response::from_parts(parts, body))
+        }
+    }
+
+    fn send_multipart<U>(
+        &self,
+        req: Request<MultipartForm>,
+    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + WasmCompatSend + 'static
+    where
+        U: From<Bytes>,
+        U: WasmCompatSend + 'static,
+    {
+        self.0.send_multipart(req)
+    }
+
+    fn send_streaming<T>(
+        &self,
+        req: Request<T>,
+    ) -> impl Future<Output = http_client::Result<StreamingResponse>> + WasmCompatSend
+    where
+        T: Into<Bytes> + WasmCompatSend,
+    {
+        self.0.send_streaming(req)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     //! Fixtures plus a loopback fake of the Anthropic Messages endpoint,

@@ -3024,10 +3024,19 @@ impl AgentRunner {
                     if !crate::providers::retry::is_transient_prompt_error(&e) {
                         if let Some(sm) = state_manager {
                             sm.set_status(None);
-                            sm.add_system_message(format!(
-                                "❌ LLM request failed: {}",
-                                crate::ui::app_state::truncate_str(&e.to_string(), 2000)
-                            ));
+                            // A refusal already says what happened; the generic
+                            // prefix would bury the provider's reason.
+                            let text = match crate::providers::refusal::Refusal::of(&e) {
+                                Some(refusal) => format!(
+                                    "❌ {}",
+                                    crate::ui::app_state::truncate_str(&refusal.to_string(), 2000)
+                                ),
+                                None => format!(
+                                    "❌ LLM request failed: {}",
+                                    crate::ui::app_state::truncate_str(&e.to_string(), 2000)
+                                ),
+                            };
+                            sm.add_system_message(text);
                         }
                         return CompletionResult::Error;
                     }

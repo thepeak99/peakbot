@@ -124,6 +124,7 @@ Two exceptions, registered ungated: `think` (its `thought` *is* the payload) and
 - **Tool errors** → returned to the model as tool results; it self-corrects.
 - **Tool panics** → caught at the tool boundary (`TimeBudget`) and returned to the model as `💥 PANIC: …` — orchestrator, sub-agent, or `delegate` itself; the innermost wrapper wins. The model self-corrects and the turn continues. The `agent_loop` `catch_unwind` is only a backstop for panics *outside* any tool (those abort the turn like Stop).
 - **API errors** (auth, network) → surface as `PromptError`, printed; loop continues. Transient errors are retried with backoff (`is_transient_prompt_error`).
+- **Refusals** (Anthropic `stop_reason: "refusal"` with no content) → `RefusalAwareHttp` (`src/providers/refusal.rs`) turns the response into a typed `Refusal`; shown as `❌ The model refused this request (category): explanation`; never retried.
 - **Max turns exceeded** → printed as an error; user retries or rephrases.
 
 ## Configuration
