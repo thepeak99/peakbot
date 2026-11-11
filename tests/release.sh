@@ -1884,6 +1884,25 @@ for df in $t73_dfs; do
     fi
 done
 
+# T74: check-version.sh reads tauri.conf.json with jq, which no desktop base
+# image ships — each Dockerfile that RUNs the check must apt-get install jq
+# (whole word on a real line, not a comment) before that RUN.
+if grep -vE '^[[:space:]]*#' desktop/scripts/check-version.sh 2>/dev/null | grep -qw jq; then
+    for df in $t73_dfs; do
+        t74_run=$(grep -nE '^[[:space:]]*RUN[[:space:]].*check-version\.sh' "$df" | head -n1 | cut -d: -f1)
+        awk -v run="$t74_run" '
+            /^[ \t]*#/ { next }
+            /^[ \t]/ { if (in_apt && NR < run && $0 ~ /(^|[ \t&;])jq([ \t\\]|$)/) fnd = 1; next }
+            { in_apt = ($1 == "RUN" && $0 ~ /apt-get[ \t]+install/)
+              if (in_apt && NR < run && $0 ~ /(^|[ \t&;])jq([ \t\\]|$)/) fnd = 1 }
+            END { exit fnd ? 0 : 1 }' "$df" \
+            && ok "T74 $df: jq (used by check-version.sh) is installed before the version check" \
+            || bad "T74 $df: jq (used by check-version.sh) is not installed before the version check"
+    done
+else
+    ok "T74 check-version.sh does not use jq: nothing to install"
+fi
+
 # ── Summary ────────────────────────────────────────────────────────────────
 
 echo ""
