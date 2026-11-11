@@ -267,15 +267,20 @@ export function ConversationsPicker({
                 ? catalog?.find((p) => p.name === c.profile)
                 : undefined;
               const rowColor = rowProfile?.color;
+              // Running keeps its amber tint even when highlighted: an in-flight turn must stay visible.
+              const running = c.running === true;
+              const live = c.active && !running;
               return (
               <div
                 key={c.id}
                 className={`group flex items-center gap-1 px-1 ${
-                  fi === highlightedIndex
-                    ? "bg-zinc-800"
-                    : c.active
-                      ? "bg-emerald-950/40 hover:bg-emerald-900/40"
-                      : "hover:bg-zinc-800"
+                  running
+                    ? "bg-amber-950/40 hover:bg-amber-900/40"
+                    : fi === highlightedIndex
+                      ? "bg-zinc-800"
+                      : live
+                        ? "bg-emerald-950/40 hover:bg-emerald-900/40"
+                        : "hover:bg-zinc-800"
                 }`}
               >
                 <button
@@ -295,17 +300,26 @@ export function ConversationsPicker({
                           style={{ backgroundColor: `var(--profile-${rowColor})` }}
                         />
                       )}
-                      {c.active && (
+                      {running && (
                         <span
-                          className="inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-400"
-                          title="Live session"
+                          data-testid="picker-status-running"
+                          aria-label="running"
+                          className="h-3.5 w-3.5 shrink-0 animate-spin rounded-full border-2 border-amber-400 border-t-transparent"
                         />
+                      )}
+                      {live && (
+                        // sr-only: the emerald tint is the visible state; this is for screen readers.
+                        <span aria-label="Live session" className="sr-only">
+                          Live session
+                        </span>
                       )}
                       <span
                         className={`truncate ${
-                          c.active
-                            ? "font-semibold text-emerald-200"
-                            : "font-medium"
+                          running
+                            ? "font-semibold text-amber-200"
+                            : live
+                              ? "font-semibold text-emerald-200"
+                              : "font-medium"
                         }`}
                       >
                         {c.name}
@@ -318,7 +332,7 @@ export function ConversationsPicker({
                     </span>
                     <span className="text-[10px] text-zinc-500">
                       {c.message_count} msgs · {c.model}
-                      {c.active && " · live"}
+                      {live && " · live"}
                     </span>
                   </span>
                 </button>

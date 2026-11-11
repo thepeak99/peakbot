@@ -138,6 +138,17 @@ const kinds = (el: HTMLElement): (string | null)[] =>
 const row = (el: HTMLElement, id: string): HTMLElement =>
   el.querySelector<HTMLElement>(`[data-testid="chat-row"][data-convo="${id}"]`)!;
 
+// The row's title span: the span whose full text is the chat name AND which
+// is the title itself (carries the structural `min-w-0` class) — not the
+// outer flex span that wraps title + badges + markers with the same text.
+const titleOf = (rowEl: HTMLElement, name: string): HTMLElement => {
+  const span = [...rowEl.querySelectorAll("span")].find(
+    (s) => s.textContent === name && s.classList.contains("min-w-0"),
+  );
+  expect(span, `a title span for "${name}" must render`).not.toBeUndefined();
+  return span!;
+};
+
 // ─── root / header / title / logo ──────────────────────────────────────────
 
 describe("ChatList — root and header", () => {
@@ -192,22 +203,77 @@ describe("ChatList — L2: status markers", () => {
     const running = c2.querySelector('[data-testid="chat-status-running"]');
     expect(running).not.toBeNull();
     expect(running!.getAttribute("aria-label")).toBe("running");
+    // The amber spinner is the running marker (kept, same mobile classes).
+    for (const cls of [
+      "h-3.5",
+      "w-3.5",
+      "animate-spin",
+      "rounded-full",
+      "border-2",
+      "border-amber-400",
+      "border-t-transparent",
+    ]) {
+      expect(running!.classList.contains(cls), `spinner class ${cls}`).toBe(true);
+    }
     expect(c2.querySelector('[data-testid="chat-status-live"]'), "running is not also live").toBeNull();
 
     const c1 = row(el, "c1");
     const live = c1.querySelector('[data-testid="chat-status-live"]');
     expect(live).not.toBeNull();
     expect(live!.getAttribute("aria-label")).toBe("live session");
+    // The live marker is visually hidden, not a visible dot.
+    expect(live!.classList.contains("sr-only"), "the live marker must be sr-only").toBe(true);
+    expect(live!.classList.contains("bg-emerald-400"), "no visible green dot").toBe(false);
     expect(c1.querySelector('[data-testid="chat-status-running"]')).toBeNull();
   });
 
   it("an unread id shows the unread marker, coexisting with live", async () => {
     const el = await render({ unread: new Set(["c1"]) });
     const c1 = row(el, "c1");
-    expect(c1.querySelector('[data-testid="chat-status-live"]')).not.toBeNull();
+    const live = c1.querySelector('[data-testid="chat-status-live"]');
+    expect(live).not.toBeNull();
+    expect(live!.classList.contains("sr-only"), "the live marker must be sr-only").toBe(true);
     const unread = c1.querySelector('[data-testid="chat-status-unread"]');
     expect(unread).not.toBeNull();
     expect(unread!.getAttribute("aria-label")).toBe("unread");
+    // The sky dot stays the only visible dot in the row.
+    expect(unread!.classList.contains("bg-sky-400")).toBe(true);
+    expect(c1.querySelector(".bg-emerald-400"), "no visible green dot").toBeNull();
+  });
+
+  it("running rows get the amber tint on the wrapper and an amber semibold title", async () => {
+    const el = await render();
+    const c2 = row(el, "c2");
+    expect(c2.classList.contains("bg-amber-950/40"), "the running wrapper tint").toBe(true);
+    const title = titleOf(c2, "Tune WS keepalive");
+    expect(title.classList.contains("font-semibold")).toBe(true);
+    expect(title.classList.contains("text-amber-200")).toBe(true);
+    // A running row is not emerald, even though a running chat is also active.
+    expect(c2.classList.contains("bg-emerald-950/40")).toBe(false);
+    expect(title.classList.contains("text-emerald-200")).toBe(false);
+  });
+
+  it("live rows keep the emerald tint and title, with the green dot removed", async () => {
+    const el = await render();
+    const c1 = row(el, "c1");
+    expect(c1.classList.contains("bg-emerald-950/40"), "the live wrapper tint").toBe(true);
+    const title = titleOf(c1, "Debug WS relay");
+    expect(title.classList.contains("font-semibold")).toBe(true);
+    expect(title.classList.contains("text-emerald-200")).toBe(true);
+    // No visible green dot: no element in the row carries bg-emerald-400.
+    expect(c1.querySelector(".bg-emerald-400"), "no visible green dot").toBeNull();
+  });
+
+  it("plain rows have no tint, a medium title and no markers", async () => {
+    const el = await render({ conversations: NO_COLOR });
+    const c3 = row(el, "c3");
+    expect(c3.className).not.toContain("bg-amber-950/40");
+    expect(c3.className).not.toContain("bg-emerald-950/40");
+    const title = titleOf(c3, "Colourless chat");
+    expect(title.classList.contains("font-medium")).toBe(true);
+    expect(c3.querySelector('[data-testid="chat-status-running"]')).toBeNull();
+    expect(c3.querySelector('[data-testid="chat-status-live"]')).toBeNull();
+    expect(c3.querySelector('[data-testid="chat-status-unread"]')).toBeNull();
   });
 });
 
