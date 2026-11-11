@@ -155,10 +155,20 @@ type SlotProps = {
   convo: string | null;
   live: ComposerLive | null;
   handle?: RefObject<ComposerSlotHandle | null>;
+  /** Per-convo draft key (single-composer shells). Omitted = not passed
+   * (desktop keep-alive slots — the feature stays off). */
+  draftKey?: string | null;
 };
 
-const element = ({ convo, live, handle }: SlotProps) => (
-  <ComposerSlot convo={convo} live={live} ref={handle} />
+const element = ({ convo, live, handle, draftKey }: SlotProps) => (
+  <ComposerSlot
+    convo={convo}
+    live={live}
+    ref={handle}
+    // `draftKey` is not on ComposerSlot's props until the fix lands; spread it
+    // past the type system so the RED tests compile (vitest doesn't typecheck).
+    {...(draftKey === undefined ? {} : ({ draftKey } as object))}
+  />
 );
 
 async function mount(props: SlotProps): Promise<HTMLDivElement> {
@@ -681,5 +691,120 @@ describe("ComposerSlot — `convo` prop changes", () => {
     await rerender({ convo: "y", live: makeLive(), handle });
     await add(handle, [pdf("second.pdf")]);
     expect(uploads.map((u) => u.convo)).toEqual(["x", "y"]);
+  });
+});
+
+// ─── per-conversation drafts (draftKey) ──────────────────────────────────
+//
+// The single (mobile + browser) composer is never remounted, so it swaps its
+// text in place when the bound conversation changes: the outgoing text is
+// stashed under the OLD `draftKey`, the incoming key's draft is restored
+// (empty when none). Contract (design §3–§5):
+//   - `draftKey === undefined` ⇒ feature OFF (desktop keep-alive tabs; a
+//     `convo` change keeps the text — the existing contract above).
+//   - `null` ⇒ a fresh, not-yet-named chat.
+//   - `null → "id"` is the SERVER NAMING the fresh chat, not a switch: the
+//     text is kept as-is.
+//   - Sending already clears the text, so a sent message is never restored.
+// Drafts live in the Composer's memory (a Map keyed by draftKey); the slot's
+// `convo` prop (attachments) is unchanged. `convo` is held constant here so
+// each test isolates the draftKey contract.
+
+describe("ComposerSlot — per-conversation drafts (draftKey)", () => {
+  it("D1: switching draftKey clears the box; coming back restores the draft", async () => {
+    const el = await mount({ convo: "c1", live: makeLive(), draftKey: "a" });
+    await typeInto(textarea(el), "draft A");
+
+    await rerender({ convo: "c1", live: makeLive(), draftKey: "b" });
+    expect(textarea(el).value, "B must not show A's text").toBe("");
+
+    await rerender({ convo: "c1", live: makeLive(), draftKey: "a" });
+    expect(textarea(el).value, "A's half-written draft is restored").toBe("draft A");
+  });
+
+  it("D2: a sent draft is not restored after leaving and returning", async () => {
+    const live = makeLive();
+    const el = await mount({ convo: "c1", live, draftKey: "a" });
+    await typeInto(textarea(el), "x");
+    await act(async () => {
+      sendButton(el)!.click();
+    });
+    expect(live.onSend).toHaveBeenCalledTimes(1);
+    expect(live.onSend).toHaveBeenCalledWith("x", []);
+
+    await rerender({ convo: "c1", live: makeLive(), draftKey: "b" });
+    await rerender({ convo: "c1", live: makeLive(), draftKey: "a" });
+    expect(
+      textarea(el).value,
+      "send clears the text, so nothing is parked under 'a'",
+    ).toBe("");
+  });
+
+  it("D3: null → id (the server names the fresh chat) keeps the text; a real switch does not", async () => {
+    const el = await mount({ convo: null, live: makeLive(), draftKey: null });
+    await typeInto(textarea(el), "hello");
+
+    await rerender({ convo: "n1", live: makeLive(), draftKey: "n1" });
+    expect(textarea(el).value, "the mint is not a switch: text stays").toBe("hello");
+
+    await rerender({ convo: "c1", live: makeLive(), draftKey: "b" });
+    expect(textarea(el).value, "a real switch empties the box").toBe("");
+
+    await rerender({ convo: "c1", live: makeLive(), draftKey: "n1" });
+    expect(textarea(el).value, "the draft was saved under the minted id").toBe("hello");
+  });
+
+  it("D4: switching to null (new chat) empties the box and keeps the draft", async () => {
+    const el = await mount({ convo: "c1", live: makeLive(), draftKey: "a" });
+    await typeInto(textarea(el), "x");
+
+    await rerender({ convo: null, live: makeLive(), draftKey: null });
+    expect(textarea(el).value, "a fresh chat starts empty").toBe("");
+
+    await rerender({ convo: "c1", live: makeLive(), draftKey: "a" });
+    expect(textarea(el).value, "A's draft is restored").toBe("x");
+  });
+
+  it("D5: re-rendering with the same draftKey keeps the text", async () => {
+    const el = await mount({ convo: "c1", live: makeLive(), draftKey: "a" });
+    await typeInto(textarea(el), "stay");
+    await rerender({ convo: "c1", live: makeLive(), draftKey: "a" });
+    expect(textarea(el).value, "no switch happened: text untouched").toBe("stay");
+  });
+
+  it("D6: without draftKey (desktop contract) a convo change keeps the text", async () => {
+    const el = await mount({ convo: null, live: makeLive() });
+    await typeInto(textarea(el), "desktop keeps me");
+    await rerender({ convo: "u", live: makeLive() });
+    expect(
+      textarea(el).value,
+      "draftKey undefined = feature off: same as the keep-alive contract",
+    ).toBe("desktop keeps me");
+  });
+
+  it("D7: two conversations keep independent drafts; toggling restores each", async () => {
+    const el = await mount({ convo: "c1", live: makeLive(), draftKey: "a" });
+    await typeInto(textarea(el), "A");
+    await rerender({ convo: "c1", live: makeLive(), draftKey: "b" });
+    await typeInto(textarea(el), "B");
+
+    await rerender({ convo: "c1", live: makeLive(), draftKey: "a" });
+    expect(textarea(el).value).toBe("A");
+    await rerender({ convo: "c1", live: makeLive(), draftKey: "b" });
+    expect(textarea(el).value).toBe("B");
+  });
+
+  it("chips still reset on the slot's convo change when draftKey is set", async () => {
+    const handle = createRef<ComposerSlotHandle>();
+    const el = await mount({ convo: "x", live: makeLive(), handle, draftKey: "a" });
+    await add(handle, [pdf("p.pdf")]);
+    expect(removeChip(el, "p.pdf")).not.toBeNull();
+
+    await rerender({ convo: "y", live: makeLive(), handle, draftKey: "a" });
+    expect(
+      removeChip(el, "p.pdf"),
+      "attachments stay per-convo: the slot's `convo` contract is unchanged",
+    ).toBeNull();
+    expect(uploads[0].abort).toHaveBeenCalledTimes(1);
   });
 });

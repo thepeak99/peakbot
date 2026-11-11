@@ -176,6 +176,48 @@ function click(el: Element): void {
   });
 }
 
+// ─── composer typing (M-tests) ────────────────────────────────────────────
+
+const textareaSetter = Object.getOwnPropertyDescriptor(
+  HTMLTextAreaElement.prototype,
+  "value",
+)!.set!;
+
+/** Type into the (single) composer's textarea: native setter + input event,
+ * as in App.tabs.test.tsx. */
+async function typeInto(ta: HTMLTextAreaElement, value: string): Promise<void> {
+  await act(async () => {
+    textareaSetter.call(ta, value);
+    ta.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
+
+/** The composer's textarea (the mobile shell renders exactly one). */
+function theTextbox(): HTMLTextAreaElement {
+  const ta = host.querySelector("textarea");
+  expect(ta, "the composer textarea must render").not.toBeNull();
+  return ta!;
+}
+
+/** The composer's Send button. */
+function theSendButton(): HTMLButtonElement {
+  const b = Array.from(host.querySelectorAll("button")).find(
+    (btn) => (btn.textContent ?? "").trim() === "Send",
+  );
+  expect(b, "the composer's Send button must render").toBeDefined();
+  return b!;
+}
+
+/** Tap a chat row's open button, like a user would. */
+async function openRow(id: string): Promise<void> {
+  const open = host.querySelector(
+    `[data-testid="chat-row"][data-convo="${id}"] button[data-testid="chat-open"]`,
+  );
+  expect(open, `row ${id} has an open button`).not.toBeNull();
+  click(open!);
+  await flush();
+}
+
 /** Await the popstate that a history.back() produces (jsdom: one task). */
 function waitForPopstate(): Promise<void> {
   return new Promise((resolve) => {
@@ -464,4 +506,99 @@ describe("App mobile Chats wiring (A1–A9)", () => {
       expect(pushSpy, "zero pushState at mount").toHaveBeenCalledTimes(0);
     },
   );
+});
+
+// ─── M1–M3: per-conversation drafts on the single (mobile) composer ──────
+//
+// The mobile shell renders ONE composer for every conversation (the
+// single-slot branch of App), so today a half-typed message follows the user
+// across the ChatList. Required: behave like the desktop tabs — B never
+// shows A's text, and returning to A restores A's draft. The Composer will
+// get a `draftKey` prop (the bound convo: `agent.convo`, null = fresh chat,
+// null → id = the server naming the fresh chat, which is NOT a switch).
+//
+// These drive the REAL App tree: the fake `switchConvo` mimics useAgent and
+// binds `convo` + `state` synchronously, so `open()`/`newChat()` re-render
+// App onto the new conversation (the A-tests use a plain spy and only assert
+// the call).
+
+describe("App mobile — per-conversation composer drafts (M1–M3)", () => {
+  /** An agent whose switchConvo, like the real useAgent, sets `convo`
+   * (and that convo's state) synchronously, so the App re-renders bound to
+   * the new conversation when a row is opened / the FAB is tapped. The real
+   * useAgent keeps `convo`/`state` in React state (setConvo on switch), so
+   * the switch re-renders App; the mock returns a plain object, so the fake
+   * performs that re-render itself. */
+  function bindingAgent(convo: string | null): FakeAgent {
+    const fake = makeAgent(stateFor(convo));
+    fake.switchConvo = vi.fn((id: string | null) => {
+      fake.convo = id;
+      fake.state = stateFor(id);
+      act(() => {
+        root!.render(<App />);
+      });
+    });
+    return fake;
+  }
+
+  it("M1: a draft typed in c1 does not follow to c2 and comes back", async () => {
+    const fake = bindingAgent("c1");
+    hoisted.agent = fake;
+    mount();
+    await flush();
+    // `loaded` flips on the first NEW list after mount, so deliver one
+    // (same pattern as A3).
+    fake.conversations = [convoRow("c1"), convoRow("c2")];
+
+    await typeInto(theTextbox(), "draft in A");
+    await toList();
+    await openRow("c2");
+    expect(theTextbox().value, "c2 must not show c1's half-typed text").toBe("");
+
+    await toList();
+    await openRow("c1");
+    expect(theTextbox().value, "c1's draft is restored").toBe("draft in A");
+  });
+
+  it("M2: the FAB opens an empty composer and c1's draft comes back", async () => {
+    const fake = bindingAgent("c1");
+    hoisted.agent = fake;
+    mount();
+    await flush();
+    fake.conversations = [convoRow("c1")];
+
+    await typeInto(theTextbox(), "draft in A");
+    await toList();
+    const fab = host.querySelector('button[aria-label="New chat"]');
+    expect(fab, "the FAB renders on the list").not.toBeNull();
+    click(fab!);
+    await flush();
+    expect(theTextbox().value, "a new chat starts empty").toBe("");
+
+    await toList();
+    await openRow("c1");
+    expect(theTextbox().value, "c1's draft is restored").toBe("draft in A");
+  });
+
+  it("M3: sent text is not restored", async () => {
+    const fake = bindingAgent("c1");
+    hoisted.agent = fake;
+    mount();
+    await flush();
+    fake.conversations = [convoRow("c1"), convoRow("c2")];
+
+    await typeInto(theTextbox(), "sent away");
+    await act(async () => {
+      theSendButton().click();
+    });
+    expect(fake.send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "send_message", text: "sent away" }),
+    );
+
+    await toList();
+    await openRow("c2");
+    await toList();
+    await openRow("c1");
+    expect(theTextbox().value, "a sent message is never restored").toBe("");
+  });
 });
