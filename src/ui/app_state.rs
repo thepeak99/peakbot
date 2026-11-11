@@ -615,7 +615,8 @@ impl ChatMessage {
     }
 
     /// Create a new tool call message with structured display:
-    /// - Shows thought intent first
+    /// - Shows the intent line first (the gate's `purpose`, or the legacy
+    ///   `thought` from saved conversations)
     /// - Shows key params (2-3 lines max)
     ///
     /// Stores raw tool_name and args for lossless persistence.
@@ -772,29 +773,39 @@ impl ChatMessage {
     }
 }
 
-/// Format tool call with structured output: thought intent first, then params
+/// Format tool call with structured output: the intent line first, then params
 pub(crate) fn format_tool_call(tool_name: &str, args: &str) -> String {
     // Special-case the think tool: show "Thinking..." instead of verbose reasoning
     if tool_name == "think" {
         return "🤔 Thinking...".to_string();
     }
 
-    // Try to parse JSON args to extract thought and key params
+    // Try to parse JSON args to extract the intent and key params
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(args) {
         let mut lines = Vec::new();
 
-        // Line 1: Thought intent (always first if present, never truncated)
-        if let Some(thought) = parsed.get("thought").and_then(|v| v.as_str())
-            && !thought.is_empty()
-        {
-            lines.push(format!("💭 {}", thought));
+        // Line 1: the intent (always first if present, never truncated) —
+        // the gate's `purpose`, with `thought` as the fallback for saved
+        // conversations that still carry the old field.
+        let intent = parsed
+            .get(crate::tools::PURPOSE_FIELD)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                parsed
+                    .get("thought")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+            });
+        if let Some(intent) = intent {
+            lines.push(format!("💭 {intent}"));
         }
 
         // Line 2: Tool name with key params
         let mut params = Vec::new();
         for (key, value) in parsed.as_object().unwrap_or(&serde_json::Map::new()) {
-            if key == "thought" {
-                continue; // Already shown
+            if key == crate::tools::PURPOSE_FIELD || key == "thought" {
+                continue; // The intent line (or its legacy twin)
             }
             let value_str = match value {
                 serde_json::Value::String(s) => truncate_str(s, 60),

@@ -1,16 +1,19 @@
-//! `PurposeGate`: a tool decorator that owns the cross-cutting `thought`
+//! `PurposeGate`: a tool decorator that owns the cross-cutting `purpose`
 //! concern for every wrapped tool (built-in and MCP).
 //!
-//! Tools no longer declare `thought` themselves. The gate:
-//! 1. injects a required `thought` property into the inner tool's schema,
-//! 2. strips `thought` from the args before delegating (the inner tool /
+//! Tools no longer declare `purpose` themselves. The gate:
+//! 1. injects a required `purpose` property into the inner tool's schema,
+//! 2. strips `purpose` from the args before delegating (the inner tool /
 //!    MCP server never declared it), and
-//! 3. appends a soft nudge to the result when `thought` is absent or blank
+//! 3. appends a soft nudge to the result when `purpose` is absent or blank
 //!    — the task still runs.
 //!
+//! A tool that declares its own `purpose` parameter is left completely
+//! untouched: schema, args, and result pass through.
+//!
 //! Implemented over `ToolDyn` (the dynamic-dispatch trait) so a missing
-//! `thought` can never produce a `JsonError` that skips the call: the gate
-//! parses the args itself and a blank `thought` is a coaching nudge, not a
+//! `purpose` can never produce a `JsonError` that skips the call: the gate
+//! parses the args itself and a blank `purpose` is a coaching nudge, not a
 //! hard error.
 
 use rig_core::completion::ToolDefinition;
@@ -18,14 +21,21 @@ use rig_core::tool::{ToolDyn, ToolError};
 use rig_core::wasm_compat::WasmBoxedFuture;
 use serde_json::{Value, json};
 
-/// Soft reminder appended to a tool result when `thought` was omitted.
-const NUDGE: &str = "⚠️ Reminder: provide the 'thought' field — briefly explain what you're \
-     about to do and why, before acting. (Tool ran anyway.)";
+// Keep name and description free of thought/reasoning wording: some models
+// refuse requests whose tool inputs ask for it.
 
-/// Description attached to the injected `thought` schema property.
-const THOUGHT_DESC: &str = "Briefly explain what you're about to do and why, before acting.";
+/// The field the gate injects into every wrapped tool's schema and strips
+/// from its args before the inner call.
+pub(crate) const PURPOSE_FIELD: &str = "purpose";
 
-/// Wraps any `Box<dyn ToolDyn>`, adding the `thought` field + nudge.
+/// Description attached to the injected `purpose` schema property.
+const DESCRIPTION: &str = "One-line statement of what this call is for.";
+
+/// Soft reminder appended to a tool result when `purpose` was omitted.
+const NUDGE: &str = "⚠️ Reminder: fill in the 'purpose' field — a one-line statement of \
+     what this call is for. (Tool ran anyway.)";
+
+/// Wraps any `Box<dyn ToolDyn>`, adding the `purpose` field + nudge.
 pub struct PurposeGate {
     inner: Box<dyn ToolDyn>,
 }
@@ -36,17 +46,30 @@ impl PurposeGate {
     }
 }
 
-/// `thought` counts as missing when absent, JSON null, or blank/whitespace.
-fn thought_missing(args: &Value) -> bool {
-    match args.get("thought") {
+/// A tool with its own `purpose` parameter keeps it: the gate must never
+/// strip or demand a real argument.
+fn owns_purpose(def: &ToolDefinition) -> bool {
+    def.parameters
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|props| props.contains_key(PURPOSE_FIELD))
+}
+
+/// `purpose` counts as missing when absent, JSON null, or blank/whitespace.
+fn purpose_missing(args: &Value) -> bool {
+    match args.get(PURPOSE_FIELD) {
         None | Some(Value::Null) => true,
         Some(Value::String(s)) => s.trim().is_empty(),
         Some(_) => false,
     }
 }
 
-/// Inject a required `thought` property into a tool schema, idempotently.
-fn inject_thought(mut def: ToolDefinition) -> ToolDefinition {
+/// Inject a required `purpose` property into a tool schema. A tool that
+/// declares its own `purpose` passes through unchanged.
+fn inject_purpose(mut def: ToolDefinition) -> ToolDefinition {
+    if owns_purpose(&def) {
+        return def;
+    }
     let Some(obj) = def.parameters.as_object_mut() else {
         return def;
     };
@@ -55,11 +78,10 @@ fn inject_thought(mut def: ToolDefinition) -> ToolDefinition {
         .entry("properties")
         .or_insert_with(|| json!({}))
         .as_object_mut()
-        && !props.contains_key("thought")
     {
         props.insert(
-            "thought".to_string(),
-            json!({ "type": "string", "description": THOUGHT_DESC }),
+            PURPOSE_FIELD.to_string(),
+            json!({ "type": "string", "description": DESCRIPTION }),
         );
     }
 
@@ -67,9 +89,9 @@ fn inject_thought(mut def: ToolDefinition) -> ToolDefinition {
         .entry("required")
         .or_insert_with(|| json!([]))
         .as_array_mut()
-        && !required.iter().any(|v| v.as_str() == Some("thought"))
+        && !required.iter().any(|v| v.as_str() == Some(PURPOSE_FIELD))
     {
-        required.insert(0, json!("thought"));
+        required.insert(0, json!(PURPOSE_FIELD));
     }
 
     def
@@ -81,11 +103,19 @@ impl ToolDyn for PurposeGate {
     }
 
     fn definition(&self, prompt: String) -> WasmBoxedFuture<'_, ToolDefinition> {
-        Box::pin(async move { inject_thought(self.inner.definition(prompt).await) })
+        Box::pin(async move { inject_purpose(self.inner.definition(prompt).await) })
     }
 
     fn call(&self, args: String) -> WasmBoxedFuture<'_, Result<String, ToolError>> {
         Box::pin(async move {
+            // Ownership is read from the inner schema on every call — no
+            // state to keep in sync, and every definition here is an
+            // in-memory builder, so it is free next to the round-trip.
+            let def = self.inner.definition(String::new()).await;
+            if owns_purpose(&def) {
+                return self.inner.call(args).await;
+            }
+
             // Non-object args (e.g. "null") aren't gateable — pass through.
             let Some(mut value) = serde_json::from_str::<Value>(&args)
                 .ok()
@@ -94,10 +124,10 @@ impl ToolDyn for PurposeGate {
                 return self.inner.call(args).await;
             };
 
-            let missing = thought_missing(&value);
-            // `thought` is synthetic — the inner tool/MCP server never
+            let missing = purpose_missing(&value);
+            // `purpose` is synthetic — the inner tool/MCP server never
             // declared it, and a strict server may reject unknown params.
-            value.as_object_mut().unwrap().remove("thought");
+            value.as_object_mut().unwrap().remove(PURPOSE_FIELD);
 
             let mut output = self.inner.call(value.to_string()).await?;
             if missing {

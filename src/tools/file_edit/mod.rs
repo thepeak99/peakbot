@@ -1072,10 +1072,9 @@ mod tests {
 
     #[tokio::test]
     async fn str_replace_call_end_to_end_json_args_with_thought_key_replaces() {
-        // Spec item (f) — full-path proof: the args arrive as ONE JSON
-        // string exactly as rig would deliver ThoughtGate's output,
-        // including the extra `thought` key, which the Args struct must
-        // ignore, not choke on. Expected GREEN today (non-empty
+        // The gate no longer touches `thought`, so a stray one can ride
+        // along in the args (a saved-conversation habit); built-ins must
+        // ignore it, not choke on it. Expected GREEN (non-empty
         // replacement is unchanged behaviour).
         let (_root, base, workspace) = test_support::rooted();
         let path = base.join("e2e_thought.txt");

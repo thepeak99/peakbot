@@ -105,15 +105,18 @@ Every tool — built-in and MCP alike — is wrapped at registration in `TimeBud
 
 Expiry returns `⏱ TIMEOUT: …` as a normal tool result — the model self-corrects; the turn is not killed. A tool that *panics* mid-call is caught at the same boundary and returned as `💥 PANIC: …` — also a normal tool result, so the turn is not killed. Design: `docs/tool-time-budget-design.md`.
 
-### The `thought` field (ThoughtGate)
+### The `purpose` field (PurposeGate)
 
-No tool declares a `thought` parameter itself. Every built-in **and** MCP tool is wrapped at registration in `ThoughtGate` (`src/tools/thought_gate.rs`):
+Every built-in **and** MCP tool is wrapped at registration in `PurposeGate` (`src/tools/purpose_gate.rs`):
 
-1. **Schema injection** — `definition()` adds a required `thought` string property (idempotent if the inner tool already has one).
-2. **Strip before delegate** — `thought` is synthetic; it's removed from args before the inner call (strict MCP servers may reject unknown params).
-3. **Soft nudge, never a hard error** — a missing/blank `thought` never blocks the call; a one-line reminder is appended to the result.
+1. **Schema injection** — `definition()` adds a required `purpose` string property ("One-line statement of what this call is for.").
+2. **Strip before the inner call** — `purpose` is synthetic; it's removed from args before the inner call (strict MCP servers may reject unknown params).
+3. **Soft nudge, never a hard error** — a missing/blank `purpose` never blocks the call; a one-line reminder is appended to the result.
+4. **A tool's own `purpose` wins** — if the inner tool already declares a `purpose` property, the gate does nothing for that tool: schema, args and result pass through untouched.
 
 Two exceptions, registered ungated: `think` (its `thought` *is* the payload) and `todo` (task text already carries the plan; some models structurally refuse the extra field).
+
+Keep the field's name and description free of thought/reasoning wording: some models refuse any request whose tool inputs ask for it. Conversations saved under the old name carry `thought` in their tool-call args; `format_tool_call` shows either as the 💭 line.
 
 ### Vector store (`src/vector/`)
 
@@ -339,7 +342,7 @@ src/
 ├── hooks/                  # SessionHook, event channel, AgentEvent
 ├── pipeline/               # delegate tool + delegation handoff (multi-agent)
 ├── state/                  # StateManager (single source of truth for sessions)
-├── tools/                  # all built-in tools + ThoughtGate + LoggingToolDyn
+├── tools/                  # all built-in tools + PurposeGate + LoggingToolDyn
 ├── skills/                 # skill discovery + SKILL.md parsing
 ├── vector/                 # VectorStore, embeddings client, parse/chunk
 ├── ui/                     # app_state, wire types; repl/ (ratatui), web/ (axum+WS+TLS), stdio/

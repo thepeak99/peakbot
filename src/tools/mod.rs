@@ -43,6 +43,7 @@ pub use list_directory::ListDirectoryTool;
 pub use pdf_read::PdfReadTool;
 #[cfg(feature = "host")]
 pub use powershell::PowerShellTool;
+pub(crate) use purpose_gate::PURPOSE_FIELD;
 pub use purpose_gate::PurposeGate;
 pub use search::SearchTool;
 #[cfg(feature = "host")]

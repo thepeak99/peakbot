@@ -575,7 +575,7 @@ where
             "fetch_url" => gate(Box::new(FetchUrlTool::new(&tool_env.fetch_url))),
             "fetch_page" => gate(Box::new(FetchPageTool)),
             // `todo` is ungated: the task text already carries the plan, so a
-            // `thought` field is redundant — and some models (e.g. MiniMax)
+            // `purpose` field is redundant — and some models (e.g. MiniMax)
             // structurally refuse it, tripping the gate's nudge on every call.
             "todo" => Box::new(todo_tool.take().unwrap_or_default()),
             // `think` is ungated: its `thought` IS the payload it echoes back,
@@ -708,7 +708,7 @@ fn wire_bash_tool(
     }
 }
 
-/// Wrap a tool in [`PurposeGate`] so it gains the cross-cutting `thought`
+/// Wrap a tool in [`PurposeGate`] so it gains the cross-cutting `purpose`
 /// field + soft nudge. Applied to every built-in and MCP tool.
 fn gate(inner: Box<dyn ToolDyn>) -> Box<dyn ToolDyn> {
     Box::new(crate::tools::PurposeGate::wrap(inner))
@@ -757,7 +757,7 @@ fn wire_label_of(config: &ProviderConfig) -> (String, String) {
     }
 }
 
-/// Gate (`thought`) then budget (wall clock) a set of already-boxed MCP tools.
+/// Gate (`purpose`) then budget (wall clock) a set of already-boxed MCP tools.
 /// The budget is outermost so it also covers the gate's own JSON work and so
 /// the timeout string is never mutated by the gate's nudge.
 pub(crate) fn prepare_mcp_tools(
@@ -1762,7 +1762,7 @@ mod tests {
     // The two seams — `add_builtin_tools`'s `builder.tools(...)` and the
     // renamed `prepare_mcp_tools` (ex-`gate_all`) — are the only two places
     // tools enter the rig builder. These tests pin that both seams wrap
-    // every tool in `TimeBudget` AND (for MCP) `ThoughtGate`, so "an
+    // every tool in `TimeBudget` AND (for MCP) `PurposeGate`, so "an
     // unbudgeted tool" stays unrepresentable. The functions don't exist
     // yet — these tests are RED.
 
@@ -1795,7 +1795,7 @@ mod tests {
 
     /// `budget_all` must be a structural pass-through on the surface area
     /// `ToolDyn` exposes: name preserved verbatim, definition body preserved
-    /// verbatim (no `thought` injection — that's `PurposeGate`'s job; if
+    /// verbatim (no `purpose` injection — that's `PurposeGate`'s job; if
     /// `TimeBudget` injected it, the gate would double-inject).
     ///
     /// Updated for the configurable-budget surface: `budget_all` now
@@ -1932,7 +1932,7 @@ mod tests {
     }
 
     /// The MCP seam (`prepare_mcp_tools`) must produce tools with BOTH the
-    /// `thought` injection (from `PurposeGate`) AND a budget (from
+    /// `purpose` injection (from `PurposeGate`) AND a budget (from
     /// `TimeBudget`). The first is observable through `definition()`; the
     /// second is observable only as "the schema wasn't touched by TimeBudget
     /// alone" — together, the schema is `PurposeGate(InnerEcho)` with the

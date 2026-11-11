@@ -38,3 +38,5 @@ This file is the working draft for the next release. When a version is tagged, t
 - On the phone, the folder picker is now available when working on a remote profile.
 
 - Web UI: a dead chat connection is now noticed and fixed on its own — the server sends a quiet liveness beat every 20 s, and a page that hears nothing for over 45 s drops the socket and dials again. It reconnects at once when the tab or app returns to the foreground or the network comes back, and on the phone the page is also told to reconnect when the app resumes.
+
+- Tools: the extra field PeakBot adds to every tool call is now `purpose` ("One-line statement of what this call is for.") instead of `thought`. Some models refused every request because of the old field and PeakBot showed `Response contained no message or tool call (empty)` (seen with `opus-5-5`). The 💭 line in the transcript works as before, including in saved conversations. A tool that has its own `purpose` parameter is passed through untouched, and a tool with its own `thought` parameter no longer loses it.
