@@ -479,7 +479,7 @@ mod tests {
     /// invariant is load-bearing because `tools_filter.allows(&t.name())` at
     /// `src/providers/mod.rs:592` keys on the wrapper's name (the gate
     /// already delegates). The definition invariant is load-bearing because
-    /// `ThoughtGate`'s injected `thought` must survive — if the budget
+    /// `PurposeGate`'s injected `purpose` must survive — if the budget
     /// decorator mutated the schema, the gate's job would be undone.
     #[tokio::test]
     async fn name_and_definition_are_pass_through() {
@@ -497,7 +497,7 @@ mod tests {
         );
         assert_eq!(
             wrapped_def.parameters, inner_def.parameters,
-            "definition().parameters must pass through (no `thought` injection here — that's ThoughtGate's job)"
+            "definition().parameters must pass through (no `purpose` injection here — that's PurposeGate's job)"
         );
     }
 

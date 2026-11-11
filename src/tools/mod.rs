@@ -14,12 +14,12 @@ mod list_directory;
 mod pdf_read;
 #[cfg(feature = "host")]
 mod powershell;
+mod purpose_gate;
 mod search;
 #[cfg(feature = "host")]
 mod shell_bg;
 mod shell_detect;
 mod think;
-mod thought_gate;
 pub(crate) mod time_budget;
 pub mod todo;
 // Compiled in both editions: the Local edition's file tools confine every
@@ -43,12 +43,13 @@ pub use list_directory::ListDirectoryTool;
 pub use pdf_read::PdfReadTool;
 #[cfg(feature = "host")]
 pub use powershell::PowerShellTool;
+pub(crate) use purpose_gate::PURPOSE_FIELD;
+pub use purpose_gate::PurposeGate;
 pub use search::SearchTool;
 #[cfg(feature = "host")]
 pub use shell_bg::ShellBgTool;
 pub use shell_detect::{ShellKind, print_no_shell_warning};
 pub use think::ThinkTool;
-pub use thought_gate::ThoughtGate;
 pub use time_budget::TimeBudget;
 pub use todo::{TodoArgs, TodoItem, TodoStatus, TodoTool};
 pub use view_image::ViewImageTool;

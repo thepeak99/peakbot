@@ -302,7 +302,7 @@ impl Tool for FetchUrlTool {
 mod tests {
     use super::*;
     use crate::config::FetchUrlConfig;
-    use crate::tools::ThoughtGate;
+    use crate::tools::PurposeGate;
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::oneshot;
@@ -481,8 +481,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thought_gate_injects_thought_into_allow_post_schema() {
-        let gate = ThoughtGate::wrap(Box::new(FetchUrlTool::new(&FetchUrlConfig {
+    async fn purpose_gate_injects_purpose_into_allow_post_schema() {
+        let gate = PurposeGate::wrap(Box::new(FetchUrlTool::new(&FetchUrlConfig {
             allow_post: true,
         })));
         // Fully qualified: `FetchUrlTool` also implements `ToolDyn` via the
@@ -492,8 +492,8 @@ mod tests {
             .as_array()
             .expect("required array");
         assert!(
-            required.iter().any(|v| v == "thought"),
-            "thought must be injected as required: {required:?}"
+            required.iter().any(|v| v == "purpose"),
+            "purpose must be injected as required: {required:?}"
         );
     }
 

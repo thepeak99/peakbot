@@ -575,7 +575,7 @@ where
             "fetch_url" => gate(Box::new(FetchUrlTool::new(&tool_env.fetch_url))),
             "fetch_page" => gate(Box::new(FetchPageTool)),
             // `todo` is ungated: the task text already carries the plan, so a
-            // `thought` field is redundant — and some models (e.g. MiniMax)
+            // `purpose` field is redundant — and some models (e.g. MiniMax)
             // structurally refuse it, tripping the gate's nudge on every call.
             "todo" => Box::new(todo_tool.take().unwrap_or_default()),
             // `think` is ungated: its `thought` IS the payload it echoes back,
@@ -708,10 +708,10 @@ fn wire_bash_tool(
     }
 }
 
-/// Wrap a tool in [`ThoughtGate`] so it gains the cross-cutting `thought`
+/// Wrap a tool in [`PurposeGate`] so it gains the cross-cutting `purpose`
 /// field + soft nudge. Applied to every built-in and MCP tool.
 fn gate(inner: Box<dyn ToolDyn>) -> Box<dyn ToolDyn> {
-    Box::new(crate::tools::ThoughtGate::wrap(inner))
+    Box::new(crate::tools::PurposeGate::wrap(inner))
 }
 
 /// Wrap every tool in a wall-clock budget and a panic boundary. Called at the
@@ -757,7 +757,7 @@ fn wire_label_of(config: &ProviderConfig) -> (String, String) {
     }
 }
 
-/// Gate (`thought`) then budget (wall clock) a set of already-boxed MCP tools.
+/// Gate (`purpose`) then budget (wall clock) a set of already-boxed MCP tools.
 /// The budget is outermost so it also covers the gate's own JSON work and so
 /// the timeout string is never mutated by the gate's nudge.
 pub(crate) fn prepare_mcp_tools(
@@ -1762,7 +1762,7 @@ mod tests {
     // The two seams — `add_builtin_tools`'s `builder.tools(...)` and the
     // renamed `prepare_mcp_tools` (ex-`gate_all`) — are the only two places
     // tools enter the rig builder. These tests pin that both seams wrap
-    // every tool in `TimeBudget` AND (for MCP) `ThoughtGate`, so "an
+    // every tool in `TimeBudget` AND (for MCP) `PurposeGate`, so "an
     // unbudgeted tool" stays unrepresentable. The functions don't exist
     // yet — these tests are RED.
 
@@ -1795,7 +1795,7 @@ mod tests {
 
     /// `budget_all` must be a structural pass-through on the surface area
     /// `ToolDyn` exposes: name preserved verbatim, definition body preserved
-    /// verbatim (no `thought` injection — that's `ThoughtGate`'s job; if
+    /// verbatim (no `purpose` injection — that's `PurposeGate`'s job; if
     /// `TimeBudget` injected it, the gate would double-inject).
     ///
     /// Updated for the configurable-budget surface: `budget_all` now
@@ -1812,11 +1812,11 @@ mod tests {
         let def = budgeted[0].definition(String::new()).await;
         assert_eq!(def.name, "echo", "definition().name must pass through");
 
-        // The exact property set from InnerEcho.definition() — no `thought`.
+        // The exact property set from InnerEcho.definition() — no `purpose`.
         let props = def.parameters["properties"].as_object().unwrap();
         assert!(
-            !props.contains_key("thought"),
-            "TimeBudget must NOT inject `thought` — that's ThoughtGate's job; got schema: {}",
+            !props.contains_key("purpose"),
+            "TimeBudget must NOT inject `purpose` — that's PurposeGate's job; got schema: {}",
             def.parameters
         );
     }
@@ -1932,16 +1932,16 @@ mod tests {
     }
 
     /// The MCP seam (`prepare_mcp_tools`) must produce tools with BOTH the
-    /// `thought` injection (from `ThoughtGate`) AND a budget (from
+    /// `purpose` injection (from `PurposeGate`) AND a budget (from
     /// `TimeBudget`). The first is observable through `definition()`; the
     /// second is observable only as "the schema wasn't touched by TimeBudget
-    /// alone" — together, the schema is `ThoughtGate(InnerEcho)` with the
+    /// alone" — together, the schema is `PurposeGate(InnerEcho)` with the
     /// TimeBudget wrapper sitting around the gate.
     ///
     /// Updated for the configurable-budget surface: same threading as
     /// `budget_all` — `cfg: &TimeoutsConfig` for the budget resolution.
     #[tokio::test]
-    async fn prepare_mcp_tools_injects_thought_and_preserves_name() {
+    async fn prepare_mcp_tools_injects_purpose_and_preserves_name() {
         let tools: Vec<Box<dyn ToolDyn>> = vec![Box::new(InnerEcho)];
         let mcp = prepare_mcp_tools(tools, &TimeoutsConfig::default());
 
@@ -1951,17 +1951,22 @@ mod tests {
         let def = mcp[0].definition(String::new()).await;
         assert_eq!(def.name, "echo", "definition().name must pass through");
 
-        // ThoughtGate effect: `thought` must appear as a required property.
+        // PurposeGate effect: `purpose` must appear as a required property.
         let props = def.parameters["properties"].as_object().unwrap();
-        assert!(
-            props.contains_key("thought"),
-            "ThoughtGate must inject `thought` for every MCP tool; got schema: {}",
+        assert_eq!(
+            props["purpose"],
+            json!({ "type": "string", "description": "One-line statement of what this call is for." }),
+            "PurposeGate must inject the exact `purpose` property; got schema: {}",
             def.parameters
         );
         let required = def.parameters["required"].as_array().unwrap();
         assert!(
-            required.iter().any(|v| v == "thought"),
-            "`thought` must be in the required list (so the model is forced to provide it); got: {required:?}"
+            required.iter().any(|v| v == "purpose"),
+            "`purpose` must be in the required list (so the model is forced to provide it); got: {required:?}"
+        );
+        assert!(
+            !props.contains_key("thought"),
+            "no `thought` property after the rename; got: {props:?}"
         );
         // The inner tool's own property must survive the gate.
         assert!(
@@ -2268,6 +2273,74 @@ mod tests {
             offenders.is_empty(),
             "built-in tool definitions must be bash-free on a PowerShell host; offenders: {offenders:?}"
         );
+    }
+
+    /// The gate owns the intent field for every built-in EXCEPT the two
+    /// tools that opt out: `think` (its real `thought` argument) and
+    /// `todo` (neither key). Drives the real `add_builtin_tools` seam.
+    #[cfg(feature = "mock")]
+    #[tokio::test]
+    async fn builtin_tools_expose_purpose_except_think_and_todo() {
+        let defs = builtin_tool_defs_under(&crate::config::NameFilter::default(), None).await;
+        let names: Vec<&str> = defs.iter().filter_map(|d| d["name"].as_str()).collect();
+        for wanted in ["think", "todo"] {
+            assert!(
+                names.contains(&wanted),
+                "expected {wanted} among the built-ins; got {names:?}"
+            );
+        }
+        assert!(
+            names.iter().any(|n| *n != "think" && *n != "todo"),
+            "need at least one gated built-in to check; got {names:?}"
+        );
+
+        for def in &defs {
+            let name = def["name"].as_str().unwrap();
+            let params = &def["parameters"];
+            let empty = serde_json::Map::new();
+            let props = params["properties"].as_object().unwrap_or(&empty);
+            let required = params["required"].as_array().cloned().unwrap_or_default();
+            match name {
+                "think" => {
+                    assert!(
+                        props.contains_key("thought"),
+                        "think keeps its own `thought` property: {params:?}"
+                    );
+                    assert!(
+                        !props.contains_key("purpose"),
+                        "ungated `think` must not gain `purpose`: {params:?}"
+                    );
+                    assert_eq!(
+                        required,
+                        vec![json!("thought")],
+                        "think's required list is untouched: {required:?}"
+                    );
+                }
+                "todo" => {
+                    assert!(
+                        !props.contains_key("purpose") && !props.contains_key("thought"),
+                        "ungated `todo` gains neither key: {params:?}"
+                    );
+                }
+                _ => {
+                    assert_eq!(
+                        props.get("purpose"),
+                        Some(
+                            &json!({ "type": "string", "description": "One-line statement of what this call is for." })
+                        ),
+                        "{name} must expose the gate's exact `purpose` property: {params:?}"
+                    );
+                    assert!(
+                        required.iter().any(|v| v == "purpose"),
+                        "{name} must require `purpose`: {required:?}"
+                    );
+                    assert!(
+                        !props.contains_key("thought"),
+                        "{name} must not keep a `thought` property: {params:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// PR3 companion pin for the sweep: on a Bash host the bg tool is
