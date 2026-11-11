@@ -10,6 +10,7 @@
 
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
+pub mod refusal;
 pub mod retry;
 
 use crate::config::resolve::{Member, Subagent};

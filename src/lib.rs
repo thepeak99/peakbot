@@ -6399,6 +6399,92 @@ headers:
         );
     }
 
+    /// End-to-end pin of the user-visible fix in the main loop: an Anthropic
+    /// refusal ends the turn as an error, costs exactly one wire request, and
+    /// leaves exactly one readable `❌` system row — never the generic
+    /// `LLM request failed` string, never rig's empty-response error.
+    #[tokio::test]
+    async fn refusal_ends_the_turn_with_a_readable_message_and_no_retry() {
+        use crate::providers::refusal::{RefusalAwareHttp, test_support};
+        use crate::ui::app_state::{ChatMessage, MessageRole};
+        use rig_core::agent::AgentBuilder;
+        use rig_core::client::completion::CompletionClient;
+        use rig_core::providers::anthropic;
+        use std::sync::atomic::Ordering;
+
+        let (base_url, hits) = test_support::serve(test_support::REFUSAL_BODY).await;
+        let client = anthropic::Client::builder()
+            .http_client(RefusalAwareHttp::default())
+            .api_key("k")
+            .base_url(&base_url)
+            .build()
+            .expect("anthropic client builds");
+
+        let sm = StateManager::new_arc();
+        sm.add_user_message("hi".to_string());
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let hook = crate::providers::build_anthropic_session_hook(
+            sender,
+            sm.stats_arc(),
+            &sm,
+            crate::providers::resolve_preserve_reasoning(None, None),
+        );
+        let agent = Arc::new(DynAgent::Anthropic(
+            AgentBuilder::new(client.completion_model("claude-opus-5-5"))
+                .max_tokens(64)
+                .hook(hook)
+                .build(),
+        ));
+
+        let mut config = test_config();
+        config.general.retry.max_retries = 3;
+        config.general.retry.initial_delay_ms = 1;
+
+        let current_turn = sm
+            .build_current_turn_message()
+            .expect("the user turn was dispatched");
+        let result =
+            AgentRunner::process_message_internal(current_turn, &Some(sm.clone()), &agent, &config)
+                .await;
+
+        assert!(
+            matches!(result, CompletionResult::Error),
+            "a refusal ends the turn with an error"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "a refusal is never retried");
+
+        let state = sm.get_state();
+        let system_rows: Vec<&ChatMessage> = state
+            .chat
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::System)
+            .collect();
+        assert_eq!(
+            system_rows.len(),
+            1,
+            "exactly one system row: {:?}",
+            state.chat.messages
+        );
+        assert_eq!(
+            system_rows[0].content,
+            format!("❌ {}", test_support::REFUSAL_SENTENCE),
+            "the refusal sentence, not the generic failure string"
+        );
+        for m in &state.chat.messages {
+            assert!(
+                !m.content.contains("LLM request failed"),
+                "no generic failure row: {:?}",
+                m.content
+            );
+            assert!(
+                !m.content.contains("Response contained no message"),
+                "no rig empty-response string: {:?}",
+                m.content
+            );
+        }
+    }
+
     /// After a tool round-trip has landed, `refresh_attempt_from_transcript`
     /// must promote the ToolResult tail to `current_turn` and stash
     /// everything before it — including the matching ToolCall — into

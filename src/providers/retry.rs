@@ -372,4 +372,43 @@ mod tests {
 
         assert_eq!(next_retry_delay(&err, 0, &cfg), None);
     }
+
+    /// A refusal is permanent even when its wording contains every transient
+    /// marker: the classifier must check the *type* behind `Instance`, not the
+    /// message text — the provider's reason string is not a status. A genuine
+    /// transport error in the same `Instance` slot stays transient.
+    #[test]
+    fn refusal_is_permanent_other_instance_errors_stay_transient() {
+        use crate::providers::refusal::Refusal;
+        use rig_core::http_client::Error;
+
+        let body = r#"{"id":"msg_x","type":"message","role":"assistant","model":"m","content":[],"stop_reason":"refusal","stop_details":{"type":"refusal","explanation":"429 rate limit overloaded 503"}}"#;
+        let refusal = Refusal::parse(body.as_bytes()).expect("a refusal body parses");
+        let refusal_err = PromptError::CompletionError(CompletionError::HttpError(
+            Error::Instance(Box::new(refusal)),
+        ));
+        assert!(
+            !is_transient_prompt_error(&refusal_err),
+            "a refusal is the provider's verdict on this payload — identical on every retry"
+        );
+        let cfg = RetryConfig {
+            max_retries: 3,
+            initial_delay_ms: 1000,
+            max_delay_ms: 8000,
+            backoff_factor: 2.0,
+        };
+        assert_eq!(
+            next_retry_delay(&refusal_err, 0, &cfg),
+            None,
+            "no retry budget is spent on a refusal"
+        );
+
+        let io_err = PromptError::CompletionError(CompletionError::HttpError(Error::Instance(
+            std::io::Error::other("reset").into(),
+        )));
+        assert!(
+            is_transient_prompt_error(&io_err),
+            "a transport reset in the same Instance slot stays transient"
+        );
+    }
 }
