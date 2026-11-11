@@ -14,7 +14,7 @@
 // the full save flow: debounced validate → PUT with base_sha256 → 409 stale
 // banner / 422 error panel / 200 toast + restart banner.
 
-import { useCallback, useEffect, useReducer, useState } from "react";
+import { useCallback, useEffect, useReducer, useState, type Ref } from "react";
 import { edition, isDesktop } from "../desktop";
 import { ApiError, getConfig, getSettings, putConfig, validateConfig } from "./api";
 import { createStore } from "./store";
@@ -74,6 +74,10 @@ export interface SettingsProps {
   activeProfile?: string | null;
   /** "← Back to chat" — closes the view (chat stays mounted underneath). */
   onClose(): void;
+  /** The overlay root, for the slide animation (React 19 ref-as-prop). */
+  ref?: Ref<HTMLDivElement>;
+  /** Mid-exit: still painted, but inert (no input, focus or AT). */
+  leaving?: boolean;
 }
 
 const SECTIONS: Record<Section, { label: string; desc: string }> = {
@@ -117,15 +121,21 @@ function asMap(v: unknown): Record<string, unknown> {
     : {};
 }
 
-export function Settings({ convo, onClose, activeProfile }: SettingsProps) {
+export function Settings({ convo, onClose, activeProfile, ref, leaving }: SettingsProps) {
   return (
     <ToastProvider>
-      <SettingsInner convo={convo} onClose={onClose} activeProfile={activeProfile} />
+      <SettingsInner
+        convo={convo}
+        onClose={onClose}
+        activeProfile={activeProfile}
+        ref={ref}
+        leaving={leaving}
+      />
     </ToastProvider>
   );
 }
 
-function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
+function SettingsInner({ convo, onClose, activeProfile, ref, leaving }: SettingsProps) {
   const { toast } = useToast();
   const [store] = useState(createStore);
   // The store is a plain object: a version counter is the re-render seam.
@@ -541,7 +551,12 @@ function SettingsInner({ convo, onClose, activeProfile }: SettingsProps) {
   const allItems = visibleGroups.flatMap((g) => g.items);
 
   return (
-    <div className="fixed inset-0 z-40 flex flex-col bg-zinc-950 text-zinc-100">
+    <div
+      ref={ref}
+      inert={leaving}
+      data-testid="settings-view"
+      className="fixed inset-0 z-40 flex flex-col bg-zinc-950 text-zinc-100"
+    >
       {/* Head: ← Back to chat · Settings title · scope switch · Ctrl , hint */}
       <header className="flex min-h-14 flex-wrap items-center gap-x-4 gap-y-2 border-b border-zinc-800 px-4 pb-2 pt-[max(0.5rem,env(safe-area-inset-top))]">
         <button

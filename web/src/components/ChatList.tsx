@@ -4,7 +4,7 @@
 // (filter/group/meta) lives in chatList.ts; this component owns only the
 // local search query and the selected chip.
 
-import { useMemo, useState } from "react";
+import { useMemo, useState, type Ref } from "react";
 import type { ReactNode } from "react";
 import type { ConversationSummary, TabColor } from "../state";
 import type { CatalogProfile } from "../types";
@@ -28,6 +28,10 @@ export interface ChatListProps {
   notifyEnabled: boolean;
   notifyPermission: NotifyPermission;
   onToggleNotify(): void;
+  /** The overlay root, for the slide animation (React 19 ref-as-prop). */
+  ref?: Ref<HTMLElement>;
+  /** Mid-exit: still painted, but inert (no input, focus or AT). */
+  leaving?: boolean;
 }
 
 export function ChatList({
@@ -43,6 +47,8 @@ export function ChatList({
   notifyEnabled,
   notifyPermission,
   onToggleNotify,
+  ref,
+  leaving,
 }: ChatListProps) {
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState("");
@@ -67,6 +73,8 @@ export function ChatList({
 
   return (
     <section
+      ref={ref}
+      inert={leaving}
       aria-label="Chats"
       data-testid="chat-list"
       className="fixed inset-0 z-40 flex flex-col overflow-hidden bg-zinc-950 text-zinc-100"
