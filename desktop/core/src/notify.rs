@@ -1,14 +1,13 @@
 //! The turn-end feed (PR-B `GET /api/notify/stream`) as the desktop sees
 //! it: SSE bytes → data payloads → `TurnEnd` → maybe a notification.
 //! Pure; the Tauri glue (`src-tauri/src/notifier.rs`) does the I/O.
-//!
-//! TDD stub: the types below are the PR-C contract (design §4.1) and the
-//! `todo!` bodies are replaced by the implementation (task 4).
 
 use std::time::Duration;
 
 use serde::Deserialize;
 use uuid::Uuid;
+
+use crate::consts::NOTIFY_RETRY_MAX;
 
 /// How the turn ended (PR-B §4.2 `outcome`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -40,8 +39,6 @@ pub struct TurnEnd {
 
 /// The feed's frame types. Only `turn_end` exists; any other `type` fails
 /// to deserialize and is skipped (PR-B §6.2: "ignore unknown type values").
-// TDD stub — PR-C implementation replaces this (parse_event uses this).
-#[allow(dead_code)]
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum FeedEvent {
@@ -49,10 +46,10 @@ enum FeedEvent {
 }
 
 /// Parse one SSE `data` payload. `None` = not a turn end we understand.
-// TDD stub — PR-C implementation replaces this
-#[allow(unused_variables)]
 pub fn parse_event(data: &str) -> Option<TurnEnd> {
-    todo!("PR-C")
+    match serde_json::from_str::<FeedEvent>(data).ok()? {
+        FeedEvent::TurnEnd(ev) => Some(ev),
+    }
 }
 
 /// Incremental SSE decoder: bytes in, complete `data` payloads out.
@@ -62,8 +59,6 @@ pub fn parse_event(data: &str) -> Option<TurnEnd> {
 /// only once complete, so a chunk boundary inside a multi-byte char is fine.
 /// A payload is emitted on the blank line that ends its event; an
 /// unterminated event at EOF is dropped (SSE spec).
-// TDD stub — PR-C implementation replaces this (the fields are the contract).
-#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct SseDecoder {
     /// Bytes after the last '\n'.
@@ -72,10 +67,37 @@ pub struct SseDecoder {
     data: Option<String>,
 }
 impl SseDecoder {
-    // TDD stub — PR-C implementation replaces this
-    #[allow(unused_variables)]
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<String> {
-        todo!("PR-C")
+        self.pending.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        // Only complete lines: a chunk may end mid-line (even mid-UTF-8-char),
+        // so the rest stays in `pending`.
+        while let Some(nl) = self.pending.iter().position(|&b| b == b'\n') {
+            let mut line: Vec<u8> = self.pending.drain(..=nl).collect();
+            line.pop(); // the '\n'
+            if line.last() == Some(&b'\r') {
+                line.pop(); // CRLF
+            }
+            let line = std::str::from_utf8(&line).unwrap_or("");
+            if line.is_empty() {
+                // The blank line that ends an event (SSE spec).
+                if let Some(data) = self.data.take() {
+                    out.push(data);
+                }
+            } else if let Some(value) = line.strip_prefix("data:") {
+                // At most one leading space; other fields are ignored.
+                let value = value.strip_prefix(' ').unwrap_or(value);
+                self.data = Some(match self.data.take() {
+                    None => value.to_string(),
+                    Some(mut prev) => {
+                        prev.push('\n');
+                        prev.push_str(value);
+                        prev
+                    }
+                });
+            }
+        }
+        out
     }
 }
 
@@ -99,19 +121,21 @@ pub enum StopReason {
 }
 
 /// 200→Stream, 401|403→Stop(Rejected), 404→Stop(Disabled), _→Retry.
-// TDD stub — PR-C implementation replaces this
-#[allow(unused_variables)]
 pub fn verdict(status: u16) -> Verdict {
-    todo!("PR-C")
+    match status {
+        200 => Verdict::Stream,
+        401 | 403 => Verdict::Stop(StopReason::Rejected),
+        404 => Verdict::Stop(StopReason::Disabled),
+        _ => Verdict::Retry,
+    }
 }
 
 /// Delay before reconnect attempt after `failures` consecutive failed
 /// attempts (0 = the previous stream was healthy and just ended):
 /// 1 s · 2^failures, capped at NOTIFY_RETRY_MAX (1, 2, 4, 8, 16, 30, 30, …).
-// TDD stub — PR-C implementation replaces this
-#[allow(unused_variables)]
 pub fn retry_delay(failures: u32) -> Duration {
-    todo!("PR-C")
+    // The shift saturates at the cap: 2^5 = 32 s is already over 30 s.
+    Duration::from_secs(1u64 << failures.min(5)).min(NOTIFY_RETRY_MAX)
 }
 
 /// The title used when the conversation has none yet.
@@ -126,19 +150,33 @@ pub struct Toast {
 
 /// The decision: `None` while the user is looking at the window
 /// (visible AND focused); otherwise the content (§6.3 table).
-// TDD stub — PR-C implementation replaces this
-#[allow(unused_variables)]
 pub fn toast(ev: &TurnEnd, user_is_looking: bool) -> Option<Toast> {
-    todo!("PR-C")
+    if user_is_looking {
+        return None;
+    }
+    let title = ev
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or(FALLBACK_TITLE)
+        .to_string();
+    let body = match (ev.source, ev.outcome) {
+        (Source::User, Outcome::Ok) => "Task complete — ready for your next message.",
+        (Source::User, Outcome::Error) => "Task failed.",
+        (Source::User, Outcome::Stopped) => "Task stopped.",
+        (Source::Background, Outcome::Ok) => "Background task update.",
+        (Source::Background, Outcome::Error) => "Background task update failed.",
+        (Source::Background, Outcome::Stopped) => "Task stopped.",
+    };
+    Some(Toast { title, body })
 }
 
 /// The script a notification click runs in the page (C5 contract).
 /// Safe to interpolate: a `Uuid` displays as `[0-9a-f-]{36}`.
-// `window.peakbotOpenConvo?.("<uuid>")`
-// TDD stub — PR-C implementation replaces this
-#[allow(unused_variables)]
+/// `window.peakbotOpenConvo?.("<uuid>")`
 pub fn open_convo_js(convo: Uuid) -> String {
-    todo!("PR-C")
+    format!("window.peakbotOpenConvo?.(\"{convo}\")")
 }
 
 #[cfg(test)]

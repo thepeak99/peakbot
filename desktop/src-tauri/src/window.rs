@@ -116,7 +116,8 @@ pub fn create_main(app: &AppHandle, nav: Arc<RwLock<Option<String>>>) -> tauri::
 }
 
 /// Show + unminimize + focus the main window (single-instance callback,
-/// `Open PeakBot`, Windows tray left-click, macOS `Reopen`).
+/// `Open PeakBot`, Windows tray left-click, macOS `Reopen`, notification
+/// click).
 pub fn focus_main(app: &AppHandle) {
     if let Some(win) = app.get_webview_window(MAIN_LABEL) {
         let _ = win.show();

@@ -68,9 +68,8 @@ impl WebTarget {
     }
 
     /// `{url_base}/api/notify/stream` [+ `?token=…`] — PR-B's turn-end feed.
-    // TDD stub — PR-C implementation replaces this
     pub fn notify_url(&self) -> Url {
-        todo!("PR-C")
+        self.with_token(&format!("{}/api/notify/stream", self.url_base()))
     }
 
     fn with_token(&self, base: &str) -> Url {

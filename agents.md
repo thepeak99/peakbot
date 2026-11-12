@@ -293,7 +293,11 @@ under a `--profile` pin. In the desktop app the web UI additionally gets
 download, install, restart; dismissible until the version changes), and
 `clipboard_image_png` returns the clipboard image as PNG for the Linux paste
 fallback (WebKitGTK ≤ 2.50, WebKit Bug 218519) — nothing else reaches the web
-origin. The web-server settings live in Settings → General.
+origin. The desktop app also listens to the turn-end feed
+(`/api/notify/stream`) **from Rust** and shows native notifications. A click
+calls `window.peakbotOpenConvo(convo)`, which the SPA defines while desktop tabs
+are mounted (`useConvoTabs`). That is a one-way eval, not an IPC grant. The
+web-server settings live in Settings → General.
 
 **First run**: with no global config (or a failed migration) the chat is
 replaced by a guided setup — Welcome → Provider → Agent → Web → Review →

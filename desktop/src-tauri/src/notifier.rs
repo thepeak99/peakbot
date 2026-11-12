@@ -1,17 +1,24 @@
 //! The turn-end notifier (PR-C design §4.4/§6.2): owns the SSE listener
 //! task for the current `Ready` phase, shows native notifications and
-//! handles their clicks. The `Notifier` struct, `run`, `feed_client`,
-//! `show` and the plugin wiring are the implementation's (tasks 6/7); this
-//! file currently holds the TDD stubs below plus the §9.3 tests.
+//! handles their clicks. The only I/O in the feature; the decisions live
+//! in `core::notify`.
 
-use peakbot_desktop_core::notify::{StopReason, TurnEnd};
-use tauri_plugin_notification::ActionPerformed;
+use std::sync::Mutex;
+
+use tauri::Manager;
+use tauri_plugin_notification::{ActionPerformed, NotificationExt};
 use url::Url;
 use uuid::Uuid;
 
+use peakbot_desktop_core::consts::{NOTIFY_CONNECT_TIMEOUT, NOTIFY_READ_TIMEOUT};
+use peakbot_desktop_core::notify::{
+    self, StopReason, TurnEnd, Verdict, open_convo_js, parse_event, retry_delay, toast,
+};
+use peakbot_desktop_core::paths::peakbot_ca_cert;
+use peakbot_desktop_core::phase::Phase;
+use peakbot_desktop_core::web_target::WebTarget;
+
 /// How one connection attempt ended.
-// TDD stub — PR-C implementation replaces this (Notifier::run matches on it).
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Attempt {
     /// 404 / 401 / 403: stop until the next `Ready`.
@@ -22,25 +29,197 @@ pub enum Attempt {
     Failed,
 }
 
+/// The listener for the current `Ready` phase. At most one task exists
+/// (the Mutex holds it); `follow` always aborts the old one first.
+pub struct Notifier {
+    app: tauri::AppHandle,
+    task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+}
+
+impl Notifier {
+    /// Registers the notification click handler (must precede any `show`:
+    /// the plugin reports clicks only to registered handlers).
+    pub fn new(app: tauri::AppHandle) -> Self {
+        // `on_action` never fails on desktop, but the signature returns a
+        // Result (it matches the mobile one).
+        if let Err(e) = app.notification().on_action({
+            let app = app.clone();
+            move |p: &ActionPerformed| {
+                let Some(convo) = convo_from_action(p) else {
+                    return;
+                };
+                // Focus first, then open the conversation in the page
+                // (one-way eval; a non-SPA page no-ops on `?.`).
+                crate::window::focus_main(&app);
+                let Some(win) = app.get_webview_window(crate::window::MAIN_LABEL) else {
+                    return;
+                };
+                if let Err(e) = win.eval(open_convo_js(convo)) {
+                    log::warn!("notification click: the page eval failed: {e}");
+                }
+            }
+        }) {
+            log::error!("registering the notification click handler failed: {e}");
+        }
+        Self {
+            app,
+            task: Mutex::new(None),
+        }
+    }
+
+    /// `Ready(t)` → (re)start the listener for `t`; any other phase → stop it.
+    /// Non-blocking; safe while quitting (no main-thread call).
+    pub fn follow(&self, phase: &Phase) {
+        let mut task = self.task.lock().expect("notifier task lock");
+        // Abort before spawning: the dropped connection must close before a
+        // quit/restart stops the server, or every shutdown ends in a
+        // SIGKILL (design §5.4).
+        if let Some(t) = task.take() {
+            t.abort()
+        }
+        if let Phase::Ready(target) = phase {
+            let app = self.app.clone();
+            *task = Some(tauri::async_runtime::spawn(run(app, target.clone())));
+        }
+    }
+}
+
+/// The listener task: connect, stream, reconnect with backoff; stop on a
+/// definitive 404/401/403 (which won't change until the next `Ready`).
+async fn run(app: tauri::AppHandle, target: WebTarget) {
+    let client = match feed_client(&target) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("notifications unavailable: {e}");
+            return;
+        }
+    };
+    let url = target.notify_url();
+    let mut failures = 0u32;
+    loop {
+        match stream_feed(&client, url.clone(), |ev| show(&app, &ev)).await {
+            Attempt::Stop(StopReason::Disabled) => {
+                log::info!("notifications are off on this PeakBot");
+                return;
+            }
+            Attempt::Stop(StopReason::Rejected) => {
+                log::warn!("the notification feed refused the token");
+                return;
+            }
+            Attempt::Closed => failures = 0,
+            Attempt::Failed => failures = failures.saturating_add(1),
+        }
+        tokio::time::sleep(retry_delay(failures)).await;
+    }
+}
+
+/// The feed's HTTP client: direct (never via a proxy), with the locked
+/// timeouts; a TLS target pins PeakBot's own CA (the file the webview
+/// already trusts).
+fn feed_client(target: &WebTarget) -> Result<reqwest::Client, String> {
+    // `rustls-no-provider`: `build()` panics without a provider installed
+    // (idempotent; the updater installs the same one).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(NOTIFY_CONNECT_TIMEOUT)
+        .read_timeout(NOTIFY_READ_TIMEOUT);
+    if target.tls {
+        let Some(pem_path) = peakbot_ca_cert() else {
+            return Err("no CA certificate path".into());
+        };
+        let pem =
+            std::fs::read(&pem_path).map_err(|e| format!("reading the CA certificate: {e}"))?;
+        let cert = reqwest::Certificate::from_pem(&pem)
+            .map_err(|e| format!("the CA certificate does not parse: {e}"))?;
+        builder = builder.tls_certs_only([cert]);
+    }
+    builder
+        .build()
+        .map_err(|e| format!("building the feed client: {e}"))
+}
+
 /// One feed connection: `GET` the URL, map the status through
 /// `notify::verdict`, then decode SSE frames and forward every `TurnEnd`
 /// to `on_event`. Never returns `Err`: the loop in `run` owns retries.
-// TDD stub — PR-C implementation replaces this
-#[allow(dead_code, unused_variables)]
 pub(crate) async fn stream_feed(
     client: &reqwest::Client,
     url: Url,
-    on_event: impl FnMut(TurnEnd),
+    mut on_event: impl FnMut(TurnEnd),
 ) -> Attempt {
-    todo!("PR-C")
+    // N4: reqwest errors are logged with `.without_url()` — the URL
+    // carries the token and must never reach a log.
+    let resp = match client.get(url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("notification feed unreachable: {}", e.without_url());
+            return Attempt::Failed;
+        }
+    };
+    match notify::verdict(resp.status().as_u16()) {
+        Verdict::Stop(r) => return Attempt::Stop(r),
+        Verdict::Retry => {
+            log::warn!("the notification feed answered {}", resp.status());
+            return Attempt::Failed;
+        }
+        Verdict::Stream => {}
+    }
+    let mut dec = notify::SseDecoder::default();
+    let mut resp = resp;
+    loop {
+        match resp.chunk().await {
+            Ok(Some(bytes)) => {
+                for data in dec.feed(&bytes) {
+                    match parse_event(&data) {
+                        Some(ev) => on_event(ev),
+                        None => log::debug!("skipped a feed frame"),
+                    }
+                }
+            }
+            // The server ended the stream (e.g. it is shutting down): a
+            // healthy end, reconnect after 1 s — not a failure.
+            Ok(None) => return Attempt::Closed,
+            // Incl. the read timeout (a dead stream).
+            Err(e) => {
+                log::warn!("the notification feed stream ended: {}", e.without_url());
+                return Attempt::Closed;
+            }
+        }
+    }
+}
+
+/// Show a notification for `ev`, unless the user is looking at the window
+/// (read at event time: `is_visible` AND `is_focused`, no cached flag).
+fn show(app: &tauri::AppHandle, ev: &TurnEnd) {
+    let looking = app
+        .get_webview_window(crate::window::MAIN_LABEL)
+        .is_some_and(|win| win.is_visible().unwrap_or(false) && win.is_focused().unwrap_or(false));
+    let Some(t) = toast(ev, looking) else {
+        return;
+    };
+    if let Err(e) = app
+        .notification()
+        .builder()
+        .title(t.title)
+        .body(t.body)
+        .extra("convo", ev.convo.to_string())
+        .show()
+    {
+        log::warn!("showing the notification failed: {e}");
+    }
 }
 
 /// The conversation a notification click refers to: `action_id == "tap"`
 /// and a `convo` extra that parses as a `Uuid`; anything else is ignored.
-// TDD stub — PR-C implementation replaces this
-#[allow(dead_code, unused_variables)]
-pub(crate) fn convo_from_action(p: &ActionPerformed) -> Option<Uuid> {
-    todo!("PR-C")
+fn convo_from_action(p: &ActionPerformed) -> Option<Uuid> {
+    // The plugin maps every platform click to the action id "tap".
+    if p.action_id() != "tap" {
+        return None;
+    }
+    // `extra` round-trips as JSON: our string comes back as a JSON string.
+    let extra = p.notification()?.extra();
+    let convo = extra.get("convo")?.as_str()?;
+    Uuid::parse_str(convo).ok()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -121,6 +300,9 @@ mod tests {
             }
             let _ = sock.write_all(format!("HTTP/1.1 {} \r\n", canned.status).as_bytes());
             let _ = sock.write_all(canned.headers.as_bytes());
+            // The blank line that ends the header section (HTTP/1.1):
+            // without it no client can tell where the body starts.
+            let _ = sock.write_all(b"\r\n");
             for (chunk, pause) in &canned.body {
                 if let Some(p) = pause {
                     thread::sleep(*p);

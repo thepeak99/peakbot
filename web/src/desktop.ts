@@ -57,6 +57,9 @@ export function setBootEdition(e: Edition | undefined): void {
 // `globalThis.__TAURI__.core.invoke`; ANY rejection — including no IPC at
 // all (a non-default address, an older desktop app) — means "the desktop
 // option is unavailable here".
+// The notification-click seam (`window.peakbotOpenConvo`, declared above)
+// is NOT a command: the desktop app evaluates it one-way in this page;
+// nothing on the page side calls it, and it grants the origin nothing.
 
 type Invoke = (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
 
