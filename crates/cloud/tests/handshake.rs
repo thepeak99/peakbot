@@ -8,6 +8,7 @@ use cloud::Error;
 use cloud::Head;
 use cloud::Result;
 use cloud::chain::VerifiedChain;
+use cloud::frames::{FrameReceiver, FrameSender, Inner, RecvOutcome, StreamMsg, encode_inner};
 use cloud::handshake::{Hs1, Initiator, Responder, SessionKeys};
 use common::*;
 
@@ -622,5 +623,221 @@ fn pipe_msg_trailing_byte_rejected() {
     assert_eq!(
         cloud::handshake::PipeMsg::parse(&bytes),
         Err(Error::Malformed)
+    );
+}
+
+// -- post-handshake data roundtrip (spec §9.1) ---------------------------------------------------
+
+#[test]
+fn handshake_then_data_roundtrip_both_directions() {
+    // Full happy-path handshake I=A → R=B; the session id is Hs1's sid.
+    let c = chain();
+    let a = card_a();
+    let b = card_b();
+    let (mut i, hs1) = Initiator::start(
+        &c,
+        a.device_id(),
+        b.device_id(),
+        keypair(1).private(),
+        &mut rng(0xA1),
+    )
+    .expect("initiator starts");
+    let (mut r, hs2) = Responder::on_hs1(
+        &c,
+        b.device_id(),
+        a.device_id(),
+        &hs1,
+        &no_fetch(),
+        keypair(2).private(),
+        &mut rng(0xB2),
+    )
+    .expect("responder on hs1");
+    let hs3 = i
+        .on_hs2(b.device_id(), &hs2, &no_fetch(), &mut rng(0xA1))
+        .expect("initiator on hs2");
+    let ki = i.keys().expect("initiator keys");
+    let kr = r.on_hs3(&c, a.device_id(), &hs3).expect("responder on hs3");
+    let sid = hs1.sid;
+
+    // I→R: several messages, so the per-direction counter advances.
+    let mut s = FrameSender::new(sid, ki.k_ir);
+    let mut r2 = FrameReceiver::new(sid, kr.k_ir);
+    for n in 1..=3u32 {
+        let inner = Inner {
+            stream: 1,
+            msg: StreamMsg::Frame(format!("i2r-{n}")),
+        };
+        let d = s.seal(&encode_inner(&inner)).expect("seal i2r");
+        assert_eq!(
+            r2.open(&d).expect("open i2r"),
+            RecvOutcome::Inner(inner),
+            "I→R message {n} must arrive with identical plaintext"
+        );
+    }
+
+    // R→I: the reverse direction works the same way.
+    let mut s = FrameSender::new(sid, ki.k_ri);
+    let mut r2 = FrameReceiver::new(sid, kr.k_ri);
+    for n in 1..=3u32 {
+        let inner = Inner {
+            stream: 1,
+            msg: StreamMsg::Frame(format!("r2i-{n}")),
+        };
+        let d = s.seal(&encode_inner(&inner)).expect("seal r2i");
+        assert_eq!(
+            r2.open(&d).expect("open r2i"),
+            RecvOutcome::Inner(inner),
+            "R→I message {n} must arrive with identical plaintext"
+        );
+    }
+
+    // Direction keys are distinct (spec §9.1): a frame sealed I→R must NOT
+    // open as if it were R→I. Feed I's own outbound frame back into I's
+    // receive path (k_ri): AEAD fails, and the strict receiver closes.
+    let mut back = FrameSender::new(sid, ki.k_ir);
+    let inner = Inner {
+        stream: 1,
+        msg: StreamMsg::Frame("loopback".into()),
+    };
+    let d = back.seal(&encode_inner(&inner)).expect("seal loopback");
+    let mut own_rx = FrameReceiver::new(sid, ki.k_ri);
+    assert_eq!(
+        own_rx.open(&d),
+        Err(Error::DecryptionError),
+        "an I→R frame must not open under the R→I key"
+    );
+    assert!(
+        own_rx.closed(),
+        "a cross-direction frame must close the session"
+    );
+}
+
+// -- initiator chain precondition (spec §8.1: both MUST be active in own chain) ---------------
+
+#[test]
+fn initiator_aborts_when_peer_not_in_own_chain() {
+    let a = card_a();
+    let b = card_b();
+
+    // A chain where B was revoked (also reused for the Hs2 case below).
+    let (revoked, e_revoke) = {
+        let e0 = entry(
+            1,
+            0,
+            [0; 32],
+            cloud::chain::ChainOp::Genesis,
+            Some(&a),
+            None,
+            &a,
+        );
+        let h0 = cloud::chain::entry_hash(&e0);
+        let e1 = entry(1, 1, h0, cloud::chain::ChainOp::Add, Some(&b), None, &a);
+        let h1 = cloud::chain::entry_hash(&e1);
+        let e2 = entry(
+            1,
+            2,
+            h1,
+            cloud::chain::ChainOp::Revoke,
+            None,
+            Some(b.device_id()),
+            &a,
+        );
+        let c = cloud::chain::extend(None, &[e0, e1, e2.clone()], None).expect("chain");
+        (c, e2)
+    };
+
+    // Case 1: r was never added to I's own chain.
+    let genesis_only = {
+        let e0 = entry(
+            1,
+            0,
+            [0; 32],
+            cloud::chain::ChainOp::Genesis,
+            Some(&a),
+            None,
+            &a,
+        );
+        cloud::chain::extend(None, &[e0], None).expect("genesis chain")
+    };
+    let res = Initiator::start(
+        &genesis_only,
+        a.device_id(),
+        b.device_id(),
+        keypair(1).private(),
+        &mut rng(0xA1),
+    );
+    assert_eq!(
+        res.err(),
+        Some(Error::NotActive),
+        "start must fail when r was never added to own chain"
+    );
+
+    // Case 2: r was revoked in I's own chain.
+    let res = Initiator::start(
+        &revoked,
+        a.device_id(),
+        b.device_id(),
+        keypair(1).private(),
+        &mut rng(0xA1),
+    );
+    assert_eq!(
+        res.err(),
+        Some(Error::NotActive),
+        "start must fail when r is revoked in own chain"
+    );
+
+    // Case 3: the chain may change between Hs1 and Hs2 (spec §8.6, I on Hs2
+    // step 3: re-checked because the chain may have changed since Hs1). I
+    // starts while r is active; Hs2 then presents a head at which r is
+    // revoked in I's own chain, and the relay serves the revoking entry on
+    // sync.
+    let c = chain_ab();
+    let (mut i, hs1) = Initiator::start(
+        &c,
+        a.device_id(),
+        b.device_id(),
+        keypair(1).private(),
+        &mut rng(0xA1),
+    )
+    .expect("start while r is active");
+    // A well-formed Hs2 from B over the revoked chain's head (the head is
+    // bound under sig_R via th2, so it cannot be a later tamper).
+    let ct = vec![0u8; 1120];
+    let th1 =
+        cloud::handshake::transcript_th1(&cloud::handshake::PipeMsg::Hs1(hs1.clone()).encode());
+    let hs2_tbs = {
+        let mut m = Vec::new();
+        m.push(1); // pipe version
+        m.push(2); // Hs2
+        m.extend_from_slice(&hs1.sid);
+        m.extend_from_slice(&(ct.len() as u32).to_be_bytes());
+        m.extend_from_slice(&ct);
+        m.extend_from_slice(&revoked.head.ce());
+        m
+    };
+    let th2 = cloud::handshake::transcript_th2(&th1, &hs2_tbs);
+    let sig_r = cloud::sign_tagged(
+        keypair(2).private(),
+        cloud::domain::HS_SIG_R,
+        &th2,
+        &mut rng(0xB2),
+    )
+    .expect("sign hs2");
+    let hs2 = cloud::handshake::Hs2 {
+        sid: hs1.sid,
+        ct,
+        head: revoked.head,
+        sig_r,
+    };
+    // The relay serves the revoking entry (seq 2) on sync.
+    let fetch = move |from_seq: u64| -> cloud::Result<Vec<Vec<u8>>> {
+        assert_eq!(from_seq, 2, "sync must start at seq 2");
+        Ok(vec![e_revoke.clone()])
+    };
+    let res = i.on_hs2(b.device_id(), &hs2, &fetch, &mut rng(0xA1));
+    assert_eq!(
+        res.err(),
+        Some(Error::NotActive),
+        "processing Hs2 from a revoked r must fail"
     );
 }
