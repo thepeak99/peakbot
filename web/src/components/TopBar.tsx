@@ -12,7 +12,7 @@ import { SelectionChip } from "./SelectionChip";
 import { NotifyToggle } from "./NotifyToggle";
 import { FocusToggle } from "./FocusToggle";
 import { ThemeToggle } from "./ThemeToggle";
-import type { NotifyPermission } from "../useTaskNotifications";
+import type { TaskNotifications } from "../useTaskNotifications";
 import { edition } from "../desktop";
 
 // Top status bar. Sessions trio (conversations + model + cwd) live here on
@@ -35,9 +35,7 @@ export function TopBar({
   onLoadConversation,
   onReattach,
   onSwitchCwd,
-  notifyEnabled,
-  notifyPermission,
-  onToggleNotify,
+  notify,
   focusMode,
   onToggleFocus,
   onOpenSettings,
@@ -68,9 +66,7 @@ export function TopBar({
   onReattach?(profile: string, agent?: string): void;
   /** Commits a cwd picked in the CwdPicker (App routes busy/idle). */
   onSwitchCwd?(path: string): void;
-  notifyEnabled: boolean;
-  notifyPermission: NotifyPermission;
-  onToggleNotify: () => void;
+  notify: TaskNotifications;
   focusMode: boolean;
   onToggleFocus: () => void;
   /** Opens the Settings view. The gear renders only when this is given —
@@ -196,11 +192,7 @@ export function TopBar({
       <div className="ml-auto flex items-center gap-4 font-mono text-[11px] tabular-nums text-zinc-500">
         <FocusToggle enabled={focusMode} onToggle={onToggleFocus} />
         <ThemeToggle />
-        <NotifyToggle
-          enabled={notifyEnabled}
-          permission={notifyPermission}
-          onToggle={onToggleNotify}
-        />
+        <NotifyToggle notify={notify} />
         {onOpenSettings && (
           <button
             type="button"
