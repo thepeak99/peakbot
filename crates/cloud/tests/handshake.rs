@@ -40,7 +40,7 @@ fn full_handshake(fetch: &Fetch) -> (SessionKeys, SessionKeys) {
     )
     .expect("responder on hs1");
     let hs3 = i
-        .on_hs2(b.device_id(), &hs2, fetch)
+        .on_hs2(b.device_id(), &hs2, fetch, &mut rng(0xA1))
         .expect("initiator on hs2");
     let ki = i.keys().expect("initiator keys");
     let kr = r.on_hs3(&c, a.device_id(), &hs3).expect("responder on hs3");
@@ -144,18 +144,17 @@ fn hs1_tamper_head_aborts_trust() {
 }
 
 #[test]
-fn hs1_tamper_eph_pk_diverges_keys() {
-    // A tampered ephemeral KEM pk decodes to a (different) key: the
-    // encapsulated shared secret diverges, so the two sides derive
-    // different session keys and the session is unusable (ct lies under
-    // both signatures; the first Data frame would fail AEAD).
+fn hs1_tamper_eph_pk_aborts_bad_signature() {
+    // eph_pk lies under th1, hence under sig_R (spec §8.3: "I's ephemeral
+    // key ... is in every signed transcript"): I must abort with
+    // BadSignature, not complete with divergent keys.
     let c = chain();
     let a = card_a();
     let b = card_b();
     let (mut i, hs1) = Initiator::start(&c, a.device_id(), b.device_id(), keypair(1).private(), &mut rng(0xA1)).unwrap();
     let mut t = hs1.clone();
     t.eph_pk[100] ^= 1;
-    let (mut r, hs2) = Responder::on_hs1(
+    let (_r, hs2) = Responder::on_hs1(
         &c,
         b.device_id(),
         a.device_id(),
@@ -164,12 +163,8 @@ fn hs1_tamper_eph_pk_diverges_keys() {
         keypair(2).private(), &mut rng(0xB2),
     )
     .expect("responder accepts decodable pk");
-    let hs3 = i
-        .on_hs2(b.device_id(), &hs2, &no_fetch())
-        .expect("initiator on hs2");
-    let ki = i.keys().expect("keys");
-    let kr = r.on_hs3(&c, a.device_id(), &hs3).expect("responder on hs3");
-    assert_ne!(ki.k_ir, kr.k_ir, "tampered eph_pk must diverge the keys");
+    let res = i.on_hs2(b.device_id(), &hs2, &no_fetch(), &mut rng(0xA1));
+    assert_eq!(res.err(), Some(Error::BadSignature));
 }
 
 // -- Hs2 field tampering ---------------------------------------------------------------
@@ -190,7 +185,7 @@ fn hs2_tamper_sig_r_aborts_bad_signature() {
     )
     .unwrap();
     hs2.sig_r[50] ^= 1;
-    let res = i.on_hs2(b.device_id(), &hs2, &no_fetch());
+    let res = i.on_hs2(b.device_id(), &hs2, &no_fetch(), &mut rng(0xA1));
     assert_eq!(res.err(), Some(Error::BadSignature));
 }
 
@@ -214,20 +209,20 @@ fn hs2_tamper_head_aborts_trust() {
         seq: hs2.head.seq,
         hash: [0xBB; 32],
     };
-    let res = i.on_hs2(b.device_id(), &hs2, &no_fetch());
+    let res = i.on_hs2(b.device_id(), &hs2, &no_fetch(), &mut rng(0xA1));
     assert_eq!(res.err(), Some(Error::Trust));
 }
 
 #[test]
-fn hs2_tamper_ct_diverges_keys() {
-    // ct is under sig_R (verified by I) and under sig_I (verified by R);
-    // a tampered ct that R signed is accepted by both signatures, but the
-    // decapsulated shared secret diverges → different keys.
+fn hs2_tamper_ct_aborts_bad_signature() {
+    // ct lies under sig_R (spec §8.2/§8.3: hs2_tbs contains bytes(ct)):
+    // tampering ct in transit makes I's th2 diverge from R's, so sig_R
+    // fails to verify.
     let c = chain();
     let a = card_a();
     let b = card_b();
     let (mut i, hs1) = Initiator::start(&c, a.device_id(), b.device_id(), keypair(1).private(), &mut rng(0xA1)).unwrap();
-    let (mut r, mut hs2) = Responder::on_hs1(
+    let (_r, mut hs2) = Responder::on_hs1(
         &c,
         b.device_id(),
         a.device_id(),
@@ -237,12 +232,8 @@ fn hs2_tamper_ct_diverges_keys() {
     )
     .unwrap();
     hs2.ct[10] ^= 1;
-    let hs3 = i
-        .on_hs2(b.device_id(), &hs2, &no_fetch())
-        .expect("sig_R covers the tampered ct");
-    let ki = i.keys().expect("keys");
-    let kr = r.on_hs3(&c, a.device_id(), &hs3).expect("responder on hs3");
-    assert_ne!(ki.k_ir, kr.k_ir, "tampered ct must diverge the keys");
+    let res = i.on_hs2(b.device_id(), &hs2, &no_fetch(), &mut rng(0xA1));
+    assert_eq!(res.err(), Some(Error::BadSignature));
 }
 
 // -- Hs3 tampering -----------------------------------------------------------------------
@@ -262,7 +253,7 @@ fn hs3_tamper_sig_i_aborts_bad_signature() {
         keypair(2).private(), &mut rng(0xB2),
     )
     .unwrap();
-    let mut hs3 = i.on_hs2(b.device_id(), &hs2, &no_fetch()).expect("hs3");
+    let mut hs3 = i.on_hs2(b.device_id(), &hs2, &no_fetch(), &mut rng(0xA1)).expect("hs3");
     hs3.sig_i[7] ^= 1;
     let res = r.on_hs3(&c, a.device_id(), &hs3);
     assert_eq!(res.err(), Some(Error::BadSignature));
@@ -345,50 +336,34 @@ fn revoked_peer_aborts_not_active() {
 
 // -- head sync (spec §8.5) -------------------------------------------------------------------
 
-#[test]
-fn newer_peer_head_forces_sync() {
-    // I's chain is stale (genesis only); R is at seq 1. I must sync via
-    // the fetch closure to accept R's newer head.
-    let c = chain();
-    let stale = cloud::chain::extend(
-        None,
-        &[entry(
-            1,
-            0,
-            [0; 32],
-            cloud::chain::ChainOp::Genesis,
-            Some(&card_a()),
-            None,
-            &card_a(),
-        )],
-        None,
-    )
-    .expect("stale chain");
+/// A three-device chain (A genesis, B added, C added) plus its raw
+/// entries. B is active from seq 1 on, so an I stale at seq 1 still
+/// satisfies the §8.1 precondition (both parties active in own chain).
+fn chain_abc() -> (VerifiedChain, Vec<Vec<u8>>) {
     let a = card_a();
     let b = card_b();
-    // Fetch returns entry 1 (the Add of B) when asked from seq 1.
+    let cc = card_c();
+    let e0 = entry(1, 0, [0; 32], cloud::chain::ChainOp::Genesis, Some(&a), None, &a);
+    let h0 = cloud::chain::entry_hash(&e0);
+    let e1 = entry(1, 1, h0, cloud::chain::ChainOp::Add, Some(&b), None, &a);
+    let h1 = cloud::chain::entry_hash(&e1);
+    let e2 = entry(1, 2, h1, cloud::chain::ChainOp::Add, Some(&cc), None, &a);
+    let full = cloud::chain::extend(None, &[e0.clone(), e1.clone(), e2.clone()], None).expect("chain");
+    (full, vec![e0, e1, e2])
+}
+
+#[test]
+fn newer_peer_head_forces_sync() {
+    // I's chain is stale (seq 1, missing the last entry); R is at seq 2.
+    // I must sync via the fetch closure to accept R's newer head (§8.5).
+    let (c, es) = chain_abc();
+    let stale = cloud::chain::extend(None, &[es[0].clone(), es[1].clone()], None).expect("stale chain");
+    let a = card_a();
+    let b = card_b();
+    // Fetch returns entry 2 (the Add of C) when asked from seq 2.
     let fetch = move |from_seq: u64| -> cloud::Result<Vec<Vec<u8>>> {
-        assert_eq!(from_seq, 1);
-        let e0 = entry(
-            1,
-            0,
-            [0; 32],
-            cloud::chain::ChainOp::Genesis,
-            Some(&card_a()),
-            None,
-            &card_a(),
-        );
-        let h0 = cloud::chain::entry_hash(&e0);
-        let e1 = entry(
-            1,
-            1,
-            h0,
-            cloud::chain::ChainOp::Add,
-            Some(&card_b()),
-            None,
-            &card_a(),
-        );
-        Ok(vec![e1])
+        assert_eq!(from_seq, 2);
+        Ok(vec![es[2].clone()])
     };
     // Start the handshake from the stale chain; R presents the newer head.
     let (mut i, hs1) = Initiator::start(&stale, a.device_id(), b.device_id(), keypair(1).private(), &mut rng(0xA1))
@@ -403,29 +378,17 @@ fn newer_peer_head_forces_sync() {
     )
     .expect("responder on hs1");
     let hs3 = i
-        .on_hs2(b.device_id(), &hs2, &fetch)
+        .on_hs2(b.device_id(), &hs2, &fetch, &mut rng(0xA1))
         .expect("initiator syncs");
     let _ = r.on_hs3(&c, a.device_id(), &hs3).expect("responder on hs3");
 }
 
 #[test]
 fn stale_head_without_relay_data_aborts_stale_chain() {
-    // I is stale; the relay cannot serve the missing entry → StaleChain.
-    let c = chain();
-    let stale = cloud::chain::extend(
-        None,
-        &[entry(
-            1,
-            0,
-            [0; 32],
-            cloud::chain::ChainOp::Genesis,
-            Some(&card_a()),
-            None,
-            &card_a(),
-        )],
-        None,
-    )
-    .expect("stale chain");
+    // I is at seq 1; R is at seq 2; the relay cannot serve the missing
+    // entry → StaleChain (spec §8.5 step 2).
+    let (c, es) = chain_abc();
+    let stale = cloud::chain::extend(None, &[es[0].clone(), es[1].clone()], None).expect("stale chain");
     let a = card_a();
     let b = card_b();
     let (mut i, hs1) = Initiator::start(&stale, a.device_id(), b.device_id(), keypair(1).private(), &mut rng(0xA1))
@@ -439,7 +402,7 @@ fn stale_head_without_relay_data_aborts_stale_chain() {
         keypair(2).private(), &mut rng(0xB2),
     )
     .expect("responder on hs1");
-    let res = i.on_hs2(b.device_id(), &hs2, &no_fetch());
+    let res = i.on_hs2(b.device_id(), &hs2, &no_fetch(), &mut rng(0xA1));
     assert_eq!(res.err(), Some(Error::StaleChain));
 }
 
@@ -466,7 +429,7 @@ fn replayed_hs1_cannot_complete_new_handshake() {
     )
     .unwrap();
     let hs3 = i
-        .on_hs2(b.device_id(), &hs2_live, &no_fetch())
+        .on_hs2(b.device_id(), &hs2_live, &no_fetch(), &mut rng(0xA1))
         .expect("live session hs3");
     let _live_keys = r
         .on_hs3(&c, a.device_id(), &hs3)

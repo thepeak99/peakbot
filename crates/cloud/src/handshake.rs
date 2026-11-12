@@ -349,11 +349,12 @@ impl Initiator {
     /// `ss = kem_decapsulate(eph_sk, ct)` (else `DecryptionError`), derive
     /// keys, zeroize `eph_sk`/`ss`, send Hs3. The session is established
     /// for I.
-    pub fn on_hs2(
+    pub fn on_hs2<R: CryptoRng>(
         &mut self,
         relay_from: DeviceId,
         hs2: &Hs2,
         fetch: &dyn Fn(u64) -> Result<Vec<Vec<u8>>>,
+        rng: &mut R,
     ) -> Result<Hs3> {
         if hs2.sid != self.sid {
             return Err(Error::Malformed);
@@ -381,9 +382,9 @@ impl Initiator {
         let ss = v1::kem_decapsulate(&eph_sk, &hs2.ct).map_err(|_| Error::DecryptionError)?;
         let th3 = transcript_th3(&th2, &hs2.sig_r);
         self.keys = Some(derive_keys(ss.as_bytes(), &th3));
-        // `sign` (production path, spec §14 A5): sig_I is not frozen in
-        // any vector; the keys do not depend on it.
-        let sig_i = self.sk.sign(&th3).map_err(v1_err)?;
+        // `sign_tagged` (spec §1.3/§8.3): sig_I covers `str(T14) ‖ th3`;
+        // the keys do not depend on it.
+        let sig_i = sign_tagged(&self.sk, domain::HS_SIG_I, &th3, rng)?;
         Ok(Hs3 {
             sid: self.sid,
             sig_i,
@@ -438,13 +439,15 @@ impl Responder {
             v1::kem_encapsulate(v1::KemAlg::X25519MlKem768, &hs1.eph_pk, rng)
                 .map_err(|_| Error::MalformedKey)?;
         let th1 = transcript_th1(&PipeMsg::Hs1(hs1.clone()).encode());
+        // R presents its OWN head (spec §8.2: Hs2 carries `head(head_R)`),
+        // so a stale initiator learns R's newer head and syncs (§8.5).
         let hs2_tbs = {
             let mut m = Vec::with_capacity(1 + 1 + 16 + 4 + CT_LEN + 40);
             m.push(constants::PIPE_VERSION);
             m.push(2);
             m.extend_from_slice(&hs1.sid);
             ce::push_bytes(&mut m, &ct);
-            m.extend_from_slice(&hs1.head.ce());
+            m.extend_from_slice(&own.head.ce());
             m
         };
         let th2 = transcript_th2(&th1, &hs2_tbs);
@@ -453,7 +456,7 @@ impl Responder {
         let hs2 = Hs2 {
             sid: hs1.sid,
             ct,
-            head: hs1.head,
+            head: own.head,
             sig_r,
         };
         let me = Self {
