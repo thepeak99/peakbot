@@ -1,16 +1,17 @@
 // Header of the mobile Conversation screen (design §4.2): "‹ Chats" back
 // button (dot badge when another chat is running / unread), centred title +
-// `profile · model` subtitle, Focus toggle and connection state on the right.
-import type { JSX } from "react";
+// a subtitle that IS the selection chip (`selector`, behind a machine prefix
+// on remote chats), Panels button, Focus toggle and connection state.
+import type { JSX, ReactNode } from "react";
 import { FocusToggle } from "./FocusToggle";
 import { PanelsButton, type PanelsButtonProps } from "./PanelsSheet";
-import type { TabColor } from "../state";
 
 interface ChatHeaderProps {
   title: string;
-  profile: string | null;
-  profileColor?: TabColor;
-  model: string;
+  /** Remote machine display name; null = this device (no prefix). */
+  machine: string | null;
+  /** `<SelectionChip sheet …/>`; renders nothing before the first state. */
+  selector: ReactNode;
   badge: boolean;
   onBack(): void;
   connected: boolean;
@@ -24,9 +25,8 @@ interface ChatHeaderProps {
 export function ChatHeader(props: ChatHeaderProps): JSX.Element {
   const {
     title,
-    profile,
-    profileColor,
-    model,
+    machine,
+    selector,
     badge,
     onBack,
     connected,
@@ -67,15 +67,14 @@ export function ChatHeader(props: ChatHeaderProps): JSX.Element {
         </h1>
         <div
           data-testid="chat-subtitle"
-          className="flex w-full items-center gap-1.5 truncate text-xs text-zinc-500"
+          className="flex w-full min-w-0 items-center justify-center gap-1 text-xs text-zinc-500"
         >
-          {profileColor && (
-            <span
-              className="h-2 w-2 shrink-0 rounded-full"
-              style={{ backgroundColor: `var(--profile-${profileColor})` }}
-            />
+          {machine && (
+            <span data-testid="chat-machine" className="shrink-0">
+              {machine} ·
+            </span>
           )}
-          <span className="truncate">{profile ? `${profile} · ${model}` : model}</span>
+          {selector}
         </div>
       </div>
 
@@ -92,14 +91,15 @@ export function ChatHeader(props: ChatHeaderProps): JSX.Element {
             offline
           </span>
         ) : isRunning ? (
-          // Mirrors the TopBar working chip: amber spinner + "working…".
+          // Spinner only: the word lives in the inline status line, so the
+          // text stays for assistive tech.
           <span
             data-testid="chat-state"
             data-state="working"
             className="flex items-center gap-1.5 text-xs text-amber-400"
           >
             <span className="h-3 w-3 animate-spin rounded-full border-2 border-amber-400 border-t-transparent shrink-0" />
-            working…
+            <span className="sr-only">working…</span>
           </span>
         ) : (
           <span

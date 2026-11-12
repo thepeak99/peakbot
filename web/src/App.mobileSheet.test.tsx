@@ -345,10 +345,10 @@ beforeEach(() => {
 
 afterEach(async () => {
   // jsdom folds two same-tick history.back() calls into ONE popstate, so
-  // unmounting with the chat layer AND the sheet open would leave backStack
-  // owing a popstate that never lands (and poison the next test). Close the
-  // sheet first, as a user would.
-  if (panelsDialog()) {
+  // unmounting with the chat layer AND a sheet (Panels, Selection or
+  // Machine) open would leave backStack owing a popstate that never lands
+  // (and poison the next test). Close the sheet first, as a user would.
+  if (tid("sheet-done")) {
     const closed = waitForPopstate();
     click(must("sheet-done"));
     await act(async () => {

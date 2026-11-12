@@ -758,6 +758,11 @@ export interface SelectionChipProps {
    *  (a remote profile whose agents are unknown) — the remote resolves its
    *  own agent. Optional so a chip without a socket owner just selects. */
   onReattach?(profile: string, agent?: string): void;
+  /** Phone header subtitle: the trigger is plain text and the drill-down
+   *  renders in `<Sheet title="Selection">`. The Sheet owns Esc / outside /
+   *  Back, so the chip's own dismissal is off; a model pick or reset closes
+   *  the sheet (an agent pick still drills to Team). Lock rules unchanged. */
+  sheet?: boolean;
 }
 // data-testids (the chip owns all of them):
 //   `selection-chip`        — the <button>. textContent =

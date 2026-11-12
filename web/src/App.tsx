@@ -46,6 +46,8 @@ import { useMobileChats } from "./useMobileChats";
 import { useScreenSlide } from "./useScreenSlide";
 import { ChatHeader } from "./components/ChatHeader";
 import { ChatList } from "./components/ChatList";
+import { SelectionChip } from "./components/SelectionChip";
+import { machineName, machineOf } from "./chatList";
 import { focusView } from "./focus";
 import { epochKey, nextEpoch, type EpochState } from "./transcriptEpoch";
 import { filterTabs, resolveActiveTab, settingsGearEnabled } from "./tabs";
@@ -145,6 +147,9 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   const catalog = state ? adaptCatalog(state) : [];
   const selection = state ? adaptSelection(state) : null;
   const boundAgent = boundAgentOf(catalog, selection);
+  // The header's machine prefix: remote chats only (this device = no prefix).
+  const chatMachineId = machineOf(catalog, selection?.profile ?? null);
+  const chatMachine = chatMachineId === null ? null : machineName(chatMachineId);
   // `/r/<L>` prefix for uploads and attachment URLs; derived, never stored.
   const base = apiBase(selection?.profile ?? null, catalog);
   const [view, setView] = useState<ViewFilter>("global");
@@ -398,13 +403,21 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
       {chats ? (
         <ChatHeader
           title={convoTitle ?? "New chat"}
-          profile={selection?.profile ?? null}
-          profileColor={
-            selection
-              ? catalog.find((p) => p.name === selection.profile)?.color
-              : undefined
+          machine={chatMachine}
+          selector={
+            <SelectionChip
+              sheet
+              catalog={catalog}
+              selection={selection}
+              models={models}
+              activeAlias={stats?.modelAlias || activeAlias}
+              locked={selectionLocked}
+              pinned={state?.profile_pinned ?? false}
+              send={send}
+              onToast={showToast}
+              onReattach={reattach}
+            />
           }
-          model={stats?.modelAlias || activeAlias}
           badge={chats.backBadge}
           onBack={chats.showChats}
           connected={connected}

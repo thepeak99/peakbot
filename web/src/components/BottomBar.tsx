@@ -12,8 +12,9 @@ import { SelectionChip } from "./SelectionChip";
 import { edition } from "../desktop";
 
 // Bottom status bar — mobile-only (hidden on lg+), except in the Chats home
-// shell (`mobileChats`), where the bar shows at every width and the Chats list
-// replaces the conversations picker. Menus open upward (`dropUp`).
+// shell (`mobileChats`): there the chat header owns the selection chip and the
+// Chats list replaces the conversations picker, so the bar holds only the
+// remote CwdPicker and renders nothing without it. Menus open upward (`dropUp`).
 export function BottomBar({
   conversations,
   conversationsError,
@@ -58,11 +59,16 @@ export function BottomBar({
   profilePinned?: boolean;
   /** Toast sink for `Next conversation: …`. */
   onToast?(message: string): void;
-  /** Chats home shell: drop the conversations picker and the `lg:hidden`
-   * gate — the Chats list replaces the picker and the shell renders no
-   * TopBar, so the bar must survive at tablet width. */
+  /** Chats home shell: drop the chip, the conversations picker and the
+   * `lg:hidden` gate; render null unless the CwdPicker shows. */
   mobileChats?: boolean;
 }) {
+  // The Local edition has no cwd of its own (the shell owns it); a remote
+  // profile's cwd lives on the remote, reached via the relay.
+  const showCwd =
+    Boolean(cwd) && (edition() !== "local" || isRemote(selection?.profile ?? null, catalog ?? []));
+  if (mobileChats && !showCwd) return null;
+
   return (
     // flex-wrap (T34b): at ≤800 px the chips must not overflow the bar
     // horizontally — they wrap to a second row instead. `lg:pr-12` clears
@@ -73,48 +79,48 @@ export function BottomBar({
         mobileChats ? "" : " lg:hidden"
       }`}
     >
-      <SelectionChip
-        catalog={catalog ?? []}
-        selection={selection ?? null}
-        models={models}
-        activeAlias={activeAlias}
-        locked={selectionLocked}
-        pinned={profilePinned}
-        send={send}
-        onToast={onToast}
-        onReattach={onReattach}
-        dropUp
-      />
-      {/* The Chats home shell renders the Chats list instead of the picker. */}
+      {/* The Chats home shell hosts the chip in the chat header and renders
+          the Chats list instead of the picker. */}
       {!mobileChats && (
-        <ConversationsPicker
-          conversations={conversations}
-          error={conversationsError}
-          hasTranscript={hasTranscript}
-          onOpen={() => send({ type: "request_conversations" })}
-          onLoad={onLoadConversation}
-          onKill={(id, profile) =>
-            send({ type: "kill_session", convo: id, ...(profile ? { profile } : {}) })
-          }
-          dropUp
-          catalog={catalog}
-        />
-      )}
-
-      {/* The Local edition has no cwd of its own (the shell owns it); a
-          remote profile's cwd lives on the remote, reached via the relay. */}
-      {cwd &&
-        (edition() !== "local" || isRemote(selection?.profile ?? null, catalog ?? [])) && (
-          <CwdPicker
-            cwd={cwd}
-            hasTranscript={hasTranscript}
-            dirListing={dirListing}
-            recentDirs={recentDirs}
+        <>
+          <SelectionChip
+            catalog={catalog ?? []}
+            selection={selection ?? null}
+            models={models}
+            activeAlias={activeAlias}
+            locked={selectionLocked}
+            pinned={profilePinned}
             send={send}
-            onSwitchCwd={onSwitchCwd ?? (() => {})}
+            onToast={onToast}
+            onReattach={onReattach}
             dropUp
           />
-        )}
+          <ConversationsPicker
+            conversations={conversations}
+            error={conversationsError}
+            hasTranscript={hasTranscript}
+            onOpen={() => send({ type: "request_conversations" })}
+            onLoad={onLoadConversation}
+            onKill={(id, profile) =>
+              send({ type: "kill_session", convo: id, ...(profile ? { profile } : {}) })
+            }
+            dropUp
+            catalog={catalog}
+          />
+        </>
+      )}
+
+      {cwd && showCwd && (
+        <CwdPicker
+          cwd={cwd}
+          hasTranscript={hasTranscript}
+          dirListing={dirListing}
+          recentDirs={recentDirs}
+          send={send}
+          onSwitchCwd={onSwitchCwd ?? (() => {})}
+          dropUp
+        />
+      )}
     </footer>
   );
 }

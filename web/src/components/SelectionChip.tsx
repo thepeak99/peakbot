@@ -15,8 +15,12 @@
 // drops the ▾, and never opens. Esc steps back out of the Model pane first,
 // then closes (both preventDefault, so Settings' Esc handler stays open);
 // mousedown outside closes.
+//
+// `sheet` (the phone header's subtitle): the trigger is plain text and the
+// same drill-down renders inside a <Sheet>, which owns Esc/Back/backdrop — so
+// the popover's own dismissal is off, and a model pick closes the sheet.
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { boundAgentOf } from "../adapt";
 import { chipAction, select } from "../state";
 import type { CatalogAgent } from "../types";
@@ -34,6 +38,7 @@ import {
 } from "../teamModels";
 import type { SelectionChipProps } from "../settings/contract";
 import { AgentPane, ModelPane, ProfilePane, TeamPane } from "./SelectionPanes";
+import { Sheet } from "./Sheet";
 
 // The popover's drill state. The Model pane can't be open without a member,
 // so the illegal state is unrepresentable.
@@ -66,6 +71,7 @@ export function SelectionChip({
   onToast,
   dropUp = false,
   onReattach,
+  sheet = false,
 }: SelectionChipProps) {
   const [open, setOpen] = useState(false);
   const [nav, setNav] = useState<Nav>({ pane: "profile" });
@@ -74,6 +80,9 @@ export function SelectionChip({
   const [browsed, setBrowsed] = useState<string | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
 
+  // Stable: the Sheet's back layer re-pushes on a new identity.
+  const close = useCallback(() => setOpen(false), []);
+
   // Locking while the popover is open closes it (read-only state).
   useEffect(() => {
     if (locked && open) setOpen(false);
@@ -81,9 +90,10 @@ export function SelectionChip({
 
   // Esc (step back from Model, else close; always preventDefault) and
   // mousedown-outside, only while open. Deps carry `nav` so the Esc handler
-  // sees the current pane.
+  // sees the current pane. Off in sheet mode: the portal would make every
+  // in-sheet click "outside" rootRef, and the Sheet owns dismissal.
   useEffect(() => {
-    if (!open) return;
+    if (!open || sheet) return;
     function onKey(e: KeyboardEvent) {
       if (e.key !== "Escape") return;
       e.preventDefault();
@@ -99,7 +109,7 @@ export function SelectionChip({
       window.removeEventListener("keydown", onKey);
       document.removeEventListener("mousedown", onDown);
     };
-  }, [open, nav]);
+  }, [open, nav, sheet]);
 
   // Nothing to show: no selection (old server / before first frame) or an
   // empty catalog.
@@ -191,7 +201,8 @@ export function SelectionChip({
       send(selectFrameFor(browsedProfile.name, teamAgent!, next));
       onToast?.(toastMsg);
     }
-    setNav({ pane: "team" });
+    if (sheet) setOpen(false);
+    else setNav({ pane: "team" });
   };
 
   const pickModel = (alias: string) => {
@@ -228,20 +239,94 @@ export function SelectionChip({
   const mobileTitle =
     nav.pane === "model" && memberView ? `Model · ${memberView.label}` : nav.pane.charAt(0).toUpperCase() + nav.pane.slice(1);
 
+  const panes = (
+    <>
+      {/* Mobile header: one pane at a time, ‹ Back steps up the drill. */}
+      <div className="hidden max-[800px]:flex shrink-0 items-center gap-1.5 border-b border-zinc-800 py-1 pl-1 pr-2">
+        {nav.pane !== "profile" ? (
+          <button
+            data-testid="selection-back"
+            type="button"
+            onClick={back}
+            className="flex shrink-0 items-center gap-1 rounded-md px-2 py-1.5 text-xs text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
+          >
+            ‹ Back
+          </button>
+        ) : (
+          <span className="shrink-0 px-1" />
+        )}
+        <span className="text-[10px] uppercase tracking-wide text-zinc-500">{mobileTitle}</span>
+      </div>
+
+      <div className={`w-44 shrink-0 border-r border-zinc-800 py-1.5 ${nav.pane !== "profile" ? HIDDEN_NARROW : ""}`}>
+        <div data-testid="selection-title-profile" className={TITLE_CLS}>
+          Profile
+        </div>
+        <ProfilePane
+          profiles={profileList}
+          selectedProfile={selection.profile}
+          browsed={browsedProfile.name}
+          pinned={pinned}
+          onBrowse={browse}
+        />
+      </div>
+
+      <div className={`w-60 shrink-0 border-r border-zinc-800 py-1.5 ${nav.pane !== "agent" ? HIDDEN_NARROW : ""}`}>
+        <div data-testid="selection-title-agent" className={TITLE_CLS}>
+          Agent
+        </div>
+        <AgentPane profile={browsedProfile} selection={selection} onPick={pickAgent} />
+      </div>
+
+      <div className={`max-h-[calc(100vh-7rem)] w-64 shrink-0 overflow-y-auto py-1.5 ${nav.pane !== "team" ? HIDDEN_NARROW : ""}`}>
+        <div data-testid="selection-title-team" className={TITLE_CLS}>
+          Team
+        </div>
+        <TeamPane
+          members={teamViews}
+          openMember={nav.pane === "model" ? nav.member : null}
+          showResetAll={anyOverride(team)}
+          onPickMember={pickMember}
+          onResetAll={resetAll}
+        />
+      </div>
+
+      {nav.pane === "model" && memberView && (
+        // Overlays the Profile column at 801–1099 px (it's chosen by then),
+        // a fourth column at ≥1100, static full width at ≤800.
+        <div className="absolute inset-y-0 left-0 z-10 w-56 overflow-y-auto border-r border-zinc-800 bg-zinc-900 py-1.5 min-[1100px]:static min-[1100px]:z-auto min-[1100px]:w-60 min-[1100px]:border-l min-[1100px]:border-r-0 max-[800px]:static max-[800px]:inset-auto max-[800px]:z-auto max-[800px]:w-full max-[800px]:border-r-0">
+          <div data-testid="selection-title-model" className={TITLE_CLS}>
+            Model · {memberView.label}
+          </div>
+          <ModelPane
+            member={memberView}
+            models={models}
+            onPick={pickModel}
+            onReset={resetMember}
+          />
+        </div>
+      )}
+    </>
+  );
+
   return (
-    <div className="relative" ref={rootRef}>
+    <div className={sheet ? "relative min-w-0" : "relative"} ref={rootRef}>
       <button
         data-testid="selection-chip"
         type="button"
         disabled={locked}
         title={locked ? "Locked after the first message" : "Switch profile / agent / team model"}
         onClick={toggle}
-        className="flex items-center gap-1 rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1 text-xs text-zinc-300 transition-colors hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-zinc-900"
+        className={
+          sheet
+            ? "flex max-w-full items-center gap-1 text-xs text-zinc-400 transition-colors hover:text-zinc-200 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:text-zinc-400"
+            : "flex items-center gap-1 rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1 text-xs text-zinc-300 transition-colors hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-zinc-900"
+        }
       >
         {locked && <span aria-hidden>🔒</span>}
         {selectedProfile?.origin === "repo" && <span aria-hidden>📁</span>}
         <span
-          className="max-w-[9rem] truncate xl:max-w-[16rem]"
+          className={sheet ? "min-w-0 truncate" : "max-w-[9rem] truncate xl:max-w-[16rem]"}
           title={`${selection.profile} › ${selection.agent} › ${chipModel}`}
         >
           {selectedProfile?.color && (
@@ -274,7 +359,19 @@ export function SelectionChip({
         {!locked && <span className="text-zinc-600">▾</span>}
       </button>
 
-      {open && !locked && (
+      {open && !locked && sheet && (
+        <Sheet title="Selection" onClose={close}>
+          <div
+            data-testid="selection-popover"
+            data-pane={nav.pane}
+            className="relative flex max-[800px]:flex-col"
+          >
+            {panes}
+          </div>
+        </Sheet>
+      )}
+
+      {open && !locked && !sheet && (
         <div
           data-testid="selection-popover"
           data-pane={nav.pane}
@@ -282,71 +379,7 @@ export function SelectionChip({
             dropUp ? "bottom-full mb-1" : "top-full mt-1"
           }`}
         >
-          {/* Mobile header: one pane at a time, ‹ Back steps up the drill. */}
-          <div className="hidden max-[800px]:flex shrink-0 items-center gap-1.5 border-b border-zinc-800 py-1 pl-1 pr-2">
-            {nav.pane !== "profile" ? (
-              <button
-                data-testid="selection-back"
-                type="button"
-                onClick={back}
-                className="flex shrink-0 items-center gap-1 rounded-md px-2 py-1.5 text-xs text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
-              >
-                ‹ Back
-              </button>
-            ) : (
-              <span className="shrink-0 px-1" />
-            )}
-            <span className="text-[10px] uppercase tracking-wide text-zinc-500">{mobileTitle}</span>
-          </div>
-
-          <div className={`w-44 shrink-0 border-r border-zinc-800 py-1.5 ${nav.pane !== "profile" ? HIDDEN_NARROW : ""}`}>
-            <div data-testid="selection-title-profile" className={TITLE_CLS}>
-              Profile
-            </div>
-            <ProfilePane
-              profiles={profileList}
-              selectedProfile={selection.profile}
-              browsed={browsedProfile.name}
-              pinned={pinned}
-              onBrowse={browse}
-            />
-          </div>
-
-          <div className={`w-60 shrink-0 border-r border-zinc-800 py-1.5 ${nav.pane !== "agent" ? HIDDEN_NARROW : ""}`}>
-            <div data-testid="selection-title-agent" className={TITLE_CLS}>
-              Agent
-            </div>
-            <AgentPane profile={browsedProfile} selection={selection} onPick={pickAgent} />
-          </div>
-
-          <div className={`max-h-[calc(100vh-7rem)] w-64 shrink-0 overflow-y-auto py-1.5 ${nav.pane !== "team" ? HIDDEN_NARROW : ""}`}>
-            <div data-testid="selection-title-team" className={TITLE_CLS}>
-              Team
-            </div>
-            <TeamPane
-              members={teamViews}
-              openMember={nav.pane === "model" ? nav.member : null}
-              showResetAll={anyOverride(team)}
-              onPickMember={pickMember}
-              onResetAll={resetAll}
-            />
-          </div>
-
-          {nav.pane === "model" && memberView && (
-            // Overlays the Profile column at 801–1099 px (it's chosen by then),
-            // a fourth column at ≥1100, static full width at ≤800.
-            <div className="absolute inset-y-0 left-0 z-10 w-56 overflow-y-auto border-r border-zinc-800 bg-zinc-900 py-1.5 min-[1100px]:static min-[1100px]:z-auto min-[1100px]:w-60 min-[1100px]:border-l min-[1100px]:border-r-0 max-[800px]:static max-[800px]:inset-auto max-[800px]:z-auto max-[800px]:w-full max-[800px]:border-r-0">
-              <div data-testid="selection-title-model" className={TITLE_CLS}>
-                Model · {memberView.label}
-              </div>
-              <ModelPane
-                member={memberView}
-                models={models}
-                onPick={pickModel}
-                onReset={resetMember}
-              />
-            </div>
-          )}
+          {panes}
         </div>
       )}
     </div>
