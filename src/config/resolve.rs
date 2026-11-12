@@ -216,8 +216,8 @@ impl Catalog {
     /// The wire projection for Settings and AppState (§8.7), in catalog
     /// order (repo first). `inherited` is derived, not stored (Z4). Remote
     /// entries carry `origin: "remote"`, `agents: []` (the relay fills them
-    /// for the active remote tab, §6.3) and a resolved colour — and never
-    /// the token, URL or fingerprint.
+    /// for the active remote tab, §6.3), a resolved colour and the machine
+    /// origin (`machine`) — never the token or the CA pin.
     pub fn infos(&self) -> Vec<ProfileInfo> {
         self.entries
             .iter()
@@ -229,6 +229,7 @@ impl Catalog {
                     overrides_global: false,
                     agents: Vec::new(),
                     color: r.color,
+                    machine: Some(r.endpoint.origin_without_slash()),
                 },
             })
             .collect()
@@ -281,6 +282,12 @@ pub struct ProfileInfo {
     pub agents: Vec<AgentInfo>,
     /// Always set (RP8): `ui.color`, else derived from the name.
     pub color: TabColor,
+    /// The server this profile runs on: `None` = this one; a remote's
+    /// normalised origin (`scheme://host[:port]`) — never its token or pin.
+    /// Serialised always (`null` for local); a missing key deserialises to
+    /// `None` (serde's Option rule), so an older remote's AppState still
+    /// parses in the relay.
+    pub machine: Option<String>,
 }
 
 /// The wire projection of an agent (§8.7).
@@ -1412,6 +1419,7 @@ fn profile_info(p: &ResolvedProfile) -> ProfileInfo {
         ),
         agents: p.agents.iter().map(agent_info).collect(),
         color: p.color,
+        machine: None,
     }
 }
 
@@ -3265,15 +3273,24 @@ profiles:
         let dev = infos.iter().find(|p| p.name == "dev").expect("dev");
         let dev_json = serde_json::to_value(dev).expect("serialise");
         let obj = dev_json.as_object().expect("object");
-        assert!(obj.contains_key("machine"), "key must be present: {dev_json}");
-        assert!(obj["machine"].is_null(), "local machine is null: {dev_json}");
+        assert!(
+            obj.contains_key("machine"),
+            "key must be present: {dev_json}"
+        );
+        assert!(
+            obj["machine"].is_null(),
+            "local machine is null: {dev_json}"
+        );
 
         let home = infos.iter().find(|p| p.name == "home-dev").expect("home");
         let home_json = serde_json::to_value(home).expect("serialise");
         assert_eq!(home_json["machine"], "https://10.2.0.48:7823");
         let text = home_json.to_string();
         assert!(!text.contains("pito"), "the token must not leak: {text}");
-        assert!(!text.contains("sha256:"), "the CA pin must not leak: {text}");
+        assert!(
+            !text.contains("sha256:"),
+            "the CA pin must not leak: {text}"
+        );
     }
 
     /// R3: an older remote's `ProfileInfo` (no `machine` key) still parses —
