@@ -31,6 +31,15 @@ pub fn session_deps(
     profile_pin: Option<String>,
 ) -> Arc<SessionDeps> {
     let uploads = UploadStore::new(UploadStore::default_root(), config.general.uploads);
+    // Boot-only: the turn-end channel is process-wide and built once
+    // (notify PR-B §7.6) — `None` iff `general.notifications.enabled`
+    // is false, so "disabled but still emitting" cannot exist. Derived
+    // before `config` moves into the Arc.
+    let turn_ends = config
+        .general
+        .notifications
+        .enabled
+        .then(crate::notify::turn_end_channel);
     Arc::new(SessionDeps {
         storage: conversation_storage(&config),
         config: Arc::new(config),
@@ -40,9 +49,7 @@ pub fn session_deps(
         shell_kind,
         profile_pin,
         uploads,
-        // TDD stub — PR-B implementation replaces this with
-        // `config.general.notifications.enabled.then(notify::turn_end_channel)`.
-        turn_ends: None,
+        turn_ends,
     })
 }
 

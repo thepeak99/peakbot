@@ -196,9 +196,10 @@ pub struct StateManager {
     // ── Turn-end feed (notify PR-B) ───────────────────────────────────────────
     /// The process-wide turn-end sender; `None` = notifications disabled, or a
     /// StateManager built outside `create_session` (tests). Fixed for life.
-    // TDD stub — PR-B implementation replaces this (read by `end_turn`).
-    #[allow(dead_code)]
     turn_ends: Option<crate::notify::TurnEndTx>,
+    /// `Some(source)` exactly while an agent turn (not a command) is open:
+    /// set by `begin_turn`, taken by `end_turn`. Never held across `.await`.
+    open_turn: Mutex<Option<crate::notify::TurnSource>>,
 }
 
 /// The response currently being materialised into transcript rows.
@@ -290,6 +291,7 @@ impl StateManager {
                 thinking: Vec::new(),
             }),
             turn_ends: None,
+            open_turn: Mutex::new(None),
         }
     }
 
@@ -1071,6 +1073,9 @@ impl StateManager {
     /// `true` write, so a Stop that fires while idle cannot poison the next
     /// turn (design D-D, invariant I1). Lock discipline: the `turn_cancel`
     /// write is taken after the `state` guard is released — never nested.
+    ///
+    /// Turns go through `begin_turn`/`end_turn`; this is the raw flag
+    /// (commands, tests) and never publishes a turn-end event.
     pub fn set_running(&self, running: bool) {
         {
             let mut state = self.state.write().unwrap();
@@ -1101,16 +1106,44 @@ impl StateManager {
 
     /// Open an agent turn: records its source, then `set_running(true)`.
     /// Only the controller calls this; commands use `set_running` directly.
-    // TDD stub — PR-B implementation replaces this (must also record `source`).
-    pub fn begin_turn(&self, _source: crate::notify::TurnSource) {
+    pub fn begin_turn(&self, source: crate::notify::TurnSource) {
+        // Record before the flag flips (I2): a reader that sees
+        // `is_running` can never observe a running turn without a source.
+        *self.open_turn.lock().unwrap() = Some(source);
         self.set_running(true);
     }
 
     /// Close the open turn: `set_running(false)`, then publish one `TurnEnd`
-    /// iff a turn was begun. Without an open turn it only clears the flag.
-    // TDD stub — PR-B implementation replaces this (must publish the TurnEnd).
-    pub fn end_turn(&self, _outcome: crate::notify::TurnOutcome) {
+    /// iff a turn was begun. Without an open turn it only clears the flag
+    /// (a panic in a command lands here).
+    pub fn end_turn(&self, outcome: crate::notify::TurnOutcome) {
+        // I2: state first — a consumer that reacts by reading state (e.g.
+        // `GET /api/conversations` `running`) sees the turn ended by the
+        // time the event arrives.
         self.set_running(false);
+        let Some(source) = self.open_turn.lock().unwrap().take() else {
+            return;
+        };
+        let Some(tx) = self.turn_ends.clone() else {
+            return;
+        };
+        // One `current_conversation` lock for the `(id, title)` pair — the
+        // full-conversation clone is not needed here.
+        let (convo, title) = {
+            let guard = self.current_conversation.lock().unwrap();
+            match guard.as_ref() {
+                Some(conv) => (conv.id, conv.title.clone()),
+                None => return,
+            }
+        };
+        // `Err` = no receivers (TUI/stdio, no SSE client) — fine by design.
+        let _ = tx.send(crate::notify::TurnEnd {
+            convo,
+            title,
+            outcome,
+            source,
+            ts: chrono::Utc::now().timestamp_millis(),
+        });
     }
 
     /// The current turn's cancellation token. Cancelling it ⇒ the turn's

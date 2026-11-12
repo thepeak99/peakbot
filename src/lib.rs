@@ -298,6 +298,19 @@ enum CompletionResult {
     CommandDone,
 }
 
+/// `process_message_internal` returns the turn outcome; the (dead-letter)
+/// completion broadcast keeps its own four-variant type, so the controller
+/// maps at the send site. `CommandDone` is unreachable from a turn (I6).
+impl From<crate::notify::TurnOutcome> for CompletionResult {
+    fn from(outcome: crate::notify::TurnOutcome) -> Self {
+        match outcome {
+            crate::notify::TurnOutcome::Ok => Self::Success,
+            crate::notify::TurnOutcome::Error => Self::Error,
+            crate::notify::TurnOutcome::Stopped => Self::Stopped,
+        }
+    }
+}
+
 /// Render a caught panic's payload as text — shared by every `catch_unwind`
 /// boundary in the crate (the `agent_loop` turn-level backstop here, and
 /// `TimeBudget::call`'s per-tool boundary in `src/tools/time_budget.rs`) so
@@ -1757,7 +1770,10 @@ impl AgentRunner {
                             // buffered background output flushes on the next drain
                             // alongside the user's message.
                             sm.reset_bg_cooldowns();
-                            sm.set_running(true);
+                            // The turn seam (notify PR-B): records the source so
+                            // `end_turn` can publish it; commands never begin
+                            // turns, so they can't emit.
+                            sm.begin_turn(crate::notify::TurnSource::User);
                         }
 
                         // Lazy memory compaction: run once, on the first user
@@ -1809,12 +1825,14 @@ impl AgentRunner {
                         )
                         .await;
 
-                        // Mark as done — snapshot run_started_at BEFORE set_running(false) clears
-                        // it, then emit a "worked for MM:SS" system message (reuses the spinner
-                        // formatter so the post-run figure matches the live indicator).
+                        // Mark as done — snapshot run_started_at BEFORE
+                        // `end_turn`'s `set_running(false)` clears it, then
+                        // emit a "worked for MM:SS" system message (reuses the
+                        // spinner formatter so the post-run figure matches the
+                        // live indicator).
                         if let Some(ref sm) = state_manager {
                             let started_at = sm.get_state().run_started_at;
-                            sm.set_running(false);
+                            sm.end_turn(result);
                             if let Some(t) = started_at {
                                 sm.add_system_message(format!(
                                     "worked for {}",
@@ -1824,7 +1842,7 @@ impl AgentRunner {
                         }
 
                         // Send completion notification
-                        completion_tx.send(result).ok();
+                        completion_tx.send(result.into()).ok();
 
                         // Post-turn bg drain seam: if any background process
                         // produced output during this turn (or while we were
@@ -1993,7 +2011,10 @@ impl AgentRunner {
                 let what = panic_text(payload);
                 if let Some(ref sm) = state_manager {
                     sm.close_interrupted_tool_call();
-                    sm.set_running(false);
+                    // The turn seam's panic backstop: `end_turn` publishes
+                    // `Error` iff a turn was open (a command panic finds
+                    // `open_turn == None` and publishes nothing).
+                    sm.end_turn(crate::notify::TurnOutcome::Error);
                     sm.set_command_running(false);
                     sm.add_system_message(format!("⚠ internal error: {what} — turn aborted"));
                 }
@@ -2843,7 +2864,7 @@ impl AgentRunner {
         state_manager: &Option<Arc<StateManager>>,
         agent: &Arc<DynAgent>,
         config: &Config,
-    ) -> CompletionResult {
+    ) -> crate::notify::TurnOutcome {
         let mut retry_count = 0;
         let mut nudged = false;
         // One-shot override for the post-compaction iteration. The compact
@@ -2892,7 +2913,7 @@ impl AgentRunner {
                     if let Some(sm) = state_manager {
                         sm.close_interrupted_tool_call();
                     }
-                    return CompletionResult::Stopped;
+                    return crate::notify::TurnOutcome::Stopped;
                 }
                 r = agent.as_ref().prompt_with_history(current_turn.clone(), &history) => r,
             };
@@ -2900,7 +2921,7 @@ impl AgentRunner {
             match result {
                 Ok(response) => {
                     let Some(sm) = state_manager.as_ref() else {
-                        return CompletionResult::Success;
+                        return crate::notify::TurnOutcome::Ok;
                     };
                     // The final reply is its own row (blank → no-op); the
                     // tool-call responses' rows already landed from the hook.
@@ -2910,12 +2931,12 @@ impl AgentRunner {
                         // Fire-and-forget: upgrade the provisional title
                         // after the first reply
                         sm.maybe_generate_title();
-                        return CompletionResult::Success;
+                        return crate::notify::TurnOutcome::Ok;
                     }
                     if nudged {
                         sm.add_system_message(EMPTY_REPLY_WARNING.to_string());
                         sm.set_final_broadcast(true);
-                        return CompletionResult::Success;
+                        return crate::notify::TurnOutcome::Ok;
                     }
                     // Blank reply with no prose row: ask once more. The nudge
                     // rides the wire only, so the transcript never shows it.
@@ -2940,7 +2961,7 @@ impl AgentRunner {
                         // No StateManager — we can't compact. This shouldn't
                         // happen in production (the hook's gate only fires
                         // when one is wired), but bail loudly if it does.
-                        return CompletionResult::Error;
+                        return crate::notify::TurnOutcome::Error;
                     };
 
                     sm.set_status(Some("Compacting context...".to_string()));
@@ -2948,7 +2969,7 @@ impl AgentRunner {
                     // the turn ends as Stopped and the history is untouched.
                     let compacted = tokio::select! {
                         biased;
-                        _ = cancel.cancelled() => return CompletionResult::Stopped,
+                        _ = cancel.cancelled() => return crate::notify::TurnOutcome::Stopped,
                         r = sm.force_compact() => r,
                     };
                     sm.set_status(None);
@@ -2965,7 +2986,7 @@ impl AgentRunner {
                                 .to_string(),
                         );
                         sm.set_final_broadcast(true);
-                        return CompletionResult::Error;
+                        return crate::notify::TurnOutcome::Error;
                     };
 
                     sm.add_system_message(format!(
@@ -3009,13 +3030,13 @@ impl AgentRunner {
                 Err(PromptError::PromptCancelled { reason, .. })
                     if reason == crate::hooks::session_hook::STOP_REASON =>
                 {
-                    return CompletionResult::Stopped;
+                    return crate::notify::TurnOutcome::Stopped;
                 }
 
                 Err(PromptError::PromptCancelled { .. }) => {
                     // Any other cancellation reason — return error instead of
                     // silently looping (which previously caused an infinite loop).
-                    return CompletionResult::Error;
+                    return crate::notify::TurnOutcome::Error;
                 }
 
                 Err(e) => {
@@ -3039,7 +3060,7 @@ impl AgentRunner {
                             };
                             sm.add_system_message(text);
                         }
-                        return CompletionResult::Error;
+                        return crate::notify::TurnOutcome::Error;
                     }
                     if retry_count >= config.general.retry.max_retries {
                         if let Some(sm) = state_manager {
@@ -3050,7 +3071,7 @@ impl AgentRunner {
                                 crate::ui::app_state::truncate_str(&e.to_string(), 2000)
                             ));
                         }
-                        return CompletionResult::Error;
+                        return crate::notify::TurnOutcome::Error;
                     }
                     let delay =
                         crate::providers::retry::backoff_delay(retry_count, &config.general.retry);
@@ -3161,16 +3182,18 @@ impl AgentRunner {
         // /load restores it with the right styling and proc-id
         // provenance.
         sm.add_user_message_from_background(synthetic.text.clone(), synthetic.proc_ids.clone());
-        sm.set_running(true);
+        // The turn seam (notify PR-B): the synthetic turn is a Background
+        // turn; its end publishes a second `TurnEnd` right after the user's.
+        sm.begin_turn(crate::notify::TurnSource::Background);
         let current_turn = sm.build_current_turn_message().unwrap_or_else(|| {
             rig_core::completion::message::Message::from(synthetic.text.as_str())
         });
         let result =
             Self::process_message_internal(current_turn, state_manager, agent, config).await;
-        sm.set_running(false);
+        sm.end_turn(result);
         // No "worked for …" system row here — bg-driven turns are
         // ambient by design; the user already saw the bg block.
-        completion_tx.send(result).ok();
+        completion_tx.send(result.into()).ok();
     }
 
     /// Internal process_command
@@ -6387,7 +6410,7 @@ headers:
         let result =
             AgentRunner::process_message_internal(current_turn, &sm_opt, &agent, &config).await;
         assert!(
-            matches!(result, CompletionResult::Success),
+            result == crate::notify::TurnOutcome::Ok,
             "the retried attempt must succeed and end the turn"
         );
 
@@ -6458,7 +6481,7 @@ headers:
                 .await;
 
         assert!(
-            matches!(result, CompletionResult::Error),
+            result == crate::notify::TurnOutcome::Error,
             "a refusal ends the turn with an error"
         );
         assert_eq!(hits.load(Ordering::SeqCst), 1, "a refusal is never retried");
@@ -7263,7 +7286,7 @@ headers:
             .expect("the cancelled turn must finish within 5s")
             .expect("the turn task must not panic");
         assert!(
-            matches!(result, CompletionResult::Stopped),
+            result == crate::notify::TurnOutcome::Stopped,
             "a cancelled turn must report Stopped"
         );
 
@@ -7364,7 +7387,7 @@ headers:
     ) -> (
         Arc<StateManager>,
         crate::mock::MockCompletionModel,
-        tokio::task::JoinHandle<CompletionResult>,
+        tokio::task::JoinHandle<crate::notify::TurnOutcome>,
     ) {
         use crate::storage::{ConversationStorage, InMemoryStorage};
 
@@ -7432,7 +7455,7 @@ headers:
             .await
             .expect("the turn finishes")
             .expect("no panic");
-        assert!(matches!(result, CompletionResult::Success));
+        assert!(result == crate::notify::TurnOutcome::Ok);
 
         let msgs = sm.get_state().chat.messages;
         let rows = agent_rows_after_user(&msgs);
@@ -7516,7 +7539,7 @@ headers:
             .await
             .expect("the turn finishes")
             .expect("no panic");
-        assert!(matches!(result, CompletionResult::Success));
+        assert!(result == crate::notify::TurnOutcome::Ok);
 
         let msgs = sm.get_state().chat.messages;
         let rows = agent_rows_after_user(&msgs);
@@ -7539,7 +7562,7 @@ headers:
             .await
             .expect("the turn finishes")
             .expect("no panic");
-        assert!(matches!(result, CompletionResult::Success));
+        assert!(result == crate::notify::TurnOutcome::Ok);
 
         let msgs = sm.get_state().chat.messages;
         let rows = agent_rows_after_user(&msgs);
@@ -7561,7 +7584,7 @@ headers:
             .await
             .expect("the turn finishes")
             .expect("no panic");
-        assert!(matches!(result, CompletionResult::Success));
+        assert!(result == crate::notify::TurnOutcome::Ok);
 
         let msgs = sm.get_state().chat.messages;
         let rows = agent_rows_after_user(&msgs);
@@ -7584,7 +7607,7 @@ headers:
             .await
             .expect("the turn finishes")
             .expect("no panic");
-        assert!(matches!(result, CompletionResult::Success));
+        assert!(result == crate::notify::TurnOutcome::Ok);
 
         let msgs = sm.get_state().chat.messages;
         let rows = agent_rows_after_user(&msgs);
@@ -7610,7 +7633,7 @@ headers:
             .await
             .expect("the turn finishes")
             .expect("no panic");
-        assert!(matches!(result, CompletionResult::Success));
+        assert!(result == crate::notify::TurnOutcome::Ok);
 
         let msgs = sm.get_state().chat.messages;
         let rows = agent_rows_after_user(&msgs);
@@ -7647,7 +7670,7 @@ headers:
             .await
             .expect("the turn finishes")
             .expect("no panic");
-        assert!(matches!(result, CompletionResult::Success));
+        assert!(result == crate::notify::TurnOutcome::Ok);
 
         let msgs = sm.get_state().chat.messages;
         let rows = agent_rows_after_user(&msgs);
@@ -7709,7 +7732,7 @@ headers:
             .await
             .expect("the turn finishes")
             .expect("no panic");
-        assert!(matches!(result, CompletionResult::Success));
+        assert!(result == crate::notify::TurnOutcome::Ok);
 
         let msgs = sm.get_state().chat.messages;
         let rows = agent_rows_after_user(&msgs);
@@ -7796,7 +7819,7 @@ headers:
             .await
             .expect("the turn finishes")
             .expect("no panic");
-        assert!(matches!(result, CompletionResult::Success));
+        assert!(result == crate::notify::TurnOutcome::Ok);
 
         let msgs = sm.get_state().chat.messages;
         let rows = agent_rows_after_user(&msgs);
@@ -7899,7 +7922,7 @@ headers:
             .expect("the cancelled turn must finish within 5s")
             .expect("the turn task must not panic");
         assert!(
-            matches!(result, CompletionResult::Stopped),
+            result == crate::notify::TurnOutcome::Stopped,
             "a cancelled turn must report Stopped"
         );
 
@@ -8001,7 +8024,7 @@ headers:
             .expect("the turn finishes")
             .expect("no panic");
         assert!(
-            matches!(result, CompletionResult::Error),
+            result == crate::notify::TurnOutcome::Error,
             "a non-transient error must report Error"
         );
 
@@ -8079,7 +8102,7 @@ headers:
             .await
             .expect("the turn finishes")
             .expect("no panic");
-        assert!(matches!(result, CompletionResult::Success));
+        assert!(result == crate::notify::TurnOutcome::Ok);
 
         let before = sm.get_agent_history();
 
@@ -8131,7 +8154,7 @@ headers:
             .await
             .expect("turn 1 finishes")
             .expect("no panic");
-        assert!(matches!(result, CompletionResult::Success));
+        assert!(result == crate::notify::TurnOutcome::Ok);
 
         // Turn 2: a fresh user message, a fresh mock agent whose model
         // answers "C" — its FIRST request is the third LLM request overall.
@@ -8160,7 +8183,7 @@ headers:
             .await
             .expect("turn 2 finishes")
             .expect("no panic");
-        assert!(matches!(result2, CompletionResult::Success));
+        assert!(result2 == crate::notify::TurnOutcome::Ok);
 
         let requests = model2.get_recorded_requests();
         assert_eq!(requests.len(), 1, "turn 2 makes exactly one request");
@@ -9537,7 +9560,7 @@ headers:
             .expect("the stopped turn must finish promptly");
 
             assert!(
-                matches!(result, CompletionResult::Stopped),
+                result == crate::notify::TurnOutcome::Stopped,
                 "PromptCancelled(\"stop\") must map to Stopped (was Error before two-stage stop)"
             );
             assert_eq!(model.request_count(), 0, "no LLM request after the press");

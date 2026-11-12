@@ -5,20 +5,54 @@
 //!
 //! The handler's only state is the `TurnEndTx`: it can't attach, create or
 //! keep alive a session (invariant I4), so the reaper ignores it.
-//!
-//! TDD stub — PR-B implementation replaces this. The stub serves nothing, so
-//! every route test below is RED for the right reason: the route does not
-//! exist yet (the `/api/*` catch-all answers 404).
 
 use crate::notify::TurnEndTx;
 use axum::Router;
+use axum::extract::State;
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::routing::get;
+use futures::stream::Stream;
+use std::time::Duration;
+
+/// Keepalive cadence: a `:` comment every 15 s keeps buffering proxies and
+/// idle timeouts from killing a feed that is legitimately quiet.
+const KEEPALIVE: Duration = Duration::from_secs(15);
 
 /// The feed's route table (PR-B design §6.1).
-// TDD stub — PR-B implementation replaces this (the `stream` SSE handler).
-// Merged into `WebUi::router` before the token layer; it serves no routes
-// until then, so the feed 404s like any unknown `/api/*` path.
-pub(crate) fn router(_turn_ends: TurnEndTx) -> Router {
+pub(crate) fn router(turn_ends: TurnEndTx) -> Router {
     Router::new()
+        .route("/api/notify/stream", get(stream))
+        .with_state(turn_ends)
+}
+
+/// `GET /api/notify/stream` — the endless SSE body. The subscription
+/// happens **before** the response is returned, so a client that has the
+/// headers cannot miss an event published afterwards (design §5.5).
+async fn stream(
+    State(tx): State<TurnEndTx>,
+) -> Sse<impl Stream<Item = Result<Event, serde_json::Error>>> {
+    let rx = tx.subscribe();
+    let body = futures::stream::unfold(rx, |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                Ok(ev) => {
+                    // Compact JSON has no raw newlines, so `Event::data`
+                    // never needs to split the frame.
+                    return Some((
+                        serde_json::to_string(&ev).map(|json| Event::default().data(json)),
+                        rx,
+                    ));
+                }
+                // A lag means a wedged client; skip the dropped events and
+                // keep streaming the rest (design §7, no lag frames).
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::debug!("turn-end feed: dropped {n} event(s) for a slow client");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
+    Sse::new(body).keep_alive(KeepAlive::new().interval(KEEPALIVE))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
