@@ -85,32 +85,37 @@ async fn frames_until_close(ws: &mut Ws, secs: u64) -> Result<Vec<Value>, Elapse
 /// no local fallback.
 #[tokio::test]
 async fn unpinned_attach_to_a_down_home_remote_answers_one_edown_error() {
-    let port = {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("port probe");
-        probe.local_addr().expect("port").port()
-    }; // dropped here: the port is now refused
-    // Plain loopback HTTP: RP3 allows it without a `ca`, so the ONLY
-    // failure in this test is the refused dial (E-DOWN).
-    let env = relay_only_env(&format!("http://127.0.0.1:{port}")).await;
+    with_dead_port(|port| async move {
+        // Plain loopback HTTP: RP3 allows it without a `ca`, so the ONLY
+        // failure in this test is the refused dial (E-DOWN).
+        let env = relay_only_env(&format!("http://127.0.0.1:{port}")).await;
 
-    let mut ws = ws_connect(env.addr).await;
-    ws_send(&mut ws, &json!({ "type": "attach", "convo": null })).await;
-    let frames = frames_until_close(&mut ws, 10)
-        .await
-        .expect("the down-remote attach is bounded");
+        let mut ws = ws_connect(env.addr).await;
+        ws_send(&mut ws, &json!({ "type": "attach", "convo": null })).await;
+        let frames = frames_until_close(&mut ws, 10)
+            .await
+            .expect("the down-remote attach is bounded");
 
-    let errs: Vec<&Value> = frames.iter().filter(|f| f["type"] == "error").collect();
-    assert_eq!(errs.len(), 1, "one locked E-DOWN error: {frames:?}");
-    let msg = errs[0]["message"].as_str().unwrap_or("");
-    assert!(
-        msg.starts_with(&format!(
+        let errs: Vec<&Value> = frames.iter().filter(|f| f["type"] == "error").collect();
+        let msg = errs
+            .first()
+            .and_then(|f| f["message"].as_str())
+            .unwrap_or("");
+        if !msg.starts_with(&format!(
             "Can't reach remote profile '{L}' at 127.0.0.1:{port}: "
-        )),
-        "E-DOWN names the profile and host:port: {msg}"
-    );
-    assert!(
-        msg.ends_with('.'),
-        "locked string ends with a period: {msg}"
-    );
-    assert!(env.registry.active_ids().is_empty(), "no local session");
+        )) {
+            // Not E-DOWN: the probed port was taken by a foreign listener
+            // (a sibling test's server) between probe and dial.
+            return Err(msg.to_string());
+        }
+        assert_eq!(errs.len(), 1, "one locked E-DOWN error: {frames:?}");
+        assert!(
+            msg.ends_with('.'),
+            "locked string ends with a period: {msg}"
+        );
+        assert!(env.registry.active_ids().is_empty(), "no local session");
+        Ok(())
+    })
+    .await
+    .expect("the down-remote attach answers one locked E-DOWN error");
 }

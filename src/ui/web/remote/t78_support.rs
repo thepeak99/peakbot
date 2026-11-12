@@ -95,6 +95,37 @@ pub fn dead_url() -> String {
     format!("http://127.0.0.1:{port}")
 }
 
+/// The bind-0/drop probe above races with sibling tests under parallel
+/// load: a foreign listener can take the port between the drop and the
+/// dial, answering 401 (E-AUTH) or failing the TLS handshake where a
+/// refused dial (E-DOWN) is expected. `run` gets a fresh probed port per
+/// attempt and returns `Ok(())` only when the E-DOWN it asserts was
+/// observed; `Err` = that attempt's port was stolen, so a new port is
+/// probed. Bounded: a real regression fails every attempt.
+pub async fn with_dead_port<F, Fut>(mut run: F) -> Result<(), String>
+where
+    F: FnMut(u16) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    const ATTEMPTS: u32 = 5;
+    let mut last = String::new();
+    for _ in 0..ATTEMPTS {
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("port probe");
+            probe.local_addr().expect("port").port()
+        }; // dropped here: the port is now refused
+        match run(port).await {
+            Ok(()) => return Ok(()),
+            Err(msg) => last = msg,
+        }
+    }
+    Err(format!(
+        "no E-DOWN after {ATTEMPTS} attempts — the probed port was stolen by a \
+         foreign listener each time (port-probe race under parallel test load); \
+         last answer: {last:?}"
+    ))
+}
+
 // ── The fake remote ─────────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]

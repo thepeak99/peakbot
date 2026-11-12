@@ -707,25 +707,34 @@ async fn remote_profile_kill_never_kills_a_local_session_with_the_same_id() {
 // (ASSUMPTION — the doc is silent), local rows still returned.
 #[tokio::test]
 async fn kill_on_an_unreachable_remote_replies_with_the_edown_string() {
-    let dead = dead_url();
-    let port = dead.rsplit(':').next().expect("port").to_string();
-    let env = LocalEnv::start(&[(L, &dead, T_REMOTE, "dev")], None).await;
-    let l1 = env.seed(None, "local one", Some("dev"), "2026-01-02T12:00:00Z");
-    let mut ws = connect_local(&env).await;
+    with_dead_port(|port| async move {
+        let env = LocalEnv::start(
+            &[(L, &format!("http://127.0.0.1:{port}"), T_REMOTE, "dev")],
+            None,
+        )
+        .await;
+        let l1 = env.seed(None, "local one", Some("dev"), "2026-01-02T12:00:00Z");
+        let mut ws = connect_local(&env).await;
 
-    let reply = kill(&mut ws, &uid(1), Some(L)).await;
+        let reply = kill(&mut ws, &uid(1), Some(L)).await;
 
-    let msg = reply["error"].as_str().expect("an error string");
-    assert!(
-        msg.starts_with(&format!(
+        let msg = reply["error"].as_str().expect("an error string");
+        if !msg.starts_with(&format!(
             "Can't reach remote profile '{L}' at 127.0.0.1:{port}: "
-        )) && msg.ends_with('.'),
-        "locked E-DOWN string, got {msg:?}"
-    );
-    assert!(
-        find(&reply, &l1.to_string()).is_some(),
-        "local rows still listed"
-    );
+        )) {
+            // The probed port was taken by a foreign listener between probe
+            // and dial; a new port on the next attempt.
+            return Err(msg.to_string());
+        }
+        assert!(msg.ends_with('.'), "locked E-DOWN string, got {msg:?}");
+        assert!(
+            find(&reply, &l1.to_string()).is_some(),
+            "local rows still listed"
+        );
+        Ok(())
+    })
+    .await
+    .expect("kill on an unreachable remote replies with the locked E-DOWN string");
 }
 
 // A stale remote token: the locked E-AUTH string (RemoteError::Auth).
