@@ -19,7 +19,8 @@ export interface MobileChatsApi {
   unread: ReadonlySet<string>;
   backBadge: boolean;
   open(convo: string, profile: string | null): void;
-  newChat(): void;
+  /** null = the server-default machine; a profile name = that machine's. */
+  newChat(profile: string | null): void;
   showChats(): void;
 }
 
@@ -104,8 +105,8 @@ export function useMobileChats(
     setScreen("conversation");
   }, []);
 
-  const newChat = useCallback(() => {
-    agentRef.current.switchConvo(null, null);
+  const newChat = useCallback((profile: string | null) => {
+    agentRef.current.switchConvo(null, profile);
     setScreen("conversation");
   }, []);
 

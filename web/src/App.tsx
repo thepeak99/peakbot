@@ -622,6 +622,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
           onOpen={chats.open}
           onNew={chats.newChat}
           onOpenSettings={settingsEnabled ? settingsView.toggle : undefined}
+          machineStatus={agent.machines}
         />
       )}
 
