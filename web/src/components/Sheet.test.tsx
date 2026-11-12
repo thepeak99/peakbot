@@ -43,13 +43,19 @@ beforeEach(() => {
   window.history.replaceState(null, "", "/");
 });
 
-afterEach(() => {
+afterEach(async () => {
   Object.defineProperty(window, "innerHeight", {
     configurable: true,
     value: originalInnerHeight,
   });
   nowSpy.mockRestore();
   vi.restoreAllMocks();
+  // A release's history.back() delivers its popstate in a task (jsdom), and
+  // the next test's mount must see a clean backStack — settle it here, like
+  // the App-level back-stack tests do (App.mobileSheet settlePopstates).
+  for (let i = 0; i < 2; i++) {
+    await new Promise((r) => setTimeout(r, 0));
+  }
   window.history.replaceState(null, "", "/");
 });
 

@@ -46,6 +46,22 @@ html.light {
   --profile-pink: #db2777;
 }
 
+/* Bottom-sheet entrance (mobile redesign): the sheet slides up from below
+   the viewport on mount. `@theme` makes `animate-sheet-in` a utility; the
+   components gate it with `motion-safe:`. */
+@theme {
+  --animate-sheet-in: sheet-in 0.25s ease-out;
+
+  @keyframes sheet-in {
+    from {
+      transform: translateY(100%);
+    }
+    to {
+      transform: translateY(0);
+    }
+  }
+}
+
 /* Window background: the SPA dark background token —
    `--color-zinc-950` (the theme's "app background", remapped by the
    `html.light` block above). Never a hard-coded hex: the shell window's
