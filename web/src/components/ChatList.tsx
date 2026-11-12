@@ -1,5 +1,5 @@
 // The mobile Chats home screen (design §4.1, PR1): a full-screen overlay with
-// a "Chats" header (logo, connection dot, theme/notify/settings), a search
+// a "Chats" header (logo, connection dot, theme/settings), a search
 // field, profile filter chips, and grouped chat rows. All view-model logic
 // (filter/group/meta) lives in chatList.ts; this component owns only the
 // local search query and the selected chip.
@@ -8,10 +8,8 @@ import { useMemo, useState, type Ref } from "react";
 import type { ReactNode } from "react";
 import type { ConversationSummary, TabColor } from "../state";
 import type { CatalogProfile } from "../types";
-import type { NotifyPermission } from "../useTaskNotifications";
 import { filterChats, groupChats, metaLine } from "../chatList";
 import type { ChatRow, Range } from "../chatList";
-import { NotifyToggle } from "./NotifyToggle";
 import { ThemeToggle } from "./ThemeToggle";
 
 export interface ChatListProps {
@@ -25,9 +23,6 @@ export interface ChatListProps {
   onNew(): void;
   /** The gear renders only when given (same rule as the TopBar). */
   onOpenSettings?: () => void;
-  notifyEnabled: boolean;
-  notifyPermission: NotifyPermission;
-  onToggleNotify(): void;
   /** The overlay root, for the slide animation (React 19 ref-as-prop). */
   ref?: Ref<HTMLElement>;
   /** Mid-exit: still painted, but inert (no input, focus or AT). */
@@ -44,9 +39,6 @@ export function ChatList({
   onOpen,
   onNew,
   onOpenSettings,
-  notifyEnabled,
-  notifyPermission,
-  onToggleNotify,
   ref,
   leaving,
 }: ChatListProps) {
@@ -88,11 +80,6 @@ export function ChatList({
           <h1 className="text-2xl font-bold tracking-tight">Chats</h1>
           <div className="ml-auto flex shrink-0 items-center gap-3">
             <ThemeToggle />
-            <NotifyToggle
-              enabled={notifyEnabled}
-              permission={notifyPermission}
-              onToggle={onToggleNotify}
-            />
             {onOpenSettings && (
               <button
                 type="button"

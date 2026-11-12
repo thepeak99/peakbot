@@ -1009,9 +1009,13 @@ function barBase() {
     conversationsError: null,
     send: vi.fn<(m: InboundMessage) => void>(),
     onLoadConversation: vi.fn(),
-    notifyEnabled: false,
-    notifyPermission: "default" as const,
-    onToggleNotify: vi.fn(),
+    notify: {
+      enabled: false,
+      permission: "default" as const,
+      toggle: vi.fn(),
+      sound: false,
+      toggleSound: vi.fn(),
+    },
     focusMode: false,
     onToggleFocus: vi.fn(),
   };
