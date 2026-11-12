@@ -38,7 +38,7 @@ import { apiBase } from "./state";
 import { useConvoTabs } from "./useConvoTabs";
 import type { TabsState } from "./convoTabs";
 import { useTaskNotifications } from "./useTaskNotifications";
-import { useFavicon } from "./useFavicon";
+import { useTabIndicator } from "./useTabIndicator";
 import { useFocusMode } from "./useFocusMode";
 import { useMobileChats } from "./useMobileChats";
 import { useScreenSlide } from "./useScreenSlide";
@@ -91,7 +91,6 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   // The drop overlay on <main> feeds the active tab's composer slot.
   const activeSlot = useRef<ComposerSlotHandle>(null);
 
-  // Swap favicon to a spinning loader while the agent is working
   const isRunning = state?.is_running ?? false;
   // A slash command (e.g. /compact) sets is_running WITHOUT adding a user row
   // — the trailing turn is already finished. Focus mode must not read that as
@@ -99,7 +98,8 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   // plain is_running; only the focus view uses turnInFlight.
   const commandRunning = state?.command_running ?? false;
   const turnInFlight = isRunning && !commandRunning;
-  useFavicon(isRunning);
+  // Tab favicon + title badge while the agent works.
+  useTabIndicator(isRunning);
 
   // Follow the newest message, but only while the user is pinned to the bottom
   // — the transcript owns that now (see `Transcript` + `useTranscriptScroll`).
@@ -408,9 +408,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
         onSwitchCwd={switchCwd}
         onLoadConversation={loadConversation}
         onReattach={reattach}
-        notifyEnabled={notify.enabled}
-        notifyPermission={notify.permission}
-        onToggleNotify={notify.toggle}
+        notify={notify}
         focusMode={focusMode.focus}
         onToggleFocus={focusMode.toggle}
         onOpenSettings={settingsEnabled ? settingsView.toggle : undefined}
@@ -553,9 +551,6 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
           onOpen={chats.open}
           onNew={chats.newChat}
           onOpenSettings={settingsEnabled ? settingsView.toggle : undefined}
-          notifyEnabled={notify.enabled}
-          notifyPermission={notify.permission}
-          onToggleNotify={notify.toggle}
         />
       )}
 
