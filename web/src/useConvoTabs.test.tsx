@@ -163,6 +163,9 @@ beforeAll(() => {
 
 beforeEach(() => {
   localStorage.clear();
+  // The notification-click seam is owned by the hook under test; a leftover
+  // global from a previous render would mask a missing cleanup.
+  delete window.peakbotOpenConvo;
 });
 
 afterEach(() => {
@@ -633,6 +636,74 @@ describe("useConvoTabs — keyboard shortcuts", () => {
     expect(e.defaultPrevented).toBe(false);
     expect(agent.switchConvo).not.toHaveBeenCalled();
     expect(views()).toHaveLength(3);
+  });
+});
+
+// ─── desktop notification click seam (PR-C design §6.4) ─────────────────
+// The desktop app evaluates `window.peakbotOpenConvo?.("<uuid>")` in the
+// page when a notification is clicked; the hook must define that global
+// while desktop tabs are mounted (it is `open(convo)`: activate the tab,
+// or open a new one). RED before implementation: the hook never sets the
+// global, so it is `undefined` while mounted.
+
+describe("useConvoTabs — window.peakbotOpenConvo (notification click)", () => {
+  it("exposes peakbotOpenConvo that activates an existing tab", async () => {
+    const agent = makeAgent({ convo: "a" });
+    const initial = state([tab("a", "A"), tab("b", "B")], 0);
+
+    await renderHook(agent, initial);
+
+    const open = window.peakbotOpenConvo;
+    expect(open, "mounted desktop tabs must define window.peakbotOpenConvo").toBeTypeOf("function");
+
+    await act(async () => {
+      open?.("b");
+    });
+
+    expect(views()[1]).toMatchObject({ active: true });
+    // The picker path: re-attach with the tab's profile (null here).
+    expect(agent.switchConvo).toHaveBeenCalledTimes(1);
+    expect(agent.switchConvo).toHaveBeenCalledWith("b", null);
+  });
+
+  it("peakbotOpenConvo opens an unknown convo in a new local tab", async () => {
+    const agent = makeAgent({ convo: "a" });
+    const initial = state([tab("a", "A")], 0);
+
+    await renderHook(agent, initial);
+
+    const open = window.peakbotOpenConvo;
+    expect(open, "mounted desktop tabs must define window.peakbotOpenConvo").toBeTypeOf("function");
+
+    await act(async () => {
+      open?.("c");
+    });
+
+    const v = views();
+    expect(v).toHaveLength(2);
+    expect(v[1]).toMatchObject({ active: true });
+    expect(storeState().tabs[1].convo).toBe("c");
+    // A new local tab: no profile.
+    expect(agent.switchConvo).toHaveBeenCalledTimes(1);
+    expect(agent.switchConvo).toHaveBeenCalledWith("c", null);
+  });
+
+  it("peakbotOpenConvo is removed on unmount and absent in a browser", async () => {
+    const agent = makeAgent({ convo: "a" });
+    const initial = state([tab("a", "A")], 0);
+
+    await renderHook(agent, initial);
+    expect(window.peakbotOpenConvo, "defined while mounted").toBeTypeOf("function");
+
+    act(() => {
+      root?.unmount();
+    });
+    root = null;
+    expect(window.peakbotOpenConvo, "removed on unmount").toBeUndefined();
+
+    // A browser (initial null) never defines it.
+    await renderHook(makeAgent(), null);
+    expect(window.peakbotOpenConvo, "absent in a browser").toBeUndefined();
   });
 });
 

@@ -8,6 +8,10 @@ import type { Theme } from "./useTheme";
 declare global {
   interface Window {
     peakbotShell?: "desktop" | "mobile";
+    /** Defined by the SPA while desktop tabs are mounted (useConvoTabs); called by
+     *  the desktop app (notifier.rs) via webview eval on a notification click:
+     *  activate that conversation's tab, or open it in a new one. */
+    peakbotOpenConvo?: (convo: string) => void;
   }
 }
 

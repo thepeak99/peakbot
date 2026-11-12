@@ -5,6 +5,7 @@
 
 mod bridge;
 mod commands;
+mod notifier;
 #[cfg(windows)]
 mod sidecar_payload;
 #[cfg(target_os = "linux")]

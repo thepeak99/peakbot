@@ -16,6 +16,7 @@ pub mod env;
 pub mod extract;
 pub mod fontconfig;
 pub mod nav;
+pub mod notify;
 pub mod paths;
 pub mod phase;
 pub mod ready;

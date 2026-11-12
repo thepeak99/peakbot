@@ -21,6 +21,17 @@ tauri-plugin-window-state = "2.5.0"
 tauri-plugin-opener = "2.7.2"
 tauri-plugin-dialog = "2.8.3"
 tauri-plugin-log = "2.10.1"
+# PR-C turn-end notifications: the only NEW crate in the tree. Used from
+# Rust only — no `notification:*` capability grant (design §6.1/§6.5).
+tauri-plugin-notification = "2.8.1"
+# Already in the lock via tauri-plugin-updater (rustls-tls): declared for
+# the notification feed client (notifier.rs). No new crates.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tokio = { version = "1", default-features = false, features = ["time"] }
+uuid = "1"
+# The feed URL (`stream_feed`'s argument): already in the lock via tauri.
+url = "2.5"
 # Updater (spike S2): rustls TLS (no aws-lc/cmake in the graph) +
 # system proxies; `zip` dropped — we ship a raw AppImage, a raw
 # setup.exe and a .app.tar.gz (tar/flate2 are unconditional on macOS).

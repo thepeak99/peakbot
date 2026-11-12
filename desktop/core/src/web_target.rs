@@ -67,6 +67,12 @@ impl WebTarget {
         self.with_token(&format!("{}/commands", self.url_base()))
     }
 
+    /// `{url_base}/api/notify/stream` [+ `?token=…`] — PR-B's turn-end feed.
+    // TDD stub — PR-C implementation replaces this
+    pub fn notify_url(&self) -> Url {
+        todo!("PR-C")
+    }
+
     fn with_token(&self, base: &str) -> Url {
         let mut u = Url::parse(base).expect("url_base is always a valid URL");
         if let Some(tok) = &self.token {
@@ -367,6 +373,46 @@ general:
         assert_eq!(t.bind.port(), 7823);
         assert_eq!(t.url().to_string(), "https://127.0.0.1:7823/");
         assert_eq!(t.probe_url().to_string(), "https://127.0.0.1:7823/commands");
+    }
+
+    // PR-C §9.2: the feed URL is the same token authority as `url()` /
+    // `probe_url()` — whatever token the window uses, the feed uses too.
+    #[test]
+    fn t_notify_url_path_and_token() {
+        let tok = Token::parse("tok+en&1").expect("token with + & parses");
+
+        // http + token: percent-encoded, same as the window URL.
+        let t = target("127.0.0.1:7824", false, Some(tok));
+        assert_eq!(
+            t.notify_url().to_string(),
+            "http://127.0.0.1:7824/api/notify/stream?token=tok%2Ben%261"
+        );
+
+        // tls: https variant.
+        let tok = Token::parse("tok+en&1").expect("token with + & parses");
+        let t = target("127.0.0.1:7824", true, Some(tok));
+        assert_eq!(
+            t.notify_url().to_string(),
+            "https://127.0.0.1:7824/api/notify/stream?token=tok%2Ben%261"
+        );
+
+        // Tokenless: the path alone, no query.
+        let t = target("127.0.0.1:7824", false, None);
+        assert_eq!(
+            t.notify_url().to_string(),
+            "http://127.0.0.1:7824/api/notify/stream"
+        );
+
+        // Always starts with `url_base()`.
+        for t in [
+            target("127.0.0.1:7824", false, None),
+            target("192.168.1.5:9000", true, None),
+        ] {
+            assert!(
+                t.notify_url().as_str().starts_with(&t.url_base()),
+                "notify_url must start with url_base()"
+            );
+        }
     }
 
     // §9.1 case 29, ported to `WebTarget`: the host follows
