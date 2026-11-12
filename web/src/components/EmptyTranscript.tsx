@@ -14,7 +14,7 @@ interface Props {
 
 export function EmptyTranscript({ welcome, scopeLabel }: Props) {
   return (
-    <section className="min-h-0 flex-1 overflow-y-auto mr-12 px-4 py-4 sm:px-6 md:px-8">
+    <section className="min-h-0 flex-1 overflow-y-auto lg:mr-12 px-4 py-4 sm:px-6 md:px-8">
       <div className="mx-auto max-w-5xl space-y-3">
         {welcome && <WelcomeBanner welcome={welcome} />}
         {scopeLabel && (

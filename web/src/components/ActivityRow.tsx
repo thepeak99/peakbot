@@ -32,7 +32,7 @@ export function ActivityRow({ step }: { step: WireChatMessage | null }) {
   const subRole = step?.source?.kind === "sub_agent" ? step.source.role : undefined;
 
   return (
-    <div className="mr-12 px-4 pb-2 sm:px-6 md:px-8">
+    <div className="lg:mr-12 px-4 pb-2 sm:px-6 md:px-8">
       <div
         className="mx-auto flex max-w-5xl items-center gap-2 rounded-md border border-zinc-800 bg-zinc-900/40 px-3 py-1.5 text-xs text-zinc-400"
         role="status"

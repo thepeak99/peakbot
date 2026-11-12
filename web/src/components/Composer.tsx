@@ -351,7 +351,7 @@ export function Composer({
       : "Stop";
 
   return (
-    <div hidden={hidden} className="border-t border-zinc-800 bg-zinc-950 p-3 pr-12">
+    <div hidden={hidden} className="border-t border-zinc-800 bg-zinc-950 p-3 lg:pr-12">
       <div className="mx-auto max-w-3xl">
         <div className="relative">
           {showPalette && (

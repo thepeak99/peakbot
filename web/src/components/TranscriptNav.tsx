@@ -31,7 +31,7 @@ export function TranscriptNav({
 }: Props) {
   return (
     <div
-      className={`pointer-events-none absolute bottom-4 right-14 z-10 flex flex-col items-end gap-2 transition-[right] duration-300 ease-out ${
+      className={`pointer-events-none absolute bottom-4 right-4 lg:right-14 z-10 flex flex-col items-end gap-2 transition-[right] duration-300 ease-out ${
         drawerOpen ? "lg:right-[344px]" : ""
       }`}
     >
