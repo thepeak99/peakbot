@@ -33,16 +33,31 @@ COPY Cargo.toml Cargo.lock* ./
 # vendor/ must land before the dep-cache build: [patch.crates-io] in
 # Cargo.toml resolves termios from this vendored path (see vendor/README.md).
 COPY vendor/ vendor/
-# cargo loads every workspace member manifest (mobile/src-tauri included), and
-# its [lib] needs the default src/lib.rs — an empty stub, created below.
+# cargo loads every workspace member manifest (mobile/src-tauri and
+# crates/cloud included), and their [lib]s need the default src/lib.rs —
+# empty stubs, created below.
 COPY mobile/src-tauri/Cargo.toml mobile/src-tauri/Cargo.toml
+COPY crates/cloud/Cargo.toml crates/cloud/Cargo.toml
 
 RUN mkdir -p src && \
     echo "fn main() {}" > src/main.rs && \
     mkdir -p mobile/src-tauri/src && \
-    touch mobile/src-tauri/src/lib.rs
+    touch mobile/src-tauri/src/lib.rs && \
+    mkdir -p crates/cloud/src && \
+    touch crates/cloud/src/lib.rs
 
-RUN cargo build --target ${TARGET} --release && \
+# crates/cloud pulls perma-crypto (a private git repo), which cargo fetches
+# even when building only the root crate. The token crosses the build
+# boundary as a BuildKit secret (Makefile: --secret id=perma_crypto_token,
+# env=PERMA_CRYPTO_TOKEN) and is mounted into THIS step only; the
+# repo-scoped insteadOf lives in GIT_CONFIG_* process env, so no token
+# ever lands in a layer.
+RUN --mount=type=secret,id=perma_crypto_token \
+    CARGO_NET_GIT_FETCH_WITH_CLI=true \
+    GIT_CONFIG_COUNT=1 \
+    GIT_CONFIG_KEY_0="url.https://x-access-token:$(cat /run/secrets/perma_crypto_token)@git.patchnotes.com/ai-bots/perma-crypto.insteadOf" \
+    GIT_CONFIG_VALUE_0="https://git.patchnotes.com/ai-bots/perma-crypto" \
+    cargo build --target ${TARGET} --release && \
     rm -rf target/${TARGET}/deps/*.rlib target/${TARGET}/deps/*.d
 
 # build.rs MUST be in the COPY set — the dummy-main dep-cache layer doesn't
