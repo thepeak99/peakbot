@@ -3,10 +3,10 @@
 // the component tree. Sending, Stop, the working spinner, and every side
 // panel are driven by live state.
 //
-// Side panels live in a single `TabbedDrawer` (vertical tab handles pinned to
-// the right edge; the body slides in). One responsive mechanism: on lg+ the
-// body is a 288px rail, below sm it spans 94vw. Replaces the old static aside
-// + separate mobile hamburger drawer.
+// Side panels: one `drawerTab` state, two surfaces — the desktop
+// `TabbedDrawer` rail (≥1024px) or the phone's `PanelsSheet` (<1024px),
+// picked by `useMediaQuery`. The Todo badge is per surface: the row count on
+// desktop, the open count on a phone.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Transcript, type TranscriptHandle } from "./components/Transcript";
@@ -25,6 +25,7 @@ import { ConvoTabBar } from "./components/ConvoTabBar";
 import { BottomBar } from "./components/BottomBar";
 import { ActivityRow } from "./components/ActivityRow";
 import { TabbedDrawer } from "./components/TabbedDrawer";
+import { PanelsSheet } from "./components/PanelsSheet";
 import { StatsPanel } from "./components/StatsPanel";
 import { TodoPanel } from "./components/TodoPanel";
 import { BgPanel } from "./components/BgPanel";
@@ -40,6 +41,7 @@ import type { TabsState } from "./convoTabs";
 import { useTaskNotifications } from "./useTaskNotifications";
 import { useTabIndicator } from "./useTabIndicator";
 import { useFocusMode } from "./useFocusMode";
+import { useMediaQuery } from "./useMediaQuery";
 import { useMobileChats } from "./useMobileChats";
 import { useScreenSlide } from "./useScreenSlide";
 import { ChatHeader } from "./components/ChatHeader";
@@ -66,6 +68,7 @@ import {
   laneOf,
   messagesByLane,
   scopeStatsToView,
+  todoCounts,
   todoTree,
   todosFromMessages,
   viewLabel,
@@ -148,6 +151,8 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   // Called once here (not in TopBar) so App can filter with the same value
   // the button renders — two useState copies would desync (plan §6.1).
   const focusMode = useFocusMode();
+  // ≥1024px: the desktop drawer rail; below: the phone's Panels sheet.
+  const isDesktop = useMediaQuery("(min-width: 1024px)");
 
   // Sub-agent roster: one entry per delegation call, in call order (Phase 2 +
   // per-call). Zero backend — derived from the transcript. A role delegated to
@@ -237,8 +242,11 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
       id: "todo",
       label: "Todo",
       content: <TodoPanel nodes={todos} />,
-      // Every rendered row counts — parents plus their nested sub-agent todos.
-      badge: todos.reduce((n, node) => n + 1 + node.children.length, 0),
+      // Per surface: every rendered row on desktop, the OPEN count on a
+      // phone (the pill badge and the panels badge both read it).
+      badge: isDesktop
+        ? todos.reduce((n, node) => n + 1 + node.children.length, 0)
+        : todoCounts(todos).open,
     },
     {
       id: "files",
@@ -284,6 +292,20 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   // field (older server) means "no rule yet" → every tab shows.
   const visibleTabs = filterTabs(tabs, state?.visible_tabs);
   const visibleTabIds = visibleTabs.map((t) => t.id);
+
+  // The phone's combined badge: running tasks + open todos, each counted only
+  // when its tab is visible (a count that opens a hidden tab is a lie). The
+  // button opens the FIRST visible tab; a count tap opens its own.
+  const shown = (id: string): boolean => visibleTabIds.includes(id);
+  const tasksN = shown("tasks") ? runningBg : 0;
+  const open = shown("todo") ? todoCounts(todos).open : 0;
+  const panels =
+    !isDesktop && visibleTabs.length > 0
+      ? { count: tasksN + open, onOpen: () => setDrawerTab(visibleTabIds[0]) }
+      : undefined;
+  // Stable for the Sheet's back layer (useBackDismiss re-pushes on a new
+  // identity).
+  const closePanels = useCallback(() => setDrawerTab(null), []);
 
   // The gear (and Ctrl+,) exist only when the server says Settings is
   // available (`settings_available`, false under a --profile pin) AND the
@@ -389,6 +411,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
           isRunning={isRunning}
           focusMode={focusMode.focus}
           onToggleFocus={focusMode.toggle}
+          panels={panels}
         />
       ) : (
         <TopBar
@@ -418,6 +441,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
         profilePinned={state?.profile_pinned ?? false}
         onToast={showToast}
         stopPending={state?.stop_pending ?? false}
+        panels={panels}
       />
       )}
       <UpdateBanner />
@@ -531,11 +555,26 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
       />
    
 
-      <TabbedDrawer
-        tabs={visibleTabs}
-        active={drawerTab}
-        onActiveChange={setDrawerTab}
-      />
+      {/* One open-panel state, two surfaces; the relocation effect above
+          covers both. */}
+      {isDesktop ? (
+        <TabbedDrawer
+          tabs={visibleTabs}
+          active={drawerTab}
+          onActiveChange={setDrawerTab}
+        />
+      ) : (
+        drawerTab !== null && (
+          <PanelsSheet
+            tabs={visibleTabs}
+            active={drawerTab}
+            onActiveChange={setDrawerTab}
+            onClose={closePanels}
+            running={isRunning}
+            onStop={() => send({ type: "stop" })}
+          />
+        )
+      )}
       </div>
 
       {chats && chatListSlide !== "gone" && (

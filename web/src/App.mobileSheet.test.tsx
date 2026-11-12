@@ -344,6 +344,17 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  // jsdom folds two same-tick history.back() calls into ONE popstate, so
+  // unmounting with the chat layer AND the sheet open would leave backStack
+  // owing a popstate that never lands (and poison the next test). Close the
+  // sheet first, as a user would.
+  if (panelsDialog()) {
+    const closed = waitForPopstate();
+    click(must("sheet-done"));
+    await act(async () => {
+      await closed;
+    });
+  }
   const backSpy = vi.spyOn(window.history, "back");
   unmount();
   const inFlight = backSpy.mock.calls.length;

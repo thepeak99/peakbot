@@ -3,6 +3,7 @@
 // `profile · model` subtitle, Focus toggle and connection state on the right.
 import type { JSX } from "react";
 import { FocusToggle } from "./FocusToggle";
+import { PanelsButton, type PanelsButtonProps } from "./PanelsSheet";
 import type { TabColor } from "../state";
 
 interface ChatHeaderProps {
@@ -16,6 +17,8 @@ interface ChatHeaderProps {
   isRunning: boolean;
   focusMode: boolean;
   onToggleFocus(): void;
+  /** Absent ⇒ no button (≥1024px or no visible tabs). */
+  panels?: PanelsButtonProps;
 }
 
 export function ChatHeader(props: ChatHeaderProps): JSX.Element {
@@ -30,6 +33,7 @@ export function ChatHeader(props: ChatHeaderProps): JSX.Element {
     isRunning,
     focusMode,
     onToggleFocus,
+    panels,
   } = props;
 
   return (
@@ -76,6 +80,7 @@ export function ChatHeader(props: ChatHeaderProps): JSX.Element {
       </div>
 
       <div className="flex shrink-0 items-center gap-3">
+        {panels && <PanelsButton {...panels} />}
         <FocusToggle enabled={focusMode} onToggle={onToggleFocus} />
         {!connected ? (
           <span
