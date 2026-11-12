@@ -71,6 +71,7 @@ fn deps_with_config(cfg: Config) -> Arc<SessionDeps> {
         storage: None,
         profile_pin: None,
         uploads: UploadStore::new(UploadStore::default_root(), UploadsConfig::default()),
+        turn_ends: None,
     })
 }
 

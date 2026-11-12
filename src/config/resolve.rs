@@ -503,6 +503,8 @@ pub fn boot_only_diff(boot: &Config, fresh: &Config) -> Vec<&'static str> {
         ("general.http", b.http != f.http),
         ("general.uploads", b.uploads != f.uploads),
         ("general.conversation", b.conversation != f.conversation),
+        // PR-B: the turn-end channel is built once at boot.
+        ("general.notifications", b.notifications != f.notifications),
     ]
     .into_iter()
     .filter_map(|(key, changed)| changed.then_some(key))

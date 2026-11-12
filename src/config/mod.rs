@@ -18,7 +18,8 @@ pub mod resolve;
 use anyhow::Context;
 pub use errors::{ConfigError, ConfigErrors, ConfigFileKind};
 pub use file::{
-    ConversationConfig, Env, General, ProfileUi, SearchConfig, VectorDbConfig, WebConfig,
+    ConversationConfig, Env, General, NotificationsConfig, ProfileUi, SearchConfig, VectorDbConfig,
+    WebConfig,
 };
 pub use migrate::{AutoMigrateError, AutoMigrateOutcome, auto_migrate, auto_migrate_repo};
 pub use model_registry::{

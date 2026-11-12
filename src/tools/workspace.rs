@@ -189,7 +189,7 @@ pub mod test_support {
                 root.path().to_path_buf(),
                 crate::config::UploadsConfig::default(),
             );
-            let sm = crate::state::StateManager::new_arc_for_session(None, store);
+            let sm = crate::state::StateManager::new_arc_for_session(None, store, None);
             sm.create_conversation("c".into(), "p".into(), "m".into(), String::new());
             let convo = sm.get_current_conversation_id().expect("minted");
             let base = root
@@ -283,7 +283,7 @@ mod tests {
             root.path().to_path_buf(),
             crate::config::UploadsConfig::default(),
         );
-        let sm = StateManager::new_arc_for_session(None, store);
+        let sm = StateManager::new_arc_for_session(None, store, None);
         sm.create_conversation(
             "test convo".into(),
             "prov".into(),
@@ -706,7 +706,7 @@ mod tests {
             root.path().to_path_buf(),
             crate::config::UploadsConfig::default(),
         );
-        let sm = StateManager::new_arc_for_session(None, store);
+        let sm = StateManager::new_arc_for_session(None, store, None);
         assert!(
             sm.get_current_conversation_id().is_none(),
             "fixture: no conversation"
@@ -1065,7 +1065,7 @@ mod tests {
             link.clone(),
             crate::config::UploadsConfig::default(),
         );
-        let sm = StateManager::new_arc_for_session(None, store);
+        let sm = StateManager::new_arc_for_session(None, store, None);
         sm.create_conversation("c".into(), "prov".into(), "model".into(), String::new());
         let convo = sm
             .get_current_conversation_id()

@@ -88,6 +88,7 @@ use uuid::Uuid;
 
 mod conversations;
 mod images;
+mod notify;
 pub mod registry;
 mod remote;
 pub mod settings;
@@ -385,6 +386,12 @@ impl WebUi {
             app = app.merge(conversations::router(self.ws_state.clone()));
         }
 
+        // The turn-end feed (PR-B §6.1): token-gated; absent (→ the
+        // `/api/*` 404) when notifications are off or in needs_setup mode.
+        if let Some(tx) = self.deps.as_ref().and_then(|d| d.turn_ends.clone()) {
+            app = app.merge(notify::router(tx));
+        }
+
         // The `/r/` proxy (remote-profiles §6.2): the three allowlisted
         // routes plus a catch-all 404 for everything else under `/r/`.
         // Before the token layer, so token-gated like `/api/uploads`.
@@ -430,8 +437,17 @@ fn format_addr_in_use(addr: SocketAddr) -> String {
     )
 }
 
+/// How long a Ctrl+C drains in-flight connections before the server is
+/// dropped. `serve_plain` and `serve_tls` share it: an open
+/// `/api/notify/stream` never finishes on its own (PR-B §7.4), so an
+/// unbounded graceful drain would hang Ctrl+C on plain HTTP.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+
 impl WebUi {
-    /// Serve plain HTTP with a Ctrl+C graceful shutdown.
+    /// Serve plain HTTP with a Ctrl+C graceful shutdown. The drain is
+    /// bounded by `SHUTDOWN_GRACE`: an open `/api/notify/stream` body never
+    /// ends on its own, so without the bound `with_graceful_shutdown` would
+    /// wait for it forever (PR-B §7.4).
     async fn serve_plain(&self, app: Router) -> Result<()> {
         let listener = match tokio::net::TcpListener::bind(self.addr).await {
             Ok(l) => l,
@@ -444,11 +460,25 @@ impl WebUi {
         eprintln!("🌐 Shifu web UI: {url}  (Ctrl+C to quit)");
         self.maybe_open_browser(&url);
 
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        tokio::spawn({
+            let s = shutdown.clone();
+            async move {
                 let _ = tokio::signal::ctrl_c().await;
-            })
-            .await?;
+                s.cancel();
+            }
+        });
+        let server =
+            axum::serve(listener, app).with_graceful_shutdown(shutdown.clone().cancelled_owned());
+        tokio::select! {
+            r = server => r?,
+            // Same bound as serve_tls: an open /api/notify/stream never
+            // finishes on its own, so the drain must be capped.
+            _ = async {
+                shutdown.cancelled().await;
+                tokio::time::sleep(SHUTDOWN_GRACE).await;
+            } => {}
+        }
         Ok(())
     }
 
@@ -477,7 +507,7 @@ impl WebUi {
         let shutdown = handle.clone();
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
-            shutdown.graceful_shutdown(Some(Duration::from_secs(3)));
+            shutdown.graceful_shutdown(Some(SHUTDOWN_GRACE));
         });
 
         let rustls_cfg =

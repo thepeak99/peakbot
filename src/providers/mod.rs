@@ -2715,7 +2715,7 @@ mod local_file_tools_tests {
     async fn local_file_read_reads_a_model_note_path_of_a_stored_attachment() {
         let root = tempfile::tempdir().unwrap();
         let store = UploadStore::new(root.path().to_path_buf(), UploadsConfig::default());
-        let sm = StateManager::new_arc_for_session(None, store.clone());
+        let sm = StateManager::new_arc_for_session(None, store.clone(), None);
         let env = local_tool_env();
         let agent = local_agent(&env, Some(sm.clone()));
         let handle = agent.tool_server_handle.clone();
@@ -2770,7 +2770,7 @@ mod local_file_tools_tests {
     async fn a_conversation_minted_after_the_tools_were_built_is_the_one_resolved_against() {
         let root = tempfile::tempdir().unwrap();
         let store = UploadStore::new(root.path().to_path_buf(), UploadsConfig::default());
-        let sm = StateManager::new_arc_for_session(None, store);
+        let sm = StateManager::new_arc_for_session(None, store, None);
         let env = local_tool_env();
         // The tools are built while NO conversation exists…
         let agent = local_agent(&env, Some(sm.clone()));
@@ -2802,7 +2802,7 @@ mod local_file_tools_tests {
     async fn main_agent_file_create_is_visible_to_the_sub_agent_file_read() {
         let root = tempfile::tempdir().unwrap();
         let store = UploadStore::new(root.path().to_path_buf(), UploadsConfig::default());
-        let sm = StateManager::new_arc_for_session(None, store);
+        let sm = StateManager::new_arc_for_session(None, store, None);
         sm.create_conversation("c".into(), "p".into(), "m".into(), String::new());
 
         let model = ResolvedModel {
@@ -2877,7 +2877,7 @@ mod local_file_tools_tests {
     ) {
         let root = tempfile::tempdir().unwrap();
         let store = UploadStore::new(root.path().to_path_buf(), UploadsConfig::default());
-        let sm = StateManager::new_arc_for_session(None, store.clone());
+        let sm = StateManager::new_arc_for_session(None, store.clone(), None);
         sm.create_conversation("c".into(), "p".into(), "m".into(), String::new());
         (root, store, sm)
     }
