@@ -4005,14 +4005,12 @@ profiles:
             .expect("the local entry remains");
         assert_eq!(local.origin, "global");
 
-        // §7: the SPA catalogue never carries a token, URL or fingerprint.
+        // §7: the SPA catalogue never carries a token or a fingerprint. The
+        // normalised origin (`machine`) IS carried — the mobile-redesign
+        // contract (R1/R2): the origin is not a secret.
         for p in &ui {
             let wire = serde_json::to_string(p).expect("serialises");
             assert!(!wire.contains("pito"), "the token reaches the wire: {wire}");
-            assert!(
-                !wire.contains("10.2.0.48") && !wire.contains("7823"),
-                "the remote URL reaches the wire: {wire}"
-            );
             assert!(
                 !wire.contains("3f9a0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab"),
                 "the CA fingerprint reaches the wire: {wire}"

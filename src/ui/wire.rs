@@ -259,6 +259,16 @@ pub(crate) struct ConversationSummaryWire {
     pub(crate) profile: Option<String>,
 }
 
+/// One remote server's reachability in a `conversations_list` (mobile
+/// redesign). `id` is the origin `ProfileInfo.machine` carries; `online` =
+/// its list answered within `LIST_TIMEOUT` (a dial error, a 401, a bad
+/// answer or the timeout all mean offline).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct MachineStatusWire {
+    pub(crate) id: String,
+    pub(crate) online: bool,
+}
+
 /// Outbound message envelopes to the client. Owning (no lifetime) so any
 /// task can push to the shared writer channel. `Deserialize` is derived so
 /// tests can round-trip recorded text frames; the live wire is serialize-only.
@@ -289,8 +299,12 @@ pub(crate) enum OutboundMessage {
     State { state: Arc<AppState> },
     /// Reply to `request_conversations` and `kill_session`; empty when no
     /// storage is configured. `error` is set iff a kill was refused.
+    /// `machines` lists the remote servers (this device is implicit) —
+    /// omitted when empty so a no-remote frame stays byte-identical.
     ConversationsList {
         items: Vec<ConversationSummaryWire>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        machines: Vec<MachineStatusWire>,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },

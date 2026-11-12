@@ -2745,7 +2745,10 @@ profiles:
     /// §7: no secret reaches a Debug print or an error. The file-layer
     /// `RemoteDef`, the whole `Config`, every parse error and the wire
     /// projection (`infos()` → AppState.catalog → the SPA) carry neither the
-    /// token nor the URL.
+    /// token nor the CA pin. The wire projection DOES carry the normalised
+    /// origin (`machine`) — the mobile-redesign contract (R1/R2): the origin
+    /// is not a secret (a token/userinfo is unexpressible, parse rejects
+    /// both), so it is allowed on the wire.
     #[test]
     fn token_never_reaches_debug_errors_or_the_wire_projection() {
         use crate::config::file::ConfigFile;
@@ -2769,14 +2772,9 @@ profiles:
         }
 
         let wire = serde_json::to_string(&cfg.catalog.infos()).expect("infos serialise");
-        for secret in [
-            "pito",
-            "s3cret",
-            "9c1e",
-            "10.2.0.48",
-            "bot.example.ts.net",
-            "3f9a0123",
-        ] {
+        // The origin (`machine`) is allowed on the wire (mobile-redesign R1);
+        // the token and the CA pin are not (R2).
+        for secret in ["pito", "s3cret", "9c1e", "3f9a0123"] {
             assert!(
                 !wire.contains(secret),
                 "the wire projection leaks {secret}: {wire}"

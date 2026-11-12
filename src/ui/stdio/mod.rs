@@ -248,7 +248,11 @@ fn dispatch_stdin_line(
                 &Default::default(),
             );
             out_tx
-                .send(OutboundMessage::ConversationsList { items, error: None })
+                .send(OutboundMessage::ConversationsList {
+                    items,
+                    machines: Vec::new(),
+                    error: None,
+                })
                 .is_ok()
         }
         Ok(InboundMessage::RequestRecentDirs) => {
