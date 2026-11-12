@@ -68,11 +68,18 @@ impl UiState {
 pub struct TauriUi {
     app: tauri::AppHandle,
     state: Arc<UiState>,
+    /// The turn-end notification listener (PR-C), started and stopped by
+    /// `phase_changed` — it follows the `Ready` phase.
+    notifier: crate::notifier::Notifier,
 }
 
 impl TauriUi {
     pub fn new(app: tauri::AppHandle, state: Arc<UiState>) -> Self {
-        Self { app, state }
+        Self {
+            notifier: crate::notifier::Notifier::new(app.clone()),
+            app,
+            state,
+        }
     }
 
     /// The shared quitting flag (managed in `setup`).
@@ -86,6 +93,9 @@ impl TauriUi {
 impl Ui for TauriUi {
     fn phase_changed(&self, phase: &Phase, tray_status: &str) {
         *self.state.snapshot.lock().expect("snapshot poisoned") = status_view(phase);
+        // Not a main-thread call, so it also runs while quitting: the abort
+        // must drop the feed connection before the server is stopped (§5.4).
+        self.notifier.follow(phase);
         // No main-thread round-trips while quitting: during
         // `RunEvent::Exit` the main thread is blocked on the shutdown
         // ack (DESIGN §4.6), and both `navigate` (webview) and

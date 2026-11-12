@@ -52,6 +52,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use super::t78_support::with_dead_port;
+
 use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
@@ -771,45 +773,50 @@ async fn remote_ready_without_v_field_is_everion_then_close() {
 #[tokio::test]
 async fn remote_down_is_edown_then_close() {
     let _guard = env_guard();
-    let port = {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("port probe");
-        probe.local_addr().expect("port").port()
-    }; // dropped here: the port is now refused
-    let ca = test_support::mint_ca();
-    let env = relay_env(
-        base_script(),
-        None,
-        Some(format!("https://127.0.0.1:{port}")),
-        &ca.fingerprint,
-        T_REMOTE,
-        T_REMOTE,
-    )
-    .await;
+    with_dead_port(|port| async move {
+        let ca = test_support::mint_ca();
+        let env = relay_env(
+            base_script(),
+            None,
+            Some(format!("https://127.0.0.1:{port}")),
+            &ca.fingerprint,
+            T_REMOTE,
+            T_REMOTE,
+        )
+        .await;
 
-    let mut ws = ws_connect(env.local).await;
-    ws_send(&mut ws, &attach_frame(None, Some(L), None)).await;
-    let started = std::time::Instant::now();
-    let frames = frames_until_close(&mut ws).await;
-    let elapsed = started.elapsed();
+        let mut ws = ws_connect(env.local).await;
+        ws_send(&mut ws, &attach_frame(None, Some(L), None)).await;
+        let started = std::time::Instant::now();
+        let frames = frames_until_close(&mut ws).await;
+        let elapsed = started.elapsed();
 
-    let errs: Vec<&Value> = frames.iter().filter(|f| f["type"] == "error").collect();
-    assert_eq!(errs.len(), 1, "one E-DOWN error: {frames:?}");
-    let msg = errs[0]["message"].as_str().unwrap_or("");
-    assert!(
-        msg.starts_with(&format!(
+        let errs: Vec<&Value> = frames.iter().filter(|f| f["type"] == "error").collect();
+        let msg = errs
+            .first()
+            .and_then(|f| f["message"].as_str())
+            .unwrap_or("");
+        if !msg.starts_with(&format!(
             "Can't reach remote profile '{L}' at 127.0.0.1:{port}: "
-        )),
-        "E-DOWN names the profile and host:port: {msg}"
-    );
-    assert!(
-        msg.ends_with('.'),
-        "locked string ends with a period: {msg}"
-    );
-    assert!(
-        elapsed < Duration::from_secs(10),
-        "bounded, took {elapsed:?}"
-    );
-    assert!(env.registry.active_ids().is_empty(), "no local session");
+        )) {
+            // The probed port was taken by a foreign listener between probe
+            // and dial; a new port on the next attempt.
+            return Err(msg.to_string());
+        }
+        assert_eq!(errs.len(), 1, "one E-DOWN error: {frames:?}");
+        assert!(
+            msg.ends_with('.'),
+            "locked string ends with a period: {msg}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "bounded, took {elapsed:?}"
+        );
+        assert!(env.registry.active_ids().is_empty(), "no local session");
+        Ok(())
+    })
+    .await
+    .expect("a down remote answers one locked E-DOWN error, then close");
 }
 
 // E-TLS-PIN: the CA bootstrap mismatch is a HARD error, forwarded verbatim

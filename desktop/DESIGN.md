@@ -550,6 +550,7 @@ fn main() {
     //      .plugin(tauri_plugin_window_state::Builder::default().build())
     //      .plugin(tauri_plugin_opener::init())
     //      .plugin(tauri_plugin_dialog::init())
+    //      .plugin(tauri_plugin_notification::init())
     //      .invoke_handler(tauri::generate_handler![commands::status, commands::act, commands::theme_set, commands::theme_get])
     //      .setup(|app| { paths; window::create_main; tray::create; spawn controller thread; send Action::Start })
     //      .build(ctx)?.run(|app, ev| match ev { RunEvent::Exit => shutdown(app), RunEvent::Reopen{..} => focus_main, _ => {} })
@@ -558,7 +559,7 @@ fn main() {
 - `window.rs`: `create_main(app, nav: Arc<RwLock<Option<String>>>)` — label `main`, title `PeakBot`, 1200×800, min 800×500, `WebviewUrl::App("index.html")`, `.on_navigation(...)`, `.on_new_window(...)`; `CloseRequested`: closing the window **never quits** — `api.prevent_close()`, then: tray visible (`tray::is_visible(&app)`) → `win.hide()`; otherwise a non-blocking confirm `close_app_dialog()` parented to the window (never `blocking_show` here — main thread ⇒ deadlock): OK → `app.exit(0)` → `RunEvent::Exit` → `Shutdown`; Cancel → nothing. `focus_main(app)` = show + unminimize + set_focus.
 - `tray.rs`: `create(app)` builds menu (status item stored on `UiState.tray_status_item`); `apply(app, status)` updates the status text. `is_visible(app)` = icon created AND (Linux) `NameHasOwner("org.kde.StatusNotifierWatcher")` via `gio` D-Bus, 500 ms timeout, any error ⇒ false (macOS/Windows: icon created suffices). Left-click: macOS/Linux → show menu; Windows → `focus_main` (`show_menu_on_left_click(!cfg!(windows))`). Quit label **`Quit PeakBot`** (no confirm). Menu: status (disabled), sep, `Open PeakBot`, `Open logs folder`, sep, `Quit PeakBot`. On macOS the same submenu `PeakBot` is appended to `Menu::default(app)` as the app menu.
 - `menu.rs` (macOS only, issue #373): `app_menu(app)` is the Tauri default menu **minus "Close Window"** (File submenu dropped, Window = minimize/maximize only), with the `PeakBot` app submenu (ids as above) first; set via `builder.menu(menu::app_menu)` in `main.rs` so Cmd+W reaches the page and the in-app tab bar closes a conversation tab instead of quitting. Never on Linux (no GTK menubar).
-- `bridge.rs`: `struct TauriUi { app, snapshot, nav, tray_status_item: Mutex<Option<MenuItem<Wry>>>, theme: Mutex<Option<Theme>> }` implements `core::Ui` — controller-thread dialogs via `bridge::native_dialog(app, d)` (OkCancelCustom/OkCustom mapping).`blocking_show()` (legal off the main thread); window-parented confirms use `.show()` (non-blocking). `phase_changed` updates snapshot, nav origin (`target.url_base()`), navigates (`target.url()`), `tray::apply`.
+- `bridge.rs`: `struct TauriUi { app, snapshot, nav, tray_status_item: Mutex<Option<MenuItem<Wry>>>, theme: Mutex<Option<Theme>> }` implements `core::Ui` — controller-thread dialogs via `bridge::native_dialog(app, d)` (OkCancelCustom/OkCustom mapping).`blocking_show()` (legal off the main thread); window-parented confirms use `.show()` (non-blocking). `phase_changed` updates snapshot, nav origin (`target.url_base()`), navigates (`target.url()`), `tray::apply`; it also calls `Notifier::follow` (`notifier.rs`, §16) **outside** the quitting guard — the listener's abort must drop the feed connection before the server is stopped (§16, design amend §5.4).
 - `commands.rs`:
   ```rust
   #[tauri::command] fn status(state: State<Snapshot>) -> StatusView;
@@ -679,8 +680,9 @@ ureq = { version = "3.4.2", default-features = false }
 getrandom = "0.3.4"
 directories-next = "2"      # same crate as peakbot's get_config_dir
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"            # settings.json (#377; was dev-only)
+serde_json = "1"            # settings.json (#377) + feed frames (§16); was dev-only
 log = "0.4"
+uuid = { version = "1", features = ["serde"] }   # feed conversation ids (§16)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.190"
 [dev-dependencies]
@@ -699,6 +701,13 @@ tauri-plugin-window-state = "2.5.0"
 tauri-plugin-opener = "2.7.2"
 tauri-plugin-dialog = "2.8.3"
 tauri-plugin-log = "2.10.1"
+tauri-plugin-notification = "2.8.1"    # turn-end notifications (§16); Rust-only, no capability grant
+# §16 feed client — already in the lock via tauri-plugin-updater (rustls-tls); no new crates
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tokio = { version = "1", default-features = false, features = ["time"] }
+uuid = "1"
+url = "2.5"
 serde = { version = "1", features = ["derive"] }
 log = "0.4"
 ```
@@ -1189,6 +1198,19 @@ L8 (#377b) Retry / switch HTTP↔HTTPS / background on↔off a few times: always
 L9 (#377b) Negative: `mv ~/.cache/peakbot/tls/ca-cert.pem /tmp/` then restart the app → WebKit cert error page (fail closed). Move it back → Retry → loads (the backend only regenerates the CA when cert *or* key is missing).
 L10 (#377b) Devtools on the remote page: `invoke('settings_get')` still rejects (I6); the browser on another device still sees its own cert prompt (unchanged).
 L11 (§4.12) Fedora 40+: open the Agents tab — the emoji (🌐/🧩) render, no hang/blank window; the `WebKitWebProcess`'s environ carries the generated `FONTCONFIG_FILE` (`/run/user/1000/peakbot-desktop-fonts-<pid>.conf`), and a user's own `FONTCONFIG_FILE` is left untouched.
+L12 (notify, §16) Setup on every OS: a desktop build whose bundled sidecar includes the feed; start a long turn (e.g. "count slowly to 30 using bash sleep"), then:
+L13 (notify) Window focused when the turn ends → **no** notification.
+L14 (notify) Another app focused → notification with the conversation title and "Task complete — ready for your next message."
+L15 (notify) Window hidden to tray (✕) → notification. Click → window shows, focused, on that conversation's tab.
+L16 (notify) Click for a conversation with no open tab → a new tab opens on it. A half-typed draft in another tab **survives**.
+L17 (notify) `general.web.tls: true` → restart → L14/L15 pass (the CA pin works).
+L18 (notify) `general.notifications.enabled: false` → Save → restart → no notifications; `desktop.log` shows "notifications are off on this PeakBot" once.
+L19 (notify) Turn from the phone / a browser on another conversation → a desktop notification for it.
+L20 (notify) Stop a running turn from the phone → "Task stopped."; force an error (bad model) → "Task failed."
+L21 (notify) **Quit** with the feed connected → the app exits as fast as before (< 1 s after Quit); the session log shows a clean shutdown, not a kill. Same for a server **restart** from Settings.
+L22 (notify) Kill the sidecar (`kill -9`) → the window goes to the Failed page; Retry → notifications work again.
+L23 (notify) `desktop.log` never contains the token (`grep <token> desktop.log` → nothing).
+L24 (notify) GNOME without AppIndicator (no tray): closing asks to quit; L14 still passes with the window minimized.
 
 ### 9.4 Manual macOS checklist (human — no Mac in CI)
 MAC1 Unzip, move to /Applications, `xattr -dr com.apple.quarantine` → app opens (Apple Silicon and, if available, Intel).
@@ -1204,6 +1226,13 @@ MAC10 Ask the agent to run `which brew git node` in session mode and in service 
 MAC11 Disable background → plist removed; session restarts.
 MAC12 `codesign -dv --verbose=4 "/Applications/PeakBot Desktop.app"` reports `Signature=adhoc`; `codesign --verify --deep` passes.
 M8 (#377) Cmd+Shift+S and the PeakBot-menu `Settings…` item both open the settings window; the item shows the shortcut.
+M9 (notify, §16) = L13 (window focused when the turn ends → no notification). **UNVERIFIED:** do banners appear at all for the ad-hoc app, is the app listed in System Settings → Notifications, does a click arrive?
+M10 (notify) = L14 (another app focused → notification).
+M11 (notify) = L15 (window hidden → notification; click → window back on the conversation).
+M12 (notify) = L16 (click for a conversation with no open tab → new tab; a half-typed draft survives).
+M13 (notify) App inactive (Cmd+Tab away) with the window visible → notification (`is_focused` false).
+M14 (notify) Window closed (red button; Dock icon remains) → notification. Click → window back on the conversation.
+M15 (notify) = L21 (quit speed with the feed connected).
 
 ### 9.5 Manual Windows checklist (human — no Windows machine in CI)
 Use **Windows Sandbox** (Win11 Pro; clean: no VC++ redist, WebView2 present) and one real Win10 22H2 machine.
@@ -1224,6 +1253,10 @@ Use **Windows Sandbox** (Win11 Pro; clean: no VC++ redist, WebView2 present) and
 - W15 The installed app launches from the Start menu: the window loads the UI, Task Manager shows `peakbot-desktop.exe` and `peakbot.exe --bind 127.0.0.1:7824` (the sidecar starts); on a system without WebView2 the installer downloaded the bootstrapper first (needs internet — offline users take the portable exe).
 - W16 Uninstall via Settings → Apps → PeakBot Desktop removes the program files (and the Start-menu shortcut).
 - W17 Run the installer over a running instance → it prompts to close the app (RestartManager) → it closes and the install completes.
+- W18 (notify, §16) W1–W4 = L13–L16 (NSIS install, currentUser). The notification is attributed to "PeakBot Desktop".
+- W19 (notify) Let the notification go to the Action Center, then click it → *expected (documented):* the conversation does not open. Record what does happen (nothing, or the app focuses).
+- W20 (notify) = L21 (quit speed with the feed connected).
+- W21 (notify) **Portable exe**, with no install on the machine: does a notification appear at all? Attributed to what? Does a click work? **UNVERIFIED.** The result decides the portable-exe line in `desktop/README.md` → Windows.
 
 ## 10. AMENDMENT (windows-portable) — single self-extracting exe (2026-10-17)
 Condensed from the locked plan (full document: `desktop/WINDOWS-PLAN.md`, kept on disk, not committed).
@@ -1592,3 +1625,101 @@ data (screenshots of secrets). Accepted: the grant is limited to the
 backend), the page ships no third-party code, and a paste-recency gate is
 unenforceable (it needs a spoofable 5th command). Bound: 50 MB per call; no
 write access.
+
+## 16. AMENDMENT (notify) — native turn-end notifications (2026-11-12)
+
+**Why.** PR-B added the turn-end feed (`GET /api/notify/stream`, token-gated
+SSE): every finished, failed or stopped turn in any conversation announces
+itself there. The desktop consumes it and shows an OS notification when the
+user is not looking at the window — including when it is hidden in the tray
+— for every conversation on this PeakBot (phone, browser, other tabs).
+
+**The key idea: the listener's lifetime IS the `Ready` phase.** `TauriUi::phase_changed`
+already reacts to every phase change (navigate, tray); it now also calls
+`Notifier::follow(phase)` — `Ready(target)` (re)starts the listener task for
+`target`, any other phase aborts it. Sidecar restarts, config changes
+(`general.notifications.enabled` is boot-only), token changes and quit all
+pass through a phase change, so there is no second state machine, no polling,
+no re-detection. A 404 simply ends the task until the next `Ready`.
+
+**The abort-before-SIGINT ordering (why `follow` is OUTSIDE the quitting
+guard).** The server bounds its graceful drain to 3 s because an open SSE
+response never ends; `STOP_GRACE` is 3 s. If the feed connection were still
+open at quit/restart, every shutdown would end in a SIGKILL. `set_phase`
+runs BEFORE `stop_child` (§4.3/§4.6), and `follow` → `abort()` is
+fire-and-forget (no main-thread call, so it is legal while quitting): the
+dropped task closes the socket, the server finds no in-flight request and
+exits at once. The call site is commented for exactly this reason — moving
+`follow` under the `!quitting()` guard is a regression (manual check L21).
+
+**The listener (glue, `src-tauri/src/notifier.rs`; decisions in `core::notify`).**
+reqwest on Tauri's tokio runtime (zero new crates — reqwest/rustls/tokio are
+already in the lock via the updater). The client is `no_proxy`, 5 s connect
+timeout, 45 s read timeout (3 missed 15 s keepalives = dead stream). A TLS
+target pins PeakBot's own CA (`paths::peakbot_ca_cert()`, `tls_certs_only`)
+— the same file the webview trusts; the rustls ring provider is installed
+before `build()` (idempotent; the updater does the same). Reconnect backoff
+1 → 30 s (locked constants, `core::consts::NOTIFY_*`); a healthy stream that
+ends (server stopping) reconnects after 1 s. The SSE decoder is ~30 lines of
+pure code in `core` — no SSE crate. reqwest errors are logged with
+`.without_url()`: the URL carries the token and never reaches a log.
+
+**Notifications (from Rust only).** Per event: `is_visible() && is_focused()`
+read at event time (no cached flag; a failed read counts as "not looking" →
+notify). If the user is not looking: title = conversation title (trimmed,
+fallback "PeakBot"), body from the locked 6-row (source, outcome) table in
+`core::notify::toast` (wording: "Task …", the same language as the browser
+bell, PR #454). Shown via `tauri-plugin-notification` with
+`.extra("convo", <uuid>)`. No `notification:*` capability grant: the plugin's
+JS shim is inert on the remote origin by ACL.
+
+**The click (the `peakbotOpenConvo` eval seam).** The plugin's `on_action`
+handler (registered in `Notifier::new`, before any `show`) filters to
+`action_id() == "tap"` and a `convo` extra that parses as a `Uuid` — the id
+is a `Uuid` from parse to eval, so JS injection is unrepresentable. It then
+`window::focus_main` (show + unminimize + focus) and evaluates
+`window.peakbotOpenConvo?.("<uuid>")` in the main window. The SPA defines that
+global while desktop tabs are mounted (`useConvoTabs`) as the picker's
+`open(convo)` — activate the tab or open a new one. **Eval, not navigation**:
+a navigation would reload the SPA and throw away every tab's in-memory draft;
+the eval is one-way (Rust → page), outside the ACL, and grants the page
+nothing. A page that is not the SPA no-ops on `?.` — the window is still
+focused.
+
+**Invariants.**
+- **N1.** At most one listener, existing only while the phase is `Ready`;
+  `follow` is the only writer (controller thread), always aborts before spawn.
+- **N2.** The listener's target is the one `Ready` announced — never re-read
+  from config.
+- **N3.** A click can only run `window.peakbotOpenConvo?.("<canonical uuid>")`.
+- **N4.** The token never reaches a log (`.without_url()`; the URL is never
+  formatted into a log line).
+- **N5.** The remote origin gains nothing (no capability, no command).
+- **N6.** The controller never waits on the listener (`abort()` is
+  fire-and-forget).
+- **N7.** Notifications are attributed to the window's state at event time.
+
+**Deliberately NOT added (and why).** No 5th IPC `notify` command (the Rust
+listener covers every case, and the command would let any script on the
+`:7823` origin post arbitrary OS notifications — a phishing surface). No
+desktop-local toggle (two off-switches already exist: the server setting and
+per-OS notification settings). No complements (attention flash, badge, icon
+swap — new state for a need nobody has stated). No coalescing (each event is
+a true event; per-platform replace-by-conversation is not exposed uniformly
+by the plugin). No SSE crate. No listener in `core` (it is std + ureq
+without TLS, blocking, uncancellable — a blocked read would keep the
+connection open across the 3 s server grace and SIGKILL every quit). No
+`notification:*` grant. No icon override (the AppImage's generic-icon
+cosmetic gap is accepted).
+
+**Residual risks (accepted / UNVERIFIED).** R1: Windows portable-exe
+notifications (AUMID not registered by a shortcut) — UNVERIFIED (manual W21).
+R2: macOS ad-hoc build (deprecated `NSUserNotification`) — UNVERIFIED (manual
+M9–M15). R3: Linux without a notification daemon (show fails, logged) or a
+daemon without default-action support (click does nothing). R4: a Windows
+click from the Action Center is not reported by the plugin — documented in
+the README. Also: events are lost across reconnects (no replay, the PR-B
+contract); a user turn plus an immediate background turn give two
+notifications; the plugin's shim leaves an unhandled-rejection console line
+on the remote page; the conversation title is visible on lock screens
+(user-approved).

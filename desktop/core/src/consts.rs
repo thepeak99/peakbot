@@ -15,3 +15,9 @@ pub const RUN_TIMEOUT: Duration = Duration::from_secs(60);
 pub const TICK: Duration = Duration::from_millis(500);
 /// Lines of session log kept for `SessionExited` details.
 pub const LOG_TAIL_LINES: usize = 20;
+/// Feed connect timeout (loopback / LAN).
+pub const NOTIFY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Feed idle limit: 3 missed 15 s server keepalives ⇒ the stream is dead.
+pub const NOTIFY_READ_TIMEOUT: Duration = Duration::from_secs(45);
+/// Reconnect backoff cap.
+pub const NOTIFY_RETRY_MAX: Duration = Duration::from_secs(30);

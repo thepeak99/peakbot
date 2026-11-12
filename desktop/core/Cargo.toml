@@ -18,8 +18,12 @@ log = "0.4"
 # thumbprint lookup (zero-dep; the one new crate).
 base64 = "0.23"
 sha1_smol = "1"
+# Turn-end feed (notify.rs): `serde_json` decodes the frames (moved from
+# dev-dependencies); `uuid` is already in the lock — the conversation id is
+# a parsed `Uuid`, never a raw string (it is interpolated into JS on click).
+serde_json = "1"
+uuid = { version = "1", features = ["serde"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.190"
 [dev-dependencies]
-serde_json = "1"
 tempfile = "3.27"
