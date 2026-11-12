@@ -63,6 +63,10 @@ pub struct SessionDeps {
     /// The upload store, built once at boot from `general.uploads` (the
     /// limits are boot-only). Cloned into each session's `StateManager`.
     pub uploads: crate::attachments::UploadStore,
+    /// The turn-end channel, built once at boot; `None` iff
+    /// `general.notifications.enabled` is false. Cloned into each session's
+    /// `StateManager`; in-process consumers `subscribe()` here.
+    pub turn_ends: Option<crate::notify::TurnEndTx>,
 }
 
 /// One running, independent agent: its `StateManager` (Model), the write
@@ -104,8 +108,11 @@ pub struct Session {
 pub fn create_session(deps: &SessionDeps, resume: Option<Uuid>) -> Result<Session> {
     // Per-session Model. Storage (if any) is shared — it writes distinct
     // files per conversation id.
-    let state_manager =
-        StateManager::new_arc_for_session(deps.storage.clone(), deps.uploads.clone());
+    let state_manager = StateManager::new_arc_for_session(
+        deps.storage.clone(),
+        deps.uploads.clone(),
+        deps.turn_ends.clone(),
+    );
 
     // ── Per-session cwd ──────────────────────────────────────────────────────
     // Resume adopts the saved cwd iff it's non-empty and still points at a
@@ -339,6 +346,8 @@ profiles:
                 crate::attachments::UploadStore::default_root(),
                 crate::config::UploadsConfig::default(),
             ),
+            // Mirrors the default `general.notifications.enabled: true`.
+            turn_ends: Some(crate::notify::turn_end_channel()),
         }
     }
 }
@@ -489,5 +498,53 @@ mod tests {
         let unpinned = test_deps(Some(Arc::new(InMemoryStorage::default())));
         let session = create_session(&unpinned, None).expect("create_session");
         assert!(!session.state_manager.get_state().profile_pinned);
+    }
+
+    /// T-B2 — `create_session` wires the shared channel into the session's
+    /// StateManager: a turn on ANY session publishes to the one
+    /// process-wide feed, and a second session publishes to the same rx.
+    #[tokio::test]
+    async fn create_session_wires_the_shared_channel() {
+        let deps = test_deps(Some(Arc::new(InMemoryStorage::default())));
+        let mut rx = deps
+            .turn_ends
+            .clone()
+            .expect("test_deps mirrors the default enabled: true")
+            .subscribe();
+
+        let session = create_session(&deps, None).expect("create_session");
+        let convo = session.conversation_id;
+        session
+            .state_manager
+            .begin_turn(crate::notify::TurnSource::User);
+        session
+            .state_manager
+            .end_turn(crate::notify::TurnOutcome::Ok);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the session's turn-end event arrives within 10s")
+            .expect("the feed stays open");
+        assert_eq!(
+            ev.convo, convo,
+            "the event names the session's conversation"
+        );
+        assert_eq!(ev.outcome, crate::notify::TurnOutcome::Ok);
+        assert_eq!(ev.source, crate::notify::TurnSource::User);
+
+        // Process-wide: a second session publishes to the same rx.
+        let session2 = create_session(&deps, None).expect("second session");
+        session2
+            .state_manager
+            .begin_turn(crate::notify::TurnSource::User);
+        session2
+            .state_manager
+            .end_turn(crate::notify::TurnOutcome::Stopped);
+        let ev2 = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the second session's event arrives")
+            .expect("the feed stays open");
+        assert_eq!(ev2.convo, session2.conversation_id);
+        assert_eq!(ev2.outcome, crate::notify::TurnOutcome::Stopped);
     }
 }

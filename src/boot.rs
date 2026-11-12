@@ -40,6 +40,9 @@ pub fn session_deps(
         shell_kind,
         profile_pin,
         uploads,
+        // TDD stub — PR-B implementation replaces this with
+        // `config.general.notifications.enabled.then(notify::turn_end_channel)`.
+        turn_ends: None,
     })
 }
 
@@ -177,5 +180,54 @@ mod tests {
         let ui = web_boot(web, WebSession::Ready(Arc::new(deps)))
             .expect("a relay-only config boots the web UI as Ready");
         let _ = ui; // the WebUi is unrunnable in a unit test; Ready-ness is the assertion
+    }
+
+    /// A global config with the `general.notifications` switch as asked.
+    /// `auto_save: false` keeps the test off the disk (no storage dir).
+    fn config_with_notifications(enabled: Option<bool>) -> Config {
+        let line = enabled
+            .map(|e| format!("  notifications:\n    enabled: {e}\n"))
+            .unwrap_or_default();
+        let text = format!(
+            "providers:\n  - name: p\n    type: openai\n    api_key: k\n    models:\n      - name: m1\n        alias: a\nprofiles:\n  p:\n    agents:\n      a:\n        model: a\ngeneral:\n  conversation:\n    auto_save: false\n{line}"
+        );
+        Config::parse(
+            Source {
+                path: std::path::Path::new("/global/config.yaml"),
+                text: &text,
+            },
+            None,
+            &ParseCtx { known_skills: &[] },
+        )
+        .expect("fixture config must parse")
+    }
+
+    /// T-B1 — the config key is the boot switch for the process-wide
+    /// channel: off ⇒ no channel at all; default ⇒ channel present.
+    #[test]
+    fn session_deps_has_no_channel_when_disabled() {
+        let base = |enabled: Option<bool>| {
+            session_deps(
+                config_with_notifications(enabled),
+                SkillRegistry::default(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+            )
+        };
+
+        assert!(
+            base(None).turn_ends.is_some(),
+            "the default config (notifications enabled: true) must build the channel"
+        );
+        assert!(
+            base(Some(true)).turn_ends.is_some(),
+            "enabled: true must build the channel"
+        );
+        assert!(
+            base(Some(false)).turn_ends.is_none(),
+            "enabled: false must mean no channel (disabled ⇒ not emittable)"
+        );
     }
 }

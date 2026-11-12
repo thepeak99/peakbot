@@ -88,6 +88,7 @@ use uuid::Uuid;
 
 mod conversations;
 mod images;
+mod notify;
 pub mod registry;
 mod remote;
 pub mod settings;
@@ -383,6 +384,13 @@ impl WebUi {
         // (no registry): the settings `/api/*` catch-all answers 404 there.
         if self.deps.is_some() {
             app = app.merge(conversations::router(self.ws_state.clone()));
+        }
+
+        // The turn-end feed (PR-B §6.1): token-gated; absent (→ the
+        // `/api/*` 404) when notifications are off or in needs_setup mode.
+        // TDD stub — `notify::router` currently serves no routes.
+        if let Some(tx) = self.deps.as_ref().and_then(|d| d.turn_ends.clone()) {
+            app = app.merge(notify::router(tx));
         }
 
         // The `/r/` proxy (remote-profiles §6.2): the three allowlisted

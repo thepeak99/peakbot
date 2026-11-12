@@ -200,6 +200,7 @@ fn deps_with_config(cfg: Config, pin: Option<&str>) -> Arc<SessionDeps> {
         storage: None,
         profile_pin: pin.map(str::to_string),
         uploads: UploadStore::new(UploadStore::default_root(), UploadsConfig::default()),
+        turn_ends: None,
     })
 }
 
@@ -979,6 +980,27 @@ async fn validate_restart_required_vs_boot() {
             .iter()
             .any(|k| k == "mcps"),
         "adding an MCP server is boot-only; got: {v}"
+    );
+
+    // PR-B §9.6: general.notifications is boot-only → flipping it requires a
+    // restart (and lands LAST in the list — the stable order pins it).
+    let text = GLOBAL_BOOT.replace(
+        "general:\n  web:",
+        "general:\n  notifications:\n    enabled: false\n  web:",
+    );
+    let resp = post_json(
+        addr,
+        "/api/config/validate",
+        None,
+        &validate_body("global", &text, None),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        v["restart_required"],
+        serde_json::json!(["general.notifications"]),
+        "flipping notifications.enabled is exactly one boot-only key"
     );
 
     // Repo scope: always [] (repo files carry no boot-only blocks).

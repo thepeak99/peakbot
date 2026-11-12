@@ -192,6 +192,13 @@ pub struct StateManager {
     /// The response currently being materialised into transcript rows.
     /// See [`ResponseSlot`].
     response: RwLock<ResponseSlot>,
+
+    // ── Turn-end feed (notify PR-B) ───────────────────────────────────────────
+    /// The process-wide turn-end sender; `None` = notifications disabled, or a
+    /// StateManager built outside `create_session` (tests). Fixed for life.
+    // TDD stub — PR-B implementation replaces this (read by `end_turn`).
+    #[allow(dead_code)]
+    turn_ends: Option<crate::notify::TurnEndTx>,
 }
 
 /// The response currently being materialised into transcript rows.
@@ -222,8 +229,13 @@ impl StateManager {
     pub fn new_arc_for_session(
         storage: Option<Arc<dyn ConversationStorage>>,
         uploads: crate::attachments::UploadStore,
+        turn_ends: Option<crate::notify::TurnEndTx>,
     ) -> Arc<Self> {
-        let sm = Arc::new(Self::new_inner(storage).with_uploads(uploads));
+        let sm = Arc::new(
+            Self::new_inner(storage)
+                .with_uploads(uploads)
+                .with_turn_ends(turn_ends),
+        );
         *sm.self_ref.write().unwrap() = Some(Arc::downgrade(&sm));
         sm
     }
@@ -277,7 +289,14 @@ impl StateManager {
                 id: 0,
                 thinking: Vec::new(),
             }),
+            turn_ends: None,
         }
+    }
+
+    /// Attach the process-wide turn-end sender (builder, like `with_uploads`).
+    fn with_turn_ends(mut self, turn_ends: Option<crate::notify::TurnEndTx>) -> Self {
+        self.turn_ends = turn_ends;
+        self
     }
 
     /// Override the upload store (tests inject a tempdir root). Also stamps
@@ -1078,6 +1097,20 @@ impl StateManager {
     /// Check if the agent is currently running
     pub fn is_running(&self) -> bool {
         self.state.read().unwrap().is_running
+    }
+
+    /// Open an agent turn: records its source, then `set_running(true)`.
+    /// Only the controller calls this; commands use `set_running` directly.
+    // TDD stub — PR-B implementation replaces this (must also record `source`).
+    pub fn begin_turn(&self, _source: crate::notify::TurnSource) {
+        self.set_running(true);
+    }
+
+    /// Close the open turn: `set_running(false)`, then publish one `TurnEnd`
+    /// iff a turn was begun. Without an open turn it only clears the flag.
+    // TDD stub — PR-B implementation replaces this (must publish the TurnEnd).
+    pub fn end_turn(&self, _outcome: crate::notify::TurnOutcome) {
+        self.set_running(false);
     }
 
     /// The current turn's cancellation token. Cancelling it ⇒ the turn's
@@ -2156,7 +2189,7 @@ impl StateManager {
     /// every wire request, including the first one of a new prompt, so this
     /// site doesn't need its own check. See `mid-compaction.md` § 3 Step 4.
     pub fn add_user_message(&self, content: String) {
-        self.begin_turn();
+        self.reset_turn_state();
         // Derive the provisional title before `content` moves into the row.
         let provisional = provisional_title(&content);
         let msg = ChatMessage::user(content);
@@ -2169,7 +2202,7 @@ impl StateManager {
     /// renderer can style the row and the transcript records which
     /// background processes contributed.
     pub fn add_user_message_from_background(&self, content: String, proc_ids: Vec<u32>) {
-        self.begin_turn();
+        self.reset_turn_state();
         let msg = ChatMessage::user_from_background(content, proc_ids);
         self.update_chat(msg);
         if let Err(e) = self.persist_current() {
@@ -2186,7 +2219,7 @@ impl StateManager {
         content: String,
         attachments: Vec<crate::attachments::Attachment>,
     ) {
-        self.begin_turn();
+        self.reset_turn_state();
         // Image-only turns derive no title (blank text ⇒ None).
         let provisional = provisional_title(&content);
         let msg = ChatMessage::user_with_attachments(content, attachments);
@@ -2225,8 +2258,9 @@ impl StateManager {
         }
     }
 
-    /// Reset per-turn state at a user-turn boundary.
-    fn begin_turn(&self) {
+    /// Reset per-turn state at a user-turn boundary. (Was `begin_turn`; renamed
+    /// so the name is free for the public turn-lifecycle method.)
+    fn reset_turn_state(&self) {
         self.clear_response_thinking();
     }
 
@@ -11721,5 +11755,143 @@ mod orchestrator_reply_tests {
             AssistantContent::Text(t) => assert_eq!(t, &Text::new("x")),
             other => panic!("second wire item must be the text, got {other:?}"),
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PR-B §9.2: turn-end feed on the StateManager.
+//
+// Written BEFORE the implementation: `begin_turn`/`end_turn` exist as TDD
+// stubs that only flip `is_running` and publish nothing, so every test that
+// expects a `TurnEnd` on the channel is RED for the right reason (no
+// publisher), while the negative tests (nothing to publish) are already
+// green. The `#[cfg(test)] use` above the tests module is unchanged — these
+// tests live in the existing `mod tests` scope.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod turn_end_tests {
+    use super::*;
+    use crate::notify::{TurnEnd, TurnOutcome, TurnSource};
+    use crate::storage::InMemoryStorage;
+    use tokio::sync::broadcast;
+
+    fn sm_with_channel() -> (Arc<StateManager>, broadcast::Receiver<TurnEnd>) {
+        let storage: Arc<dyn ConversationStorage> = Arc::new(InMemoryStorage::new());
+        let sm = StateManager::new_arc_for_session(
+            Some(storage),
+            crate::attachments::UploadStore::new(
+                std::env::temp_dir().join("peakbot-test-uploads"),
+                crate::config::UploadsConfig::default(),
+            ),
+            Some(crate::notify::turn_end_channel()),
+        );
+        let tx = sm.turn_ends.clone().expect("channel wired");
+        (sm, tx.subscribe())
+    }
+
+    fn no_events(rx: &mut broadcast::Receiver<TurnEnd>) {
+        assert!(
+            rx.try_recv().is_err(),
+            "no TurnEnd must be on the channel (got: {:?})",
+            rx.try_recv().ok()
+        );
+    }
+
+    /// I1: one `TurnEnd` per begun turn, carrying the current convo id, the
+    /// turn's source and the outcome — and then nothing.
+    #[tokio::test]
+    async fn end_turn_publishes_one_event_with_convo_and_source() {
+        let (sm, mut rx) = sm_with_channel();
+        sm.ensure_boot_conversation(std::path::Path::new("."), "mock-model");
+        let convo = sm.get_current_conversation_id().expect("boot conversation");
+
+        sm.begin_turn(TurnSource::Background);
+        sm.end_turn(TurnOutcome::Stopped);
+
+        let ev = rx
+            .try_recv()
+            .expect("begin_turn + end_turn must publish exactly one event");
+        assert_eq!(ev.convo, convo, "the event names the current conversation");
+        assert_eq!(ev.source, TurnSource::Background);
+        assert_eq!(ev.outcome, TurnOutcome::Stopped);
+        no_events(&mut rx);
+    }
+
+    /// I2: a consumer reacting by reading state sees the turn already ended
+    /// when the event arrives.
+    #[tokio::test]
+    async fn end_turn_clears_running_before_publishing() {
+        let (sm, mut rx) = sm_with_channel();
+        sm.ensure_boot_conversation(std::path::Path::new("."), "mock-model");
+        let sm2 = sm.clone();
+        let probe = tokio::spawn(async move {
+            let ev = rx
+                .recv()
+                .await
+                .expect("the event arrives (and the probe never deadlocks)");
+            (ev, sm2.is_running())
+        });
+        sm.begin_turn(TurnSource::User);
+        assert!(sm.is_running(), "begin_turn opens the turn");
+        sm.end_turn(TurnOutcome::Ok);
+        let (ev, running) = tokio::time::timeout(std::time::Duration::from_secs(10), probe)
+            .await
+            .expect("the subscriber receives the event within 10s")
+            .expect("subscriber task alive");
+        assert!(!running, "is_running is false at receipt (state first, I2)");
+        assert_eq!(ev.outcome, TurnOutcome::Ok);
+    }
+
+    /// Models a panic during a command: `set_running` without a begun turn —
+    /// `end_turn` clears the flag and publishes nothing.
+    #[tokio::test]
+    async fn end_turn_without_begin_publishes_nothing() {
+        let (sm, mut rx) = sm_with_channel();
+        sm.set_running(true);
+        sm.end_turn(TurnOutcome::Error);
+        assert!(!sm.is_running(), "end_turn always clears the running flag");
+        no_events(&mut rx);
+    }
+
+    /// Commands and tests flip `set_running` directly: that must never emit.
+    #[tokio::test]
+    async fn set_running_alone_never_publishes() {
+        let (sm, mut rx) = sm_with_channel();
+        sm.set_running(true);
+        sm.set_running(false);
+        no_events(&mut rx);
+    }
+
+    /// A bare SM (no sender) survives begin/end: no panic, nothing to observe.
+    #[test]
+    fn no_sender_means_no_publish_and_no_panic() {
+        let sm = StateManager::new_arc();
+        sm.begin_turn(TurnSource::User);
+        assert!(sm.is_running());
+        sm.end_turn(TurnOutcome::Ok);
+        assert!(!sm.is_running());
+    }
+
+    /// Q1 pinned: the event's title is `Conversation.title` as-is — the
+    /// provisional (opening-message) title on the first turn.
+    #[tokio::test]
+    async fn title_is_the_conversation_title() {
+        let (sm, mut rx) = sm_with_channel();
+        sm.ensure_boot_conversation(std::path::Path::new("."), "mock-model");
+        sm.add_user_message("hello world".to_string());
+        let expected = sm
+            .get_current_conversation()
+            .expect("current conversation")
+            .title
+            .clone()
+            .expect("add_user_message stamps the provisional title");
+        sm.begin_turn(TurnSource::User);
+        sm.end_turn(TurnOutcome::Ok);
+        let ev = rx.try_recv().expect("one event");
+        assert_eq!(
+            ev.title,
+            Some(expected),
+            "title is the conversation title, as-is"
+        );
     }
 }

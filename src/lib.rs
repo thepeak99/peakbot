@@ -30,6 +30,7 @@ mod mcp_auth;
 mod memory_compaction;
 #[cfg(feature = "mock")]
 pub mod mock;
+pub mod notify;
 pub mod paths;
 pub mod pipeline;
 mod providers;
@@ -9030,6 +9031,9 @@ headers:
             started: Arc<Notify>,
             release: Arc<Notify>,
             ran: Arc<AtomicUsize>,
+            /// The turn-end feed as seen by a subscriber — subscribed BEFORE
+            /// `run_loop` spawns, so no event can be missed (PR-B design §9.3).
+            turn_ends: tokio::sync::broadcast::Receiver<crate::notify::TurnEnd>,
         }
 
         impl Rig {
@@ -9077,6 +9081,14 @@ headers:
                 );
             }
 
+            /// Wait (≤10s) for the next `TurnEnd` on the feed.
+            pub(super) async fn next_turn_end(&mut self) -> crate::notify::TurnEnd {
+                tokio::time::timeout(std::time::Duration::from_secs(10), self.turn_ends.recv())
+                    .await
+                    .expect("a turn-end event arrives within 10s")
+                    .expect("the turn-end feed stays open")
+            }
+
             async fn wait_stop_pending(&self) {
                 let sm = self.sm.clone();
                 let ok = tokio::time::timeout(std::time::Duration::from_secs(5), async move {
@@ -9121,11 +9133,40 @@ headers:
             m.role == MessageRole::System && m.content.starts_with("Agent stopped by user")
         }
 
-        /// Build a mock-backed runner around [`GateTool`].
+        /// The rig's upload root: `new_arc_for_session` needs a store; the
+        /// turn tests never attach, so the tempdir is only a root.
+        fn rig_uploads() -> crate::attachments::UploadStore {
+            crate::attachments::UploadStore::new(
+                tempfile::tempdir().expect("rig uploads tempdir").keep(),
+                crate::config::UploadsConfig::default(),
+            )
+        }
+
+        /// Build a mock-backed runner around [`GateTool`] on the turn-end
+        /// feed (PR-B design §9.3 rig change): the SM gets the process-wide
+        /// channel and the rig keeps a subscriber from before `run_loop`.
         fn spawn_rig(responses: Vec<crate::mock::MockResponse>) -> Rig {
+            spawn_rig_with_feed(responses, Some(crate::notify::turn_end_channel()))
+        }
+
+        /// The same rig with the feed switch: `None` models
+        /// `general.notifications.enabled: false` (no channel at all).
+        fn spawn_rig_with_feed(
+            responses: Vec<crate::mock::MockResponse>,
+            tx: Option<crate::notify::TurnEndTx>,
+        ) -> Rig {
             let storage: Arc<dyn crate::storage::ConversationStorage> =
                 Arc::new(crate::storage::InMemoryStorage::new());
-            let sm = StateManager::new_arc_with_storage(storage.clone());
+            let sm =
+                StateManager::new_arc_for_session(Some(storage.clone()), rig_uploads(), tx.clone());
+            // Subscribe before the loop spawns — and before the `tx` name is
+            // taken by the action channel below: once the rig exists, every
+            // event the controller publishes is ours. The feed-less rig keeps
+            // a throwaway receiver (never read — T-L6).
+            let turn_ends_rx = match tx.clone() {
+                Some(tx) => tx.subscribe(),
+                None => tokio::sync::broadcast::channel(1).0.subscribe(),
+            };
 
             let model = crate::mock::MockCompletionModel::new();
             for r in responses {
@@ -9178,6 +9219,7 @@ headers:
             let h = tokio::spawn(async move { runner.run_loop(rx).await });
 
             Rig {
+                turn_ends: turn_ends_rx,
                 sm,
                 storage,
                 model,
@@ -9507,6 +9549,188 @@ headers:
                     .all(|m| m.role != MessageRole::ToolResult),
                 "the graceful arm must not synthesise INTERRUPTED results"
             );
+        }
+
+        // ── PR-B §9.3: the controller publishes turn-end events ─────────────
+        //
+        // Written BEFORE the implementation. The `begin_turn`/`end_turn`
+        // stubs flip `is_running` but publish nothing, so every test that
+        // awaits an event is RED (10 s timeout in `next_turn_end`) for the
+        // right reason: nothing publishes yet. T-L6 is the negative test
+        // (no channel at all) and is already green.
+
+        /// T-L1 — a normal user turn ends with one `TurnEnd{ok, user}`.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn user_turn_emits_ok_turn_end() {
+            let mut rig = spawn_rig(vec![crate::mock::MockResponse::text("hello")]);
+            rig.send("hi");
+            let ev = rig.next_turn_end().await;
+            assert_eq!(ev.outcome, crate::notify::TurnOutcome::Ok);
+            assert_eq!(ev.source, crate::notify::TurnSource::User);
+            assert_eq!(
+                ev.convo,
+                rig.sm
+                    .get_current_conversation_id()
+                    .expect("boot conversation"),
+                "the event names the conversation the session is on"
+            );
+            assert!(!rig.sm.is_running(), "the turn is over");
+            rig.shutdown().await;
+        }
+
+        /// T-L2 — a non-transient LLM error ends the turn with `error`
+        /// (same shape as T10: "authentication failed" is not retried).
+        #[tokio::test(flavor = "multi_thread")]
+        async fn llm_error_emits_error_turn_end() {
+            let mut rig = spawn_rig(vec![crate::mock::MockResponse::error(
+                "authentication failed",
+            )]);
+            rig.send("hi");
+            let ev = rig.next_turn_end().await;
+            assert_eq!(ev.outcome, crate::notify::TurnOutcome::Error);
+            assert_eq!(ev.source, crate::notify::TurnSource::User);
+            assert!(!rig.sm.is_running());
+            rig.shutdown().await;
+        }
+
+        /// T-L3 — Stop (immediate, 2nd press) ends the turn with `stopped`,
+        /// exactly once: the later `StopMarker` adds nothing.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn stop_emits_stopped_turn_end() {
+            let mut rig = spawn_rig(vec![
+                gate_call(),
+                crate::mock::MockResponse::text("never sent"),
+            ]);
+            rig.send("go");
+            rig.wait_tool_started().await;
+            rig.press();
+            rig.press(); // escalate → immediate
+            rig.wait_stop_message().await;
+
+            let ev = rig.next_turn_end().await;
+            assert_eq!(ev.outcome, crate::notify::TurnOutcome::Stopped);
+            assert_eq!(ev.source, crate::notify::TurnSource::User);
+            // Settle: a stray second event (e.g. from the StopMarker) would
+            // land shortly after the stop message.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert!(
+                rig.turn_ends.try_recv().is_err(),
+                "exactly one event per stopped turn (got a second: {:?})",
+                rig.turn_ends.try_recv().ok()
+            );
+            rig.shutdown().await;
+        }
+
+        /// T-L4 — a `[bg output]` synthetic turn ends with
+        /// `TurnEnd{ok, background}`: the second event after the user turn.
+        #[cfg(feature = "host")]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn bg_output_turn_emits_background_turn_end() {
+            let mut rig = spawn_rig(vec![
+                crate::mock::MockResponse::text("first"),
+                crate::mock::MockResponse::text("bg handled"),
+            ]);
+            rig.send("hi");
+            rig.next_turn_end().await; // the user turn's event
+
+            // The bg-notify pipe is attached by `run_loop`; this child's
+            // output is drained into a synthetic turn on the next idle wake.
+            rig.sm
+                .start_bg(crate::bg_processes::StartParams {
+                    command: "echo bg-done".into(),
+                    capture_cap: 10,
+                    cwd: None,
+                    label: None,
+                    cooldown: std::time::Duration::ZERO,
+                    env: None,
+                    shell: crate::tools::ShellKind::Bash { path: "sh".into() },
+                })
+                .expect("the bg child starts");
+
+            let ev = rig.next_turn_end().await;
+            assert_eq!(ev.source, crate::notify::TurnSource::Background);
+            assert_eq!(ev.outcome, crate::notify::TurnOutcome::Ok);
+            rig.shutdown().await;
+        }
+
+        /// T-L5 — a slash command ends without a turn: no event. A real
+        /// turn right after it still emits its one event (positive control).
+        #[tokio::test(flavor = "multi_thread")]
+        async fn slash_command_emits_nothing() {
+            let mut rig = spawn_rig(vec![crate::mock::MockResponse::text("hello")]);
+            rig.send("/stats");
+            rig.wait_for("the /stats system row", |m| {
+                m.iter().any(|m| {
+                    m.role == MessageRole::System && m.content.starts_with("## Session Statistics")
+                })
+            })
+            .await;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert!(
+                rig.turn_ends.try_recv().is_err(),
+                "a slash command is not a turn and must not emit (got: {:?})",
+                rig.turn_ends.try_recv().ok()
+            );
+            // Positive control: a real turn still publishes.
+            rig.send("hi");
+            let ev = rig.next_turn_end().await;
+            assert_eq!(ev.outcome, crate::notify::TurnOutcome::Ok);
+            assert_eq!(ev.source, crate::notify::TurnSource::User);
+            rig.shutdown().await;
+        }
+
+        /// T-L6 — notifications disabled (no channel): the turn completes
+        /// normally and nothing panics. Emission needs a sender; the
+        /// config→`None` link is T-B1.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn disabled_means_no_channel_no_events() {
+            let rig = spawn_rig_with_feed(vec![crate::mock::MockResponse::text("hello")], None);
+            rig.send("hi");
+            rig.wait_for("the reply", |m| {
+                m.iter()
+                    .any(|m| m.role == MessageRole::Agent && m.content == "hello")
+            })
+            .await;
+            assert!(!rig.sm.is_running());
+            rig.shutdown().await;
+        }
+
+        /// T-L7 — the payload is content-free: no message text in any event,
+        /// and the key set is exactly `{type,convo,title,outcome,source,ts}`.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn payload_has_no_message_content() {
+            let mut rig = spawn_rig(vec![
+                crate::mock::MockResponse::text("SECRET-REPLY-1"),
+                crate::mock::MockResponse::text("SECRET-REPLY-2"),
+            ]);
+            rig.send("opening");
+            let ev1 = rig.next_turn_end().await;
+            rig.send("SECRET-FOLLOWUP");
+            let ev2 = rig.next_turn_end().await;
+
+            for (i, ev) in [ev1, ev2].into_iter().enumerate() {
+                let json = serde_json::to_string(&ev).expect("the event serialises");
+                for secret in ["SECRET-REPLY-1", "SECRET-REPLY-2", "SECRET-FOLLOWUP"] {
+                    assert!(
+                        !json.contains(secret),
+                        "event {i} must not carry message text: {json}"
+                    );
+                }
+                let mut keys: Vec<String> = serde_json::to_value(&ev)
+                    .expect("an object")
+                    .as_object()
+                    .expect("an object")
+                    .keys()
+                    .cloned()
+                    .collect();
+                keys.sort();
+                assert_eq!(
+                    keys,
+                    vec!["convo", "outcome", "source", "title", "ts", "type"],
+                    "event {i}: the exact key set — {json}"
+                );
+            }
+            rig.shutdown().await;
         }
     }
 

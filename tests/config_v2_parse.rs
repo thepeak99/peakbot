@@ -222,6 +222,27 @@ fn rows() -> Vec<Row> {
         message: None,
     });
 
+    // P2-notifications — unknown field inside `general.notifications`
+    // (PR-B §9.6): the block is `deny_unknown_fields`.
+    r.push(Row {
+        name: "P2-notifications",
+        global: "providers:\n  - name: p\n    type: openai\n    api_key: k\n    models:\n      - name: m1\n        alias: a\n      - name: m2\n        alias: b\nprofiles:\n  p:\n    agents:\n      a:\n        model: a\ngeneral:\n  notifications:\n    sound: true\n",
+        repo: None,
+        file: ConfigFileKind::Global,
+        path: vec![key("general"), key("notifications")],
+        message: None,
+    });
+
+    // notifications-type — wrong type for `notifications.enabled` (path only).
+    r.push(Row {
+        name: "notifications-type",
+        global: "providers:\n  - name: p\n    type: openai\n    api_key: k\n    models:\n      - name: m1\n        alias: a\n      - name: m2\n        alias: b\nprofiles:\n  p:\n    agents:\n      a:\n        model: a\ngeneral:\n  notifications:\n    enabled: 'yes'\n",
+        repo: None,
+        file: ConfigFileKind::Global,
+        path: vec![key("general"), key("notifications"), key("enabled")],
+        message: None,
+    });
+
     // P3 — `persona` under a subagent: P2 rewritten to the dedicated message.
     r.push(g(
         "P3",
@@ -1314,6 +1335,16 @@ fn general_defaults_when_absent() {
 }
 
 #[test]
+fn notifications_enabled_false_parses() {
+    let yaml = "providers:\n  - name: p\n    type: openai\n    api_key: k\n    models:\n      - name: m1\n        alias: a\n      - name: m2\n        alias: b\nprofiles:\n  p:\n    agents:\n      a:\n        model: a\ngeneral:\n  notifications:\n    enabled: false\n";
+    let cfg = parsed(yaml);
+    assert!(
+        !cfg.general.notifications.enabled,
+        "enabled: false must parse to a disabled feed"
+    );
+}
+
+#[test]
 fn web_bind_is_a_real_socket_addr() {
     let yaml = "providers:\n  - name: p\n    type: openai\n    api_key: k\n    models:\n      - name: m1\n        alias: a\n      - name: m2\n        alias: b\nprofiles:\n  p:\n    agents:\n      a:\n        model: a\ngeneral:\n  web:\n    bind: 0.0.0.0:8080\n";
     let cfg = parsed(yaml);
@@ -1389,6 +1420,10 @@ fn boot_only_diff_lists_each_changed_boot_only_block() {
             "general.conversation",
             "providers:\n  - name: p\n    type: openai\n    api_key: k\n    models:\n      - name: m1\n        alias: a\n      - name: m2\n        alias: b\nprofiles:\n  p:\n    agents:\n      a:\n        model: a\ngeneral:\n  conversation:\n    storage_dir: /tmp/convs\n",
         ),
+        (
+            "general.notifications",
+            "providers:\n  - name: p\n    type: openai\n    api_key: k\n    models:\n      - name: m1\n        alias: a\n      - name: m2\n        alias: b\nprofiles:\n  p:\n    agents:\n      a:\n        model: a\ngeneral:\n  notifications:\n    enabled: false\n",
+        ),
     ];
     for (want, yaml) in cases {
         let fresh = parsed(yaml);
@@ -1401,8 +1436,8 @@ fn boot_only_diff_lists_each_changed_boot_only_block() {
 }
 
 #[test]
-fn boot_only_diff_all_five_blocks_in_stable_order() {
-    let yaml = "providers:\n  - name: p\n    type: openai\n    api_key: k\n    models:\n      - name: m1\n        alias: a\n      - name: m2\n        alias: b\nprofiles:\n  p:\n    agents:\n      a:\n        model: a\nmcps:\n  - name: playwright\n    command: npx\ngeneral:\n  web:\n    tls: true\n  http:\n    connect_timeout_secs: 5\n  uploads:\n    max_file_mb: 9\n  conversation:\n    storage_dir: /tmp/convs\n";
+fn boot_only_diff_all_six_blocks_in_stable_order() {
+    let yaml = "providers:\n  - name: p\n    type: openai\n    api_key: k\n    models:\n      - name: m1\n        alias: a\n      - name: m2\n        alias: b\nprofiles:\n  p:\n    agents:\n      a:\n        model: a\nmcps:\n  - name: playwright\n    command: npx\ngeneral:\n  web:\n    tls: true\n  http:\n    connect_timeout_secs: 5\n  uploads:\n    max_file_mb: 9\n  conversation:\n    storage_dir: /tmp/convs\n  notifications:\n    enabled: false\n";
     assert_eq!(
         boot_only_diff(&parsed(BASE), &parsed(yaml)),
         vec![
@@ -1410,9 +1445,10 @@ fn boot_only_diff_all_five_blocks_in_stable_order() {
             "general.web",
             "general.http",
             "general.uploads",
-            "general.conversation"
+            "general.conversation",
+            "general.notifications"
         ],
-        "the key order is stable"
+        "the key order is stable (general.notifications LAST, per PR-B §9.6)"
     );
 }
 

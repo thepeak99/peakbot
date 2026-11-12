@@ -19,8 +19,8 @@
 use std::net::SocketAddr;
 
 use peakbot::config::file::{
-    AgentDef, ConfigFile, ConversationConfig, General, ProfileDef, ProfileEntry, RepoFile,
-    SearchConfig, SubagentDef, VectorDbConfig, WebConfig,
+    AgentDef, ConfigFile, ConversationConfig, General, NotificationsConfig, ProfileDef,
+    ProfileEntry, RepoFile, SearchConfig, SubagentDef, VectorDbConfig, WebConfig,
 };
 use peakbot::config::{
     ContextConfig, FetchUrlConfig, HttpConfig, McpAuth, McpTransportType, MemoryConfig, NameFilter,
@@ -307,6 +307,11 @@ fn global_example_general_block() {
             max_files: 10
         }
     );
+    assert_eq!(
+        g.notifications,
+        NotificationsConfig { enabled: true },
+        "absent notifications: enabled defaults to true (the feed is on by default)"
+    );
 }
 
 // ---------- §3.2 repo example fixture ----------
@@ -391,6 +396,31 @@ fn general_absent_gives_full_defaults() {
     assert_eq!(g.timeouts, TimeoutsConfig::default());
     assert_eq!(g.http, HttpConfig::default());
     assert_eq!(g.uploads, UploadsConfig::default());
+    assert_eq!(
+        g.notifications,
+        NotificationsConfig { enabled: true },
+        "absent notifications: enabled defaults to true (the feed is on by default)"
+    );
+}
+
+/// PR-B §9.6: the `general.notifications` key — absent ⇒ enabled, and an
+/// empty block ⇒ enabled (the hand-rolled Default, like `conversation`).
+#[test]
+fn notifications_defaults_to_enabled() {
+    let g: General = serde_yaml::from_str("{}").expect("an empty general block must parse");
+    assert_eq!(
+        g.notifications,
+        NotificationsConfig { enabled: true },
+        "absent notifications: enabled defaults to true"
+    );
+
+    let g: General =
+        serde_yaml::from_str("notifications: {}").expect("an empty notifications block must parse");
+    assert_eq!(
+        g.notifications,
+        NotificationsConfig { enabled: true },
+        "an empty notifications block: enabled defaults to true"
+    );
 }
 
 #[test]

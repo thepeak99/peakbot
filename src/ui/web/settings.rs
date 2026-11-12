@@ -903,6 +903,7 @@ mod tests {
             storage: None,
             profile_pin: None,
             uploads: UploadStore::new(UploadStore::default_root(), UploadsConfig::default()),
+            turn_ends: None,
         })
     }
 
