@@ -19,7 +19,7 @@ use crate::ce::{self, Reader};
 use crate::chain::VerifiedChain;
 use crate::constants;
 use crate::domain;
-use crate::{DeviceId, Error, Head, Result, SessionId, h, sign_tagged, verify_tagged, v1_err};
+use crate::{DeviceId, Error, Head, Result, SessionId, h, sign_tagged, v1_err, verify_tagged};
 
 const EPH_PK_LEN: usize = 1216;
 const CT_LEN: usize = 1120;
@@ -259,10 +259,10 @@ pub fn derive_keys(ss: &[u8; 64], th3: &[u8; 32]) -> SessionKeys {
 fn hkdf32(ikm: &[u8], salt: &[u8], info: &str) -> [u8; 32] {
     let mut out = [0u8; 32];
     // A non-empty salt always succeeds; the zero fallback is unreachable.
-    if let Ok(v) = v1::hkdf_sha3_256(ikm, salt, info.as_bytes(), 32) {
-        if v.len() == 32 {
-            out.copy_from_slice(&v);
-        }
+    if let Ok(v) = v1::hkdf_sha3_256(ikm, salt, info.as_bytes(), 32)
+        && v.len() == 32
+    {
+        out.copy_from_slice(&v);
     }
     out
 }
@@ -362,13 +362,8 @@ impl Initiator {
         if relay_from != self.peer_id {
             return Err(Error::Misrouted);
         }
-        self.chain = crate::chain::check_head(
-            &self.chain,
-            self.self_id,
-            hs2.head,
-            self.peer_id,
-            fetch,
-        )?;
+        self.chain =
+            crate::chain::check_head(&self.chain, self.self_id, hs2.head, self.peer_id, fetch)?;
         let th2 = transcript_th2(&self.th1, &hs2.tbs());
         let card = self
             .chain
@@ -435,9 +430,8 @@ impl Responder {
             return Err(Error::Misrouted);
         }
         crate::chain::check_head(own, self_id, hs1.head, hs1.i, fetch)?;
-        let (ct, ss) =
-            v1::kem_encapsulate(v1::KemAlg::X25519MlKem768, &hs1.eph_pk, rng)
-                .map_err(|_| Error::MalformedKey)?;
+        let (ct, ss) = v1::kem_encapsulate(v1::KemAlg::X25519MlKem768, &hs1.eph_pk, rng)
+            .map_err(|_| Error::MalformedKey)?;
         let th1 = transcript_th1(&PipeMsg::Hs1(hs1.clone()).encode());
         // R presents its OWN head (spec §8.2: Hs2 carries `head(head_R)`),
         // so a stale initiator learns R's newer head and syncs (§8.5).

@@ -80,7 +80,8 @@ impl DeviceCard {
 
     /// Canonical Encoding (spec §4.1). Output length ≤ 3280.
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(1 + 13 + 4 + VK_LEN + 21 + 4 + KEM_PK_LEN + 4 + MAX_NAME + 1);
+        let mut out =
+            Vec::with_capacity(1 + 13 + 4 + VK_LEN + 21 + 4 + KEM_PK_LEN + 4 + MAX_NAME + 1);
         out.push(1);
         ce::push_str(&mut out, v1::SigAlg::MlDsa65.alg_id());
         ce::push_bytes(&mut out, &self.vk);

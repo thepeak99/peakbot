@@ -157,10 +157,7 @@ impl FrameReceiver {
                 return Err(Error::DecryptionError);
             }
         };
-        let inner = decode_inner(&pt).map_err(|e| {
-            self.close(e);
-            e
-        })?;
+        let inner = decode_inner(&pt).inspect_err(|&e| self.close(e))?;
         self.expected += 1;
         Ok(RecvOutcome::Inner(inner))
     }
@@ -284,7 +281,9 @@ enum StreamState {
         headed: bool,
     },
     /// One direction ended (S3/S4): the second End closes the stream.
-    Ended { attach: bool },
+    Ended {
+        attach: bool,
+    },
     Closed,
     Reset,
 }
@@ -379,7 +378,13 @@ impl Mux {
                     if attach || headed {
                         return Err(Error::Protocol);
                     }
-                    self.streams.insert(id, StreamState::Open { attach, headed: true });
+                    self.streams.insert(
+                        id,
+                        StreamState::Open {
+                            attach,
+                            headed: true,
+                        },
+                    );
                     Ok(events)
                 }
                 StreamMsg::End => {

@@ -14,8 +14,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use perma_crypto::v1;
 use rand_core::CryptoRng;
 
-use crate::ce::{self, Reader};
 use crate::card::{DeviceCard, MAX_CARD};
+use crate::ce::{self, Reader};
 use crate::domain;
 use crate::{DeviceId, Error, Head, Result, sign_tagged, verify_tagged};
 
@@ -275,10 +275,7 @@ pub fn extend(
         let h = entry_hash(raw);
         let expected_seq = match s.head {
             None => 0,
-            Some(head) => head
-                .seq
-                .checked_add(1)
-                .ok_or(Error::TooLong)?,
+            Some(head) => head.seq.checked_add(1).ok_or(Error::TooLong)?,
         };
         if e.seq != expected_seq {
             return Err(Error::Gap);
@@ -296,10 +293,10 @@ pub fn extend(
             }
             let pk = c.public_key()?;
             verify_tagged(&pk, domain::CHAIN_SIG, &e.body, &e.sig)?;
-            if let Some(p) = pinned {
-                if h != p {
-                    return Err(Error::GenesisMismatch);
-                }
+            if let Some(p) = pinned
+                && h != p
+            {
+                return Err(Error::GenesisMismatch);
             }
             s.genesis = Some(h);
             s.active.insert(id, c);
@@ -307,7 +304,9 @@ pub fn extend(
             if e.op == ChainOp::Genesis {
                 return Err(Error::BadGenesis);
             }
-            let head = s.head.expect("non-genesis seq implies a head");
+            // Unreachable: a non-genesis seq passed the continuity check,
+            // which requires a head. Fail closed anyway (no expect).
+            let head = s.head.ok_or(Error::Gap)?;
             if e.prev != head.hash {
                 return Err(Error::BadPrev);
             }
@@ -390,7 +389,9 @@ pub fn check_head(
         }
         own.clone()
     } else {
-        let served = fetch(own.head.seq + 1)?;
+        // Checked arithmetic (§1.5): a head at u64::MAX cannot be served.
+        let from_seq = own.head.seq.checked_add(1).ok_or(Error::TooLong)?;
+        let served = fetch(from_seq)?;
         let synced = sync(own, &served)?;
         if synced.head.seq < peer_head.seq {
             return Err(Error::StaleChain);

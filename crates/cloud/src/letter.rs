@@ -12,12 +12,12 @@
 use perma_crypto::v1;
 use rand_core::CryptoRng;
 
-use crate::ce::{self, Reader};
 use crate::card::{DeviceCard, MAX_CARD};
+use crate::ce::{self, Reader};
+use crate::chain::VerifiedChain;
 use crate::constants;
 use crate::domain;
-use crate::chain::VerifiedChain;
-use crate::{DeviceId, Error, Head, LetterId, Result, sign_tagged, verify_tagged, v1_err};
+use crate::{DeviceId, Error, Head, LetterId, Result, sign_tagged, v1_err, verify_tagged};
 
 const SIG_LEN: usize = 3309;
 
@@ -354,11 +354,7 @@ pub fn check_letter(in_: &mut LetterIn) -> Result<AcceptedLetter> {
     // 7.
     let body_bytes = &signed[..signed.len() - 4 - SIG_LEN];
     let dispatch = match &body.body {
-        LetterKindBody::EnrollRequest {
-            card,
-            has_mac,
-            ..
-        } => {
+        LetterKindBody::EnrollRequest { card, has_mac, .. } => {
             let c = DeviceCard::parse(card).map_err(|_| Error::Malformed)?;
             let id = c.device_id();
             if id != body.from

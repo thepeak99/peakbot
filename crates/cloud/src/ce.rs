@@ -44,7 +44,9 @@ impl<'a> Reader<'a> {
 
     pub(crate) fn u64(&mut self) -> Result<u64, Error> {
         let b = self.take(8)?;
-        Ok(u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+        Ok(u64::from_be_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
     }
 
     /// `fix[n](x)`: exactly `n` raw bytes.
@@ -80,7 +82,9 @@ impl<'a> Reader<'a> {
     /// `str(s)`: `bytes(utf8(s))`, valid UTF-8, per-field maximum.
     pub(crate) fn str_field(&mut self, max: usize) -> Result<String, Error> {
         let b = self.bytes(max)?;
-        std::str::from_utf8(b).map(|s| s.to_string()).map_err(|_| Error::Malformed)
+        std::str::from_utf8(b)
+            .map(|s| s.to_string())
+            .map_err(|_| Error::Malformed)
     }
 }
 

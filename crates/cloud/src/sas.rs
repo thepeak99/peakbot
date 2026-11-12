@@ -11,9 +11,9 @@
 //! re-derives words with a new head (spec §5.5 R2, the pure-API part of
 //! the ordering rule).
 
+use crate::Head;
 use crate::ce::push_bytes;
 use crate::domain;
-use crate::Head;
 
 /// Six SAS words. Constructible only by `crate::sas::words` /
 /// `words_from_digest`; the fields are private, so the head used is

@@ -133,11 +133,7 @@ pub fn hello_tbs(origin: &str, nonce: [u8; 32], device_id: DeviceId, mode: u8) -
 
 /// Sign the Hello tbs with tag `pbc1 relay hello` (spec §10.2).
 /// `sign_with_rng` (A5) for reproducible vectors.
-pub fn sign_hello<R: CryptoRng>(
-    sk: &v1::PrivateKey,
-    tbs: &[u8],
-    rng: &mut R,
-) -> Result<Vec<u8>> {
+pub fn sign_hello<R: CryptoRng>(sk: &v1::PrivateKey, tbs: &[u8], rng: &mut R) -> Result<Vec<u8>> {
     sign_tagged(sk, domain::RELAY_HELLO, tbs, rng)
 }
 

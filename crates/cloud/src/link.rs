@@ -98,9 +98,7 @@ fn percent_decode(s: &str) -> Result<String> {
     if b.is_empty() {
         return Err(Error::BadLink);
     }
-    let hex = |c: u8| -> Option<u8> {
-        (c as char).to_digit(16).map(|d| d as u8)
-    };
+    let hex = |c: u8| -> Option<u8> { (c as char).to_digit(16).map(|d| d as u8) };
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
@@ -151,9 +149,7 @@ fn parse_origin(s: &str) -> Result<String> {
 fn percent_encode_unreserved(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if c.is_ascii_alphanumeric()
-            || matches!(c, '-' | '.' | '_' | '~')
-        {
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~') {
             out.push(c);
         } else {
             out.push('%');
@@ -169,17 +165,19 @@ fn percent_encode_unreserved(s: &str) -> String {
 pub fn mac_key(secret: &[u8; 32]) -> [u8; 32] {
     let mut out = [0u8; 32];
     // A non-empty salt always succeeds; the zero fallback is unreachable.
-    if let Ok(v) = v1_hkdf(secret, domain::ENROLL.as_bytes(), domain::ENROLL_MAC_KEY.as_bytes()) {
-        if v.len() == 32 {
-            out.copy_from_slice(&v);
-        }
+    if let Ok(v) = v1_hkdf(
+        secret,
+        domain::ENROLL.as_bytes(),
+        domain::ENROLL_MAC_KEY.as_bytes(),
+    ) && v.len() == 32
+    {
+        out.copy_from_slice(&v);
     }
     out
 }
 
 fn v1_hkdf(ikm: &[u8], salt: &[u8], info: &[u8]) -> Result<Vec<u8>> {
-    perma_crypto::v1::hkdf_sha3_256(ikm, salt, info, 32)
-        .map_err(|e| crate::v1_err(e))
+    perma_crypto::v1::hkdf_sha3_256(ikm, salt, info, 32).map_err(crate::v1_err)
 }
 
 /// `mac = MAC(mac_key; "pbc1 enroll mac";

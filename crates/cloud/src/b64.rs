@@ -7,8 +7,7 @@
 
 use crate::Error;
 
-const ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 /// Encode exactly 32 bytes as canonical base64url (43 chars, no padding).
 pub fn url_encode_32(bytes: &[u8; 32]) -> String {
@@ -46,8 +45,7 @@ pub fn url_decode_32(s: &str) -> Result<[u8; 32], Error> {
         value[i] = ALPHABET
             .iter()
             .position(|&a| a == c)
-            .ok_or(Error::BadLink)?
-            as u8;
+            .ok_or(Error::BadLink)? as u8;
     }
     // Canonical: the 4 trailing bits of the last character are zero.
     if value[42] & 0x03 != 0 {

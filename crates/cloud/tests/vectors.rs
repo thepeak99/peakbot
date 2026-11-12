@@ -170,8 +170,14 @@ fn vector_hs_a_to_b_transcript() {
     let a = card_a();
     let b = card_b();
     let no_fetch = |_from: u64| Ok(Vec::new() as Vec<Vec<u8>>);
-    let (mut i, hs1) =
-        Initiator::start(&c, a.device_id(), b.device_id(), keypair(1).private(), &mut rng(0xA1)).expect("start");
+    let (mut i, hs1) = Initiator::start(
+        &c,
+        a.device_id(),
+        b.device_id(),
+        keypair(1).private(),
+        &mut rng(0xA1),
+    )
+    .expect("start");
     let (mut r, hs2) = Responder::on_hs1(
         &c,
         b.device_id(),
@@ -206,4 +212,3 @@ fn vector_data_a_to_b_open_attach_frame() {
     assert_eq!(cloud::frames::decode_inner(&bytes).expect("decode"), inner);
     assert_eq!(hex(&bytes), DATA_FRAME0_INNER, "frame0 inner regression");
 }
-

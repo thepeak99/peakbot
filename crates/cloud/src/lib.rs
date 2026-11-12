@@ -9,10 +9,10 @@
 #![deny(unsafe_code)]
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-mod bip39;
-mod ce;
 pub mod b64;
+mod bip39;
 pub mod card;
+mod ce;
 pub mod chain;
 pub mod codec;
 pub mod constants;
