@@ -393,6 +393,22 @@ export function flatTree(items: TodoItem[]): TodoNode[] {
   return items.map((item) => ({ item, children: [] }));
 }
 
+/** Rows the Todo panel renders (parents + their children); `open` is
+ * pending | inProgress, so `cancelled`/`completed` count as done. */
+export function todoCounts(nodes: TodoNode[]): { open: number; total: number } {
+  let open = 0;
+  let total = 0;
+  const count = (item: TodoItem): void => {
+    total += 1;
+    if (item.status === "pending" || item.status === "inProgress") open += 1;
+  };
+  for (const node of nodes) {
+    count(node.item);
+    for (const child of node.children) count(child);
+  }
+  return { open, total };
+}
+
 function isDelegateCall(m: WireChatMessage): boolean {
   return m.role === "toolcall" && m.tool_name === "delegate";
 }
