@@ -298,7 +298,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   // button opens the FIRST visible tab; a count tap opens its own.
   const shown = (id: string): boolean => visibleTabIds.includes(id);
   const tasksN = shown("tasks") ? runningBg : 0;
-  const open = shown("todo") ? todoCounts(todos).open : 0;
+  const { open, total } = shown("todo") ? todoCounts(todos) : { open: 0, total: 0 };
   const panels =
     !isDesktop && visibleTabs.length > 0
       ? { count: tasksN + open, onOpen: () => setDrawerTab(visibleTabIds[0]) }
@@ -500,7 +500,26 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
             />
           )}
 
-          {focusing && turnInFlight && <ActivityRow step={focused?.activity ?? null} />}
+          {isDesktop && focusing && turnInFlight && (
+            <ActivityRow line={{ kind: "step", step: focused?.activity ?? null }} />
+          )}
+          {!isDesktop && (isRunning || tasksN > 0 || open > 0) && (
+            <ActivityRow
+              line={
+                isRunning
+                  ? focusing && turnInFlight
+                    ? { kind: "step", step: focused?.activity ?? null }
+                    : { kind: "working" }
+                  : { kind: "idle" }
+              }
+              counts={{
+                tasks: tasksN,
+                todosDone: total - open,
+                todosTotal: total,
+                onOpen: setDrawerTab,
+              }}
+            />
+          )}
 
           {convoTabs ? (
             // Keep-alive: every tab's composer stays mounted, only the active
