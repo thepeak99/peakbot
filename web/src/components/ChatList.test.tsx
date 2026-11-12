@@ -14,7 +14,6 @@ import { createRoot, type Root } from "react-dom/client";
 import { ChatList } from "./ChatList";
 import type { ConversationSummary } from "../state";
 import type { CatalogProfile } from "../types";
-import type { NotifyPermission } from "../useTaskNotifications";
 
 beforeAll(() => {
   (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT?: boolean })
@@ -73,9 +72,6 @@ interface ListProps {
   onOpen(convo: string, profile: string | null): void;
   onNew(): void;
   onOpenSettings?: () => void;
-  notifyEnabled: boolean;
-  notifyPermission: NotifyPermission;
-  onToggleNotify(): void;
 }
 
 const baseProps: ListProps = {
@@ -87,9 +83,6 @@ const baseProps: ListProps = {
   error: null,
   onOpen: () => {},
   onNew: () => {},
-  notifyEnabled: false,
-  notifyPermission: "default",
-  onToggleNotify: () => {},
 };
 
 // ─── harness ───────────────────────────────────────────────────────────────

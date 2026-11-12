@@ -52,7 +52,7 @@ import type {
   ModelInfo,
 } from "../state";
 import type { SubAgentRun } from "../types";
-import type { NotifyPermission } from "../useTaskNotifications";
+import type { TaskNotifications } from "../useTaskNotifications";
 
 // React 19's `flushSync` checks `IS_REACT_ACT_ENVIRONMENT`; set once so the
 // console stays clean, matching Transcript.test.tsx's setup.
@@ -81,9 +81,7 @@ interface TopBarFixtureProps {
   conversations: ConversationSummary[];
   send: (msg: InboundMessage) => void;
   onLoadConversation: (id: string) => void;
-  notifyEnabled: boolean;
-  notifyPermission: NotifyPermission;
-  onToggleNotify: () => void;
+  notify: TaskNotifications;
   // Focus mode (plan §6.3): not on TopBar's declared props yet — the
   // fixture carries them so the case-25 tests target the post-
   // implementation call site. `focusMode: true` is the shipped default
@@ -102,14 +100,18 @@ const baseProps: TopBarFixtureProps = {
   cwd: null,
   dirListing: null,
   conversations: [],
-  notifyPermission: "unsupported",
+  notify: {
+    enabled: false,
+    permission: "unsupported",
+    toggle: () => {},
+    sound: false,
+    toggleSound: () => {},
+  },
   isRunning: false,
   statusMessage: null,
   subAgent: null,
   send: () => {},
   onLoadConversation: () => {},
-  notifyEnabled: false,
-  onToggleNotify: () => {},
   focusMode: true,
   onToggleFocus: () => {},
   stopPending: false,
