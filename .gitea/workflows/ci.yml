@@ -19,6 +19,11 @@ jobs:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
       GITHUB_TOKEN: ${{ github.token }}
+      # The cloud crate depends on perma-crypto, a private git repo: a
+      # read-only token (repo secret, added by a human) authenticates the
+      # fetch; the git CLI is required for cargo's git deps.
+      PERMA_CRYPTO_TOKEN: ${{ secrets.PERMA_CRYPTO_TOKEN }}
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
     steps:
       - name: Checkout (no-node, pure git)
@@ -28,6 +33,11 @@ jobs:
             "https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git" \
             "$GITHUB_SHA"
           git checkout --detach FETCH_HEAD
+      - name: Allow fetching the private perma-crypto git dep
+        run: |
+          git config --global \
+            url."https://x-access-token:${PERMA_CRYPTO_TOKEN}@git.patchnotes.com/ai-bots/perma-crypto".insteadOf \
+            "https://git.patchnotes.com/ai-bots/perma-crypto"
       # Release-pipeline contract tests (Makefile targets + .gitea/workflows/
       # release.yml): fast, no docker builds — run before the cargo gate.
       # rust:1.95 lacks jq. The suite sets its own git identity in the
@@ -88,6 +98,11 @@ jobs:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
       GITHUB_TOKEN: ${{ github.token }}
+      # Same as the ci job: the workspace lock includes the private
+      # perma-crypto git dep of the cloud crate (also needed by the
+      # root-workspace mobile step below).
+      PERMA_CRYPTO_TOKEN: ${{ secrets.PERMA_CRYPTO_TOKEN }}
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
     steps:
       - name: Checkout (no-node, pure git)
@@ -97,6 +112,11 @@ jobs:
             "https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git" \
             "$GITHUB_SHA"
           git checkout --detach FETCH_HEAD
+      - name: Allow fetching the private perma-crypto git dep
+        run: |
+          git config --global \
+            url."https://x-access-token:${PERMA_CRYPTO_TOKEN}@git.patchnotes.com/ai-bots/perma-crypto".insteadOf \
+            "https://git.patchnotes.com/ai-bots/perma-crypto"
       - name: Install rustfmt + clippy
         run: rustup component add rustfmt clippy
       # Tauri 2 Linux prerequisites (same set as Dockerfile.desktop-linux).
@@ -159,6 +179,10 @@ jobs:
 
     env:
       GITHUB_TOKEN: ${{ github.token }}
+      # The workspace lock includes the private perma-crypto git dep of
+      # the cloud crate; cargo inside the container needs the token.
+      PERMA_CRYPTO_TOKEN: ${{ secrets.PERMA_CRYPTO_TOKEN }}
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
     steps:
       - name: Checkout (no-node, pure git)
@@ -183,9 +207,15 @@ jobs:
       # source is baked into the image.
       - name: cargo ndk check (Local edition, arm64-v8a)
         run: |
+          # The git insteadOf config must run INSIDE the container (the
+          # container has its own HOME), so it is part of the docker run
+          # rather than a separate step.
           docker run --rm \
             -v "$PWD":/work -w /work \
             -v pbm-cargo-reg:/opt/cargo/registry \
             -v pbm-cargo-target:/work/target \
+            -e CARGO_NET_GIT_FETCH_WITH_CLI=true \
+            -e PERMA_CRYPTO_TOKEN="$PERMA_CRYPTO_TOKEN" \
             localhost/peakbot-mobile-android:toolchain \
-            cargo ndk -t arm64-v8a check --locked -p peakbot --lib --no-default-features
+            sh -c 'git config --global url."https://x-access-token:${PERMA_CRYPTO_TOKEN}@git.patchnotes.com/ai-bots/perma-crypto".insteadOf "https://git.patchnotes.com/ai-bots/perma-crypto" \
+              && cargo ndk -t arm64-v8a check --locked -p peakbot --lib --no-default-features'
