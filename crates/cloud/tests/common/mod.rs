@@ -99,13 +99,14 @@ pub fn b64url32(b: &[u8; 32]) -> String {
     let mut out = String::with_capacity(43);
     for c in 0..43u32 {
         if c == 42 {
-            // Last char: only 4 data bits; the low 2 bits stay zero.
-            out.push(A[(b[31] >> 4) as usize] as char);
+            // Last char: the final 4 bits (low nibble of b[31]) shifted
+            // left 2; the unused low 2 bits stay zero (RFC 4648).
+            out.push(A[((b[31] & 0x0F) << 2) as usize] as char);
             break;
         }
         let bit = (c * 6) % 8;
         let byte = (c * 6) / 8;
-        let v = ((b[byte as usize] as u16) << 8 | b[byte as usize + 1] as u16) >> (8 - bit);
+        let v = ((b[byte as usize] as u16) << 8 | b[byte as usize + 1] as u16) >> (10 - bit);
         out.push(A[(v & 0x3F) as usize] as char);
     }
     out
@@ -122,9 +123,17 @@ pub fn link_head() -> Head {
     }
 }
 
+/// The relay origin as it appears in the link: percent-encoded per the
+/// spec §6.1 ABNF (`relay = 1*( unreserved / pct-encoded )`) — raw `:`
+/// and `/` are not unreserved, so a raw origin is a BadLink.
+pub fn encoded_relay() -> String {
+    LINK_RELAY.replace(':', "%3A").replace('/', "%2F")
+}
+
 pub fn good_link() -> String {
     format!(
-        "peakbot-cloud:v1?relay={LINK_RELAY}&dev={dev}&head=42:{h}&s={s}",
+        "peakbot-cloud:v1?relay={}&dev={dev}&head=42:{h}&s={s}",
+        encoded_relay(),
         dev = b64url32(&LINK_DEV),
         h = b64url32(&link_head().hash),
         s = b64url32(&LINK_SECRET),

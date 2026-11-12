@@ -132,10 +132,11 @@ fn display_is_two_rows_of_three_numbered_lowercase() {
     let rows: Vec<&str> = d.lines().collect();
     assert_eq!(rows.len(), 2);
     let words = w.words();
-    for (row, chunk) in rows.iter().zip([&words[0..3], &words[3..6]]) {
+    for (r, (row, chunk)) in rows.iter().zip([&words[0..3], &words[3..6]]).enumerate() {
         let mut pos = 0usize;
         for (n, word) in chunk.iter().enumerate() {
-            let num = (n + 1).to_string();
+            // spec §5.3: numbering runs 1..6 across both rows.
+            let num = (3 * r + n + 1).to_string();
             assert!(
                 row[pos..].starts_with(&format!("{num} ")),
                 "row {row:?} missing number {n}"

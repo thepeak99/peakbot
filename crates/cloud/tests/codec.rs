@@ -127,7 +127,7 @@ fn hello_tbs_layout_is_canonical() {
     let origin = "https://relay.example";
     let nonce = [0x5A; 32];
     let device = [0x01; 32];
-    let mut expected = origin.len().to_be_bytes().to_vec();
+    let mut expected = (origin.len() as u32).to_be_bytes().to_vec();
     expected.extend_from_slice(origin.as_bytes());
     expected.extend_from_slice(&nonce);
     expected.extend_from_slice(&device);

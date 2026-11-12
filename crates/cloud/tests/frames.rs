@@ -250,7 +250,7 @@ fn mux_stream_id_zero_reserved() {
 
 #[test]
 fn mux_non_increasing_stream_id_aborts() {
-    let mut m = Mux::new(Role::Responder);
+    let mut m = Mux::new(Role::Initiator);
     assert!(
         m.feed(&Inner {
             stream: 2,
@@ -278,7 +278,7 @@ fn mux_non_increasing_stream_id_aborts() {
 
 #[test]
 fn mux_chunk_on_attach_aborts() {
-    let mut m = Mux::new(Role::Responder);
+    let mut m = Mux::new(Role::Initiator);
     assert!(
         m.feed(&Inner {
             stream: 1,
@@ -297,7 +297,7 @@ fn mux_chunk_on_attach_aborts() {
 
 #[test]
 fn mux_head_on_attach_aborts() {
-    let mut m = Mux::new(Role::Responder);
+    let mut m = Mux::new(Role::Initiator);
     assert!(
         m.feed(&Inner {
             stream: 1,
@@ -320,7 +320,7 @@ fn mux_head_on_attach_aborts() {
 
 #[test]
 fn mux_frame_on_non_attach_aborts() {
-    let mut m = Mux::new(Role::Responder);
+    let mut m = Mux::new(Role::Initiator);
     assert!(
         m.feed(&Inner {
             stream: 1,
@@ -339,7 +339,7 @@ fn mux_frame_on_non_attach_aborts() {
 
 #[test]
 fn mux_chunk_over_max_chunk_aborts() {
-    let mut m = Mux::new(Role::Responder);
+    let mut m = Mux::new(Role::Initiator);
     assert!(
         m.feed(&Inner {
             stream: 1,
@@ -370,7 +370,7 @@ fn mux_message_for_never_opened_id_aborts() {
 
 #[test]
 fn mux_reset_ends_stream_both_directions() {
-    let mut m = Mux::new(Role::Responder);
+    let mut m = Mux::new(Role::Initiator);
     assert!(
         m.feed(&Inner {
             stream: 1,
@@ -401,30 +401,29 @@ fn mux_reset_ends_stream_both_directions() {
 #[test]
 fn mux_end_both_sides_closes_stream() {
     // Attach: each side ends its direction; the stream closes when both
-    // have sent End (S3). The responder side sees the initiator's End
-    // (event) and its own End (event) → Closed after the second.
-    let mut r = Mux::new(Role::Responder);
+    // have sent End (S3). The initiator's mux observes its own Open and
+    // both Ends (its own, then the peer's) → Closed on the second.
+    // (Verified from the initiator side: the responder mux rejects Open
+    // per S1, so it cannot track the stream from the Open alone.)
     let mut i = Mux::new(Role::Initiator);
     let open = Inner {
         stream: 1,
         msg: StreamMsg::Open(Op::Attach),
     };
     assert!(i.feed(&open).is_ok());
-    assert!(r.feed(&open).is_ok());
     let end = Inner {
         stream: 1,
         msg: StreamMsg::End,
     };
-    assert!(i.feed(&end).is_ok());
-    assert!(r.feed(&end).is_ok(), "first End does not close");
+    assert!(i.feed(&end).is_ok(), "own End: one direction, no close");
     // The peer's End arrives: both directions ended → Closed.
-    let events = r.feed(&end).expect("peer end");
+    let events = i.feed(&end).expect("peer end");
     assert!(events.contains(&MuxEvent::Closed(1)));
 }
 
 #[test]
 fn mux_max_64_streams_answers_reset_too_large() {
-    let mut m = Mux::new(Role::Responder);
+    let mut m = Mux::new(Role::Initiator);
     for id in 1..=64u32 {
         assert!(
             m.feed(&Inner {

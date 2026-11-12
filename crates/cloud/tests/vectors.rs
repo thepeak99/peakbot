@@ -176,13 +176,14 @@ fn vector_hs_a_to_b_transcript() {
     let b = card_b();
     let no_fetch = |_from: u64| Ok(Vec::new() as Vec<Vec<u8>>);
     let (mut i, hs1) =
-        Initiator::start(&c, a.device_id(), b.device_id(), &mut rng(0xA1)).expect("start");
+        Initiator::start(&c, a.device_id(), b.device_id(), keypair(1).private(), &mut rng(0xA1)).expect("start");
     let (mut r, hs2) = Responder::on_hs1(
         &c,
         b.device_id(),
         a.device_id(),
         &hs1,
         &no_fetch,
+        keypair(2).private(),
         &mut rng(0xB2),
     )
     .expect("on hs1");

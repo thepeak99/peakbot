@@ -6,10 +6,12 @@
 //! first byte is `UnknownVersion`.
 
 use perma_crypto::v1;
+use rand_core::CryptoRng;
 
-use crate::DeviceId;
-use crate::LetterId;
-use crate::Result;
+use crate::ce::push_str;
+use crate::constants;
+use crate::domain;
+use crate::{DeviceId, LetterId, Result, sign_tagged, verify_tagged};
 
 /// Device → relay messages (spec §10.1). Variant index = declaration
 /// order.
@@ -71,43 +73,75 @@ pub enum FromRelay {
 /// Encode a device→relay envelope: `u8(1) ‖ bincode_standard(msg)`
 /// (spec §10.1).
 pub fn encode_to_relay(msg: &ToRelay) -> Vec<u8> {
-    todo!()
+    let mut out = vec![constants::PROTOCOL_VERSION];
+    let body = bincode::encode_to_vec(msg, bincode::config::standard()).unwrap_or_default();
+    out.extend_from_slice(&body);
+    out
 }
 
 /// Decode a device→relay envelope. First byte ≠ 1 → `UnknownVersion`;
 /// decode limit violations → `Malformed`.
 pub fn decode_to_relay(bytes: &[u8]) -> Result<ToRelay> {
-    todo!()
+    let body = decode_envelope(bytes)?;
+    let (msg, _) = bincode::decode_from_slice(
+        body,
+        bincode::config::standard().with_limit::<{ constants::MAX_ENVELOPE_PIPE }>(),
+    )
+    .map_err(|_| crate::Error::Malformed)?;
+    Ok(msg)
 }
 
 /// Encode a relay→device envelope (spec §10.1).
 pub fn encode_from_relay(msg: &FromRelay) -> Vec<u8> {
-    todo!()
+    let mut out = vec![constants::PROTOCOL_VERSION];
+    let body = bincode::encode_to_vec(msg, bincode::config::standard()).unwrap_or_default();
+    out.extend_from_slice(&body);
+    out
 }
 
 /// Decode a relay→device envelope (spec §10.1).
 pub fn decode_from_relay(bytes: &[u8]) -> Result<FromRelay> {
-    todo!()
+    let body = decode_envelope(bytes)?;
+    let (msg, _) = bincode::decode_from_slice(
+        body,
+        bincode::config::standard().with_limit::<{ constants::MAX_ENVELOPE_CHAIN }>(),
+    )
+    .map_err(|_| crate::Error::Malformed)?;
+    Ok(msg)
+}
+
+/// Strip and check the version byte (spec §10.1, V1: exact match).
+fn decode_envelope(bytes: &[u8]) -> Result<&[u8]> {
+    let (first, rest) = bytes.split_first().ok_or(crate::Error::Malformed)?;
+    if *first != constants::PROTOCOL_VERSION {
+        return Err(crate::Error::UnknownVersion);
+    }
+    Ok(rest)
 }
 
 /// The Hello signing input (spec §10.2):
 /// `str(origin) ‖ fix[32](nonce) ‖ fix[32](device_id) ‖ u8(mode)` with
 /// `mode`: 0 = Hello, 1 = HelloPending.
 pub fn hello_tbs(origin: &str, nonce: [u8; 32], device_id: DeviceId, mode: u8) -> Vec<u8> {
-    todo!()
+    let mut out = Vec::with_capacity(4 + origin.len() + 32 + 32 + 1);
+    push_str(&mut out, origin);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&device_id);
+    out.push(mode);
+    out
 }
 
 /// Sign the Hello tbs with tag `pbc1 relay hello` (spec §10.2).
 /// `sign_with_rng` (A5) for reproducible vectors.
-pub fn sign_hello<R: rand_core::CryptoRng>(
+pub fn sign_hello<R: CryptoRng>(
     sk: &v1::PrivateKey,
     tbs: &[u8],
     rng: &mut R,
 ) -> Result<Vec<u8>> {
-    todo!()
+    sign_tagged(sk, domain::RELAY_HELLO, tbs, rng)
 }
 
 /// Verify a Hello signature under the card's key (spec §10.2).
 pub fn verify_hello(pk: &v1::PublicKey, tbs: &[u8], sig: &[u8]) -> Result<()> {
-    todo!()
+    verify_tagged(pk, domain::RELAY_HELLO, tbs, sig)
 }

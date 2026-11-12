@@ -23,6 +23,9 @@ bincode = { version = "=2.0.1", features = ["derive"] }
 perma-crypto = { git = "https://git.patchnotes.com/ai-bots/perma-crypto.git", rev = "bb917b548f75922a2a3c39f9797798546ba8bd26" }
 # Same major version perma-crypto depends on (rand 0.9 family).
 rand_core = "=0.9.5"
+# Unicode general categories for the card name rules N1 (Cc/Cf check,
+# spec §4.1). Pure embedded data, no I/O.
+unicode-properties = "0.1.4"
 thiserror = "=2.0.18"
 
 [dev-dependencies]

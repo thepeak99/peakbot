@@ -11,6 +11,8 @@
 //! re-derives words with a new head (spec §5.5 R2, the pure-API part of
 //! the ordering rule).
 
+use crate::ce::push_bytes;
+use crate::domain;
 use crate::Head;
 
 /// Six SAS words. Constructible only by `crate::sas::words` /
@@ -30,14 +32,26 @@ impl SasWords {
 
     /// The six words from the embedded BIP-39 English list.
     pub fn words(&self) -> [&'static str; 6] {
-        todo!()
+        let list = bip39_english();
+        [
+            list[self.indices[0] as usize],
+            list[self.indices[1] as usize],
+            list[self.indices[2] as usize],
+            list[self.indices[3] as usize],
+            list[self.indices[4] as usize],
+            list[self.indices[5] as usize],
+        ]
     }
 
     /// Display string: two rows of three, numbered, e.g.
     /// `1 word  2 word  3 word\n4 word  5 word  6 word` (spec §5.3).
     /// Both screens use identical formatting.
     pub fn display(&self) -> String {
-        todo!()
+        let w = self.words();
+        format!(
+            "1 {}  2 {}  3 {}\n4 {}  5 {}  6 {}",
+            w[0], w[1], w[2], w[3], w[4], w[5]
+        )
     }
 }
 
@@ -46,25 +60,38 @@ impl SasWords {
 /// `\n` is `2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda`
 /// (spec §5.3; asserted in tests).
 pub fn bip39_english() -> &'static [&'static str] {
-    todo!()
+    crate::bip39::BIP39_ENGLISH.as_slice()
 }
 
 /// The SAS digest `d` (spec §5.1):
 /// `sha3_256(u32(8) ‖ "pbc1 sas" ‖ u32(len(card)) ‖ card ‖ u64(h.seq) ‖ fix[32](h.hash))`.
 /// `card` is the exact CE card bytes.
 pub fn digest(card: &[u8], head: &Head) -> [u8; 32] {
-    todo!()
+    let mut m = Vec::with_capacity(4 + card.len() + 40);
+    push_bytes(&mut m, card);
+    m.extend_from_slice(&head.ce());
+    crate::h(domain::SAS, &m)
 }
 
 /// Six SAS words for a card and a head (spec §5.1–§5.3). 66-bit
 /// MSB-first extraction, BIP-39 mapping.
 pub fn words(card: &[u8], head: &Head) -> SasWords {
-    todo!()
+    words_from_digest(&digest(card, head))
 }
 
 /// Six SAS words directly from a digest (spec §5.2). Exposed so the bit
 /// extraction can be tested against edge digests (all-zero / all-0xFF,
 /// spec §15 `sas_edge`) without a full card.
 pub fn words_from_digest(d: &[u8; 32]) -> SasWords {
-    todo!()
+    // x72 = d[0..9] as big-endian; x = top 66 bits (d[0] bit 7 is MSB).
+    let mut x72 = 0u128;
+    for b in &d[..9] {
+        x72 = (x72 << 8) | u128::from(*b);
+    }
+    let x = x72 >> 6;
+    let mut indices = [0u16; 6];
+    for (i, slot) in indices.iter_mut().enumerate() {
+        *slot = ((x >> (55 - 11 * i as u32)) & 0x7FF) as u16;
+    }
+    SasWords { indices }
 }

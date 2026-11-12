@@ -28,7 +28,7 @@ fn full_handshake(fetch: &Fetch) -> (SessionKeys, SessionKeys) {
     let c = chain();
     let a = card_a();
     let b = card_b();
-    let (mut i, hs1) = Initiator::start(&c, a.device_id(), b.device_id(), &mut rng(0xA1))
+    let (mut i, hs1) = Initiator::start(&c, a.device_id(), b.device_id(), keypair(1).private(), &mut rng(0xA1))
         .expect("initiator starts");
     let (mut r, hs2) = Responder::on_hs1(
         &c,
@@ -36,7 +36,7 @@ fn full_handshake(fetch: &Fetch) -> (SessionKeys, SessionKeys) {
         a.device_id(),
         &hs1,
         &fetch,
-        &mut rng(0xB2),
+        keypair(2).private(), &mut rng(0xB2),
     )
     .expect("responder on hs1");
     let hs3 = i
@@ -65,7 +65,7 @@ fn hs1_tamper_r_field_aborts_misrouted() {
     let c = chain();
     let a = card_a();
     let b = card_b();
-    let (_i, hs1) = Initiator::start(&c, a.device_id(), b.device_id(), &mut rng(0xA1)).unwrap();
+    let (_i, hs1) = Initiator::start(&c, a.device_id(), b.device_id(), keypair(1).private(), &mut rng(0xA1)).unwrap();
     let mut t = hs1.clone();
     t.r[0] ^= 1; // r ≠ self
     let res = Responder::on_hs1(
@@ -74,7 +74,7 @@ fn hs1_tamper_r_field_aborts_misrouted() {
         a.device_id(),
         &t,
         &no_fetch(),
-        &mut rng(0xB2),
+        keypair(2).private(), &mut rng(0xB2),
     );
     assert_eq!(res.err(), Some(Error::Misrouted));
 }
@@ -84,7 +84,7 @@ fn hs1_tamper_i_field_aborts_misrouted() {
     let c = chain();
     let a = card_a();
     let b = card_b();
-    let (_i, hs1) = Initiator::start(&c, a.device_id(), b.device_id(), &mut rng(0xA1)).unwrap();
+    let (_i, hs1) = Initiator::start(&c, a.device_id(), b.device_id(), keypair(1).private(), &mut rng(0xA1)).unwrap();
     let mut t = hs1.clone();
     t.i[0] ^= 1; // i ≠ relay-supplied from
     let res = Responder::on_hs1(
@@ -93,7 +93,7 @@ fn hs1_tamper_i_field_aborts_misrouted() {
         a.device_id(),
         &t,
         &no_fetch(),
-        &mut rng(0xB2),
+        keypair(2).private(), &mut rng(0xB2),
     );
     assert_eq!(res.err(), Some(Error::Misrouted));
 }
@@ -115,7 +115,7 @@ fn hs1_i_equals_self_rejected() {
         b.device_id(),
         &hs1,
         &no_fetch(),
-        &mut rng(0xB2),
+        keypair(2).private(), &mut rng(0xB2),
     );
     assert_eq!(res.err(), Some(Error::Misrouted));
 }
@@ -126,7 +126,7 @@ fn hs1_tamper_head_aborts_trust() {
     let c = chain();
     let a = card_a();
     let b = card_b();
-    let (_i, hs1) = Initiator::start(&c, a.device_id(), b.device_id(), &mut rng(0xA1)).unwrap();
+    let (_i, hs1) = Initiator::start(&c, a.device_id(), b.device_id(), keypair(1).private(), &mut rng(0xA1)).unwrap();
     let mut t = hs1.clone();
     t.head = Head {
         seq: t.head.seq,
@@ -138,7 +138,7 @@ fn hs1_tamper_head_aborts_trust() {
         a.device_id(),
         &t,
         &no_fetch(),
-        &mut rng(0xB2),
+        keypair(2).private(), &mut rng(0xB2),
     );
     assert_eq!(res.err(), Some(Error::Trust));
 }
@@ -152,7 +152,7 @@ fn hs1_tamper_eph_pk_diverges_keys() {
     let c = chain();
     let a = card_a();
     let b = card_b();
-    let (mut i, hs1) = Initiator::start(&c, a.device_id(), b.device_id(), &mut rng(0xA1)).unwrap();
+    let (mut i, hs1) = Initiator::start(&c, a.device_id(), b.device_id(), keypair(1).private(), &mut rng(0xA1)).unwrap();
     let mut t = hs1.clone();
     t.eph_pk[100] ^= 1;
     let (mut r, hs2) = Responder::on_hs1(
@@ -161,7 +161,7 @@ fn hs1_tamper_eph_pk_diverges_keys() {
         a.device_id(),
         &t,
         &no_fetch(),
-        &mut rng(0xB2),
+        keypair(2).private(), &mut rng(0xB2),
     )
     .expect("responder accepts decodable pk");
     let hs3 = i
@@ -179,14 +179,14 @@ fn hs2_tamper_sig_r_aborts_bad_signature() {
     let c = chain();
     let a = card_a();
     let b = card_b();
-    let (mut i, hs1) = Initiator::start(&c, a.device_id(), b.device_id(), &mut rng(0xA1)).unwrap();
+    let (mut i, hs1) = Initiator::start(&c, a.device_id(), b.device_id(), keypair(1).private(), &mut rng(0xA1)).unwrap();
     let (_r, mut hs2) = Responder::on_hs1(
         &c,
         b.device_id(),
         a.device_id(),
         &hs1,
         &no_fetch(),
-        &mut rng(0xB2),
+        keypair(2).private(), &mut rng(0xB2),
     )
     .unwrap();
     hs2.sig_r[50] ^= 1;
@@ -200,14 +200,14 @@ fn hs2_tamper_head_aborts_trust() {
     let c = chain();
     let a = card_a();
     let b = card_b();
-    let (mut i, hs1) = Initiator::start(&c, a.device_id(), b.device_id(), &mut rng(0xA1)).unwrap();
+    let (mut i, hs1) = Initiator::start(&c, a.device_id(), b.device_id(), keypair(1).private(), &mut rng(0xA1)).unwrap();
     let (_r, mut hs2) = Responder::on_hs1(
         &c,
         b.device_id(),
         a.device_id(),
         &hs1,
         &no_fetch(),
-        &mut rng(0xB2),
+        keypair(2).private(), &mut rng(0xB2),
     )
     .unwrap();
     hs2.head = Head {
@@ -226,14 +226,14 @@ fn hs2_tamper_ct_diverges_keys() {
     let c = chain();
     let a = card_a();
     let b = card_b();
-    let (mut i, hs1) = Initiator::start(&c, a.device_id(), b.device_id(), &mut rng(0xA1)).unwrap();
+    let (mut i, hs1) = Initiator::start(&c, a.device_id(), b.device_id(), keypair(1).private(), &mut rng(0xA1)).unwrap();
     let (mut r, mut hs2) = Responder::on_hs1(
         &c,
         b.device_id(),
         a.device_id(),
         &hs1,
         &no_fetch(),
-        &mut rng(0xB2),
+        keypair(2).private(), &mut rng(0xB2),
     )
     .unwrap();
     hs2.ct[10] ^= 1;
@@ -252,14 +252,14 @@ fn hs3_tamper_sig_i_aborts_bad_signature() {
     let c = chain();
     let a = card_a();
     let b = card_b();
-    let (mut i, hs1) = Initiator::start(&c, a.device_id(), b.device_id(), &mut rng(0xA1)).unwrap();
+    let (mut i, hs1) = Initiator::start(&c, a.device_id(), b.device_id(), keypair(1).private(), &mut rng(0xA1)).unwrap();
     let (mut r, hs2) = Responder::on_hs1(
         &c,
         b.device_id(),
         a.device_id(),
         &hs1,
         &no_fetch(),
-        &mut rng(0xB2),
+        keypair(2).private(), &mut rng(0xB2),
     )
     .unwrap();
     let mut hs3 = i.on_hs2(b.device_id(), &hs2, &no_fetch()).expect("hs3");
@@ -289,7 +289,7 @@ fn inactive_i_aborts_not_active() {
         cdev.device_id(),
         &hs1,
         &no_fetch(),
-        &mut rng(0xB2),
+        keypair(2).private(), &mut rng(0xB2),
     );
     assert_eq!(res.err(), Some(Error::NotActive));
 }
@@ -338,7 +338,7 @@ fn revoked_peer_aborts_not_active() {
         a.device_id(),
         &hs1,
         &no_fetch(),
-        &mut rng(0xB2),
+        keypair(2).private(), &mut rng(0xB2),
     );
     assert_eq!(res.err(), Some(Error::NotActive));
 }
@@ -391,7 +391,7 @@ fn newer_peer_head_forces_sync() {
         Ok(vec![e1])
     };
     // Start the handshake from the stale chain; R presents the newer head.
-    let (mut i, hs1) = Initiator::start(&stale, a.device_id(), b.device_id(), &mut rng(0xA1))
+    let (mut i, hs1) = Initiator::start(&stale, a.device_id(), b.device_id(), keypair(1).private(), &mut rng(0xA1))
         .expect("start from stale");
     let (mut r, hs2) = Responder::on_hs1(
         &c,
@@ -399,7 +399,7 @@ fn newer_peer_head_forces_sync() {
         a.device_id(),
         &hs1,
         &fetch,
-        &mut rng(0xB2),
+        keypair(2).private(), &mut rng(0xB2),
     )
     .expect("responder on hs1");
     let hs3 = i
@@ -428,7 +428,7 @@ fn stale_head_without_relay_data_aborts_stale_chain() {
     .expect("stale chain");
     let a = card_a();
     let b = card_b();
-    let (mut i, hs1) = Initiator::start(&stale, a.device_id(), b.device_id(), &mut rng(0xA1))
+    let (mut i, hs1) = Initiator::start(&stale, a.device_id(), b.device_id(), keypair(1).private(), &mut rng(0xA1))
         .expect("start from stale");
     let (_r, hs2) = Responder::on_hs1(
         &c,
@@ -436,7 +436,7 @@ fn stale_head_without_relay_data_aborts_stale_chain() {
         a.device_id(),
         &hs1,
         &no_fetch(),
-        &mut rng(0xB2),
+        keypair(2).private(), &mut rng(0xB2),
     )
     .expect("responder on hs1");
     let res = i.on_hs2(b.device_id(), &hs2, &no_fetch());
@@ -455,14 +455,14 @@ fn replayed_hs1_cannot_complete_new_handshake() {
     let c = chain();
     let a = card_a();
     let b = card_b();
-    let (mut i, hs1) = Initiator::start(&c, a.device_id(), b.device_id(), &mut rng(0xA1)).unwrap();
+    let (mut i, hs1) = Initiator::start(&c, a.device_id(), b.device_id(), keypair(1).private(), &mut rng(0xA1)).unwrap();
     let (mut r, hs2_live) = Responder::on_hs1(
         &c,
         b.device_id(),
         a.device_id(),
         &hs1,
         &no_fetch(),
-        &mut rng(0xB2),
+        keypair(2).private(), &mut rng(0xB2),
     )
     .unwrap();
     let hs3 = i
@@ -472,14 +472,16 @@ fn replayed_hs1_cannot_complete_new_handshake() {
         .on_hs3(&c, a.device_id(), &hs3)
         .expect("live session established");
 
-    // Replay the same Hs1.
+    // Replay the same Hs1. A fresh attempt uses fresh KEM randomness
+    // (spec §8.6) — a distinct seed, since the same seed would
+    // deterministically reproduce the same ct (spec §15.1).
     let (mut r2, _hs2b) = Responder::on_hs1(
         &c,
         b.device_id(),
         a.device_id(),
         &hs1,
         &no_fetch(),
-        &mut rng(0xB2),
+        keypair(2).private(), &mut rng(0xB3),
     )
     .expect("R re-pends with fresh ct");
     // The old Hs3 must NOT verify against the new pending state.
@@ -494,7 +496,7 @@ fn pipe_msg_roundtrip_and_version() {
     let c = chain();
     let a = card_a();
     let b = card_b();
-    let (_i, hs1) = Initiator::start(&c, a.device_id(), b.device_id(), &mut rng(0xA1)).unwrap();
+    let (_i, hs1) = Initiator::start(&c, a.device_id(), b.device_id(), keypair(1).private(), &mut rng(0xA1)).unwrap();
     let m = cloud::handshake::PipeMsg::Hs1(hs1.clone());
     let bytes = m.encode();
     let parsed = cloud::handshake::PipeMsg::parse(&bytes).expect("roundtrip");
@@ -506,7 +508,7 @@ fn pipe_msg_unknown_version_rejected() {
     let c = chain();
     let a = card_a();
     let b = card_b();
-    let (_i, hs1) = Initiator::start(&c, a.device_id(), b.device_id(), &mut rng(0xA1)).unwrap();
+    let (_i, hs1) = Initiator::start(&c, a.device_id(), b.device_id(), keypair(1).private(), &mut rng(0xA1)).unwrap();
     let mut bytes = cloud::handshake::PipeMsg::Hs1(hs1).encode();
     bytes[0] = 2; // version 2
     assert_eq!(
@@ -520,7 +522,7 @@ fn pipe_msg_trailing_byte_rejected() {
     let c = chain();
     let a = card_a();
     let b = card_b();
-    let (_i, hs1) = Initiator::start(&c, a.device_id(), b.device_id(), &mut rng(0xA1)).unwrap();
+    let (_i, hs1) = Initiator::start(&c, a.device_id(), b.device_id(), keypair(1).private(), &mut rng(0xA1)).unwrap();
     let mut bytes = cloud::handshake::PipeMsg::Hs1(hs1).encode();
     bytes.push(0x00);
     assert_eq!(

@@ -274,7 +274,9 @@ fn future_skew_301s_rejected() {
 fn to_mismatch_rejected() {
     let chain = chain_ab();
     let (sealed, lid, from) = enroll_request(3, 1, [0xEE; 16], NOW, None);
-    // Deliver to B, but the letter says to A.
+    // Deliver to B, but the letter says to A. The seal AAD binds `to`
+    // (spec §7.3), so the open in step 2 fails before the step-4 id
+    // check (spec wins over the original IdMismatch expectation).
     let mut seen = ReplaySet::new();
     assert_eq!(
         check(
@@ -287,7 +289,7 @@ fn to_mismatch_rejected() {
             &chain,
             &mut seen
         ),
-        Err(Error::IdMismatch)
+        Err(Error::DecryptionError)
     );
 }
 
@@ -295,6 +297,8 @@ fn to_mismatch_rejected() {
 fn letter_id_mismatch_rejected() {
     let chain = chain_ab();
     let (sealed, _lid, from) = enroll_request(3, 1, [0xEE; 16], NOW, None);
+    // The AAD binds the relay letter_id (spec §7.3): a mismatched relay
+    // field fails at the step-2 open, before the step-4 id check.
     let mut seen = ReplaySet::new();
     assert_eq!(
         check(
@@ -307,7 +311,7 @@ fn letter_id_mismatch_rejected() {
             &chain,
             &mut seen
         ),
-        Err(Error::IdMismatch)
+        Err(Error::DecryptionError)
     );
 }
 
@@ -315,6 +319,8 @@ fn letter_id_mismatch_rejected() {
 fn from_mismatch_rejected() {
     let chain = chain_ab();
     let (sealed, lid, _from) = enroll_request(3, 1, [0xEE; 16], NOW, None);
+    // The AAD binds the relay from (spec §7.3): a mismatched relay field
+    // fails at the step-2 open, before the step-4 id check.
     let mut seen = ReplaySet::new();
     assert_eq!(
         check(
@@ -327,7 +333,7 @@ fn from_mismatch_rejected() {
             &chain,
             &mut seen
         ),
-        Err(Error::IdMismatch)
+        Err(Error::DecryptionError)
     );
 }
 
@@ -493,13 +499,14 @@ fn enroll_reject_from_inactive_sender_rejected() {
     // C is not active; a reject must come from an active device.
     let (sealed, lid, from) = enroll_reject(3, 1, [0xDD; 16], NOW);
     let mut seen = ReplaySet::new();
+    // Recipient must be Pending for a Reject (§7.1; step 3 precedes step 7).
     assert_eq!(
         check(
             sealed,
             from,
             lid,
             1,
-            RecipientState::Active,
+            RecipientState::Pending,
             NOW,
             &chain,
             &mut seen

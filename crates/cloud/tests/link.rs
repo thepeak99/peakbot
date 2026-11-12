@@ -83,12 +83,12 @@ fn rejects_case_sensitive_scheme() {
 
 #[test]
 fn rejects_non_canonical_b64() {
-    // LINK_SECRET = 0x22×32 → canonical last char 'C' (0x22 >> 4 = 2).
-    // 'B' (value 1) has the low 2 bits set → non-canonical.
+    // LINK_SECRET = 0x22×32 → canonical last char 'I' ((0x22 & 0xF) << 2 = 8).
+    // 'J' (value 9) has the low 2 bits set → non-canonical.
     let s = good_link();
     let enc = b64url32(&LINK_SECRET);
-    assert!(enc.ends_with('C'));
-    let s = s.replacen(&enc, &format!("{}B", &enc[..enc.len() - 1]), 1);
+    assert!(enc.ends_with('I'));
+    let s = s.replacen(&enc, &format!("{}J", &enc[..enc.len() - 1]), 1);
     assert_eq!(Link::parse(&s), Err(Error::BadLink));
 }
 
@@ -112,7 +112,7 @@ fn rejects_seq_zero_is_allowed() {
     h.seq = 0;
     let s = format!(
         "peakbot-cloud:v1?relay={}&dev={}&head=0:{}&s={}",
-        LINK_RELAY,
+        encoded_relay(),
         b64url32(&LINK_DEV),
         b64url32(&h.hash),
         b64url32(&LINK_SECRET),
