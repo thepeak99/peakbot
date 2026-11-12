@@ -1034,4 +1034,23 @@ mod tests {
             "an unknown convo id never leaves the boot cwd"
         );
     }
+
+    // The server's own pairing links put the token in the query RAW
+    // (`set_query`, no form-encoding). `require_token` must keep accepting
+    // that raw spelling after it learns to percent-decode (token decode
+    // fix), so pin it here: URL-safe and literal-`+` tokens stay verbatim.
+    #[test]
+    fn entry_link_carries_a_url_safe_token_verbatim() {
+        let link = entry_link("host.local", 7823, "AbC-123_xyz.~", "sha256:ab:cd");
+        assert_eq!(
+            link,
+            "https://host.local:7823/?token=AbC-123_xyz.~&ca=sha256:ab:cd"
+        );
+    }
+
+    #[test]
+    fn entry_link_leaves_a_literal_plus_in_the_token_raw() {
+        let link = entry_link("host.local", 443, "ab+cd", "sha256:ff");
+        assert_eq!(link, "https://host.local/?token=ab+cd&ca=sha256:ff");
+    }
 }
