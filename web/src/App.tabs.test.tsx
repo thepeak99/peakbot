@@ -23,7 +23,8 @@
 //
 // Finding things in the DOM (deliberately via public, user-visible hooks):
 //   - conversation tabs : `nav[aria-label="Conversations"] [role="tab"]`
-//                         (the right-hand drawer also uses role="tab")
+//                         (at desktop width the right-hand drawer also uses
+//                         role="tab"; matchMedia mocks min-width:1024px true)
 //   - close tab         : button[aria-label="Close tab"] inside a tab
 //   - composers         : every <textarea>; a composer is "visible" iff no
 //                         ancestor carries the `hidden` attribute
@@ -67,6 +68,7 @@ interface FakeAgent {
   activeAlias: string;
   conversations: unknown[];
   conversationsError: string | null;
+  machines: { id: string; online: boolean }[];
   commands: unknown[];
   dirListing: null;
   recentDirs: string[];
@@ -115,6 +117,7 @@ function makeAgent(convo: string | null): FakeAgent {
     activeAlias: "",
     conversations: [],
     conversationsError: null,
+    machines: [],
     commands: [],
     dirListing: null,
     recentDirs: [],
@@ -157,9 +160,12 @@ let originalMatchMedia: typeof window.matchMedia | undefined;
 
 beforeEach(() => {
   originalMatchMedia = window.matchMedia;
+  // Desktop width: per-tab composers are a desktop feature, and below
+  // 1024px the drawer's role="tab" handles are replaced by the Panels sheet.
+  // Only the width query matches; `(pointer: coarse)` stays false.
   window.matchMedia = ((media: string) =>
     ({
-      matches: false,
+      matches: media.includes("min-width: 1024px"),
       media,
       onchange: null,
       addListener: () => {},

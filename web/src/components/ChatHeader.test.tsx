@@ -1,5 +1,7 @@
 // Tests for `components/ChatHeader.tsx` — the mobile Conversation header
-// (design §4.2, H1–H6).
+// (design §4.2, H1–H6; mobile-redesign design §2.5/§2.7: the subtitle IS the
+// selection chip, `chat-machine` prefixes remote chats, the working state is
+// a spinner with sr-only text, and `panels` adds the Panels button).
 //
 // Harness modeled on BottomBar.test.tsx (raw createRoot + act,
 // querySelector). No shell marker is needed: the header is a plain presentational
@@ -12,32 +14,38 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { ChatHeader } from "./ChatHeader";
-import type { TabColor } from "../state";
+import type { ReactNode } from "react";
+import type { PanelsButtonProps } from "./PanelsSheet";
 
 beforeAll(() => {
   (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT?: boolean })
     .IS_REACT_ACT_ENVIRONMENT = true;
 });
 
-// Mirrors design §4.2, so overrides like `profile: null` type-check.
+// Mirrors the mobile-redesign ChatHeader props (design §2.5).
 interface HeaderProps {
   title: string;
-  profile: string | null;
-  profileColor?: TabColor;
-  model: string;
+  machine: string | null;
+  selector: ReactNode;
   badge: boolean;
   onBack(): void;
   connected: boolean;
   isRunning: boolean;
   focusMode: boolean;
   onToggleFocus(): void;
+  panels?: PanelsButtonProps;
 }
+
+const SELECTOR = (
+  <button type="button" data-testid="selection-chip">
+    home › team › sonnet
+  </button>
+);
 
 const baseProps: HeaderProps = {
   title: "Fix the WS relay",
-  profile: "home",
-  profileColor: "teal",
-  model: "sonnet",
+  machine: null,
+  selector: SELECTOR,
   badge: false,
   onBack: () => {},
   connected: true,
@@ -74,14 +82,6 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-// The design names no selector for the colour dot; the repo's established
-// idiom (ConversationsPicker) is a span whose inline style carries
-// `var(--profile-<color>)`, so that is the closest reading.
-const hasColorDot = (el: HTMLElement, color: string): boolean =>
-  [...el.querySelectorAll<HTMLElement>("*")].some((n) =>
-    (n.getAttribute("style") ?? "").includes(`var(--profile-${color})`),
-  );
-
 describe("ChatHeader — H1–H6", () => {
   it("H1: the back button is labelled 'Back to chats', reads 'Chats', calls onBack once", async () => {
     const onBack = vi.fn();
@@ -105,23 +105,37 @@ describe("ChatHeader — H1–H6", () => {
     expect(el.querySelector('[data-testid="chat-back-badge"]')).not.toBeNull();
   });
 
-  it("H3: title (truncate) and subtitle; a null profile drops the profile", async () => {
-    let el = await render({ title: "Fix the WS relay", profile: "home", model: "sonnet" });
+  it("H3: the title truncates and the subtitle hosts the selector node", async () => {
+    const el = await render({ title: "Fix the WS relay" });
     const title = el.querySelector('[data-testid="chat-title"]');
     expect(title!.textContent).toBe("Fix the WS relay");
     expect(title!.classList.contains("truncate")).toBe(true);
-    expect(el.querySelector('[data-testid="chat-subtitle"]')!.textContent).toBe("home · sonnet");
-
-    el = await render({ profile: null, model: "sonnet" });
-    expect(el.querySelector('[data-testid="chat-subtitle"]')!.textContent).toBe("sonnet");
+    const subtitle = el.querySelector('[data-testid="chat-subtitle"]')!;
+    expect(
+      subtitle.querySelector('[data-testid="selection-chip"]'),
+      "the selector (the chip) lives inside the subtitle",
+    ).not.toBeNull();
+    expect(subtitle.textContent).toContain("home › team › sonnet");
   });
 
-  it("H3: the colour dot is present iff profileColor", async () => {
-    let el = await render({ profileColor: "teal" });
-    expect(hasColorDot(el, "teal")).toBe(true);
+  it("H3: the machine prefix renders iff machine is set", async () => {
+    let el = await render({ machine: null });
+    expect(el.querySelector('[data-testid="chat-machine"]'), "no prefix for a local chat").toBeNull();
 
-    el = await render({ profileColor: undefined });
-    expect(hasColorDot(el, "teal")).toBe(false);
+    el = await render({ machine: "home-server.local:7823" });
+    const prefix = el.querySelector('[data-testid="chat-machine"]');
+    expect(prefix, "a remote chat shows the machine").not.toBeNull();
+    expect(prefix!.textContent).toBe("home-server.local:7823 ·");
+    expect(
+      el.querySelector('[data-testid="chat-subtitle"]')!.contains(prefix!),
+      "the prefix is part of the subtitle",
+    ).toBe(true);
+  });
+
+  it("H3: an empty selector renders no chip and no crash (before the first state)", async () => {
+    const el = await render({ selector: null });
+    expect(el.querySelector('[data-testid="chat-subtitle"]')).not.toBeNull();
+    expect(el.querySelector('[data-testid="selection-chip"]')).toBeNull();
   });
 
   it("H4: state is offline (wins), then working, then connected", async () => {
@@ -132,7 +146,14 @@ describe("ChatHeader — H1–H6", () => {
     el = await render({ connected: true, isRunning: true });
     state = el.querySelector('[data-testid="chat-state"]');
     expect(state!.getAttribute("data-state")).toBe("working");
+    // The word moved to the inline status line: here it is a spinner with
+    // sr-only text, so the label stays for assistive tech.
     expect(state!.textContent).toContain("working…");
+    expect(
+      state!.querySelector(".sr-only")?.textContent,
+      "the working text is sr-only (no visible word in the header)",
+    ).toContain("working…");
+    expect(state!.querySelector(".animate-spin"), "the spinner renders").not.toBeNull();
 
     el = await render({ connected: true, isRunning: false });
     state = el.querySelector('[data-testid="chat-state"]');
@@ -156,16 +177,29 @@ describe("ChatHeader — H1–H6", () => {
     expect(focus!.getAttribute("aria-pressed")).toBe("true");
   });
 
-  it("H6: the header keeps min-h-14 + the top safe-area inset; no gear, no pickers", async () => {
-    const el = await render();
+  it("H6: the header keeps min-h-14 + the top safe-area inset; no gear; a panels button iff panels", async () => {
+    let el = await render();
     const header = el.querySelector("header");
     expect(header, "a header element must render").not.toBeNull();
     expect(header!.classList.contains("min-h-14")).toBe(true);
     expect(header!.className).toContain("pt-[env(safe-area-inset-top)]");
     expect(el.querySelector('button[aria-label="Settings"]'), "no gear").toBeNull();
-    expect(
-      el.querySelector('button[title="Load a saved conversation"]'),
-      "no pickers",
-    ).toBeNull();
+    expect(el.querySelector('[data-testid="panels-button"]'), "no panels button without `panels`").toBeNull();
+
+    const onOpen = vi.fn();
+    el = await render({ panels: { count: 2, onOpen } });
+    const btn = el.querySelector<HTMLButtonElement>('[data-testid="panels-button"]');
+    expect(btn, "the panels button renders with `panels`").not.toBeNull();
+    expect(el.querySelector('[data-testid="panels-badge"]')!.textContent).toBe("2");
+    await act(async () => {
+      btn!.click();
+    });
+    expect(onOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it("the panels button hides its badge at 0 but stays", async () => {
+    const el = await render({ panels: { count: 0, onOpen: () => {} } });
+    expect(el.querySelector('[data-testid="panels-button"]')).not.toBeNull();
+    expect(el.querySelector('[data-testid="panels-badge"]')).toBeNull();
   });
 });

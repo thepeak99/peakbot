@@ -1,9 +1,9 @@
 // Tests for `components/BottomBar.tsx` — mobile layout contract.
 //
-// Two contracts in one file:
-//  1. Rail clearance (mobile): the fixed right-hand TabbedDrawer rail (40px
-//     handles) overlaps the bottom bar on phones, so the <footer> carries
-//     `pr-12` so its pickers never sit under the rail.
+// Contracts in this file:
+//  1. Rail clearance (desktop only): the fixed right-hand TabbedDrawer rail
+//     (40px handles) exists from lg up, so the <footer> carries `lg:pr-12` —
+//     never a bare `pr-12`, because phones have no rail (mobile redesign).
 //  2. Overflow (T34b): at ≤800 px the chips must not overflow the bar
 //     horizontally — they wrap to a second row instead. The selection chip
 //     (profile, agent, team models) replaced the separate model chip and the
@@ -17,6 +17,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { BottomBar } from "./BottomBar";
 import type { ConversationSummary, InboundMessage, ModelInfo } from "../state";
+import { setBootEdition } from "../desktop";
 import type { CatalogProfile, Selection } from "../types";
 
 beforeAll(() => {
@@ -46,7 +47,7 @@ const CATALOG: CatalogProfile[] = [
   {
     name: "dev",
     origin: "global",
-    overridesGlobal: false,
+    overridesGlobal: false, machine: null,
     agents: [{ name: "main", model: "sonnet", subagents: [] }],
   },
 ];
@@ -104,18 +105,20 @@ afterEach(() => {
   }
 });
 
-describe("BottomBar — rail clearance (mobile)", () => {
-  it("footer has the pr-12 right clearance class", async () => {
+describe("BottomBar — rail clearance (desktop only)", () => {
+  it("footer has the lg:pr-12 right clearance class and no bare pr-12", async () => {
     const el = await mount(null);
     const footer = el.querySelector("footer")!;
     expect(footer).not.toBeNull();
-    expect(footer.classList.contains("pr-12")).toBe(true);
+    expect(footer.classList.contains("lg:pr-12")).toBe(true);
+    expect(footer.classList.contains("pr-12"), "phones have no rail").toBe(false);
   });
 
-  it("footer keeps pr-12 when the cwd picker is shown too", async () => {
+  it("footer keeps lg:pr-12 when the cwd picker is shown too", async () => {
     const el = await mount("/tmp/project");
     const footer = el.querySelector("footer")!;
-    expect(footer.classList.contains("pr-12")).toBe(true);
+    expect(footer.classList.contains("lg:pr-12")).toBe(true);
+    expect(footer.classList.contains("pr-12")).toBe(false);
   });
 
   it("footer stays mobile-only (lg:hidden) — regression", async () => {
@@ -158,23 +161,105 @@ describe("bottom bar mobile overflow (T34b)", () => {
   });
 });
 
-// The mobile Chats home shell (design §2 / A8): `mobileChats` drops the
-// ConversationsPicker (the Chats list replaces it) and the `lg:hidden` gate
-// (the shell renders no TopBar, so tablets keep the bar). Default false.
+// The mobile Chats home shell (design §2 / A8; mobile redesign B1–B3):
+// `mobileChats` drops the ConversationsPicker (the Chats list replaces it),
+// the SelectionChip (the chat header's subtitle owns it) and the `lg:hidden`
+// gate. The bar renders NOTHING unless the CwdPicker does — a remote chat in
+// the Local edition still needs it (#442, Z7). Default false.
 describe("BottomBar — mobileChats (the Chats home shell)", () => {
-  it("mobileChats=true drops the ConversationsPicker and the lg:hidden gate", async () => {
-    const el = await mount(null, true);
+  afterEach(() => {
+    setBootEdition(undefined);
+  });
+
+  const REMOTE_CATALOG: CatalogProfile[] = [
+    { name: "dev", origin: "global", overridesGlobal: false, machine: null, agents: [] },
+    {
+      name: "dev on home",
+      origin: "remote",
+      overridesGlobal: false,
+      machine: "https://home.local:7823",
+      agents: [],
+    },
+  ];
+
+  async function mountShell(opts: {
+    cwd: string | null;
+    catalog?: CatalogProfile[];
+    selection?: Selection | null;
+  }): Promise<HTMLDivElement> {
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    await act(async () => {
+      root = createRoot(container!);
+      root.render(
+        <BottomBar
+          conversations={CONVERSATIONS}
+          conversationsError={null}
+          models={MODELS}
+          activeAlias="sonnet"
+          hasTranscript={true}
+          cwd={opts.cwd}
+          dirListing={null}
+          recentDirs={[]}
+          send={vi.fn((m: InboundMessage) => void m)}
+          onLoadConversation={vi.fn()}
+          catalog={opts.catalog ?? CATALOG}
+          selection={opts.selection === undefined ? SELECTION : opts.selection}
+          selectionLocked={true}
+          profilePinned={false}
+          onToast={vi.fn()}
+          mobileChats={true}
+        />,
+      );
+    });
+    return container;
+  }
+
+  it("B1: mobileChats=true drops the picker, the chip and the lg:hidden gate", async () => {
+    // A cwd keeps the bar alive so its content can be inspected (browser edition).
+    const el = await mountShell({ cwd: "/work/repo" });
     expect(el.querySelector('[data-testid="bottom-bar"]')).not.toBeNull();
     expect(
       el.querySelector('button[title="Load a saved conversation"]'),
       "no ConversationsPicker in the Chats shell",
     ).toBeNull();
+    expect(
+      el.querySelector('[data-testid="selection-chip"]'),
+      "the chip moved to the chat header",
+    ).toBeNull();
     expect(el.querySelector("footer")!.classList.contains("lg:hidden")).toBe(false);
+    expect(el.querySelector('button[title="/work/repo"]'), "the cwd picker stays").not.toBeNull();
   });
 
-  it("mobileChats defaults to false: the picker and lg:hidden stay", async () => {
+  it("B2: with nothing to show (Local edition, local chat) the bar renders null", async () => {
+    setBootEdition("local");
+    const el = await mountShell({ cwd: "/work/repo" });
+    expect(el.querySelector("footer"), "no empty bar").toBeNull();
+    expect(el.querySelector('[data-testid="bottom-bar"]')).toBeNull();
+    expect(el.innerHTML, "nothing rendered at all").toBe("");
+  });
+
+  it("B2: no cwd at all in the shell also renders null", async () => {
+    const el = await mountShell({ cwd: null });
+    expect(el.querySelector('[data-testid="bottom-bar"]')).toBeNull();
+  });
+
+  it("B3: a remote chat in the Local edition still renders the CwdPicker", async () => {
+    setBootEdition("local");
+    const el = await mountShell({
+      cwd: "/srv/remote-project",
+      catalog: REMOTE_CATALOG,
+      selection: { profile: "dev on home", agent: "main", subagentModels: {} },
+    });
+    expect(el.querySelector('[data-testid="bottom-bar"]'), "the bar survives for the cwd").not.toBeNull();
+    expect(el.querySelector('button[title="/srv/remote-project"]'), "the remote CwdPicker").not.toBeNull();
+    expect(el.querySelector('[data-testid="selection-chip"]'), "still no chip").toBeNull();
+  });
+
+  it("mobileChats defaults to false: the picker, the chip and lg:hidden stay", async () => {
     const el = await mount(null);
     expect(el.querySelector('button[title="Load a saved conversation"]')).not.toBeNull();
+    expect(el.querySelector('[data-testid="selection-chip"]'), "the chip renders in a browser").not.toBeNull();
     expect(el.querySelector("footer")!.classList.contains("lg:hidden")).toBe(true);
   });
 });

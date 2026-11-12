@@ -6,24 +6,37 @@
 // local instant, `row(id, over)` is a `ConversationSummary` with sane
 // defaults.
 //
-// RED before implementation: `./chatList` does not exist yet, so this file
-// fails at import — the right reason (feature absent).
+// RED before implementation: the machine helpers (`deriveMachines`,
+// `machineOf`, `machineName`, `resolveFilter`, `filterByMachine`,
+// `ALL_MACHINES`, `LOCAL_MACHINE_NAME`) are not exported yet, so the P1 tests
+// fail with "is not a function" — the right reason (feature absent). The
+// pre-existing groupChats/filterChats/... tests above must stay green.
 
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import {
+  ALL_MACHINES,
+  LOCAL_MACHINE_NAME,
   NO_ACTIVITY,
   backBadge,
+  deriveMachines,
+  filterByMachine,
   filterChats,
   foldActivity,
   groupChats,
+  machineName,
+  machineOf,
   metaLine,
   relativeTime,
+  resolveFilter,
   type Activity,
   type ChatRow,
   type ChatSection,
+  type Machine,
+  type MachineFilter,
   type Range,
 } from "./chatList";
-import type { ConversationSummary } from "./state";
+import type { ConversationSummary, WireMachineStatus } from "./state";
+import type { CatalogProfile } from "./types";
 
 // ─── fixtures (design §3 convention) ──────────────────────────────────────
 
@@ -303,5 +316,196 @@ describe("NO_ACTIVITY", () => {
   it("is an empty running/unread activity", () => {
     expect(NO_ACTIVITY.running.size).toBe(0);
     expect(NO_ACTIVITY.unread.size).toBe(0);
+  });
+});
+
+// ─── P1: machine derivation + filter (mobile-redesign design §2.4) ────────
+//
+// A "machine" is this device (id `null`) or one remote origin. The helpers
+// are pure: derived from the catalog (profile → machine) and the optional
+// `machines` statuses of the last `conversations_list`.
+
+const HS = "https://home-server.local:7823";
+const WB = "https://10.0.0.5:7823";
+
+const prof = (name: string, machine: string | null): CatalogProfile => ({
+  name,
+  origin: machine === null ? "global" : "remote",
+  overridesGlobal: false,
+  machine,
+  agents: [],
+});
+
+const CAT: CatalogProfile[] = [
+  prof("dev", null),
+  prof("home-dev", HS),
+  prof("media", HS),
+  prof("work", WB),
+];
+
+describe("machineOf", () => {
+  it("returns the catalog entry's machine for a local and a remote profile", () => {
+    expect(machineOf(CAT, "dev")).toBeNull();
+    expect(machineOf(CAT, "home-dev")).toBe(HS);
+    expect(machineOf(CAT, "work")).toBe(WB);
+  });
+
+  it("a null profile (legacy row) is local", () => {
+    expect(machineOf(CAT, null)).toBeNull();
+  });
+
+  it("an unknown profile is local", () => {
+    expect(machineOf(CAT, "nope")).toBeNull();
+  });
+
+  it("an empty catalog makes everything local", () => {
+    expect(machineOf([], "home-dev")).toBeNull();
+  });
+});
+
+describe("machineName", () => {
+  it("null is 'This device' (LOCAL_MACHINE_NAME)", () => {
+    expect(LOCAL_MACHINE_NAME).toBe("This device");
+    expect(machineName(null)).toBe("This device");
+  });
+
+  it("a remote origin is its host, keeping a non-default port", () => {
+    expect(machineName("https://h:7823")).toBe("h:7823");
+    expect(machineName("https://10.0.0.5:7823")).toBe("10.0.0.5:7823");
+  });
+
+  it("a default-port origin is the bare host", () => {
+    expect(machineName("https://h")).toBe("h");
+    expect(machineName("https://bot.example.ts.net")).toBe("bot.example.ts.net");
+  });
+
+  it("two servers on one host stay distinct by port", () => {
+    expect(machineName("https://h:7823")).not.toBe(machineName("https://h:7824"));
+  });
+});
+
+describe("deriveMachines", () => {
+  const st = (id: string, online: boolean): WireMachineStatus => ({ id, online });
+  const ids = (m: Machine[]): (string | null)[] => m.map((x) => x.id);
+
+  it("local first, then remotes in first-catalog-appearance order", () => {
+    const got = deriveMachines(CAT, []);
+    expect(ids(got)).toEqual([null, HS, WB]);
+  });
+
+  it("groups profiles by origin: one machine per distinct origin, profiles in catalog order", () => {
+    const got = deriveMachines(CAT, []);
+    expect(got.find((m) => m.id === HS)!.profiles).toEqual(["home-dev", "media"]);
+    expect(got.find((m) => m.id === WB)!.profiles).toEqual(["work"]);
+    expect(got.find((m) => m.id === null)!.profiles).toEqual(["dev"]);
+  });
+
+  it("names come from machineName", () => {
+    const got = deriveMachines(CAT, []);
+    expect(got.map((m) => m.name)).toEqual(["This device", "home-server.local:7823", "10.0.0.5:7823"]);
+  });
+
+  it("no local entry when the catalog has no local profile", () => {
+    const remoteOnly = [prof("a", HS), prof("b", WB)];
+    expect(ids(deriveMachines(remoteOnly, []))).toEqual([HS, WB]);
+  });
+
+  it("local is always online; a remote follows its status", () => {
+    const got = deriveMachines(CAT, [st(HS, true), st(WB, false)]);
+    expect(got.find((m) => m.id === null)!.online).toBe(true);
+    expect(got.find((m) => m.id === HS)!.online).toBe(true);
+    expect(got.find((m) => m.id === WB)!.online).toBe(false);
+  });
+
+  it("a remote with no status is online (unknown is not offline)", () => {
+    const got = deriveMachines(CAT, [st(WB, false)]);
+    expect(got.find((m) => m.id === HS)!.online).toBe(true);
+  });
+
+  it("a status for an origin the catalog does not carry is ignored", () => {
+    const got = deriveMachines(CAT, [st("https://ghost:1", false)]);
+    expect(ids(got)).toEqual([null, HS, WB]);
+  });
+
+  it("an empty catalog derives no machines", () => {
+    expect(deriveMachines([], [st(HS, true)])).toEqual([]);
+  });
+
+  it("a catalog of local profiles only is one machine", () => {
+    expect(ids(deriveMachines([prof("a", null), prof("b", null)], []))).toEqual([null]);
+  });
+
+  it("every machine has a non-empty profile list", () => {
+    for (const m of deriveMachines(CAT, [])) expect(m.profiles.length).toBeGreaterThan(0);
+  });
+});
+
+describe("resolveFilter", () => {
+  // Lazy: a describe-body call would fail the whole FILE at collection while
+  // `deriveMachines` is absent, hiding the pre-existing tests above.
+  let machines: Machine[] = [];
+  beforeEach(() => {
+    machines = deriveMachines(CAT, []);
+  });
+  const one = (id: string | null): MachineFilter => ({ kind: "one", id });
+
+  it("a valid selection passes through", () => {
+    expect(resolveFilter(one(HS), machines)).toEqual(one(HS));
+    expect(resolveFilter(one(null), machines)).toEqual(one(null));
+  });
+
+  it("All stays All", () => {
+    expect(resolveFilter(ALL_MACHINES, machines)).toEqual({ kind: "all" });
+  });
+
+  it("a stale id (machine no longer exists) resolves to All", () => {
+    expect(resolveFilter(one("https://gone:1"), machines)).toEqual({ kind: "all" });
+  });
+
+  it("fewer than 2 machines resolves to All even for a valid id", () => {
+    const single = deriveMachines([prof("a", null)], []);
+    expect(resolveFilter(one(null), single)).toEqual({ kind: "all" });
+    expect(resolveFilter(one(null), [])).toEqual({ kind: "all" });
+  });
+
+  it("ALL_MACHINES is the all filter", () => {
+    expect(ALL_MACHINES).toEqual({ kind: "all" });
+  });
+});
+
+describe("filterByMachine", () => {
+  const rows = [
+    row("l1", { profile: "dev" }),
+    row("h1", { profile: "home-dev" }),
+    row("h2", { profile: "media" }),
+    row("w1", { profile: "work" }),
+    row("legacy", { profile: null }),
+  ];
+  const idsOf = (list: ConversationSummary[]): string[] => list.map((r) => r.id);
+
+  it("All returns every row, unchanged", () => {
+    expect(idsOf(filterByMachine(rows, CAT, ALL_MACHINES))).toEqual(["l1", "h1", "h2", "w1", "legacy"]);
+  });
+
+  it("one remote machine keeps the rows of all its profiles", () => {
+    expect(idsOf(filterByMachine(rows, CAT, { kind: "one", id: HS }))).toEqual(["h1", "h2"]);
+  });
+
+  it("this device keeps local rows, including legacy profile-less ones", () => {
+    expect(idsOf(filterByMachine(rows, CAT, { kind: "one", id: null }))).toEqual(["l1", "legacy"]);
+  });
+
+  it("keeps the input order", () => {
+    const shuffled = [rows[2], rows[1], rows[0]];
+    expect(idsOf(filterByMachine(shuffled, CAT, { kind: "one", id: HS }))).toEqual(["h2", "h1"]);
+  });
+
+  it("an empty list stays empty", () => {
+    expect(filterByMachine([], CAT, { kind: "one", id: HS })).toEqual([]);
+  });
+
+  it("composes with filterChats", () => {
+    const list = filterByMachine(rows, CAT, { kind: "one", id: HS });
+    expect(filterChats(list, "", "media").map((r) => r.chat.id)).toEqual(["h2"]);
   });
 });

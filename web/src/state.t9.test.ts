@@ -23,7 +23,7 @@ const CATALOG: CatalogProfile[] = [
   {
     name: "dev",
     origin: "global",
-    overridesGlobal: false,
+    overridesGlobal: false, machine: null,
     agents: [
       { name: "team", model: "sonnet", subagents: [] },
       { name: "review", model: "sonnet", subagents: [] },
@@ -33,7 +33,7 @@ const CATALOG: CatalogProfile[] = [
   {
     name: "home-dev",
     origin: "remote",
-    overridesGlobal: false,
+    overridesGlobal: false, machine: null,
     agents: [{ name: "ops", model: "sonnet", subagents: [] }],
     color: "pink",
   },
@@ -73,7 +73,7 @@ describe("chipAction — the chip's select-vs-reattach decision (design §6.4)",
   it("reattaches for a switch between two different remote profiles", () => {
     const other: CatalogProfile[] = [
       ...CATALOG,
-      { name: "home-vps", origin: "remote", overridesGlobal: false, agents: [{ name: "a", model: "m", subagents: [] }], color: "blue" },
+      { name: "home-vps", origin: "remote", overridesGlobal: false, machine: null, agents: [{ name: "a", model: "m", subagents: [] }], color: "blue" },
     ];
     expect(chipAction(sel("home-dev", "ops"), sel("home-vps", "a"), other)).toBe("reattach");
   });
@@ -94,7 +94,7 @@ describe("apiBase — the /r/<L>/ prefix (design §6.4)", () => {
 
   it("encodes special characters in the name", () => {
     const cat: CatalogProfile[] = [
-      { name: "home dev", origin: "remote", overridesGlobal: false, agents: [], color: "pink" },
+      { name: "home dev", origin: "remote", overridesGlobal: false, machine: null, agents: [], color: "pink" },
     ];
     expect(apiBase("home dev", cat)).toBe("/r/home%20dev");
   });

@@ -10,11 +10,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   LAST_CHAT_KEY,
+  MACHINE_KEY,
   bootMobileChats,
   loadLastChat,
+  loadMachineFilter,
   parseLastChat,
+  parseMachineFilter,
   resumeTarget,
   saveLastChat,
+  saveMachineFilter,
 } from "./mobileStorage";
 
 // A storage whose accessors throw — stands in for a browser that denies
@@ -197,5 +201,114 @@ describe("loadLastChat / saveLastChat", () => {
     expect(() =>
       saveLastChat(throwingStorage(), { convo: "c1", profile: null }),
     ).not.toThrow();
+  });
+});
+
+// ─── P2: the machine filter (mobile-redesign design §2.3) ─────────────────
+//
+// Key `peakbot.mobile.machine`; value `{"v":1,"kind":"all"}` |
+// `{"v":1,"kind":"one","id":null}` | `{"v":1,"kind":"one","id":"https://h:7823"}`.
+// Parsing is strict (like `parseLastChat`): anything else reads as All.
+// Storage access is best-effort.
+
+const ALL = { kind: "all" } as const;
+
+describe("MACHINE_KEY", () => {
+  it("is the mobile machine-filter key", () => {
+    expect(MACHINE_KEY).toBe("peakbot.mobile.machine");
+  });
+});
+
+describe("parseMachineFilter", () => {
+  it("parses all three valid v1 shapes", () => {
+    expect(parseMachineFilter(JSON.stringify({ v: 1, kind: "all" }))).toEqual(ALL);
+    expect(parseMachineFilter(JSON.stringify({ v: 1, kind: "one", id: null }))).toEqual({
+      kind: "one",
+      id: null,
+    });
+    expect(parseMachineFilter(JSON.stringify({ v: 1, kind: "one", id: "https://h:7823" }))).toEqual({
+      kind: "one",
+      id: "https://h:7823",
+    });
+  });
+
+  it.each([
+    ["null (nothing stored)", null],
+    ["garbage", "garbage"],
+    ["an array", "[]"],
+    ["JSON null", "null"],
+    ["a number", "5"],
+    ["an empty string", ""],
+  ] as const)("reads %s as All", (_label, raw) => {
+    expect(parseMachineFilter(raw)).toEqual(ALL);
+  });
+
+  it("a different version reads as All", () => {
+    expect(parseMachineFilter(JSON.stringify({ v: 2, kind: "all" }))).toEqual(ALL);
+    expect(parseMachineFilter(JSON.stringify({ v: 2, kind: "one", id: "https://h:7823" }))).toEqual(ALL);
+    expect(parseMachineFilter(JSON.stringify({ kind: "one", id: "https://h:7823" }))).toEqual(ALL);
+  });
+
+  it("an unknown kind reads as All", () => {
+    expect(parseMachineFilter(JSON.stringify({ v: 1, kind: "some" }))).toEqual(ALL);
+    expect(parseMachineFilter(JSON.stringify({ v: 1 }))).toEqual(ALL);
+  });
+
+  it("a 'one' with a wrong-typed or missing id reads as All", () => {
+    expect(parseMachineFilter(JSON.stringify({ v: 1, kind: "one", id: 7 }))).toEqual(ALL);
+    expect(parseMachineFilter(JSON.stringify({ v: 1, kind: "one", id: {} }))).toEqual(ALL);
+    expect(parseMachineFilter(JSON.stringify({ v: 1, kind: "one" }))).toEqual(ALL);
+  });
+
+});
+
+describe("loadMachineFilter / saveMachineFilter", () => {
+  it("round-trips all three shapes", () => {
+    for (const f of [
+      { kind: "all" } as const,
+      { kind: "one", id: null } as const,
+      { kind: "one", id: "https://h:7823" } as const,
+    ]) {
+      saveMachineFilter(window.localStorage, f);
+      expect(loadMachineFilter(window.localStorage)).toEqual(f);
+    }
+  });
+
+  it("save writes the versioned shape under MACHINE_KEY", () => {
+    saveMachineFilter(window.localStorage, { kind: "one", id: "https://h:7823" });
+    expect(JSON.parse(window.localStorage.getItem(MACHINE_KEY)!)).toEqual({
+      v: 1,
+      kind: "one",
+      id: "https://h:7823",
+    });
+    saveMachineFilter(window.localStorage, { kind: "all" });
+    expect(JSON.parse(window.localStorage.getItem(MACHINE_KEY)!)).toEqual({ v: 1, kind: "all" });
+  });
+
+  it("load returns All when nothing is stored", () => {
+    expect(loadMachineFilter(window.localStorage)).toEqual(ALL);
+  });
+
+  it("load returns All on a corrupt payload", () => {
+    window.localStorage.setItem(MACHINE_KEY, "garbage");
+    expect(loadMachineFilter(window.localStorage)).toEqual(ALL);
+  });
+
+  it("load never throws on a throwing storage and returns All", () => {
+    expect(() => loadMachineFilter(throwingStorage())).not.toThrow();
+    expect(loadMachineFilter(throwingStorage())).toEqual(ALL);
+  });
+
+  it("save never throws on a throwing storage", () => {
+    expect(() => saveMachineFilter(throwingStorage(), { kind: "all" })).not.toThrow();
+    expect(() =>
+      saveMachineFilter(throwingStorage(), { kind: "one", id: "https://h:7823" }),
+    ).not.toThrow();
+  });
+
+  it("does not touch the last-chat key", () => {
+    saveLastChat(window.localStorage, { convo: "c1", profile: null });
+    saveMachineFilter(window.localStorage, { kind: "one", id: null });
+    expect(loadLastChat(window.localStorage)).toEqual({ convo: "c1", profile: null });
   });
 });

@@ -3216,6 +3216,76 @@ profiles:
         assert_eq!(dev.agents[0].name, "team");
     }
 
+    /// R1: a remote entry's `machine` is its normalised origin
+    /// (`scheme://host[:port]`, no trailing slash); a local entry's is `None`.
+    #[test]
+    fn infos_carry_the_machine_origin_for_remotes_and_none_for_local() {
+        let cfg = parse(GLOBAL_YAML, None).expect("fixture must parse");
+        let infos = cfg.catalog.infos();
+        let machine = |name: &str| {
+            infos
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("{name} in infos"))
+                .machine
+                .clone()
+        };
+        assert_eq!(machine("home-dev"), Some("https://10.2.0.48:7823".into()));
+        assert_eq!(
+            machine("vps-web"),
+            Some("https://bot.example.ts.net".into()),
+            "no trailing slash, default port stays implicit"
+        );
+        assert_eq!(machine("sandbox"), Some("http://127.0.0.1:7824".into()));
+        assert_eq!(machine("dev"), None, "a local profile runs on this device");
+    }
+
+    /// R1: `machine` is the same string `RemoteRef.origin` uses, so the SPA's
+    /// machine id and the `conversations_list` status id match by construction.
+    #[test]
+    fn infos_machine_equals_the_endpoint_origin_without_slash() {
+        let cfg = parse(GLOBAL_YAML, None).expect("fixture must parse");
+        let remote = cfg.catalog.remote("home-dev").expect("home-dev is remote");
+        let info = cfg
+            .catalog
+            .infos()
+            .into_iter()
+            .find(|p| p.name == "home-dev")
+            .expect("home-dev in infos");
+        assert_eq!(info.machine, Some(remote.endpoint.origin_without_slash()));
+    }
+
+    /// R2: a local profile serialises `"machine": null` (key present); a
+    /// remote's JSON carries the origin and never the token or the CA pin.
+    #[test]
+    fn profile_info_json_has_machine_null_for_local_and_no_secrets_for_remote() {
+        let cfg = parse(GLOBAL_YAML, None).expect("fixture must parse");
+        let infos = cfg.catalog.infos();
+
+        let dev = infos.iter().find(|p| p.name == "dev").expect("dev");
+        let dev_json = serde_json::to_value(dev).expect("serialise");
+        let obj = dev_json.as_object().expect("object");
+        assert!(obj.contains_key("machine"), "key must be present: {dev_json}");
+        assert!(obj["machine"].is_null(), "local machine is null: {dev_json}");
+
+        let home = infos.iter().find(|p| p.name == "home-dev").expect("home");
+        let home_json = serde_json::to_value(home).expect("serialise");
+        assert_eq!(home_json["machine"], "https://10.2.0.48:7823");
+        let text = home_json.to_string();
+        assert!(!text.contains("pito"), "the token must not leak: {text}");
+        assert!(!text.contains("sha256:"), "the CA pin must not leak: {text}");
+    }
+
+    /// R3: an older remote's `ProfileInfo` (no `machine` key) still parses —
+    /// the relay deserialises remote AppState frames.
+    #[test]
+    fn profile_info_json_without_machine_deserializes_to_none() {
+        let json = r#"{"name":"dev","origin":"global","overrides_global":false,"agents":[],"color":"teal"}"#;
+        let info: ProfileInfo = serde_json::from_str(json).expect("old shape must parse");
+        assert_eq!(info.machine, None);
+        assert_eq!(info.name, "dev");
+    }
+
     /// §4.2: the catalog keeps ONE ordered list of `CatalogEntry` — repo
     /// first, then global in file order, LOCAL and REMOTE entries mixed.
     #[test]

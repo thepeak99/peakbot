@@ -37,7 +37,7 @@ const CATALOG: CatalogProfile[] = [
   {
     name: "peakbot-dev",
     origin: "repo",
-    overridesGlobal: false,
+    overridesGlobal: false, machine: null,
     agents: [
       {
         name: "team",
@@ -53,7 +53,7 @@ const CATALOG: CatalogProfile[] = [
   {
     name: "writer",
     origin: "global",
-    overridesGlobal: false,
+    overridesGlobal: false, machine: null,
     agents: [
       { name: "draft", model: "haiku", subagents: [] },
       {
@@ -446,7 +446,7 @@ describe("selection chip (T32, spec §9.1)", () => {
       {
         name: "équipe.v2 ✨",
         origin: "global",
-        overridesGlobal: false,
+        overridesGlobal: false, machine: null,
         agents: [
           { name: "agent é", model: "módel.1", subagents: [] },
           { name: "agent ü", model: "módel.1", subagents: [] },
@@ -1214,14 +1214,14 @@ describe("chip colour dot (remote-profiles T2)", () => {
     {
       name: "peakbot-dev",
       origin: "repo",
-      overridesGlobal: false,
+      overridesGlobal: false, machine: null,
       agents: [{ name: "team", model: "sonnet", subagents: [] }],
       color: "teal",
     },
     {
       name: "writer",
       origin: "global",
-      overridesGlobal: false,
+      overridesGlobal: false, machine: null,
       agents: [{ name: "draft", model: "haiku", subagents: [] }],
     },
   ];

@@ -86,6 +86,7 @@ function makeAgent(state: AppState | null) {
     activeAlias: "",
     conversations: [],
     conversationsError: null,
+    machines: [],
     commands: [],
     dirListing: null,
     recentDirs: [],

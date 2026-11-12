@@ -1562,11 +1562,11 @@ describe("Composer — Stop label by stopPending (two-stage stop)", () => {
 
 // ─── Mobile: right-rail clearance + keep-focus buttons ───────────────────
 //
-// On phones the fixed right-hand TabbedDrawer rail (40px handles) overlaps
-// the composer. Contract (Tailwind classes ARE the layout contract — jsdom
-// has no layout engine):
-//   1. the Composer's outer container carries `pr-12` (rail clearance) so
-//      its controls never sit under the rail;
+// The fixed right-hand TabbedDrawer rail (40px handles) exists from lg up
+// only (phones get the Panels sheet). Contract (Tailwind classes ARE the
+// layout contract — jsdom has no layout engine):
+//   1. the Composer's outer container carries `lg:pr-12` (rail clearance
+//      from lg up) and NO bare `pr-12`, so phones use the full width;
 //   2. Stop, Queue and Pause call preventDefault() on `pointerdown`, so the
 //      textarea keeps focus (tapping them must not collapse the soft
 //      keyboard, which would shift the layout and cancel the tap).
@@ -1583,17 +1583,19 @@ const pointerDown = async (el: HTMLElement): Promise<boolean> => {
   return ev.defaultPrevented;
 };
 
-describe("Composer — rail clearance (mobile)", () => {
-  it("outer container has the pr-12 right clearance class (idle)", async () => {
+describe("Composer — rail clearance (desktop only)", () => {
+  it("outer container has lg:pr-12 and no bare pr-12 (idle)", async () => {
     const el = await mount(makeProps());
     const outer = el.firstElementChild as HTMLElement;
-    expect(outer.classList.contains("pr-12")).toBe(true);
+    expect(outer.classList.contains("lg:pr-12")).toBe(true);
+    expect(outer.classList.contains("pr-12"), "phones use the full width").toBe(false);
   });
 
-  it("outer container keeps pr-12 while a turn is running", async () => {
+  it("outer container keeps lg:pr-12 while a turn is running", async () => {
     const el = await mount(makeProps({ isRunning: true }));
     const outer = el.firstElementChild as HTMLElement;
-    expect(outer.classList.contains("pr-12")).toBe(true);
+    expect(outer.classList.contains("lg:pr-12")).toBe(true);
+    expect(outer.classList.contains("pr-12")).toBe(false);
   });
 });
 
@@ -1741,9 +1743,10 @@ describe("Composer — hidden prop: root attribute", () => {
     expect(composerRoot(el).hasAttribute("hidden")).toBe(false);
   });
 
-  it("keeps the existing root classes (pr-12 clearance) alongside hidden", async () => {
+  it("keeps the existing root classes (lg:pr-12 clearance) alongside hidden", async () => {
     const el = await mount({ ...makeProps(), hidden: true } as unknown as ComposerProps);
-    expect(composerRoot(el).classList.contains("pr-12")).toBe(true);
+    expect(composerRoot(el).classList.contains("lg:pr-12")).toBe(true);
+    expect(composerRoot(el).classList.contains("pr-12")).toBe(false);
   });
 });
 

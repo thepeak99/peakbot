@@ -12,7 +12,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { ChatList } from "./ChatList";
-import type { ConversationSummary } from "../state";
+import type { ConversationSummary, WireMachineStatus } from "../state";
 import type { CatalogProfile } from "../types";
 
 beforeAll(() => {
@@ -23,8 +23,8 @@ beforeAll(() => {
 // ─── fixtures ──────────────────────────────────────────────────────────────
 
 const CATALOG: CatalogProfile[] = [
-  { name: "home", origin: "global", overridesGlobal: false, agents: [], color: "teal" },
-  { name: "dev", origin: "remote", overridesGlobal: false, agents: [], color: "orange" },
+  { name: "home", origin: "global", overridesGlobal: false, machine: null, agents: [], color: "teal" },
+  { name: "dev", origin: "remote", overridesGlobal: false, machine: null, agents: [], color: "orange" },
 ];
 
 const CONVOS: ConversationSummary[] = [
@@ -61,7 +61,11 @@ const NO_COLOR: ConversationSummary[] = [
   },
 ];
 
-// Mirrors design §4.1 (PR1 props), so overrides like `error` / `onOpenSettings` type-check.
+// Mirrors design §4.1 (PR1 props) plus the mobile-redesign `machineStatus` /
+// `onNew(profile)` (design §2.5), so overrides type-check. The CATALOG below
+// is a SINGLE machine (this device — a remote entry with `machine: null` is
+// the legacy shape), so the machine UI stays out of this file's way; the
+// machine behaviour lives in ChatList.machines.test.tsx.
 interface ListProps {
   conversations: ConversationSummary[];
   catalog: CatalogProfile[];
@@ -70,8 +74,9 @@ interface ListProps {
   connected: boolean;
   error: string | null;
   onOpen(convo: string, profile: string | null): void;
-  onNew(): void;
+  onNew(profile: string | null): void;
   onOpenSettings?: () => void;
+  machineStatus: WireMachineStatus[];
 }
 
 const baseProps: ListProps = {
@@ -83,6 +88,7 @@ const baseProps: ListProps = {
   error: null,
   onOpen: () => {},
   onNew: () => {},
+  machineStatus: [],
 };
 
 // ─── harness ───────────────────────────────────────────────────────────────
@@ -153,6 +159,11 @@ describe("ChatList — root and header", () => {
     expect(el.querySelector("h1")!.textContent).toBe("Chats");
     expect(el.querySelector('img[src="/logo_shifu.png"]')).not.toBeNull();
   });
+
+  it("with a single machine the header is unchanged: no machine pill", async () => {
+    const el = await render();
+    expect(el.querySelector('[data-testid="machine-pill"]')).toBeNull();
+  });
 });
 
 // ─── L1–L9 ─────────────────────────────────────────────────────────────────
@@ -177,11 +188,18 @@ describe("ChatList — L1: sections and rows", () => {
     expect(c1bar!.getAttribute("style")).toContain("var(--profile-teal)");
   });
 
-  it("a remote profile shows the remote badge; a local one does not", async () => {
+  it("rows carry no 'remote' badge (Z8: the machine tag replaces it); the chip keeps its own", async () => {
     const el = await render();
-    expect(row(el, "c2").textContent).toContain("remote");
-    expect(row(el, "c1").textContent).not.toContain("remote");
+    for (const id of ["c1", "c2"]) {
+      const badges = [...row(el, id).querySelectorAll("span")].filter(
+        (s) => (s.textContent ?? "").trim() === "remote",
+      );
+      expect(badges, `row ${id} has no remote badge`).toEqual([]);
+    }
+    const devChip = el.querySelector('button[data-testid="chat-filter"][data-profile="dev"]')!;
+    expect(devChip.textContent, "chips keep the remote badge").toContain("remote");
   });
+
 
   it("a row whose profile has no catalog colour has no bar", async () => {
     const el = await render({ conversations: NO_COLOR });
@@ -327,7 +345,7 @@ describe("ChatList — L4: search", () => {
 });
 
 describe("ChatList — L5: open and new", () => {
-  it("a row's open button calls onOpen(id, profile ?? null); the FAB calls onNew", async () => {
+  it("a row's open button calls onOpen(id, profile ?? null); the FAB calls onNew(null)", async () => {
     const onOpen = vi.fn();
     const onNew = vi.fn();
     const el = await render({ onOpen, onNew });
@@ -344,6 +362,16 @@ describe("ChatList — L5: open and new", () => {
       fab.click();
     });
     expect(onNew).toHaveBeenCalledTimes(1);
+    // Compare as a boolean: if the FAB still forwards the click event, a
+    // `toHaveBeenCalledWith(null)` diff would pretty-print the event's DOM
+    // and fiber graph and OOM the worker.
+    expect(onNew.mock.calls[0]?.[0] === null, "one machine ⇒ onNew(null): the server-default path").toBe(true);
+  });
+
+  it("the FAB is enabled and labelled 'New chat' with a single machine", async () => {
+    const el = await render();
+    const fab = el.querySelector<HTMLButtonElement>('button[aria-label="New chat"]')!;
+    expect(fab.disabled).toBe(false);
   });
 });
 

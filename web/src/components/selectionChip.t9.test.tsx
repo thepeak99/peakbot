@@ -39,7 +39,7 @@ const CATALOG: CatalogProfile[] = [
   {
     name: "dev",
     origin: "global",
-    overridesGlobal: false,
+    overridesGlobal: false, machine: null,
     agents: [
       { name: "team", model: "sonnet", subagents: [] },
       { name: "review", model: "sonnet", subagents: [] },
@@ -49,7 +49,7 @@ const CATALOG: CatalogProfile[] = [
   {
     name: "home-dev",
     origin: "remote",
-    overridesGlobal: false,
+    overridesGlobal: false, machine: null,
     agents: [
       { name: "ops", model: "sonnet", subagents: [] },
       { name: "watch", model: "sonnet", subagents: [] },

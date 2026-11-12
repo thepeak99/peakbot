@@ -724,6 +724,7 @@ mod tests {
     fn conversations_list_omits_error_when_none() {
         let m = OutboundMessage::ConversationsList {
             items: vec![],
+            machines: vec![],
             error: None,
         };
         let json = serde_json::to_string(&m).unwrap();
@@ -737,6 +738,7 @@ mod tests {
     fn conversations_list_serializes_error_when_some() {
         let m = OutboundMessage::ConversationsList {
             items: vec![],
+            machines: vec![],
             error: Some("Can't kill a running conversation — press Stop first.".to_string()),
         };
         let json = serde_json::to_string(&m).unwrap();
@@ -746,6 +748,87 @@ mod tests {
             parsed["error"], "Can't kill a running conversation — press Stop first.",
             "a refused kill must carry the message on the wire"
         );
+    }
+
+    /// R4: remote machine statuses ride the frame as `machines:[{id,online}]`.
+    #[test]
+    fn conversations_list_serializes_machines() {
+        let m = OutboundMessage::ConversationsList {
+            items: vec![],
+            machines: vec![
+                MachineStatusWire {
+                    id: "https://10.0.0.5:7823".to_string(),
+                    online: false,
+                },
+                MachineStatusWire {
+                    id: "https://home-server.local:7823".to_string(),
+                    online: true,
+                },
+            ],
+            error: None,
+        };
+        let v: serde_json::Value = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["type"], "conversations_list");
+        assert_eq!(
+            v["machines"],
+            serde_json::json!([
+                {"id": "https://10.0.0.5:7823", "online": false},
+                {"id": "https://home-server.local:7823", "online": true},
+            ])
+        );
+    }
+
+    /// R5: no remotes ⇒ the key is omitted and the frame is byte-identical to
+    /// today's (the stdio transport and every single-machine install).
+    #[test]
+    fn conversations_list_omits_machines_when_empty() {
+        let m = OutboundMessage::ConversationsList {
+            items: vec![],
+            machines: Vec::new(),
+            error: None,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(json, r#"{"type":"conversations_list","items":[]}"#);
+        assert!(!json.contains("machines"), "json = {json}");
+    }
+
+    /// R6: a frame from an older server (no `machines`) deserialises to `[]`.
+    #[test]
+    fn conversations_list_without_machines_deserializes_to_empty() {
+        let parsed: OutboundMessage =
+            serde_json::from_str(r#"{"type":"conversations_list","items":[]}"#)
+                .expect("old frame must parse");
+        match parsed {
+            OutboundMessage::ConversationsList {
+                items,
+                machines,
+                error,
+            } => {
+                assert!(items.is_empty());
+                assert!(machines.is_empty(), "absent machines ⇒ empty: {machines:?}");
+                assert!(error.is_none());
+            }
+            other => panic!("expected ConversationsList, got {other:?}"),
+        }
+    }
+
+    /// R4 (round-trip): the status shape survives serde in both directions —
+    /// the relay deserialises a remote's frame.
+    #[test]
+    fn conversations_list_machines_round_trip() {
+        let json = r#"{"type":"conversations_list","items":[],"machines":[{"id":"https://h:7823","online":true}]}"#;
+        let parsed: OutboundMessage = serde_json::from_str(json).expect("parses");
+        let OutboundMessage::ConversationsList { machines, .. } = &parsed else {
+            panic!("expected ConversationsList");
+        };
+        assert_eq!(
+            machines,
+            &vec![MachineStatusWire {
+                id: "https://h:7823".to_string(),
+                online: true,
+            }]
+        );
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
     }
 
     /// `State` now carries `Arc<AppState>`; serde with the `rc` feature

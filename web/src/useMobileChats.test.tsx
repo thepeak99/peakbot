@@ -86,7 +86,7 @@ type Api = {
   unread: ReadonlySet<string>;
   backBadge: boolean;
   open(convo: string, profile: string | null): void;
-  newChat(): void;
+  newChat(profile: string | null): void;
   showChats(): void;
 };
 
@@ -359,20 +359,34 @@ describe("useMobileChats — navigation (N1–N13)", () => {
     expect(pushSpy).toHaveBeenCalledTimes(1);
   });
 
-  it("N8: newChat() re-attaches to null and pushes a marker", async () => {
+  it("N8: newChat(null) re-attaches to (null, null) and pushes a marker", async () => {
     const agent = makeAgent({ convo: "c1" });
     await renderHook(agent, vi.fn());
     await toChats();
 
     const pushSpy = vi.spyOn(window.history, "pushState");
     await act(async () => {
-      A().newChat();
+      A().newChat(null);
     });
 
     expect(agent.switchConvo).toHaveBeenCalledTimes(1);
     expect(agent.switchConvo).toHaveBeenCalledWith(null, null);
     expect(A().screen).toBe("conversation");
     expect(pushSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("N8: newChat('dev') re-attaches to (null, 'dev') — a new chat on that profile", async () => {
+    const agent = makeAgent({ convo: "c1" });
+    await renderHook(agent, vi.fn());
+    await toChats();
+
+    await act(async () => {
+      A().newChat("dev");
+    });
+
+    expect(agent.switchConvo).toHaveBeenCalledTimes(1);
+    expect(agent.switchConvo).toHaveBeenCalledWith(null, "dev");
+    expect(A().screen).toBe("conversation");
   });
 
   it("N9: an OS Back on the list issues no history call; the popstate is ignored", async () => {
