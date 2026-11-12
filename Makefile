@@ -76,9 +76,11 @@ build-windows: $(OUTPUT_DIR)/$(WIN_BIN)
 
 $(OUTPUT_DIR)/$(WIN_BIN): Dockerfile.windows
 	@mkdir -p $(OUTPUT_DIR)
+	@[ -n "$(PERMA_CRYPTO_TOKEN)" ] || { echo "❌ PERMA_CRYPTO_TOKEN is not set — export the read-only git.patchnotes.com token (crates/cloud's private perma-crypto git dep needs it)"; exit 1; }
 	@echo "🔨 Cross-compiling peakbot for Windows..."
 	$(CONTAINER_BUILDER) build \
 		--output type=local,dest=$(OUTPUT_DIR) \
+		--secret id=perma_crypto_token,env=PERMA_CRYPTO_TOKEN \
 		-f $(DOCKERFILE) \
 		.
 	@echo "✅ Built: $(OUTPUT_DIR)/$(WIN_BIN)"
@@ -89,9 +91,11 @@ build-linux: $(OUTPUT_DIR)/$(LINUX_BIN)
 
 $(OUTPUT_DIR)/$(LINUX_BIN): Dockerfile.linux
 	@mkdir -p $(OUTPUT_DIR)
+	@[ -n "$(PERMA_CRYPTO_TOKEN)" ] || { echo "❌ PERMA_CRYPTO_TOKEN is not set — export the read-only git.patchnotes.com token (crates/cloud's private perma-crypto git dep needs it)"; exit 1; }
 	@echo "🐧 Building peakbot for Linux..."
 	$(CONTAINER_BUILDER) build \
 		--output type=local,dest=$(OUTPUT_DIR) \
+		--secret id=perma_crypto_token,env=PERMA_CRYPTO_TOKEN \
 		-f $(DOCKERFILE_LINUX) \
 		.
 	@chmod +x $(OUTPUT_DIR)/$(LINUX_BIN)
@@ -103,9 +107,11 @@ build-macos: $(OUTPUT_DIR)/$(MACOS_BIN)
 
 $(OUTPUT_DIR)/$(MACOS_BIN): Dockerfile.macos
 	@mkdir -p $(OUTPUT_DIR)
+	@[ -n "$(PERMA_CRYPTO_TOKEN)" ] || { echo "❌ PERMA_CRYPTO_TOKEN is not set — export the read-only git.patchnotes.com token (crates/cloud's private perma-crypto git dep needs it)"; exit 1; }
 	@echo "🍎 Cross-compiling peakbot for macOS (universal2)..."
 	$(CONTAINER_BUILDER) build \
 		--output type=local,dest=$(OUTPUT_DIR) \
+		--secret id=perma_crypto_token,env=PERMA_CRYPTO_TOKEN \
 		-f $(DOCKERFILE_MACOS) \
 		.
 	@chmod +x $(OUTPUT_DIR)/$(MACOS_BIN)
@@ -117,9 +123,11 @@ build-android: $(OUTPUT_DIR)/$(ANDROID_BIN)
 
 $(OUTPUT_DIR)/$(ANDROID_BIN): Dockerfile.android
 	@mkdir -p $(OUTPUT_DIR)
+	@[ -n "$(PERMA_CRYPTO_TOKEN)" ] || { echo "❌ PERMA_CRYPTO_TOKEN is not set — export the read-only git.patchnotes.com token (crates/cloud's private perma-crypto git dep needs it)"; exit 1; }
 	@echo "🤖 Cross-compiling peakbot for Android (arm64)..."
 	$(CONTAINER_BUILDER) build \
 		--output type=local,dest=$(OUTPUT_DIR) \
+		--secret id=perma_crypto_token,env=PERMA_CRYPTO_TOKEN \
 		-f $(DOCKERFILE_ANDROID) \
 		.
 	@chmod +x $(OUTPUT_DIR)/$(ANDROID_BIN)
@@ -465,11 +473,13 @@ release-tag:
 ## release-build-linux: Build linux/amd64 binary (via Dockerfile.linux) with the release version baked into the filename
 release-build-linux:
 	@set -eu; \
+	[ -n "$(PERMA_CRYPTO_TOKEN)" ] || { echo "❌ PERMA_CRYPTO_TOKEN is not set — export the read-only git.patchnotes.com token (crates/cloud's private perma-crypto git dep needs it)"; exit 1; }; \
 	mkdir -p $(OUTPUT_DIR); \
 	echo "🐧 Building peakbot $(RELEASE_VERSION) for Linux..."; \
 	$(CONTAINER_BUILDER) build \
 		--build-arg VERSION=$(RELEASE_VERSION) \
 		--output type=local,dest=$(OUTPUT_DIR) \
+		--secret id=perma_crypto_token,env=PERMA_CRYPTO_TOKEN \
 		-f $(DOCKERFILE_LINUX) \
 		.; \
 	chmod +x $(OUTPUT_DIR)/peakbot-$(RELEASE_VERSION)-linux-amd64; \
@@ -479,11 +489,13 @@ release-build-linux:
 ## release-build-windows: Build windows/amd64 binary (via Dockerfile.windows) with the release version baked into the filename
 release-build-windows:
 	@set -eu; \
+	[ -n "$(PERMA_CRYPTO_TOKEN)" ] || { echo "❌ PERMA_CRYPTO_TOKEN is not set — export the read-only git.patchnotes.com token (crates/cloud's private perma-crypto git dep needs it)"; exit 1; }; \
 	mkdir -p $(OUTPUT_DIR); \
 	echo "🔨 Cross-compiling peakbot $(RELEASE_VERSION) for Windows..."; \
 	$(CONTAINER_BUILDER) build \
 		--build-arg VERSION=$(RELEASE_VERSION) \
 		--output type=local,dest=$(OUTPUT_DIR) \
+		--secret id=perma_crypto_token,env=PERMA_CRYPTO_TOKEN \
 		-f $(DOCKERFILE) \
 		.; \
 	echo "✅ $(OUTPUT_DIR)/peakbot-$(RELEASE_VERSION)-windows-amd64.exe"; \
@@ -492,11 +504,13 @@ release-build-windows:
 ## release-build-macos: Build macOS universal2 binary (via Dockerfile.macos) with the release version baked into the filename
 release-build-macos:
 	@set -eu; \
+	[ -n "$(PERMA_CRYPTO_TOKEN)" ] || { echo "❌ PERMA_CRYPTO_TOKEN is not set — export the read-only git.patchnotes.com token (crates/cloud's private perma-crypto git dep needs it)"; exit 1; }; \
 	mkdir -p $(OUTPUT_DIR); \
 	echo "🍎 Building peakbot $(RELEASE_VERSION) for macOS (universal2)..."; \
 	$(CONTAINER_BUILDER) build \
 		--build-arg VERSION=$(RELEASE_VERSION) \
 		--output type=local,dest=$(OUTPUT_DIR) \
+		--secret id=perma_crypto_token,env=PERMA_CRYPTO_TOKEN \
 		-f $(DOCKERFILE_MACOS) \
 		.; \
 	chmod +x $(OUTPUT_DIR)/peakbot-$(RELEASE_VERSION)-macos-universal2; \
@@ -506,11 +520,13 @@ release-build-macos:
 ## release-build-android: Build Android arm64 binary (via Dockerfile.android) with the release version baked into the filename
 release-build-android:
 	@set -eu; \
+	[ -n "$(PERMA_CRYPTO_TOKEN)" ] || { echo "❌ PERMA_CRYPTO_TOKEN is not set — export the read-only git.patchnotes.com token (crates/cloud's private perma-crypto git dep needs it)"; exit 1; }; \
 	mkdir -p $(OUTPUT_DIR); \
 	echo "🤖 Building peakbot $(RELEASE_VERSION) for Android (arm64)..."; \
 	$(CONTAINER_BUILDER) build \
 		--build-arg VERSION=$(RELEASE_VERSION) \
 		--output type=local,dest=$(OUTPUT_DIR) \
+		--secret id=perma_crypto_token,env=PERMA_CRYPTO_TOKEN \
 		-f $(DOCKERFILE_ANDROID) \
 		.; \
 	chmod +x $(OUTPUT_DIR)/peakbot-$(RELEASE_VERSION)-android-arm64; \

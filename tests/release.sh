@@ -1903,6 +1903,47 @@ else
     ok "T74 check-version.sh does not use jq: nothing to install"
 fi
 
+# T75: the cloud crate's private perma-crypto git dep must reach the
+# container builds as a BuildKit secret — mounted on a cargo RUN step in
+# each of the four Dockerfiles, threaded through every Makefile container
+# build (--secret id=perma_crypto_token,env=PERMA_CRYPTO_TOKEN) and
+# release.yml (secret → env + non-empty preflight) — and it must NEVER be
+# passed as a --build-arg (build-args are visible in image history/logs).
+t75=1; why75=""
+fail75() { t75=0; why75="${why75}${why75:+; }$1"; }
+for df in Dockerfile.linux Dockerfile.windows Dockerfile.macos Dockerfile.android; do
+    awk '
+        /^[ \t]*#/ { next }
+        $1 == "RUN" && $0 ~ /--mount=type=secret,id=perma_crypto_token/ { inrun = 1; next }
+        inrun { if ($0 ~ /(^|[ \t&;(])cargo[ \t]+[^ \t]+/) found = 1; if ($0 !~ /\\$/) inrun = 0 }
+        END { exit found ? 0 : 1 }' "$df" 2>/dev/null \
+        || fail75 "$df: cargo step does not mount --mount=type=secret,id=perma_crypto_token"
+    grep -qE -- '--build-arg[= ]*[A-Za-z0-9_.-]*(token|TOKEN|perma|PERMA)' "$df" 2>/dev/null \
+        && fail75 "$df: token passed via --build-arg (must be a BuildKit secret)"
+done
+grep -qE -- '--build-arg[= ]*[A-Za-z0-9_.-]*(token|TOKEN|perma|PERMA)' Makefile 2>/dev/null \
+    && fail75 "Makefile: token passed via --build-arg (must be a BuildKit secret)"
+t75_secret_n=$(grep -cF -- '--secret id=perma_crypto_token,env=PERMA_CRYPTO_TOKEN' Makefile 2>/dev/null)
+[ "${t75_secret_n:-0}" -eq 8 ] \
+    || fail75 "Makefile: expected 8 --secret id=perma_crypto_token,env=PERMA_CRYPTO_TOKEN (4 build-* + 4 release-build-*), found ${t75_secret_n:-0}"
+t75_guard_n=$(grep -cF -- '[ -n "$(PERMA_CRYPTO_TOKEN)" ]' Makefile 2>/dev/null)
+[ "${t75_guard_n:-0}" -eq 8 ] \
+    || fail75 "Makefile: expected 8 PERMA_CRYPTO_TOKEN non-empty guards, found ${t75_guard_n:-0}"
+grep -qF 'secrets.PERMA_CRYPTO_TOKEN' "$RY" 2>/dev/null \
+    || fail75 "release.yml: no secrets.PERMA_CRYPTO_TOKEN mapping"
+t75_mr_line=$(grep -nF -- 'make release' "$RY" 2>/dev/null | head -n 1 | cut -d: -f1)
+t75_pre='-[nz][[:space:]]+"\$\{?'
+t75_vl=$(grep -nE -- "${t75_pre}PERMA_CRYPTO_TOKEN\}?" "$RY" 2>/dev/null | head -n 1 | cut -d: -f1)
+[ -n "$t75_vl" ] || fail75 "release.yml: no non-empty test on PERMA_CRYPTO_TOKEN"
+if [ -n "$t75_vl" ] && [ -n "$t75_mr_line" ] && [ "$t75_vl" -ge "$t75_mr_line" ]; then
+    fail75 "release.yml: PERMA_CRYPTO_TOKEN preflight is not before make release"
+fi
+if [ "$t75" -eq 1 ]; then
+    ok "T75 perma-crypto token crosses the build boundary as a BuildKit secret (Dockerfile cargo RUN + Makefile 8x + release.yml env/preflight), never a build-arg"
+else
+    bad "T75 perma-crypto token crosses the build boundary as a BuildKit secret (Dockerfile cargo RUN + Makefile 8x + release.yml env/preflight), never a build-arg ($why75)"
+fi
+
 # ── Summary ────────────────────────────────────────────────────────────────
 
 echo ""

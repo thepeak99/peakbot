@@ -19,6 +19,10 @@ jobs:
       GH_RELEASE_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      # crates/cloud's private perma-crypto git dep: the container builds
+      # fetch it via a BuildKit secret (Makefile --secret id=perma_crypto_token,
+      # env=PERMA_CRYPTO_TOKEN). Read-only token; never a build-arg/layer.
+      PERMA_CRYPTO_TOKEN: ${{ secrets.PERMA_CRYPTO_TOKEN }}
       # The endpoint is a Gitea VARIABLE (not a secret); the keys are secrets.
       SHIFU_S3_ENDPOINT: ${{ vars.SHIFU_S3_ENDPOINT }}
       SHIFU_S3_ACCESS_KEY: ${{ secrets.SHIFU_S3_ACCESS_KEY }}
@@ -43,6 +47,7 @@ jobs:
           [ -n "$GH_RELEASE_TOKEN" ] || { echo "GH_RELEASE_TOKEN secret missing/empty" >&2; exit 1; }
           [ -n "$TAURI_SIGNING_PRIVATE_KEY" ] || { echo "TAURI_SIGNING_PRIVATE_KEY secret missing/empty" >&2; exit 1; }
           [ -n "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" ] || { echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD secret missing/empty" >&2; exit 1; }
+          [ -n "$PERMA_CRYPTO_TOKEN" ] || { echo "PERMA_CRYPTO_TOKEN secret missing/empty" >&2; exit 1; }
           [ -n "$SHIFU_S3_ENDPOINT" ] || { echo "SHIFU_S3_ENDPOINT variable missing/empty" >&2; exit 1; }
           [ -n "$SHIFU_S3_ACCESS_KEY" ] || { echo "SHIFU_S3_ACCESS_KEY secret missing/empty" >&2; exit 1; }
           [ -n "$SHIFU_S3_SECRET_KEY" ] || { echo "SHIFU_S3_SECRET_KEY secret missing/empty" >&2; exit 1; }
