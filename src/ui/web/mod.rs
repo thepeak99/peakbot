@@ -251,7 +251,7 @@ impl WebUi {
     fn entry_url(&self) -> String {
         let scheme = if self.tls { "https" } else { "http" };
         match &self.token {
-            Some(t) => format!("{scheme}://{}/?token={}", self.addr, t),
+            Some(t) => format!("{scheme}://{}/?token={}", self.addr, encode_token(t)),
             None => format!("{scheme}://{}/", self.addr),
         }
     }
@@ -565,8 +565,18 @@ pub async fn require_token(
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    let via_query = token_from_query(req.uri().query()).is_some_and(|t| ct_eq(t, &token));
-    let ok = via_query || token_from_cookie(&req).is_some_and(|t| ct_eq(t, &token));
+    let via_query = token_from_query(req.uri().query()).is_some_and(|t| {
+        // Raw first (older clients send it verbatim), then percent-decoded,
+        // then form-decoded (`+` → space, what `url::Url` clients emit).
+        let form = t.replace('+', " ");
+        ct_eq_any(
+            &[Some(t.into()), decode_lenient(t), decode_lenient(&form)],
+            &token,
+        )
+    });
+    let ok = via_query
+        || token_from_cookie(&req)
+            .is_some_and(|t| ct_eq_any(&[Some(t.into()), decode_lenient(t)], &token));
 
     if !ok {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
@@ -576,12 +586,43 @@ pub async fn require_token(
     if via_query {
         // `HttpOnly` keeps JS from reading it; `SameSite=Strict` blocks
         // cross-site carriage. No `Secure` — the server is plain HTTP.
+        let token = encode_token(&token);
         let cookie = format!("{TOKEN_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict");
         if let Ok(v) = header::HeaderValue::from_str(&cookie) {
             resp.headers_mut().insert(header::SET_COOKIE, v);
         }
     }
     resp
+}
+
+/// Everything but RFC 3986 unreserved characters gets percent-encoded.
+const TOKEN_ENCODE: percent_encoding::AsciiSet = percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// Percent-encode a token for a cookie value or a query value. The raw secret
+/// breaks both: `;` ends a cookie early, `&`/`%`/`+` corrupt a query. Clients
+/// (the desktop app, browsers) encode, so the gate must decode — see
+/// [`require_token`] — and everything we emit must be encoded.
+pub(super) fn encode_token(token: &str) -> String {
+    percent_encoding::utf8_percent_encode(token, &TOKEN_ENCODE).to_string()
+}
+
+/// Percent-decode leniently: an invalid escape (`%zz`) stays literal, and
+/// bytes that aren't UTF-8 yield `None` (no match, no panic).
+fn decode_lenient(s: &str) -> Option<std::borrow::Cow<'_, str>> {
+    percent_encoding::percent_decode_str(s).decode_utf8().ok()
+}
+
+/// True if any candidate equals the secret. Every candidate is compared (no
+/// early exit) so timing doesn't reveal which form matched.
+fn ct_eq_any(candidates: &[Option<std::borrow::Cow<'_, str>>], secret: &str) -> bool {
+    candidates
+        .iter()
+        .flatten()
+        .fold(false, |hit, c| ct_eq(c, secret) | hit)
 }
 
 /// Extract the `token` value from a URL query string, if present.

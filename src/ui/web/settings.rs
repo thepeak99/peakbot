@@ -196,9 +196,9 @@ fn is_loopback_name(name: &str) -> bool {
 /// One entry link: `https://<host>[:<port>]/?token=<token>&ca=<fp>` — the
 /// bind port rides the link (a dropped port would dial :443), omitted on
 /// 443; IPv6 hosts bracketed, built with [`url::Url`] (design §8.4). The
-/// query goes in via `set_query` so it stays verbatim: `query_pairs_mut`
-/// would form-encode the fingerprint's `:` to `%3A`, and the token is
-/// formatted the same (raw) way as [`WebUi::entry_url`] in `super`.
+/// query goes in via `set_query` so the fingerprint stays verbatim:
+/// `query_pairs_mut` would form-encode its `:` to `%3A`. The token is
+/// percent-encoded, same as [`WebUi::entry_url`] in `super`.
 fn entry_link(host: &str, port: u16, token: &str, fp: &str) -> String {
     let host = if host.contains(':') {
         format!("[{host}]")
@@ -211,7 +211,10 @@ fn entry_link(host: &str, port: u16, token: &str, fp: &str) -> String {
         format!("{host}:{port}")
     };
     let mut url = Url::parse(&format!("https://{authority}/")).expect("a well-formed host");
-    url.set_query(Some(&format!("token={token}&ca={fp}")));
+    url.set_query(Some(&format!(
+        "token={}&ca={fp}",
+        super::encode_token(token)
+    )));
     url.to_string()
 }
 
@@ -1049,8 +1052,9 @@ mod tests {
     }
 
     #[test]
-    fn entry_link_leaves_a_literal_plus_in_the_token_raw() {
+    fn entry_link_encodes_a_literal_plus_in_the_token() {
+        // A raw `+` in a query means space to every form decoder.
         let link = entry_link("host.local", 443, "ab+cd", "sha256:ff");
-        assert_eq!(link, "https://host.local/?token=ab+cd&ca=sha256:ff");
+        assert_eq!(link, "https://host.local/?token=ab%2Bcd&ca=sha256:ff");
     }
 }
