@@ -271,6 +271,16 @@ export interface WireProfileInfo {
   /** Resolved accent (RP8: always set server-side, `ui.color` else
    * derived from the name). Optional so old wire snapshots parse. */
   color?: TabColor;
+  /** Remote origin `scheme://host[:port]`; null = this device. Absent (old
+   * server) reads as local. Never carries a token or pin. */
+  machine?: string | null;
+}
+
+/** One remote server's reachability in a `conversations_list` frame
+ * (src/ui/wire.rs `MachineStatusWire`); remote servers only. */
+export interface WireMachineStatus {
+  id: string;
+  online: boolean;
 }
 
 /** The (profile, agent) a conversation is bound to (src/config/resolve.rs
@@ -337,7 +347,13 @@ export type OutboundMessage =
   | { type: "attached"; convo: string }
   | { type: "models_available"; active: string; models: ModelInfo[] }
   | { type: "state"; state: AppState }
-  | { type: "conversations_list"; items: ConversationSummary[]; error?: string }
+  | {
+      type: "conversations_list";
+      items: ConversationSummary[];
+      /** Remote machine statuses; omitted by servers with no remotes. */
+      machines?: WireMachineStatus[];
+      error?: string;
+    }
   | {
       type: "dir_listing";
       path: string;

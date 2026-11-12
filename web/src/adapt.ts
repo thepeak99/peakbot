@@ -168,12 +168,14 @@ export function adaptSubAgent(s: AppState): SubAgentRun | null {
 
 /** The catalog (profiles → agents → sub-agents) this install declares,
  * mapped from the wire's snake_case to the view's camelCase. An absent
- * field (old snapshot) normalises to `[]`, the safe default. */
+ * field (old snapshot) normalises to `[]`, the safe default; an absent
+ * `machine` (old server) normalises to `null` (this device). */
 export function adaptCatalog(s: AppState): CatalogProfile[] {
   return (s.catalog ?? []).map((p) => ({
     name: p.name,
     origin: p.origin,
     overridesGlobal: p.overrides_global,
+    machine: p.machine ?? null,
     agents: p.agents.map((a) => ({
       name: a.name,
       model: a.model,

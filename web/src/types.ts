@@ -178,7 +178,13 @@ export interface CatalogProfile {
   /** Resolved accent (RP8: always set server-side). Optional so old wire
    * snapshots parse; absent = no dot. */
   color?: TabColor;
+  /** The machine this profile runs on: null = this device, else the
+   * remote's normalised origin. Required — normalised by the adapter. */
+  machine: MachineId;
 }
+
+/** A machine: null = this device, else a remote's normalised origin. */
+export type MachineId = string | null;
 
 /** The (profile, agent) this conversation is bound to, normalised by the
  * adapter: `null` when the wire field is absent (old snapshot). */

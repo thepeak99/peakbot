@@ -27,6 +27,7 @@ import type {
   InboundMessage,
   ModelInfo,
   SlashCommand,
+  WireMachineStatus,
 } from "./state";
 
 export interface AgentConnection {
@@ -41,6 +42,10 @@ export interface AgentConnection {
   activeAlias: string;
   conversations: ConversationSummary[];
   conversationsError: string | null;
+  /** Machine statuses of the last `conversations_list` frame (remote
+   * servers only); `[]` when the frame omitted them (old/no-remote server).
+   * A fresh frame replaces the previous snapshot. */
+  machines: WireMachineStatus[];
   commands: SlashCommand[];
   /** Latest `dir_listing` reply for the cwd picker (request/response over the
    * socket, not part of AppState — browsing is ephemeral). `null` until the
@@ -98,6 +103,7 @@ export function useAgent(): AgentConnection {
   const [conversationsError, setConversationsError] = useState<string | null>(
     null,
   );
+  const [machines, setMachines] = useState<WireMachineStatus[]>([]);
   const [commands, setCommands] = useState<SlashCommand[]>([]);
   const [dirListing, setDirListing] = useState<DirListing | null>(null);
   const [recentDirs, setRecentDirs] = useState<string[]>([]);
@@ -253,6 +259,7 @@ export function useAgent(): AgentConnection {
           case "conversations_list":
             setConversations(msg.items);
             setConversationsError(msg.error ?? null);
+            setMachines(msg.machines ?? []);
             break;
           case "dir_listing":
             setDirListing({
@@ -402,6 +409,7 @@ export function useAgent(): AgentConnection {
     activeAlias,
     conversations,
     conversationsError,
+    machines,
     commands,
     dirListing,
     recentDirs,
