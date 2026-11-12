@@ -349,6 +349,9 @@ pub struct General {
     /// Boot-only.
     #[serde(default)]
     pub uploads: UploadsConfig,
+    /// Boot-only.
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
 }
 
 impl Default for General {
@@ -364,7 +367,23 @@ impl Default for General {
             timeouts: TimeoutsConfig::default(),
             http: HttpConfig::default(),
             uploads: UploadsConfig::default(),
+            notifications: NotificationsConfig::default(),
         }
+    }
+}
+
+/// `general.notifications` — boot-only: the turn-end channel is built once.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationsConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+// Hand-rolled like `ConversationConfig`: a derived Default would be `false`.
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 

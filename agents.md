@@ -151,6 +151,7 @@ Editing `config.yaml` (global or the repo file) or skills does not require a res
 | `general.search`, `general.context`, `general.agent_max_turns` | `general.http` (published once into the client factory) |
 | `general.cost_tracking`, `general.retry`, `general.timeouts` | `general.uploads` (max_file_mb / max_files, read once) |
 | skills + system prompt | `general.conversation` (auto_save / storage_dir, built at boot) |
+| | `general.notifications` (the turn-end feed is built once at boot) |
 
 `vector_db` is reload-safe: a process-wide handle registry keyed by the resolved `db_path` shares one DB across profiles and reloads (the same `db_path` with different embeddings is a parse error).
 
@@ -210,6 +211,7 @@ general:
     delegate_secs: 7200            # 1..=86400 each
   http: { connect_timeout_secs: 30, read_timeout_secs: 1800 }    # boot-only
   uploads: { max_file_mb: 50, max_files: 10 }                    # boot-only (vision limits)
+  notifications: { enabled: true }                               # boot-only — turn-end event feed (GET /api/notify/stream)
 ```
 
 The per-profile capability blocks — `tools:`, `mcps:`, `fetch_url:`, `env:`, `memory:`, `vector_db:`, `ui.tabs:` — live on each profile, not at the top level; see [Agents and subagents](#agents-and-subagents).
@@ -291,7 +293,11 @@ under a `--profile` pin. In the desktop app the web UI additionally gets
 download, install, restart; dismissible until the version changes), and
 `clipboard_image_png` returns the clipboard image as PNG for the Linux paste
 fallback (WebKitGTK ≤ 2.50, WebKit Bug 218519) — nothing else reaches the web
-origin. The web-server settings live in Settings → General.
+origin. The desktop app also listens to the turn-end feed
+(`/api/notify/stream`) **from Rust** and shows native notifications. A click
+calls `window.peakbotOpenConvo(convo)`, which the SPA defines while desktop tabs
+are mounted (`useConvoTabs`). That is a one-way eval, not an IPC grant. The
+web-server settings live in Settings → General.
 
 **First run**: with no global config (or a failed migration) the chat is
 replaced by a guided setup — Welcome → Provider → Agent → Web → Review →
@@ -310,6 +316,8 @@ else).
 | `--profile <name>` | — | Pins a global profile: every conversation runs under it, `/profile` is refused, repo files are ignored, settings API disabled |
 
 **Sticky sessions** (#118): a conversation is addressed as `?convo=<uuid>`; a live session (StateManager + controller loop) stays bound to it independently of any socket. Reconnects and multiple tabs re-attach to the same running session. A session is reaped only when **fully idle** — no sockets, agent not mid-turn, no live `bash_bg` children — for `general.web.session_ttl_secs` (default 600; `reaper_tick_secs` 60). See `src/ui/web/registry.rs`. Killing a live session (✕ on a conversation row) is refused while a turn runs — Stop first; running turns, including delegations, continue with no browser attached.
+
+**Turn-end feed**: `GET /api/notify/stream` (token-gated like every route) is a Server-Sent Events stream with one `data:` JSON frame per finished agent turn in **any** conversation this server owns: `{"type":"turn_end","convo":…,"title":…|null,"outcome":"ok"|"error"|"stopped","source":"user"|"background","ts":<unix ms>}`, plus a `:` keepalive every 15 s. No message content; slash commands emit nothing; relayed remote-profile conversations are reported by their own server. The stream is not a session socket: it never attaches, creates or keeps alive a session (the reaper ignores it). No replay: events missed while disconnected are gone; slow readers drop events. `general.notifications.enabled: false` → no events, 404. In-process consumers subscribe to `SessionDeps::turn_ends` (`src/notify.rs`); the one publisher is `StateManager::end_turn`, called by the controller with the outcome. Ctrl+C drains open connections for at most 3 s (plain HTTP and TLS alike).
 
 **Auth**: the token is presented once as `?token=…`; the server sets a `peakbot_token` cookie which authenticates everything after, including the `/ws` upgrade. Single-operator shared secret, not a user system. Token precedence: `--token` > `PEAKBOT_WEB_TOKEN` > `general.web.token`.
 
@@ -336,6 +344,7 @@ Prefer skills or MCP servers over baking tools into the binary. Skills: drop a d
 src/
 ├── main.rs / lib.rs        # entry, AgentRunner, system prompt building
 ├── boot.rs                 # session_deps + web_boot: the boot shared by main and embed
+├── notify.rs               # TurnEnd events + the process-wide turn-end channel (all editions)
 ├── embed.rs                # LocalCore — the phone app's in-process core (Local edition only)
 ├── session.rs              # SessionDeps + create_session factory
 ├── config/                 # Config::parse (the one boundary), migration, BUILTIN_TOOL_NAMES

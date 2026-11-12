@@ -316,23 +316,31 @@ async fn remote_401_becomes_502_with_the_locked_auth_string_for_every_get_route(
 // §5.5 / §5.12 E-DOWN: unreachable → 502 with the locked string.
 #[tokio::test]
 async fn remote_down_is_502_with_the_locked_edown_string_for_every_route() {
-    let dead = dead_url();
-    let port = dead.rsplit(':').next().expect("port").to_string();
-    let env = env_for(&[(L, &dead, T_REMOTE, "dev")]).await;
-    let prefix = format!("Can't reach remote profile '{L}' at 127.0.0.1:{port}: ");
+    with_dead_port(|port| async move {
+        let env = env_for(&[(L, &format!("http://127.0.0.1:{port}"), T_REMOTE, "dev")]).await;
+        let prefix = format!("Can't reach remote profile '{L}' at 127.0.0.1:{port}: ");
 
-    let g1 = get(&env, &format!("/r/{L}/images/{}", img())).await;
-    let g2 = get(&env, &format!("/r/{L}/api/uploads/{CONVO}/{FILE}")).await;
-    let p = post_upload(&env, &upload_post_path(L, CONVO, "a.png"), b"x".to_vec()).await;
+        let g1 = get(&env, &format!("/r/{L}/images/{}", img())).await;
+        let g2 = get(&env, &format!("/r/{L}/api/uploads/{CONVO}/{FILE}")).await;
+        let p = post_upload(&env, &upload_post_path(L, CONVO, "a.png"), b"x".to_vec()).await;
 
-    for (what, resp) in [("image", g1), ("upload get", g2), ("upload post", p)] {
-        assert_eq!(resp.status(), 502, "{what}");
-        let text = resp.text().await.expect("body");
-        assert!(
-            text.starts_with(&prefix) && text.ends_with('.'),
-            "{what}: locked E-DOWN string, got {text:?}"
-        );
-    }
+        for (what, resp) in [("image", g1), ("upload get", g2), ("upload post", p)] {
+            let status = resp.status();
+            let text = resp.text().await.expect("body");
+            if status != 502 || !text.starts_with(&prefix) {
+                // The probed port was taken by a foreign listener between
+                // probe and dial; a new port on the next attempt.
+                return Err(format!("{what}: {status} {text:?}"));
+            }
+            assert!(
+                text.ends_with('.'),
+                "{what}: locked E-DOWN string, got {text:?}"
+            );
+        }
+        Ok(())
+    })
+    .await
+    .expect("remote down is 502 with the locked E-DOWN string for every route");
 }
 
 // ═══════════════════════════════════════════════════════════════════════

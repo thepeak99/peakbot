@@ -30,6 +30,7 @@ mod mcp_auth;
 mod memory_compaction;
 #[cfg(feature = "mock")]
 pub mod mock;
+pub mod notify;
 pub mod paths;
 pub mod pipeline;
 mod providers;
@@ -295,6 +296,19 @@ enum CompletionResult {
     Stopped,
     Error,
     CommandDone,
+}
+
+/// `process_message_internal` returns the turn outcome; the (dead-letter)
+/// completion broadcast keeps its own four-variant type, so the controller
+/// maps at the send site. `CommandDone` is unreachable from a turn (I6).
+impl From<crate::notify::TurnOutcome> for CompletionResult {
+    fn from(outcome: crate::notify::TurnOutcome) -> Self {
+        match outcome {
+            crate::notify::TurnOutcome::Ok => Self::Success,
+            crate::notify::TurnOutcome::Error => Self::Error,
+            crate::notify::TurnOutcome::Stopped => Self::Stopped,
+        }
+    }
 }
 
 /// Render a caught panic's payload as text — shared by every `catch_unwind`
@@ -1756,7 +1770,10 @@ impl AgentRunner {
                             // buffered background output flushes on the next drain
                             // alongside the user's message.
                             sm.reset_bg_cooldowns();
-                            sm.set_running(true);
+                            // The turn seam (notify PR-B): records the source so
+                            // `end_turn` can publish it; commands never begin
+                            // turns, so they can't emit.
+                            sm.begin_turn(crate::notify::TurnSource::User);
                         }
 
                         // Lazy memory compaction: run once, on the first user
@@ -1808,12 +1825,14 @@ impl AgentRunner {
                         )
                         .await;
 
-                        // Mark as done — snapshot run_started_at BEFORE set_running(false) clears
-                        // it, then emit a "worked for MM:SS" system message (reuses the spinner
-                        // formatter so the post-run figure matches the live indicator).
+                        // Mark as done — snapshot run_started_at BEFORE
+                        // `end_turn`'s `set_running(false)` clears it, then
+                        // emit a "worked for MM:SS" system message (reuses the
+                        // spinner formatter so the post-run figure matches the
+                        // live indicator).
                         if let Some(ref sm) = state_manager {
                             let started_at = sm.get_state().run_started_at;
-                            sm.set_running(false);
+                            sm.end_turn(result);
                             if let Some(t) = started_at {
                                 sm.add_system_message(format!(
                                     "worked for {}",
@@ -1823,7 +1842,7 @@ impl AgentRunner {
                         }
 
                         // Send completion notification
-                        completion_tx.send(result).ok();
+                        completion_tx.send(result.into()).ok();
 
                         // Post-turn bg drain seam: if any background process
                         // produced output during this turn (or while we were
@@ -1992,7 +2011,10 @@ impl AgentRunner {
                 let what = panic_text(payload);
                 if let Some(ref sm) = state_manager {
                     sm.close_interrupted_tool_call();
-                    sm.set_running(false);
+                    // The turn seam's panic backstop: `end_turn` publishes
+                    // `Error` iff a turn was open (a command panic finds
+                    // `open_turn == None` and publishes nothing).
+                    sm.end_turn(crate::notify::TurnOutcome::Error);
                     sm.set_command_running(false);
                     sm.add_system_message(format!("⚠ internal error: {what} — turn aborted"));
                 }
@@ -2842,7 +2864,7 @@ impl AgentRunner {
         state_manager: &Option<Arc<StateManager>>,
         agent: &Arc<DynAgent>,
         config: &Config,
-    ) -> CompletionResult {
+    ) -> crate::notify::TurnOutcome {
         let mut retry_count = 0;
         let mut nudged = false;
         // One-shot override for the post-compaction iteration. The compact
@@ -2891,7 +2913,7 @@ impl AgentRunner {
                     if let Some(sm) = state_manager {
                         sm.close_interrupted_tool_call();
                     }
-                    return CompletionResult::Stopped;
+                    return crate::notify::TurnOutcome::Stopped;
                 }
                 r = agent.as_ref().prompt_with_history(current_turn.clone(), &history) => r,
             };
@@ -2899,7 +2921,7 @@ impl AgentRunner {
             match result {
                 Ok(response) => {
                     let Some(sm) = state_manager.as_ref() else {
-                        return CompletionResult::Success;
+                        return crate::notify::TurnOutcome::Ok;
                     };
                     // The final reply is its own row (blank → no-op); the
                     // tool-call responses' rows already landed from the hook.
@@ -2909,12 +2931,12 @@ impl AgentRunner {
                         // Fire-and-forget: upgrade the provisional title
                         // after the first reply
                         sm.maybe_generate_title();
-                        return CompletionResult::Success;
+                        return crate::notify::TurnOutcome::Ok;
                     }
                     if nudged {
                         sm.add_system_message(EMPTY_REPLY_WARNING.to_string());
                         sm.set_final_broadcast(true);
-                        return CompletionResult::Success;
+                        return crate::notify::TurnOutcome::Ok;
                     }
                     // Blank reply with no prose row: ask once more. The nudge
                     // rides the wire only, so the transcript never shows it.
@@ -2939,7 +2961,7 @@ impl AgentRunner {
                         // No StateManager — we can't compact. This shouldn't
                         // happen in production (the hook's gate only fires
                         // when one is wired), but bail loudly if it does.
-                        return CompletionResult::Error;
+                        return crate::notify::TurnOutcome::Error;
                     };
 
                     sm.set_status(Some("Compacting context...".to_string()));
@@ -2947,7 +2969,7 @@ impl AgentRunner {
                     // the turn ends as Stopped and the history is untouched.
                     let compacted = tokio::select! {
                         biased;
-                        _ = cancel.cancelled() => return CompletionResult::Stopped,
+                        _ = cancel.cancelled() => return crate::notify::TurnOutcome::Stopped,
                         r = sm.force_compact() => r,
                     };
                     sm.set_status(None);
@@ -2964,7 +2986,7 @@ impl AgentRunner {
                                 .to_string(),
                         );
                         sm.set_final_broadcast(true);
-                        return CompletionResult::Error;
+                        return crate::notify::TurnOutcome::Error;
                     };
 
                     sm.add_system_message(format!(
@@ -3008,13 +3030,13 @@ impl AgentRunner {
                 Err(PromptError::PromptCancelled { reason, .. })
                     if reason == crate::hooks::session_hook::STOP_REASON =>
                 {
-                    return CompletionResult::Stopped;
+                    return crate::notify::TurnOutcome::Stopped;
                 }
 
                 Err(PromptError::PromptCancelled { .. }) => {
                     // Any other cancellation reason — return error instead of
                     // silently looping (which previously caused an infinite loop).
-                    return CompletionResult::Error;
+                    return crate::notify::TurnOutcome::Error;
                 }
 
                 Err(e) => {
@@ -3038,7 +3060,7 @@ impl AgentRunner {
                             };
                             sm.add_system_message(text);
                         }
-                        return CompletionResult::Error;
+                        return crate::notify::TurnOutcome::Error;
                     }
                     if retry_count >= config.general.retry.max_retries {
                         if let Some(sm) = state_manager {
@@ -3049,7 +3071,7 @@ impl AgentRunner {
                                 crate::ui::app_state::truncate_str(&e.to_string(), 2000)
                             ));
                         }
-                        return CompletionResult::Error;
+                        return crate::notify::TurnOutcome::Error;
                     }
                     let delay =
                         crate::providers::retry::backoff_delay(retry_count, &config.general.retry);
@@ -3160,16 +3182,18 @@ impl AgentRunner {
         // /load restores it with the right styling and proc-id
         // provenance.
         sm.add_user_message_from_background(synthetic.text.clone(), synthetic.proc_ids.clone());
-        sm.set_running(true);
+        // The turn seam (notify PR-B): the synthetic turn is a Background
+        // turn; its end publishes a second `TurnEnd` right after the user's.
+        sm.begin_turn(crate::notify::TurnSource::Background);
         let current_turn = sm.build_current_turn_message().unwrap_or_else(|| {
             rig_core::completion::message::Message::from(synthetic.text.as_str())
         });
         let result =
             Self::process_message_internal(current_turn, state_manager, agent, config).await;
-        sm.set_running(false);
+        sm.end_turn(result);
         // No "worked for …" system row here — bg-driven turns are
         // ambient by design; the user already saw the bg block.
-        completion_tx.send(result).ok();
+        completion_tx.send(result.into()).ok();
     }
 
     /// Internal process_command
@@ -6386,7 +6410,7 @@ headers:
         let result =
             AgentRunner::process_message_internal(current_turn, &sm_opt, &agent, &config).await;
         assert!(
-            matches!(result, CompletionResult::Success),
+            result == crate::notify::TurnOutcome::Ok,
             "the retried attempt must succeed and end the turn"
         );
 
@@ -6457,7 +6481,7 @@ headers:
                 .await;
 
         assert!(
-            matches!(result, CompletionResult::Error),
+            result == crate::notify::TurnOutcome::Error,
             "a refusal ends the turn with an error"
         );
         assert_eq!(hits.load(Ordering::SeqCst), 1, "a refusal is never retried");
@@ -7262,7 +7286,7 @@ headers:
             .expect("the cancelled turn must finish within 5s")
             .expect("the turn task must not panic");
         assert!(
-            matches!(result, CompletionResult::Stopped),
+            result == crate::notify::TurnOutcome::Stopped,
             "a cancelled turn must report Stopped"
         );
 
@@ -7363,7 +7387,7 @@ headers:
     ) -> (
         Arc<StateManager>,
         crate::mock::MockCompletionModel,
-        tokio::task::JoinHandle<CompletionResult>,
+        tokio::task::JoinHandle<crate::notify::TurnOutcome>,
     ) {
         use crate::storage::{ConversationStorage, InMemoryStorage};
 
@@ -7431,7 +7455,7 @@ headers:
             .await
             .expect("the turn finishes")
             .expect("no panic");
-        assert!(matches!(result, CompletionResult::Success));
+        assert!(result == crate::notify::TurnOutcome::Ok);
 
         let msgs = sm.get_state().chat.messages;
         let rows = agent_rows_after_user(&msgs);
@@ -7515,7 +7539,7 @@ headers:
             .await
             .expect("the turn finishes")
             .expect("no panic");
-        assert!(matches!(result, CompletionResult::Success));
+        assert!(result == crate::notify::TurnOutcome::Ok);
 
         let msgs = sm.get_state().chat.messages;
         let rows = agent_rows_after_user(&msgs);
@@ -7538,7 +7562,7 @@ headers:
             .await
             .expect("the turn finishes")
             .expect("no panic");
-        assert!(matches!(result, CompletionResult::Success));
+        assert!(result == crate::notify::TurnOutcome::Ok);
 
         let msgs = sm.get_state().chat.messages;
         let rows = agent_rows_after_user(&msgs);
@@ -7560,7 +7584,7 @@ headers:
             .await
             .expect("the turn finishes")
             .expect("no panic");
-        assert!(matches!(result, CompletionResult::Success));
+        assert!(result == crate::notify::TurnOutcome::Ok);
 
         let msgs = sm.get_state().chat.messages;
         let rows = agent_rows_after_user(&msgs);
@@ -7583,7 +7607,7 @@ headers:
             .await
             .expect("the turn finishes")
             .expect("no panic");
-        assert!(matches!(result, CompletionResult::Success));
+        assert!(result == crate::notify::TurnOutcome::Ok);
 
         let msgs = sm.get_state().chat.messages;
         let rows = agent_rows_after_user(&msgs);
@@ -7609,7 +7633,7 @@ headers:
             .await
             .expect("the turn finishes")
             .expect("no panic");
-        assert!(matches!(result, CompletionResult::Success));
+        assert!(result == crate::notify::TurnOutcome::Ok);
 
         let msgs = sm.get_state().chat.messages;
         let rows = agent_rows_after_user(&msgs);
@@ -7646,7 +7670,7 @@ headers:
             .await
             .expect("the turn finishes")
             .expect("no panic");
-        assert!(matches!(result, CompletionResult::Success));
+        assert!(result == crate::notify::TurnOutcome::Ok);
 
         let msgs = sm.get_state().chat.messages;
         let rows = agent_rows_after_user(&msgs);
@@ -7708,7 +7732,7 @@ headers:
             .await
             .expect("the turn finishes")
             .expect("no panic");
-        assert!(matches!(result, CompletionResult::Success));
+        assert!(result == crate::notify::TurnOutcome::Ok);
 
         let msgs = sm.get_state().chat.messages;
         let rows = agent_rows_after_user(&msgs);
@@ -7795,7 +7819,7 @@ headers:
             .await
             .expect("the turn finishes")
             .expect("no panic");
-        assert!(matches!(result, CompletionResult::Success));
+        assert!(result == crate::notify::TurnOutcome::Ok);
 
         let msgs = sm.get_state().chat.messages;
         let rows = agent_rows_after_user(&msgs);
@@ -7898,7 +7922,7 @@ headers:
             .expect("the cancelled turn must finish within 5s")
             .expect("the turn task must not panic");
         assert!(
-            matches!(result, CompletionResult::Stopped),
+            result == crate::notify::TurnOutcome::Stopped,
             "a cancelled turn must report Stopped"
         );
 
@@ -8000,7 +8024,7 @@ headers:
             .expect("the turn finishes")
             .expect("no panic");
         assert!(
-            matches!(result, CompletionResult::Error),
+            result == crate::notify::TurnOutcome::Error,
             "a non-transient error must report Error"
         );
 
@@ -8078,7 +8102,7 @@ headers:
             .await
             .expect("the turn finishes")
             .expect("no panic");
-        assert!(matches!(result, CompletionResult::Success));
+        assert!(result == crate::notify::TurnOutcome::Ok);
 
         let before = sm.get_agent_history();
 
@@ -8130,7 +8154,7 @@ headers:
             .await
             .expect("turn 1 finishes")
             .expect("no panic");
-        assert!(matches!(result, CompletionResult::Success));
+        assert!(result == crate::notify::TurnOutcome::Ok);
 
         // Turn 2: a fresh user message, a fresh mock agent whose model
         // answers "C" — its FIRST request is the third LLM request overall.
@@ -8159,7 +8183,7 @@ headers:
             .await
             .expect("turn 2 finishes")
             .expect("no panic");
-        assert!(matches!(result2, CompletionResult::Success));
+        assert!(result2 == crate::notify::TurnOutcome::Ok);
 
         let requests = model2.get_recorded_requests();
         assert_eq!(requests.len(), 1, "turn 2 makes exactly one request");
@@ -9030,6 +9054,9 @@ headers:
             started: Arc<Notify>,
             release: Arc<Notify>,
             ran: Arc<AtomicUsize>,
+            /// The turn-end feed as seen by a subscriber — subscribed BEFORE
+            /// `run_loop` spawns, so no event can be missed (PR-B design §9.3).
+            turn_ends: tokio::sync::broadcast::Receiver<crate::notify::TurnEnd>,
         }
 
         impl Rig {
@@ -9077,6 +9104,14 @@ headers:
                 );
             }
 
+            /// Wait (≤10s) for the next `TurnEnd` on the feed.
+            pub(super) async fn next_turn_end(&mut self) -> crate::notify::TurnEnd {
+                tokio::time::timeout(std::time::Duration::from_secs(10), self.turn_ends.recv())
+                    .await
+                    .expect("a turn-end event arrives within 10s")
+                    .expect("the turn-end feed stays open")
+            }
+
             async fn wait_stop_pending(&self) {
                 let sm = self.sm.clone();
                 let ok = tokio::time::timeout(std::time::Duration::from_secs(5), async move {
@@ -9121,11 +9156,40 @@ headers:
             m.role == MessageRole::System && m.content.starts_with("Agent stopped by user")
         }
 
-        /// Build a mock-backed runner around [`GateTool`].
+        /// The rig's upload root: `new_arc_for_session` needs a store; the
+        /// turn tests never attach, so the tempdir is only a root.
+        fn rig_uploads() -> crate::attachments::UploadStore {
+            crate::attachments::UploadStore::new(
+                tempfile::tempdir().expect("rig uploads tempdir").keep(),
+                crate::config::UploadsConfig::default(),
+            )
+        }
+
+        /// Build a mock-backed runner around [`GateTool`] on the turn-end
+        /// feed (PR-B design §9.3 rig change): the SM gets the process-wide
+        /// channel and the rig keeps a subscriber from before `run_loop`.
         fn spawn_rig(responses: Vec<crate::mock::MockResponse>) -> Rig {
+            spawn_rig_with_feed(responses, Some(crate::notify::turn_end_channel()))
+        }
+
+        /// The same rig with the feed switch: `None` models
+        /// `general.notifications.enabled: false` (no channel at all).
+        fn spawn_rig_with_feed(
+            responses: Vec<crate::mock::MockResponse>,
+            tx: Option<crate::notify::TurnEndTx>,
+        ) -> Rig {
             let storage: Arc<dyn crate::storage::ConversationStorage> =
                 Arc::new(crate::storage::InMemoryStorage::new());
-            let sm = StateManager::new_arc_with_storage(storage.clone());
+            let sm =
+                StateManager::new_arc_for_session(Some(storage.clone()), rig_uploads(), tx.clone());
+            // Subscribe before the loop spawns — and before the `tx` name is
+            // taken by the action channel below: once the rig exists, every
+            // event the controller publishes is ours. The feed-less rig keeps
+            // a throwaway receiver (never read — T-L6).
+            let turn_ends_rx = match tx.clone() {
+                Some(tx) => tx.subscribe(),
+                None => tokio::sync::broadcast::channel(1).0.subscribe(),
+            };
 
             let model = crate::mock::MockCompletionModel::new();
             for r in responses {
@@ -9178,6 +9242,7 @@ headers:
             let h = tokio::spawn(async move { runner.run_loop(rx).await });
 
             Rig {
+                turn_ends: turn_ends_rx,
                 sm,
                 storage,
                 model,
@@ -9495,7 +9560,7 @@ headers:
             .expect("the stopped turn must finish promptly");
 
             assert!(
-                matches!(result, CompletionResult::Stopped),
+                result == crate::notify::TurnOutcome::Stopped,
                 "PromptCancelled(\"stop\") must map to Stopped (was Error before two-stage stop)"
             );
             assert_eq!(model.request_count(), 0, "no LLM request after the press");
@@ -9507,6 +9572,188 @@ headers:
                     .all(|m| m.role != MessageRole::ToolResult),
                 "the graceful arm must not synthesise INTERRUPTED results"
             );
+        }
+
+        // ── PR-B §9.3: the controller publishes turn-end events ─────────────
+        //
+        // Written BEFORE the implementation. The `begin_turn`/`end_turn`
+        // stubs flip `is_running` but publish nothing, so every test that
+        // awaits an event is RED (10 s timeout in `next_turn_end`) for the
+        // right reason: nothing publishes yet. T-L6 is the negative test
+        // (no channel at all) and is already green.
+
+        /// T-L1 — a normal user turn ends with one `TurnEnd{ok, user}`.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn user_turn_emits_ok_turn_end() {
+            let mut rig = spawn_rig(vec![crate::mock::MockResponse::text("hello")]);
+            rig.send("hi");
+            let ev = rig.next_turn_end().await;
+            assert_eq!(ev.outcome, crate::notify::TurnOutcome::Ok);
+            assert_eq!(ev.source, crate::notify::TurnSource::User);
+            assert_eq!(
+                ev.convo,
+                rig.sm
+                    .get_current_conversation_id()
+                    .expect("boot conversation"),
+                "the event names the conversation the session is on"
+            );
+            assert!(!rig.sm.is_running(), "the turn is over");
+            rig.shutdown().await;
+        }
+
+        /// T-L2 — a non-transient LLM error ends the turn with `error`
+        /// (same shape as T10: "authentication failed" is not retried).
+        #[tokio::test(flavor = "multi_thread")]
+        async fn llm_error_emits_error_turn_end() {
+            let mut rig = spawn_rig(vec![crate::mock::MockResponse::error(
+                "authentication failed",
+            )]);
+            rig.send("hi");
+            let ev = rig.next_turn_end().await;
+            assert_eq!(ev.outcome, crate::notify::TurnOutcome::Error);
+            assert_eq!(ev.source, crate::notify::TurnSource::User);
+            assert!(!rig.sm.is_running());
+            rig.shutdown().await;
+        }
+
+        /// T-L3 — Stop (immediate, 2nd press) ends the turn with `stopped`,
+        /// exactly once: the later `StopMarker` adds nothing.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn stop_emits_stopped_turn_end() {
+            let mut rig = spawn_rig(vec![
+                gate_call(),
+                crate::mock::MockResponse::text("never sent"),
+            ]);
+            rig.send("go");
+            rig.wait_tool_started().await;
+            rig.press();
+            rig.press(); // escalate → immediate
+            rig.wait_stop_message().await;
+
+            let ev = rig.next_turn_end().await;
+            assert_eq!(ev.outcome, crate::notify::TurnOutcome::Stopped);
+            assert_eq!(ev.source, crate::notify::TurnSource::User);
+            // Settle: a stray second event (e.g. from the StopMarker) would
+            // land shortly after the stop message.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert!(
+                rig.turn_ends.try_recv().is_err(),
+                "exactly one event per stopped turn (got a second: {:?})",
+                rig.turn_ends.try_recv().ok()
+            );
+            rig.shutdown().await;
+        }
+
+        /// T-L4 — a `[bg output]` synthetic turn ends with
+        /// `TurnEnd{ok, background}`: the second event after the user turn.
+        #[cfg(feature = "host")]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn bg_output_turn_emits_background_turn_end() {
+            let mut rig = spawn_rig(vec![
+                crate::mock::MockResponse::text("first"),
+                crate::mock::MockResponse::text("bg handled"),
+            ]);
+            rig.send("hi");
+            rig.next_turn_end().await; // the user turn's event
+
+            // The bg-notify pipe is attached by `run_loop`; this child's
+            // output is drained into a synthetic turn on the next idle wake.
+            rig.sm
+                .start_bg(crate::bg_processes::StartParams {
+                    command: "echo bg-done".into(),
+                    capture_cap: 10,
+                    cwd: None,
+                    label: None,
+                    cooldown: std::time::Duration::ZERO,
+                    env: None,
+                    shell: crate::tools::ShellKind::Bash { path: "sh".into() },
+                })
+                .expect("the bg child starts");
+
+            let ev = rig.next_turn_end().await;
+            assert_eq!(ev.source, crate::notify::TurnSource::Background);
+            assert_eq!(ev.outcome, crate::notify::TurnOutcome::Ok);
+            rig.shutdown().await;
+        }
+
+        /// T-L5 — a slash command ends without a turn: no event. A real
+        /// turn right after it still emits its one event (positive control).
+        #[tokio::test(flavor = "multi_thread")]
+        async fn slash_command_emits_nothing() {
+            let mut rig = spawn_rig(vec![crate::mock::MockResponse::text("hello")]);
+            rig.send("/stats");
+            rig.wait_for("the /stats system row", |m| {
+                m.iter().any(|m| {
+                    m.role == MessageRole::System && m.content.starts_with("## Session Statistics")
+                })
+            })
+            .await;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert!(
+                rig.turn_ends.try_recv().is_err(),
+                "a slash command is not a turn and must not emit (got: {:?})",
+                rig.turn_ends.try_recv().ok()
+            );
+            // Positive control: a real turn still publishes.
+            rig.send("hi");
+            let ev = rig.next_turn_end().await;
+            assert_eq!(ev.outcome, crate::notify::TurnOutcome::Ok);
+            assert_eq!(ev.source, crate::notify::TurnSource::User);
+            rig.shutdown().await;
+        }
+
+        /// T-L6 — notifications disabled (no channel): the turn completes
+        /// normally and nothing panics. Emission needs a sender; the
+        /// config→`None` link is T-B1.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn disabled_means_no_channel_no_events() {
+            let rig = spawn_rig_with_feed(vec![crate::mock::MockResponse::text("hello")], None);
+            rig.send("hi");
+            rig.wait_for("the reply", |m| {
+                m.iter()
+                    .any(|m| m.role == MessageRole::Agent && m.content == "hello")
+            })
+            .await;
+            assert!(!rig.sm.is_running());
+            rig.shutdown().await;
+        }
+
+        /// T-L7 — the payload is content-free: no message text in any event,
+        /// and the key set is exactly `{type,convo,title,outcome,source,ts}`.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn payload_has_no_message_content() {
+            let mut rig = spawn_rig(vec![
+                crate::mock::MockResponse::text("SECRET-REPLY-1"),
+                crate::mock::MockResponse::text("SECRET-REPLY-2"),
+            ]);
+            rig.send("opening");
+            let ev1 = rig.next_turn_end().await;
+            rig.send("SECRET-FOLLOWUP");
+            let ev2 = rig.next_turn_end().await;
+
+            for (i, ev) in [ev1, ev2].into_iter().enumerate() {
+                let json = serde_json::to_string(&ev).expect("the event serialises");
+                for secret in ["SECRET-REPLY-1", "SECRET-REPLY-2", "SECRET-FOLLOWUP"] {
+                    assert!(
+                        !json.contains(secret),
+                        "event {i} must not carry message text: {json}"
+                    );
+                }
+                let mut keys: Vec<String> = serde_json::to_value(&ev)
+                    .expect("an object")
+                    .as_object()
+                    .expect("an object")
+                    .keys()
+                    .cloned()
+                    .collect();
+                keys.sort();
+                assert_eq!(
+                    keys,
+                    vec!["convo", "outcome", "source", "title", "ts", "type"],
+                    "event {i}: the exact key set — {json}"
+                );
+            }
+            rig.shutdown().await;
         }
     }
 

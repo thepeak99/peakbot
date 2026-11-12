@@ -67,6 +67,19 @@ PeakBot (the server, and any jobs it is running) keeps running.
   have no tray. There, closing the window asks **Close PeakBot?** first, because closing
   stops PeakBot. **Cancel** keeps it running.
 
+## Notifications
+
+When a conversation finishes (or fails, or is stopped) and you're not looking at the
+PeakBot window — another app is in front, or the window is hidden in the tray — PeakBot
+shows a system notification with the conversation's name. Click it to bring PeakBot back
+on that conversation. Nothing is shown while the window is in front.
+
+- **Turn off:** set `general.notifications.enabled: false` in Settings (restart
+  required), or turn off notifications for PeakBot Desktop in your system settings.
+- **Windows:** clicking a notification after it has moved to the Action Center only
+  shows it; it doesn't open the conversation.
+- **Linux:** needs a notification service (every major desktop has one).
+
 ## Upgrading from the background service
 
 Earlier versions could keep PeakBot running as a system service (systemd / launchd,

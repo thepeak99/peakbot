@@ -5,6 +5,7 @@
 
 mod bridge;
 mod commands;
+mod notifier;
 #[cfg(windows)]
 mod sidecar_payload;
 #[cfg(target_os = "linux")]
@@ -156,6 +157,9 @@ fn main() {
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // Turn-end notifications (PR-C): used from Rust only — no
+        // `notification:*` capability grant (design §6.1/§6.5).
+        .plugin(tauri_plugin_notification::init())
         // Requires `plugins.updater.pubkey` in tauri.conf.json (plan
         // "Glue"); the endpoints + pubkey stay in the config.
         .plugin(tauri_plugin_updater::Builder::new().build())

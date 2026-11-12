@@ -208,6 +208,18 @@ export function useConvoTabs(
     return () => window.removeEventListener("keydown", onKeyDown, true);
   }, [enabled, dispatch]);
 
+  // The desktop app's notification click (PR-C design §6.4): a one-way
+  // webview eval from `notifier.rs`, not an IPC grant. The global is the
+  // picker's `open(convo)` — activate the tab, or open a new one — so a
+  // click never reloads the page (drafts survive).
+  useEffect(() => {
+    if (!enabled) return;
+    window.peakbotOpenConvo = (convo) => dispatch((s) => openConvo(s, convo, "", null));
+    return () => {
+      delete window.peakbotOpenConvo;
+    };
+  }, [enabled, dispatch]);
+
   const views = useMemo(
     () => (tabs ? tabViews(tabs, status, activeRunning, agent.state?.catalog) : []),
     [tabs, status, activeRunning, agent.state?.catalog],
