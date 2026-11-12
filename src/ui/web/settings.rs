@@ -196,9 +196,9 @@ fn is_loopback_name(name: &str) -> bool {
 /// One entry link: `https://<host>[:<port>]/?token=<token>&ca=<fp>` — the
 /// bind port rides the link (a dropped port would dial :443), omitted on
 /// 443; IPv6 hosts bracketed, built with [`url::Url`] (design §8.4). The
-/// query goes in via `set_query` so it stays verbatim: `query_pairs_mut`
-/// would form-encode the fingerprint's `:` to `%3A`, and the token is
-/// formatted the same (raw) way as [`WebUi::entry_url`] in `super`.
+/// query goes in via `set_query` so the fingerprint stays verbatim:
+/// `query_pairs_mut` would form-encode its `:` to `%3A`. The token is
+/// percent-encoded, same as [`WebUi::entry_url`] in `super`.
 fn entry_link(host: &str, port: u16, token: &str, fp: &str) -> String {
     let host = if host.contains(':') {
         format!("[{host}]")
@@ -211,7 +211,10 @@ fn entry_link(host: &str, port: u16, token: &str, fp: &str) -> String {
         format!("{host}:{port}")
     };
     let mut url = Url::parse(&format!("https://{authority}/")).expect("a well-formed host");
-    url.set_query(Some(&format!("token={token}&ca={fp}")));
+    url.set_query(Some(&format!(
+        "token={}&ca={fp}",
+        super::encode_token(token)
+    )));
     url.to_string()
 }
 
@@ -1033,5 +1036,25 @@ mod tests {
             PathBuf::from("/boot"),
             "an unknown convo id never leaves the boot cwd"
         );
+    }
+
+    // The server's own pairing links put the token in the query RAW
+    // (`set_query`, no form-encoding). `require_token` must keep accepting
+    // that raw spelling after it learns to percent-decode (token decode
+    // fix), so pin it here: URL-safe and literal-`+` tokens stay verbatim.
+    #[test]
+    fn entry_link_carries_a_url_safe_token_verbatim() {
+        let link = entry_link("host.local", 7823, "AbC-123_xyz.~", "sha256:ab:cd");
+        assert_eq!(
+            link,
+            "https://host.local:7823/?token=AbC-123_xyz.~&ca=sha256:ab:cd"
+        );
+    }
+
+    #[test]
+    fn entry_link_encodes_a_literal_plus_in_the_token() {
+        // A raw `+` in a query means space to every form decoder.
+        let link = entry_link("host.local", 443, "ab+cd", "sha256:ff");
+        assert_eq!(link, "https://host.local/?token=ab%2Bcd&ca=sha256:ff");
     }
 }

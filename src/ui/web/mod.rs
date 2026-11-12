@@ -251,7 +251,7 @@ impl WebUi {
     fn entry_url(&self) -> String {
         let scheme = if self.tls { "https" } else { "http" };
         match &self.token {
-            Some(t) => format!("{scheme}://{}/?token={}", self.addr, t),
+            Some(t) => format!("{scheme}://{}/?token={}", self.addr, encode_token(t)),
             None => format!("{scheme}://{}/", self.addr),
         }
     }
@@ -565,8 +565,18 @@ pub async fn require_token(
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    let via_query = token_from_query(req.uri().query()).is_some_and(|t| ct_eq(t, &token));
-    let ok = via_query || token_from_cookie(&req).is_some_and(|t| ct_eq(t, &token));
+    let via_query = token_from_query(req.uri().query()).is_some_and(|t| {
+        // Raw first (older clients send it verbatim), then percent-decoded,
+        // then form-decoded (`+` → space, what `url::Url` clients emit).
+        let form = t.replace('+', " ");
+        ct_eq_any(
+            &[Some(t.into()), decode_lenient(t), decode_lenient(&form)],
+            &token,
+        )
+    });
+    let ok = via_query
+        || token_from_cookie(&req)
+            .is_some_and(|t| ct_eq_any(&[Some(t.into()), decode_lenient(t)], &token));
 
     if !ok {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
@@ -576,12 +586,43 @@ pub async fn require_token(
     if via_query {
         // `HttpOnly` keeps JS from reading it; `SameSite=Strict` blocks
         // cross-site carriage. No `Secure` — the server is plain HTTP.
+        let token = encode_token(&token);
         let cookie = format!("{TOKEN_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict");
         if let Ok(v) = header::HeaderValue::from_str(&cookie) {
             resp.headers_mut().insert(header::SET_COOKIE, v);
         }
     }
     resp
+}
+
+/// Everything but RFC 3986 unreserved characters gets percent-encoded.
+const TOKEN_ENCODE: percent_encoding::AsciiSet = percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// Percent-encode a token for a cookie value or a query value. The raw secret
+/// breaks both: `;` ends a cookie early, `&`/`%`/`+` corrupt a query. Clients
+/// (the desktop app, browsers) encode, so the gate must decode — see
+/// [`require_token`] — and everything we emit must be encoded.
+pub(super) fn encode_token(token: &str) -> String {
+    percent_encoding::utf8_percent_encode(token, &TOKEN_ENCODE).to_string()
+}
+
+/// Percent-decode leniently: an invalid escape (`%zz`) stays literal, and
+/// bytes that aren't UTF-8 yield `None` (no match, no panic).
+fn decode_lenient(s: &str) -> Option<std::borrow::Cow<'_, str>> {
+    percent_encoding::percent_decode_str(s).decode_utf8().ok()
+}
+
+/// True if any candidate equals the secret. Every candidate is compared (no
+/// early exit) so timing doesn't reveal which form matched.
+fn ct_eq_any(candidates: &[Option<std::borrow::Cow<'_, str>>], secret: &str) -> bool {
+    candidates
+        .iter()
+        .flatten()
+        .fold(false, |hit, c| ct_eq(c, secret) | hit)
 }
 
 /// Extract the `token` value from a URL query string, if present.
@@ -1850,6 +1891,217 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         // Cookie-authed requests don't re-issue Set-Cookie.
         assert!(!resp.headers().contains_key(reqwest::header::SET_COOKIE));
+    }
+
+    // --- `?token=` percent-decoding (token decode bug) ---
+    //
+    // `require_token` used to compare the RAW query value with the secret, so
+    // a client that correctly percent-encodes a token with reserved
+    // characters (the desktop's `WebTarget::with_token`, which uses
+    // `Url::query_pairs_mut().append_pair`) got a 401. The server's own links
+    // (`entry_url`, the pairing links, the relay's `Cookie:`) put the token
+    // in RAW, so raw forms must keep working next to the decoded one.
+
+    /// A token with reserved characters (`+`, `&`, `%`, space, `=`) that the
+    /// server accepts verbatim from `--token` / config.
+    const SPECIAL_TOKEN: &str = "a+b&c%d =x";
+
+    /// `GET /commands?token=<query_value>` against a gate guarding `secret`.
+    /// `query_value` goes on the wire exactly as given (already encoded).
+    async fn status_for_query_token(secret: &str, query_value: &str) -> StatusCode {
+        let addr = spawn_gated(secret).await;
+        bare_client()
+            .get(format!("http://{addr}/commands?token={query_value}"))
+            .send()
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// How the desktop (`WebTarget::with_token`) encodes the token: a
+    /// form-urlencoded `append_pair` on a `Url`.
+    fn desktop_encoded(token: &str) -> String {
+        let mut u = url::Url::parse("http://h/").unwrap();
+        u.query_pairs_mut().append_pair("token", token);
+        u.query()
+            .unwrap()
+            .strip_prefix("token=")
+            .unwrap()
+            .to_string()
+    }
+
+    /// RED today: the raw value `a%2Bb%26c%25d%20%3Dx` != the secret.
+    #[tokio::test]
+    async fn percent_encoded_query_token_is_accepted() {
+        let encoded = percent_encoding::utf8_percent_encode(
+            SPECIAL_TOKEN,
+            percent_encoding::NON_ALPHANUMERIC,
+        )
+        .to_string();
+        assert_eq!(encoded, "a%2Bb%26c%25d%20%3Dx");
+        assert_eq!(
+            status_for_query_token(SPECIAL_TOKEN, &encoded).await,
+            StatusCode::OK
+        );
+    }
+
+    /// RED today: exactly what the desktop sends (`+` for the space,
+    /// `%2B`/`%26`/`%25`/`%3D` for the reserved bytes).
+    #[tokio::test]
+    async fn desktop_form_encoded_query_token_is_accepted() {
+        let encoded = desktop_encoded(SPECIAL_TOKEN);
+        assert_eq!(encoded, "a%2Bb%26c%25d+%3Dx");
+        assert_eq!(
+            status_for_query_token(SPECIAL_TOKEN, &encoded).await,
+            StatusCode::OK
+        );
+    }
+
+    /// RED today: form encoding writes a space as `+`.
+    #[tokio::test]
+    async fn plus_in_query_is_accepted_as_form_encoded_space() {
+        assert_eq!(status_for_query_token("a b", "a+b").await, StatusCode::OK);
+    }
+
+    /// GREEN guard — a fix that decodes `+` to space unconditionally would
+    /// break the raw links the server prints for a token with a literal `+`.
+    #[tokio::test]
+    async fn raw_literal_plus_query_token_still_accepted() {
+        assert_eq!(
+            status_for_query_token("ab+cd", "ab+cd").await,
+            StatusCode::OK
+        );
+    }
+
+    /// GREEN guard — the raw `%` of a raw link (`entry_url` doesn't encode)
+    /// is not a valid escape; it must keep matching the secret verbatim.
+    #[tokio::test]
+    async fn raw_query_token_with_invalid_percent_escape_still_accepted() {
+        assert_eq!(
+            status_for_query_token("pw%zz", "pw%zz").await,
+            StatusCode::OK
+        );
+    }
+
+    /// GREEN guard.
+    #[tokio::test]
+    async fn plain_query_token_still_accepted() {
+        let token = "AbC-123_xyz.~";
+        assert_eq!(status_for_query_token(token, token).await, StatusCode::OK);
+    }
+
+    /// GREEN guard — a decoded-but-different value never matches.
+    #[tokio::test]
+    async fn wrong_query_token_rejected() {
+        assert_eq!(
+            status_for_query_token("s3cret", "nope").await,
+            StatusCode::UNAUTHORIZED
+        );
+        // Encoded-but-wrong, and a prefix of the right one.
+        assert_eq!(
+            status_for_query_token(SPECIAL_TOKEN, "a%2Bb%26c%25d").await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// GREEN guard — malformed / non-UTF-8 escapes are a clean 401, no panic.
+    #[tokio::test]
+    async fn invalid_percent_escapes_in_query_token_are_rejected_not_panics() {
+        for bad in ["%ZZ", "%", "%2", "%FF%FE", "%00", ""] {
+            assert_eq!(
+                status_for_query_token("s3cret", bad).await,
+                StatusCode::UNAUTHORIZED,
+                "token={bad:?}"
+            );
+        }
+    }
+
+    /// GREEN guard — an encoded `&` is data, not a pair separator:
+    /// `s3cret%26x` decodes to `s3cret&x`, which is not `s3cret`.
+    #[tokio::test]
+    async fn encoded_ampersand_does_not_truncate_query_token() {
+        assert_eq!(
+            status_for_query_token("s3cret", "s3cret%26x").await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// GREEN pin — the relay (`remote::Client`) sends the token RAW as
+    /// `Cookie: peakbot_token=<token>`; that must stay accepted for a token
+    /// with special characters (space and `%` included, as `HeaderValue`
+    /// allows them).
+    #[tokio::test]
+    async fn raw_cookie_with_special_token_still_accepted() {
+        let addr = spawn_gated(SPECIAL_TOKEN).await;
+        let resp = bare_client()
+            .get(format!("http://{addr}/commands"))
+            .header(
+                reqwest::header::COOKIE,
+                format!("peakbot_token={SPECIAL_TOKEN}"),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// RED today (only because the query leg 401s): a query-authed request
+    /// sets a cookie, and replaying exactly the `name=value` pair the server
+    /// wrote must authenticate (browser round trip). Agnostic to whether the
+    /// fix writes the cookie raw or encoded.
+    #[tokio::test]
+    async fn set_cookie_for_special_token_round_trips() {
+        let addr = spawn_gated(SPECIAL_TOKEN).await;
+        let first = bare_client()
+            .get(format!(
+                "http://{addr}/commands?token={}",
+                desktop_encoded(SPECIAL_TOKEN)
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let set_cookie = first.headers()[reqwest::header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .to_string();
+        // A browser stores/sends the pair up to the first `;`.
+        let pair = set_cookie.split(';').next().unwrap().trim().to_string();
+        let replay = bare_client()
+            .get(format!("http://{addr}/commands"))
+            .header(reqwest::header::COOKIE, pair)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK, "Set-Cookie: {set_cookie}");
+    }
+
+    /// RED today — a SECOND, independent cookie bug: the cookie value is the
+    /// raw secret, so a `;` in it ends the cookie value early
+    /// (`peakbot_token=a;b; Path=/` is stored by a browser as `a`) and the
+    /// replay 401s. Authenticating via the raw query (`;` is legal there)
+    /// works today; only the cookie round trip is broken.
+    #[tokio::test]
+    async fn set_cookie_for_token_with_semicolon_round_trips() {
+        let addr = spawn_gated("a;b").await;
+        let first = bare_client()
+            .get(format!("http://{addr}/commands?token=a;b"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let set_cookie = first.headers()[reqwest::header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let pair = set_cookie.split(';').next().unwrap().trim().to_string();
+        let replay = bare_client()
+            .get(format!("http://{addr}/commands"))
+            .header(reqwest::header::COOKIE, pair)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK, "Set-Cookie: {set_cookie}");
     }
 
     #[tokio::test]

@@ -15,5 +15,6 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ### Fixes
 
+- **Web tokens with special characters work.** Tokens containing characters like `+`, `&`, `%`, `;` or spaces were rejected by the desktop app and broke links and cookies; the server now accepts correctly encoded tokens, and the links it prints are encoded.
 - Mobile: each conversation keeps its own half-typed message again — switching chats from the chat list no longer carries text into the other conversation, and coming back restores your draft.
 - Opening a different chat no longer flashes the previous chat's messages. Your five most recently viewed chats now open instantly and refresh in place; any other chat shows an empty screen for a moment while it loads. Applies to the mobile chat list, desktop tabs and the conversations picker.
