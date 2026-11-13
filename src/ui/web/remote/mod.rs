@@ -62,6 +62,10 @@ mod t8_tests;
 #[cfg(test)]
 mod t9_tests;
 
+// P3 PR-A A6: the typed GetTarget boundary (RED until A6 lands).
+#[cfg(test)]
+mod t11_tests;
+
 // Unpinned attach on a relay-only config (remotes through the on-device
 // core).
 #[cfg(test)]
