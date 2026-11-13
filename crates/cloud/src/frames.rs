@@ -273,16 +273,23 @@ pub enum MuxEvent {
 }
 
 /// Per-stream state as seen by one side (spec §9.5).
+///
+/// `End` is a HALF-close (S3/S4): each direction ends on its own and the
+/// stream closes when both have. The mux is fed messages of both
+/// directions without a direction tag, so direction is inferred: on a
+/// non-Attach stream everything before `Head` is the initiator's, hence a
+/// first `End` before `Head` is the request's End.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamState {
-    Open {
+    Live {
         attach: bool,
-        /// Head sent on this (non-Attach) stream; at most one (S4).
+        /// Head seen on this (non-Attach) stream; at most one (S4).
         headed: bool,
-    },
-    /// One direction ended (S3/S4): the second End closes the stream.
-    Ended {
-        attach: bool,
+        /// The request direction (initiator) has ended; known only when
+        /// the End arrived before `Head`.
+        req_ended: bool,
+        /// Number of `End`s seen so far (0 or 1; the second closes).
+        ends: u8,
     },
     Closed,
     Reset,
@@ -317,7 +324,8 @@ impl Mux {
     /// - S3: Attach: `Frame` both ways, `End` per direction, closed when
     ///   both ended; `Chunk`/`Head` on Attach → `Protocol`.
     /// - S4: other ops: initiator `Open, Chunk*, End`; responder
-    ///   `Head, Chunk*, End`; out of sequence or `Frame` → `Protocol`.
+    ///   `Head, Chunk*, End`; `End` is a HALF-close (the stream closes on
+    ///   the second End); out of sequence or `Frame` → `Protocol`.
     /// - S5: `Reset` ends a stream both ways; messages for a reset/closed
     ///   id are dropped silently (no event); a message for an id that was
     ///   never opened → `Protocol`.
@@ -345,9 +353,11 @@ impl Mux {
             }
             self.streams.insert(
                 id,
-                StreamState::Open {
+                StreamState::Live {
                     attach: matches!(op, Op::Attach),
                     headed: false,
+                    req_ended: false,
+                    ends: 0,
                 },
             );
             self.max_opened = id;
@@ -361,73 +371,72 @@ impl Mux {
                 // S5: in-flight messages are dropped silently.
                 Ok(events)
             }
-            StreamState::Open { attach, headed } => match &inner.msg {
-                StreamMsg::Frame(_) => {
-                    if !attach {
-                        return Err(Error::Protocol);
+            StreamState::Live {
+                attach,
+                headed,
+                req_ended,
+                ends,
+            } => {
+                let live = |headed, req_ended, ends| StreamState::Live {
+                    attach,
+                    headed,
+                    req_ended,
+                    ends,
+                };
+                match &inner.msg {
+                    StreamMsg::Frame(_) => {
+                        if !attach {
+                            return Err(Error::Protocol);
+                        }
+                        Ok(events)
                     }
-                    Ok(events)
-                }
-                StreamMsg::Chunk(c) => {
-                    if attach || c.len() > constants::MAX_CHUNK {
-                        return Err(Error::Protocol);
+                    StreamMsg::Chunk(c) => {
+                        if attach || c.len() > constants::MAX_CHUNK {
+                            return Err(Error::Protocol);
+                        }
+                        // Before Head only the request can send; after its
+                        // End a Chunk is out of sequence (S4).
+                        if !headed && req_ended {
+                            return Err(Error::Protocol);
+                        }
+                        Ok(events)
                     }
-                    Ok(events)
-                }
-                StreamMsg::Head { .. } => {
-                    if attach || headed {
-                        return Err(Error::Protocol);
+                    StreamMsg::Head { .. } => {
+                        if attach || headed {
+                            return Err(Error::Protocol);
+                        }
+                        self.streams.insert(id, live(true, req_ended, ends));
+                        Ok(events)
                     }
-                    self.streams.insert(
-                        id,
-                        StreamState::Open {
-                            attach,
-                            headed: true,
-                        },
-                    );
-                    Ok(events)
-                }
-                StreamMsg::End => {
-                    self.streams.insert(id, StreamState::Ended { attach });
-                    Ok(events)
-                }
-                StreamMsg::Reset(code) => {
-                    self.streams.insert(id, StreamState::Reset);
-                    self.open_count -= 1;
-                    events.push(MuxEvent::Reset(id, normalize_reset(*code)));
-                    Ok(events)
-                }
-                StreamMsg::Open(_) => Err(Error::Protocol),
-            },
-            StreamState::Ended { attach } => match &inner.msg {
-                StreamMsg::Frame(_) => {
-                    if !attach {
-                        return Err(Error::Protocol);
+                    StreamMsg::End => {
+                        if !attach && !headed {
+                            // Only the request can End before Head; a
+                            // second End without a Head is out of sequence.
+                            if req_ended {
+                                return Err(Error::Protocol);
+                            }
+                            self.streams.insert(id, live(false, true, 1));
+                            return Ok(events);
+                        }
+                        if ends >= 1 {
+                            // Both directions ended (S3/S4).
+                            self.streams.insert(id, StreamState::Closed);
+                            self.open_count -= 1;
+                            events.push(MuxEvent::Closed(id));
+                        } else {
+                            self.streams.insert(id, live(headed, req_ended, 1));
+                        }
+                        Ok(events)
                     }
-                    Ok(events)
-                }
-                StreamMsg::Chunk(c) => {
-                    if attach || c.len() > constants::MAX_CHUNK {
-                        return Err(Error::Protocol);
+                    StreamMsg::Reset(code) => {
+                        self.streams.insert(id, StreamState::Reset);
+                        self.open_count -= 1;
+                        events.push(MuxEvent::Reset(id, normalize_reset(*code)));
+                        Ok(events)
                     }
-                    Ok(events)
+                    StreamMsg::Open(_) => Err(Error::Protocol),
                 }
-                StreamMsg::End => {
-                    // Both directions ended (S3/S4).
-                    self.streams.insert(id, StreamState::Closed);
-                    self.open_count -= 1;
-                    events.push(MuxEvent::Closed(id));
-                    Ok(events)
-                }
-                StreamMsg::Reset(code) => {
-                    self.streams.insert(id, StreamState::Reset);
-                    self.open_count -= 1;
-                    events.push(MuxEvent::Reset(id, normalize_reset(*code)));
-                    Ok(events)
-                }
-                StreamMsg::Head { .. } => Err(Error::Protocol),
-                StreamMsg::Open(_) => Err(Error::Protocol),
-            },
+            }
         }
     }
 }
