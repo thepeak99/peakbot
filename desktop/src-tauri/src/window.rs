@@ -159,3 +159,37 @@ mod shell_marker_tests {
         );
     }
 }
+
+// ─── window minimum size (option D) ─────────────────────────────────────
+//
+// The SPA breaks at the 1024px web breakpoint (below it the phone layout
+// renders), so the desktop window must never be resizable into it: the
+// minimum is 1024×600 and the layout is always wide.
+//
+// RED before implementation: MIN_WIDTH / MIN_HEIGHT do not exist yet, so
+// this module fails to compile. `create_main` must size the window through
+// the constants (`.min_inner_size(MIN_WIDTH, MIN_HEIGHT)`).
+
+#[cfg(test)]
+mod min_size_tests {
+    use super::{MIN_HEIGHT, MIN_WIDTH};
+
+    /// The web breakpoint (web/src/App.tsx): below 1024px the SPA renders
+    /// the phone layout, so the window must never be able to shrink there.
+    const WEB_BREAKPOINT_WIDTH: f64 = 1024.0;
+
+    #[test]
+    fn min_width_is_1024() {
+        assert_eq!(MIN_WIDTH, 1024.0);
+    }
+
+    #[test]
+    fn min_height_is_600() {
+        assert_eq!(MIN_HEIGHT, 600.0);
+    }
+
+    #[test]
+    fn min_width_never_dips_below_the_web_breakpoint() {
+        assert!(MIN_WIDTH >= WEB_BREAKPOINT_WIDTH);
+    }
+}

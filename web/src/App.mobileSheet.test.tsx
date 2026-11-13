@@ -1259,6 +1259,113 @@ describe("App mobile sheet — X2: the transcript rows follow the breakpoint", (
   });
 });
 
+// ═══ D1 — option D: the desktop shell is always wide ════════════════════
+//
+// `window.peakbotShell = "desktop"` (the desktop app's init script,
+// desktop/src-tauri/src/window.rs) must force the DESKTOP layout at every
+// viewport width — the desktop window is sized ≥1024×600 (see the
+// MIN_WIDTH/MIN_HEIGHT tests in window.rs) and never shrinks into the phone
+// face. The phone layout stays the browser's (and the mobile shell's) at
+// <1024px.
+//
+// RED before implementation: App derives the layout solely from
+// useMediaQuery("(min-width: 1024px)"), so a narrow desktop shell renders
+// the phone layout and the first four tests fail. `peakbotShell` is reset
+// to "browser" by the file-wide afterEach.
+
+describe("App desktop — option D: the desktop shell is always wide", () => {
+  const withRows = (): FakeAgent =>
+    makeAgent(
+      stateFor("c1", {
+        chat: {
+          messages: [
+            { role: "user", content: "hi", timestamp: T },
+            { role: "agent", content: "yo", timestamp: T },
+          ],
+          auto_scroll: true,
+          scroll_offset: 0,
+        },
+      } as Partial<AppState>),
+    );
+
+  async function withViewport(run: () => Promise<void>): Promise<void> {
+    const desc = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "offsetHeight");
+    Object.defineProperty(HTMLElement.prototype, "offsetHeight", { configurable: true, get: () => 400 });
+    try {
+      await run();
+    } finally {
+      if (desc) Object.defineProperty(HTMLElement.prototype, "offsetHeight", desc);
+    }
+  }
+
+  it("a NARROW desktop-shell viewport renders the drawer rail — no panels button, no sheet", async () => {
+    // desktopWidth stays false: matchMedia reports <1024.
+    setShell("desktop");
+    hoisted.agent = makeAgent(withTabs());
+    mount();
+    await flush();
+    const rail = host.querySelector('aside[aria-label="Side panels"] [role="tablist"]');
+    expect(rail, "the desktop drawer rail renders in the desktop shell at any width").not.toBeNull();
+    expect(tid("panels-button"), "no phone panels button in the desktop shell").toBeNull();
+    expect(panelsDialog(), "no phone sheet in the desktop shell").toBeNull();
+    expect(host.querySelector("header"), "no phone ChatHeader in the desktop shell").toBeNull();
+  });
+
+  it("a NARROW desktop-shell viewport keeps the desktop composer face ('Type a message…')", async () => {
+    setShell("desktop");
+    hoisted.agent = makeAgent(withTabs());
+    mount();
+    await flush();
+    const ta = host.querySelector('[data-testid="composer"] textarea') as HTMLTextAreaElement;
+    expect(ta, "the composer textarea renders").not.toBeNull();
+    expect(ta!.placeholder, "the desktop placeholder, not the phone's 'Message'").toBe("Type a message…");
+  });
+
+  it("a NARROW desktop-shell viewport keeps the desktop message labels ('You' / 'Shifu')", async () => {
+    await withViewport(async () => {
+      setShell("desktop");
+      hoisted.agent = withRows();
+      mount();
+      await flush();
+      const rows = [...host.querySelectorAll("[data-index]")].map((r) => r.textContent ?? "");
+      expect(rows.length, "rows render").toBe(2);
+      expect(rows.join("|"), "the user row keeps its 'You' label").toContain("You");
+      expect(rows.join("|"), "the agent row keeps its label").toContain("Shifu");
+    });
+  });
+
+  it("crossing the breakpoint DOWN inside the desktop shell never shows the phone layout", async () => {
+    desktopWidth = true;
+    setShell("desktop");
+    hoisted.agent = makeAgent(withTabs());
+    mount();
+    await flush();
+    expect(
+      host.querySelector('aside[aria-label="Side panels"] [role="tablist"]'),
+      "wide desktop shell: the rail",
+    ).not.toBeNull();
+
+    await setDesktop(false);
+    await flush();
+
+    expect(
+      host.querySelector('aside[aria-label="Side panels"] [role="tablist"]'),
+      "the rail survives the shrink",
+    ).not.toBeNull();
+    expect(tid("panels-button"), "no phone panels button after the shrink").toBeNull();
+    expect(panelsDialog(), "no phone sheet after the shrink").toBeNull();
+  });
+
+  it("the BROWSER at the same narrow width still gets the phone layout (regression guard)", async () => {
+    setShell("browser");
+    hoisted.agent = makeAgent(withTabs());
+    mount();
+    await flush();
+    expect(host.querySelector('aside[aria-label="Side panels"]'), "no drawer rail in a browser").toBeNull();
+    expect(tid("panels-button"), "the phone panels button renders in a browser").not.toBeNull();
+  });
+});
+
 // ═══ B32 — the fresh-chat empty state (batch 3, fidelity plan 3.10) ══════
 
 describe("App mobile sheet — B32: the fresh-chat empty state", () => {
