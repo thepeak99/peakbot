@@ -12,7 +12,7 @@ use std::fmt;
 use std::io;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -1409,10 +1409,6 @@ impl Directory {
         self.clients.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
-
-/// Process-wide because `WsState` is built in many places (tests included);
-/// it re-reads the global config on every call anyway (§5.11).
-pub(super) static DIRECTORY: LazyLock<Directory> = LazyLock::new(Directory::new);
 
 /// The global config only (repo files never define remotes, §5.11).
 fn load_config() -> Result<Config, RemoteError> {

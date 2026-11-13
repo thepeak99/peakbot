@@ -159,6 +159,7 @@ fn harness(yaml: &str, pin: Option<&str>) -> Harness {
         active_alias: "local".into(),
         session_ttl: Duration::from_secs(3600),
         uploads: deps.uploads.clone(),
+        directory: std::sync::Arc::new(crate::ui::web::remote_types::Directory::new()),
     };
     Harness {
         _home: home,

@@ -184,8 +184,30 @@ pub fn boot_cloud(
     store: Arc<dyn crate::cloud::SeedStore>,
     inbound: Option<crate::cloud::InboundHook>,
 ) -> Option<crate::cloud::CloudHandle> {
-    let _ = (config, state_dir, device_name, store, inbound);
-    todo!("P3 PR-C: boot wiring — spawn CloudLink when general.cloud is set")
+    let Some(def) = &config.general.cloud else {
+        return None;
+    };
+    // The resolve layer already validated this block; a re-parse failure is
+    // a logic bug — stay Disabled rather than boot a broken link.
+    let Ok(Some(mut cloud)) = crate::cloud::config::parse_cloud(Some(def)) else {
+        tracing::error!("general.cloud failed to re-parse; Cloud Mode stays off");
+        return None;
+    };
+    cloud.state_dir = state_dir;
+    cloud.device_name = device_name.to_string();
+    // Card platform byte (spec §4.1): the host edition is a computer, the
+    // Local edition is the phone.
+    #[cfg(feature = "host")]
+    {
+        cloud.platform = 1;
+    }
+    #[cfg(not(feature = "host"))]
+    {
+        cloud.platform = 4;
+    }
+    let handle = crate::cloud::spawn(cloud, store, inbound);
+    crate::cloud::set_boot_handle(handle.clone());
+    Some(handle)
 }
 
 #[cfg(test)]

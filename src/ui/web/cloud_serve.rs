@@ -453,6 +453,7 @@ profiles:
             active_alias: "local".into(),
             session_ttl: Duration::from_secs(3600),
             uploads,
+            directory: std::sync::Arc::new(crate::ui::web::remote_types::Directory::new()),
         };
         WebEnv {
             _home: home,

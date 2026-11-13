@@ -364,6 +364,7 @@ async fn relay_env(
         active_alias: "local".into(),
         session_ttl: Duration::from_secs(3600),
         uploads: deps.uploads.clone(),
+        directory: std::sync::Arc::new(crate::ui::web::remote_types::Directory::new()),
     };
     let local = serve_local_ws(&state).await;
     RelayEnv {

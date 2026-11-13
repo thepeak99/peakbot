@@ -59,7 +59,7 @@ fn img() -> String {
 }
 
 async fn env_for(remotes: &[RemoteSpec<'_>]) -> LocalEnv {
-    LocalEnv::start(remotes, Some(proxy::router())).await
+    LocalEnv::start(remotes, Some(proxy::router(std::sync::Arc::new(super::Directory::new())))).await
 }
 
 /// One remote `dev` as `home-dev`, healthy.

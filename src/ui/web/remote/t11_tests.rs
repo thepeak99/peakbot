@@ -118,7 +118,7 @@ fn get_target_path_renders_the_upstream_path() {
 // ═══════════════════════════════════════════════════════════════════════
 
 async fn env_for(remotes: &[RemoteSpec<'_>]) -> LocalEnv {
-    LocalEnv::start(remotes, Some(proxy::router())).await
+    LocalEnv::start(remotes, Some(proxy::router(std::sync::Arc::new(super::Directory::new())))).await
 }
 
 /// One remote `dev` as `home-dev`, healthy; its `rec` counts every hit.

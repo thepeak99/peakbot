@@ -511,6 +511,7 @@ impl LocalEnv {
             active_alias: "local".into(),
             session_ttl: Duration::from_secs(3600),
             uploads: deps.uploads.clone(),
+            directory: std::sync::Arc::new(crate::ui::web::remote_types::Directory::new()),
         };
         let mut app = Router::new()
             .route("/ws", get(ws_handler))

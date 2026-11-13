@@ -41,12 +41,11 @@ profiles:
 /// `general.cloud` pointing at the fake relay (loopback plain is a legal
 /// endpoint, RP3).
 fn with_cloud_yaml(relay_url: &str) -> String {
-    format!(
-        r#"
-{NO_CLOUD_YAML}
-  cloud:
-    relay: {relay_url}
-"#
+    // `cloud:` is a `general` key; appending it after `profiles:` nested it there.
+    NO_CLOUD_YAML.replacen(
+        "general:\n",
+        &format!("general:\n  cloud:\n    relay: {relay_url}\n"),
+        1,
     )
 }
 
