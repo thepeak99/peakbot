@@ -240,13 +240,14 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
             peakbotVersion={welcome?.peakbotVersion}
             scopeLabel={scopeLabel}
             laneMessages={laneMessages}
+            phone={!isDesktop}
           />
         ) : null,
     },
     {
       id: "todo",
       label: "Todo",
-      content: <TodoPanel nodes={todos} />,
+      content: <TodoPanel nodes={todos} phone={!isDesktop} />,
       // Per surface: every rendered row on desktop, the OPEN count on a
       // phone (the pill badge and the panels badge both read it).
       badge: isDesktop
@@ -262,7 +263,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
     {
       id: "tasks",
       label: "Tasks",
-      content: <BgPanel processes={bg} />,
+      content: <BgPanel processes={bg} phone={!isDesktop} />,
       badge: runningBg,
     },
     {

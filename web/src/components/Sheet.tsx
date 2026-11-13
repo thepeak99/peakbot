@@ -118,7 +118,7 @@ export function Sheet({ title, onClose, detents = false, above, children }: Shee
     <div className="fixed inset-0 z-50">
       <div
         data-testid="sheet-backdrop"
-        className="absolute inset-0 bg-black/55"
+        className="absolute inset-0 bg-black/55 light:bg-black/40"
         onClick={onClose}
       />
       <div
@@ -139,23 +139,22 @@ export function Sheet({ title, onClose, detents = false, above, children }: Shee
       >
         {above && <div className="absolute inset-x-0 bottom-full mb-3.5 flex justify-center px-4">{above}</div>}
         <div
-          className={`${detents ? "h-full" : "max-h-[92dvh]"} flex flex-col overflow-hidden rounded-t-2xl border-t border-zinc-700/60 bg-zinc-900 shadow-[0_-12px_40px_rgba(0,0,0,0.5)] motion-safe:animate-sheet-in`}
+          className={`${detents ? "h-full" : "max-h-[92dvh]"} flex flex-col overflow-hidden rounded-t-sheet border-t border-zinc-700 bg-zinc-900 pb-[env(safe-area-inset-bottom)] shadow-[0_-12px_40px_rgba(0,0,0,0.5)] motion-safe:animate-sheet-in`}
         >
-          {detents && (
-            <div
-              data-testid="sheet-grabber"
-              onPointerDown={startDrag}
-              className="flex h-7 flex-none touch-none items-start justify-center"
-            >
-              <div className="mt-1.5 h-[5px] w-9 rounded-full bg-zinc-600" />
-            </div>
-          )}
+          {/* The mock's .grab is on every sheet; only detent sheets drag from it. */}
+          <div
+            data-testid="sheet-grabber"
+            onPointerDown={detents ? startDrag : undefined}
+            className={`flex flex-none justify-center pt-2 ${detents ? "touch-none" : ""}`}
+          >
+            <div className="h-[5px] w-[38px] rounded-[3px] bg-zinc-700" />
+          </div>
           <div
             data-testid="sheet-header"
             onPointerDown={startDrag}
-            className="flex flex-none touch-none items-center justify-between gap-2 px-4 pb-1"
+            className="flex flex-none touch-none items-center justify-between gap-2 px-[18px] pb-1.5 pt-2.5"
           >
-            <h2 className="text-[17px] font-bold tracking-tight text-zinc-100">{title}</h2>
+            <h2 className="text-[17px] font-bold tracking-[-0.01em] text-zinc-100">{title}</h2>
             <button
               type="button"
               data-testid="sheet-done"

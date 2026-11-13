@@ -4,10 +4,10 @@
 // sheet's top edge via the `above` slot. `PanelsButton` (icon + combined
 // badge) is shared by ChatHeader and TopBar.
 
-import type { JSX } from "react";
+import { useEffect, useRef, type JSX } from "react";
 import { Sheet } from "./Sheet";
 import type { DrawerTab } from "./TabbedDrawer";
-import { IB, IBI_HI } from "./phoneUi";
+import { IB, IBI_HI, PILL_OFF, PILL_ON } from "./phoneUi";
 
 export interface PanelsButtonProps {
   /** Running background tasks + open todos, summed over visible tabs. */
@@ -75,6 +75,13 @@ export function PanelsSheet({
   onStop,
 }: PanelsSheetProps): JSX.Element {
   const activeTab = tabs.find((t) => t.id === active);
+  const stripRef = useRef<HTMLDivElement>(null);
+  // Keep the selected pill in view when the strip overflows (the mock centres it).
+  useEffect(() => {
+    stripRef.current
+      ?.querySelector<HTMLElement>('[aria-selected="true"]')
+      ?.scrollIntoView?.({ inline: "center", block: "nearest", behavior: "smooth" });
+  }, [active]);
   return (
     <Sheet
       title="Panels"
@@ -104,45 +111,46 @@ export function PanelsSheet({
         ) : null
       }
     >
-      <div
-        role="tablist"
-        aria-label="Panels"
-        className="flex gap-2 overflow-x-auto px-4 pb-3 pt-1"
-        style={{ scrollbarWidth: "none" }}
-      >
-        {tabs.map((t) => {
-          const selected = active === t.id;
-          return (
-            <button
-              key={t.id}
-              type="button"
-              role="tab"
-              data-testid="panels-pill"
-              data-tab={t.id}
-              aria-selected={selected}
-              onClick={() => onActiveChange(t.id)}
-              className={`flex h-10 flex-none cursor-pointer items-center rounded-full border px-4 text-sm transition-colors ${
-                selected
-                  ? "border-zinc-100 bg-zinc-100 font-semibold text-zinc-900"
-                  : "border-zinc-700 bg-zinc-800/60 font-medium text-zinc-400 hover:text-zinc-200"
-              }`}
-            >
-              {t.label}
-              {t.badge != null && t.badge > 0 && (
-                <span
-                  data-testid="panels-pill-badge"
-                  className={`ml-2 rounded-full px-1.5 font-mono text-[11px] leading-4 ${
-                    selected ? "bg-zinc-900/20 text-zinc-900" : "bg-sky-600 text-white"
-                  }`}
-                >
-                  {t.badge}
-                </span>
-              )}
-            </button>
-          );
-        })}
+      <div className="relative flex-none">
+        <div
+          ref={stripRef}
+          role="tablist"
+          aria-label="Panels"
+          className="flex gap-2 overflow-x-auto px-4 pb-3 pt-1.5"
+          style={{ scrollbarWidth: "none" }}
+        >
+          {tabs.map((t) => {
+            const selected = active === t.id;
+            return (
+              <button
+                key={t.id}
+                type="button"
+                role="tab"
+                data-testid="panels-pill"
+                data-tab={t.id}
+                aria-selected={selected}
+                onClick={() => onActiveChange(t.id)}
+                className={`flex h-10 flex-none cursor-pointer items-center rounded-[20px] border px-[15px] text-sm transition-colors ${
+                  selected ? PILL_ON : PILL_OFF
+                }`}
+              >
+                {t.label}
+                {t.badge != null && t.badge > 0 && (
+                  <span
+                    data-testid="panels-pill-badge"
+                    className="ml-[7px] h-4 min-w-4 rounded-lg bg-sky-600 px-1 text-center font-mono text-[10px] font-semibold leading-4 text-white"
+                  >
+                    {t.badge}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+        {/* Right-edge fade: the strip scrolls sideways (mock .pills::after). */}
+        <span aria-hidden className="pointer-events-none absolute inset-y-0 right-0 w-9 bg-gradient-to-r from-transparent to-zinc-900" />
       </div>
-      <div role="tabpanel" className="min-h-0 px-4 pb-4">
+      <div role="tabpanel" className="min-h-0 px-4 pb-2 pt-1">
         {activeTab?.content}
       </div>
     </Sheet>
