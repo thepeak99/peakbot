@@ -733,7 +733,7 @@ profiles:
 
 `ui.color` (one of red, orange, yellow, green, teal, blue, purple, pink) colours the tab accent, picker row and chip dot for local AND remote profiles; unset → a stable colour derived from the profile name (FNV-1a-32 % 8). The server resolves it into `ProfileInfo.color` — the SPA never derives a colour.
 
-Where it lives: `src/config/remote.rs` (parse), `src/ui/web/remote/{mod,relay,proxy}.rs` (client, relay, `/r/` proxy), `src/ui/web/conversations.rs` (merged list + kill), `web/src/settings/{profiles,connectPhone,pairingLink}` (Settings UI).
+Where it lives: `src/config/remote.rs` (parse), `src/ui/web/remote/{mod,relay,proxy}.rs` (client, relay, `/r/` proxy), `src/ui/web/conversations.rs` (merged list + kill), `web/src/settings/{profiles,connectPhone,pairingLink}` (Settings UI). The controller's transport is an **enum** (`remote::Client` / `WsStream` / `Upstream`, Direct-only today): Cloud Mode adds variants — add variants, don't branch above the transport.
 
 ## CI (Gitea Actions)
 

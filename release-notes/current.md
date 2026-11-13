@@ -6,6 +6,7 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ### Features
 
+- **Internal: remote-profile transport seam.** The remote-profile controller now rides an enum over transports (direct connection only, today) so Cloud Mode devices can join without touching the proxy, relay or listing code. User-visible: unknown `/r/` paths (anything that isn't an image or an upload fetch) are now refused with a local 404 without contacting the remote server.
 - **PeakBot Mobile: smoother screen changes.** Opening a chat, going back to Chats, and opening or closing Settings now slide and fade like a native messenger. Motion is off when the phone asks for reduced motion; desktop and browser are unchanged.
 - **PeakBot Desktop: notifications when a task finishes.** When a conversation finishes, fails or is stopped while the PeakBot window is in the background or hidden in the tray, you get a system notification with the conversation's name. Click it to jump straight back to that conversation. It works for every conversation on this PeakBot, including ones you started from your phone or a browser. To turn notifications off, set `general.notifications.enabled: false` (restart required) or use your system's notification settings.
 - **Chats list and the desktop conversations picker: consistent row states.** Running chats are now highlighted in amber with a spinner, live sessions keep their green highlight without the extra green dot, and the blue dot is the only marker (mobile: new messages).
