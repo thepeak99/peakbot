@@ -152,6 +152,7 @@ Editing `config.yaml` (global or the repo file) or skills does not require a res
 | `general.cost_tracking`, `general.retry`, `general.timeouts` | `general.uploads` (max_file_mb / max_files, read once) |
 | skills + system prompt | `general.conversation` (auto_save / storage_dir, built at boot) |
 | | `general.notifications` (the turn-end feed is built once at boot) |
+| | `general.cloud` (restart-only: the CloudLink actor and its relay socket are built once at boot) |
 
 `vector_db` is reload-safe: a process-wide handle registry keyed by the resolved `db_path` shares one DB across profiles and reloads (the same `db_path` with different embeddings is a parse error).
 
@@ -326,6 +327,17 @@ else).
 **TLS** (`--tls` or `general.web.tls: true`): PeakBot self-signs a long-lived CA in `dirs::cache_dir()/peakbot/tls/` (key 0600, never silently regenerated — delete the dir to rotate) and mints a fresh leaf each boot with SANs for loopback, the LAN IP, any bind IP, and `<hostname>.local`. The CA public cert is served at the tokenless route `GET /peakbot-ca.crt` for one-time install on phones (iOS additionally needs Settings → General → About → Certificate Trust Settings). TLS complements the token, never replaces it. Implementation: `src/ui/web/tls.rs` (`rcgen` + `rustls`/aws-lc-rs, no OpenSSL).
 
 **Testing the web UI**: `make dev` runs backend (`:8080`) + Vite HMR (`:5173`); drive it with the `playwright-cli` skill (accessibility snapshots, console logs, WS traces). For pure server-side WS probing, `websocat ws://localhost:7823/ws`.
+
+## Cloud Mode (`src/cloud/`, `src/ui/web/cloud_api.rs`)
+
+`general.cloud: { relay, ca }` (absent = off; **restart-only**, see the reload table) joins this PeakBot to a relay account so its devices can pair. The protocol lives in `crates/cloud` (pure, no I/O); `src/cloud/` is only IO, state and glue.
+
+- **One owner.** A single `CloudLink` actor task owns the relay socket, the verified chain and every peer session. No `Mutex` around protocol state: callers talk to it through `CloudHandle` (commands in, `watch<CloudState>` out). The only lock is the login-listener slot, outside the actor.
+- **Secrets.** The seed and session token live in a `SeedStore` (OS keyring on the host, 0600 file fallback; `MemSeedStore` in tests). A `SeedStore` never logs secret material; `Seed`/`SessionToken` are not `Clone` and Debug-redact.
+- **Enrollment.** First device → genesis. A new device freezes the chain head *before* showing the six SAS words, posts an `EnrollRequest` to every active device, and stays Pending. Approval needs an explicit `letter_id` (nothing is ever approved by default); reject sends `EnrollReject`; revoke closes that device's sessions; logout self-revokes (if others remain), `POST /logout`, then wipes the seed.
+- **API** (`/api/cloud/*`, token-gated, both editions; 404 `cloud_disabled` when off): `state`, `devices`, `devices/{id}/profiles`, `events` (one SSE stream, full state per change) are always readable; `login`, `genesis`, `enroll/approve`, `enroll/reject`, `devices/{id}/revoke`, `logout` return 403 `settings_disabled` when the `settings` tab is filtered off.
+
+---
 
 ## Extending
 

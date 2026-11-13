@@ -18,6 +18,12 @@ mock = []
 # file + doc tools, MCP, the installer, the TUI and the CLI. Without it the
 # crate is the Local edition PeakBot runs in-process on a phone.
 default = ["host"]
+# Cloud Mode (p3-design §A/§C): the OS keyring is the green-phase home of
+# the seed/token. Its `sync-secret-service` backend needs the system
+# `libdbus-1-dev` at build time, which the RED sandbox lacks — so the
+# `keyring` CRATE is added in the green phase. The skeleton keeps
+# `KeyringSeedStore` a stub (todo!() bodies, no keyring import) and the
+# `FileSeedStore` 0600 fallback, so both editions compile now.
 host = [
     "dep:portable-pty",
     "dep:rmcp",
@@ -29,6 +35,8 @@ host = [
     "dep:clap",
     "dep:open",
     "dep:libc",
+    "dep:keyring",
+    "dep:dbus-secret-service",
 ]
 
 [[bin]]
@@ -94,6 +102,20 @@ rmcp = { version = "1.6", optional = true, features = [
     "auth",
 ] }
 tokio = { version = "1", features = ["full"] }
+# pbc1 protocol core (Cloud Mode PR-B; p3-design §A): chain, handshake,
+# frames, relay codecs. Non-optional — BOTH editions need it.
+peakbot-cloud = { path = "crates/cloud" }
+# The crypto source the enroll seams name in their signatures (same rev as
+# `crates/cloud` — it must stay bit-identical).
+perma-crypto = { git = "https://git.patchnotes.com/ai-bots/perma-crypto.git", rev = "bb917b548f75922a2a3c39f9797798546ba8bd26" }
+# RNG trait for the login/enroll seams (`&mut impl CryptoRng`); the same
+# 0.9 family perma-crypto depends on.
+rand_core = "=0.9.5"
+# CSPRNG for the actor (login state, seeds, backoff jitter): rand 0.9 is
+# a dev-dependency, so the actor fills bytes through getrandom directly.
+getrandom = "0.3"
+# Zeroizing secret wrappers for cloud identity (p3-design §C).
+zeroize = "1"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 thiserror = "2"
@@ -158,7 +180,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 # MCP OAuth 2.1 (#19, src/mcp_auth.rs): one-shot localhost callback listener.
 # The `query` extractor URL-decodes auto (Linear `%3A`-encodes the auth code).
 # `ws` feature is for the default PeakBot WebSocket transport (src/ui/web/).
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "ws"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "ws", "json"] }
 # Cloud Mode CloudServe: `ServiceExt::oneshot` runs a tunnelled op through the
 # same in-process router the HTTP routes use (already in the tree via axum).
 tower = { version = "0.5", default-features = false, features = ["util"] }
@@ -223,6 +245,27 @@ sha2 = "0.10"
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true }
 
+# Cloud Mode (p3-design §C): the OS keyring (host only). Pinned exactly — the
+# platform-native backend is selected per target so the other platforms'
+# native crates (security-framework, windows-sys) never build here.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "=3.6.3", optional = true, default-features = false, features = ["apple-native"] }
+
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "=3.6.3", optional = true, default-features = false, features = ["windows-native"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))'.dependencies]
+keyring = { version = "=3.6.3", optional = true, default-features = false, features = ["sync-secret-service", "crypto-rust"] }
+# Same crate keyring pulls in, promoted: build libdbus from the vendored
+# source instead of the system libdbus-1-dev (absent on headless servers).
+# Secret Service platforms only — Android/iOS have no D-Bus to build for.
+dbus-secret-service = { version = "=4.1.0", optional = true, features = ["vendored"] }
+
+# Other unix (Android, iOS): no native backend feature, so keyring falls
+# back to its mock store and `cloud::keyring` still compiles (host feature on).
+[target.'cfg(not(any(target_os = "macos", windows, target_os = "linux", target_os = "freebsd", target_os = "openbsd")))'.dependencies]
+keyring = { version = "=3.6.3", optional = true, default-features = false }
+
 # Android-only TLS roots: reqwest 0.13's `rustls-platform-verifier` panics at
 # runtime on Android (needs a JVM Context, reqwest#2968), so src/http.rs roots
 # TLS in the bundled Mozilla certs. `rustls` itself is a top-level dep above.
@@ -235,6 +278,10 @@ webpki-roots = "1"
 rustls-platform-verifier = "0.6"
 
 [dev-dependencies]
+# Deterministic RNGs for the fake relay / test devices (spec §15.1 style:
+# seeded ChaCha20Rng). Same 0.9 family perma-crypto depends on.
+rand = "0.9"
+rand_chacha = "0.9"
 tempfile = "3.27"
 insta = { version = "1.40", features = ["yaml", "serde", "filters", "json"] }
 # `default-features = false`: with defaults on, this self edge would switch

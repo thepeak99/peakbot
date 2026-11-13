@@ -11,6 +11,9 @@ pub const PEAKBOT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub mod attachments;
 pub mod bg_processes;
 pub mod boot;
+// Cloud Mode (p3-design §A): the process-wide CloudLink actor + config +
+// stores. Both editions; only `cloud::keyring` is host-gated.
+pub mod cloud;
 pub mod config;
 mod context_manager;
 mod conversation;

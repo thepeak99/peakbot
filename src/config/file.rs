@@ -352,6 +352,10 @@ pub struct General {
     /// Boot-only.
     #[serde(default)]
     pub notifications: NotificationsConfig,
+    /// Boot-only; absent = Cloud Mode off (`CloudState::Disabled`).
+    /// p3-design §B: one process-wide `general.cloud`, built at boot.
+    #[serde(default)]
+    pub cloud: Option<crate::cloud::config::CloudDef>,
 }
 
 impl Default for General {
@@ -368,6 +372,7 @@ impl Default for General {
             http: HttpConfig::default(),
             uploads: UploadsConfig::default(),
             notifications: NotificationsConfig::default(),
+            cloud: None,
         }
     }
 }

@@ -512,6 +512,8 @@ pub fn boot_only_diff(boot: &Config, fresh: &Config) -> Vec<&'static str> {
         ("general.conversation", b.conversation != f.conversation),
         // PR-B: the turn-end channel is built once at boot.
         ("general.notifications", b.notifications != f.notifications),
+        // P3: one process-wide CloudLink (socket + identity), built at boot.
+        ("general.cloud", b.cloud != f.cloud),
     ]
     .into_iter()
     .filter_map(|(key, changed)| changed.then_some(key))
@@ -1302,6 +1304,14 @@ impl Resolver<'_> {
                 at(&base, &["context", "threshold"]),
                 format!("must be greater than 0 and at most 1, got {threshold}"),
             );
+        }
+        // P3 §B: same endpoint rules as remote profiles, keyed general.cloud.*.
+        if let Some(def) = &general.cloud
+            && let Err(field_errors) = crate::cloud::config::parse_cloud(Some(def))
+        {
+            for e in field_errors {
+                sink.push(at(&base, &["cloud", e.field]), e.message);
+            }
         }
         if let Some(alias) = &general.context.compaction_model {
             self.model(sink, at(&base, &["context", "compaction_model"]), alias);

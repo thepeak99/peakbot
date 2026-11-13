@@ -80,6 +80,12 @@ pub enum Endpoint {
 }
 
 impl Endpoint {
+    /// The relay/remote origin, whichever trust mode it carries.
+    pub fn origin(&self) -> &Url {
+        match self {
+            Endpoint::Tls { origin, .. } | Endpoint::LoopbackPlain { origin } => origin,
+        }
+    }
     /// The origin without its trailing slash, for messages (RP4).
     pub fn origin_without_slash(&self) -> String {
         let origin = match self {
@@ -103,6 +109,7 @@ pub struct RemoteProfile {
 /// One §4.4 violation of a `remote:` block: the field the error is keyed
 /// at and the locked message. `Config::parse` prefixes the path with
 /// `profiles.<n>.remote`.
+#[derive(Debug)]
 pub struct RemoteFieldError {
     pub field: &'static str,
     pub message: String,
@@ -113,7 +120,13 @@ const URL_SHAPE_MESSAGE: &str = "only scheme://host[:port] — put the token in 
 const URL_LOOPBACK_MESSAGE: &str =
     "remote profiles connect over HTTPS — http is allowed only for 127.0.0.1 / localhost";
 const TOKEN_MESSAGE: &str = "the remote's web token (as printed by its `?token=…` link)";
-const CA_MISSING_MESSAGE: &str = "pin the server's CA (`ca: sha256:…` from its pairing link) or use `ca: system` for a publicly trusted certificate";
+/// p3-design §B: the CA-missing message with the noun parameterised —
+/// remote profiles read "server's", `general.cloud` reads "relay's".
+pub(crate) fn ca_missing(noun: &str) -> String {
+    format!(
+        "pin the {noun} CA (`ca: sha256:…` from its pairing link) or use `ca: system` for a publicly trusted certificate"
+    )
+}
 const CA_HTTP_MESSAGE: &str = "`ca` applies to https only";
 const CA_SHAPE_MESSAGE: &str = "expected `system` or `sha256:<64 hex chars>`";
 
@@ -124,39 +137,12 @@ pub fn parse_remote(
     def: &RemoteDef,
     color: Option<TabColor>,
 ) -> Result<RemoteProfile, Vec<RemoteFieldError>> {
-    let mut errors: Vec<RemoteFieldError> = Vec::new();
-    let mut endpoint: Option<Endpoint> = None;
-
-    match parse_origin(&def.url) {
-        Ok(origin) => {
-            if origin.scheme() == "https" {
-                // RP2: https needs a pin or an explicit `system`.
-                match def.ca.as_deref().map(parse_ca) {
-                    Some(Ok(trust)) => endpoint = Some(Endpoint::Tls { origin, trust }),
-                    Some(Err(message)) => errors.push(RemoteFieldError {
-                        field: "ca",
-                        message,
-                    }),
-                    None => errors.push(RemoteFieldError {
-                        field: "ca",
-                        message: CA_MISSING_MESSAGE.to_string(),
-                    }),
-                }
-            } else if def.ca.is_some() {
-                // RP3: plaintext is loopback-only, and it has no CA.
-                errors.push(RemoteFieldError {
-                    field: "ca",
-                    message: CA_HTTP_MESSAGE.to_string(),
-                });
-            } else {
-                endpoint = Some(Endpoint::LoopbackPlain { origin });
-            }
-        }
-        Err(message) => errors.push(RemoteFieldError {
-            field: "url",
-            message,
-        }),
-    }
+    // Same url+ca rules as `general.cloud.relay`; only the noun differs.
+    let (endpoint, mut errors) =
+        match parse_endpoint(&def.url, def.ca.as_deref(), "url", "server's") {
+            Ok(endpoint) => (Some(endpoint), Vec::new()),
+            Err(errors) => (None, errors),
+        };
 
     if !cookie_safe_token(&def.token) {
         errors.push(RemoteFieldError {
@@ -191,6 +177,43 @@ pub fn parse_remote(
             color: color.unwrap_or_else(|| TabColor::derived(name)),
         }),
         _ => Err(errors),
+    }
+}
+
+/// The url+ca half of `parse_remote` (p3-design §B), shared by remote
+/// profiles and `general.cloud.relay`: one rule, one code path. One error
+/// per violation, keyed `url_field` / `ca`; `ca_noun` ("server's" /
+/// "relay's") only words the missing-CA message.
+pub(crate) fn parse_endpoint(
+    url: &str,
+    ca: Option<&str>,
+    url_field: &'static str,
+    ca_noun: &str,
+) -> Result<Endpoint, Vec<RemoteFieldError>> {
+    let ca_error = |message: String| {
+        Err(vec![RemoteFieldError {
+            field: "ca",
+            message,
+        }])
+    };
+    let origin = parse_origin(url).map_err(|message| {
+        vec![RemoteFieldError {
+            field: url_field,
+            message,
+        }]
+    })?;
+    if origin.scheme() == "https" {
+        // RP2: https needs a pin or an explicit `system`.
+        match ca.map(parse_ca) {
+            Some(Ok(trust)) => Ok(Endpoint::Tls { origin, trust }),
+            Some(Err(message)) => ca_error(message),
+            None => ca_error(ca_missing(ca_noun)),
+        }
+    } else if ca.is_some() {
+        // RP3: plaintext is loopback-only, and it has no CA.
+        ca_error(CA_HTTP_MESSAGE.to_string())
+    } else {
+        Ok(Endpoint::LoopbackPlain { origin })
     }
 }
 
