@@ -188,6 +188,7 @@ pub(crate) struct DeviceId([u8; 32]);
 
 impl DeviceId {
     /// Fixture constructor; chain-derived ids arrive with PR-B.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
@@ -842,21 +843,6 @@ pub(crate) async fn forward_state(
     }
 }
 
-/// [`handle_socket`] over any transport that speaks axum WS `Message`s
-/// (p3-design §E.1 / spike §2a): the axum path passes the split socket,
-/// CloudServe (PR-C) adapts its `Frame(String)` stream to `Message::Text`.
-/// PR-A seam only — A1 moves the `handle_socket` body here and threads the
-/// `principal` (`relayed = principal_forces || frame.relayed`;
-/// `refused_for` drops a `CloudPeer` `shutdown` with one error frame).
-#[allow(dead_code)] // callers: the A1 body move + CloudServe (PR-C)
-async fn serve_socket<Si, St, E>(_sink: Si, _stream: St, _state: WsState, _principal: Principal)
-where
-    Si: Sink<Message> + Unpin + Send + 'static,
-    St: futures::Stream<Item = Result<Message, E>> + Unpin + Send + 'static,
-{
-    todo!("P3 PR-A A1: move the handle_socket body here with the principal")
-}
-
 /// Drive one browser connection. The first frame must be `Attach`, which
 /// binds the socket to a session in the registry (sharing an active one,
 /// resuming a persisted one, or minting fresh). The socket then runs the
@@ -864,7 +850,24 @@ where
 /// over WS frames. On close it **detaches** — the session survives for other
 /// sockets and for reconnect, and only expires via the reaper or a kill.
 async fn handle_socket(socket: WebSocket, state: WsState) {
-    let (ws_sink, mut ws_stream) = socket.split();
+    let (ws_sink, ws_stream) = socket.split();
+    serve_socket(ws_sink, ws_stream, state, Principal::Token).await;
+}
+
+/// [`handle_socket`] over any transport that speaks axum WS `Message`s
+/// (p3-design §E.1): the axum path passes the split socket; CloudServe
+/// (PR-C) adapts its `Frame(String)` stream to `Message::Text`. The
+/// `principal` is the server-side boundary: a `CloudPeer` has `relayed`
+/// forced on (no chaining) and its `shutdown` refused (§E.1).
+async fn serve_socket<Si, St, E>(
+    ws_sink: Si,
+    mut ws_stream: St,
+    state: WsState,
+    principal: Principal,
+) where
+    Si: Sink<Message> + Unpin + Send + 'static,
+    St: futures::Stream<Item = Result<Message, E>> + Unpin + Send + 'static,
+{
 
     // Bounded FIFO (32) for ordered frames + a 1-deep coalescing `watch`
     // slot for `state` snapshots. Per-socket memory is ~3 payload-sized
@@ -889,6 +892,9 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
         },
         None => return,
     };
+    // §E.1: the server decides — a cloud peer is always a relay, whatever
+    // the frame claims (the client flag stays a hint for the token path).
+    let relayed = relayed || matches!(principal, Principal::CloudPeer(_));
 
     // Bind to a session. On failure, send one error frame and drop the socket.
     // The `/ws` upgrade is only mounted when deps exist (needs_setup mode
@@ -1025,7 +1031,7 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
     let reader_tx = out_tx.clone();
 
     // Process a non-attach handshake frame before the reader loop starts.
-    if let Some(frame) = leftover {
+    if let Some(frame) = leftover.filter(|f| !refused_for(principal, f, &out_tx)) {
         dispatch_inbound(
             &frame,
             &action_sender,
@@ -1045,7 +1051,7 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
                 Ok(_) => continue,
             };
             let trimmed = text.trim();
-            if trimmed.is_empty() {
+            if trimmed.is_empty() || refused_for(principal, trimmed, &reader_tx) {
                 continue;
             }
             if !dispatch_inbound(
@@ -1087,6 +1093,23 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
         let _ = writer_task.await;
     }
     registry.detach(session_key);
+}
+
+/// A cloud peer may not stop the host: its `shutdown` is answered with the
+/// locked error frame and DROPPED — the session keeps serving (§E.1).
+/// The token-holder path is unchanged.
+fn refused_for(principal: Principal, frame: &str, out_tx: &OutboundTx) -> bool {
+    let refused = matches!(principal, Principal::CloudPeer(_))
+        && matches!(
+            serde_json::from_str::<InboundMessage>(frame),
+            Ok(InboundMessage::Shutdown)
+        );
+    if refused {
+        let _ = out_tx.send(OutboundMessage::Error {
+            message: "shutdown is not allowed over Cloud Mode".into(),
+        });
+    }
+    refused
 }
 
 /// Send one `error` frame, then close: dropping the last sender lets the
@@ -1165,9 +1188,10 @@ fn boot_has_local(catalog: &crate::config::resolve::Catalog, name: &str) -> bool
 
 /// Await the first text frame of a connection, skipping non-text control
 /// frames. Returns `None` if the socket closes first.
-async fn read_first_frame(
-    ws_stream: &mut futures::stream::SplitStream<WebSocket>,
-) -> Option<String> {
+async fn read_first_frame<St, E>(ws_stream: &mut St) -> Option<String>
+where
+    St: futures::Stream<Item = Result<Message, E>> + Unpin,
+{
     while let Some(frame) = ws_stream.next().await {
         match frame {
             Ok(Message::Text(t)) => return Some(t.to_string()),
