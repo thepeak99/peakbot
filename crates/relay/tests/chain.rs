@@ -175,7 +175,10 @@ async fn add_revoked_device_rejected() {
     a.send(ToRelay::ChainAppend { entry: e.encode() }).await;
     expect_error(&a.recv().await, relay_error::INVALID_ENTRY).await;
     let rest = fetch_chain(&mut a, 3).await;
-    assert!(rest.is_empty(), "no row at seq 3 after refused re-add of revoked");
+    assert!(
+        rest.is_empty(),
+        "no row at seq 3 after refused re-add of revoked"
+    );
 }
 
 #[tokio::test]
