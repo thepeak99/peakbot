@@ -119,6 +119,27 @@ pub enum CloudError {
     Trust(TrustError),
     Reset(u16),
     Io(String),
+    /// Flow-specific refusals (§H.1 "specific errors").
+    Flow(FlowError),
+}
+
+/// The §H.1 route-specific errors (not in the D.6 `CloudError` list — the
+/// Architect must confirm this home).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowError {
+    AlreadyLoggedIn,
+    NotPendingEmpty,
+    GenesisTaken,
+    UnknownRequest,
+    ChainBusy,
+    UseLogout,
+    LastDevice,
+}
+
+/// `POST /api/cloud/logout` → `{"revoked": bool}` (G.6 step 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogoutOutcome {
+    pub revoked: bool,
 }
 
 impl std::fmt::Display for CloudError {
@@ -131,6 +152,7 @@ impl std::fmt::Display for CloudError {
             CloudError::Trust(e) => write!(f, "trust error: {e:?}"),
             CloudError::Reset(code) => write!(f, "stream reset: {code}"),
             CloudError::Io(msg) => f.write_str(msg),
+            CloudError::Flow(e) => write!(f, "{e:?}"),
         }
     }
 }
@@ -198,8 +220,19 @@ impl CloudHandle {
 
     /// Logout = self-revoke (best effort) + `POST /logout` + WIPE (seed,
     /// token, chain, pin) → `LoggedOut{SignedOut}` (§G.6).
-    pub async fn logout(&self) -> Result<(), CloudError> {
+    pub async fn logout(&self) -> Result<LogoutOutcome, CloudError> {
         todo!("p3 PR-B: CloudHandle::logout")
+    }
+
+    /// This device's id (derived from the seed; `None` before a seed exists).
+    pub fn device_id(&self) -> Option<DeviceId> {
+        todo!("p3 PR-B: CloudHandle::device_id")
+    }
+
+    /// `last_login_error` of the API state (G.1 step 5): set by a failed
+    /// login, cleared by the next attempt.
+    pub fn last_login_error(&self) -> Option<String> {
+        todo!("p3 PR-B: CloudHandle::last_login_error")
     }
 
     /// Open a stream to `device` for `op` (§D.5): Active + the peer in
@@ -209,28 +242,28 @@ impl CloudHandle {
     }
 
     /// Genesis for an empty account (§G.2).
-    pub(crate) async fn genesis(&self) -> Result<DeviceId, CloudError> {
+    pub async fn genesis(&self) -> Result<DeviceId, CloudError> {
         todo!("p3 PR-B: CloudHandle::genesis")
     }
 
     /// Approve an `EnrollRequest` (§G.4): `Add` at head+1.
-    pub(crate) async fn approve(&self, letter_id: LetterId) -> Result<DeviceId, CloudError> {
+    pub async fn approve(&self, letter_id: LetterId) -> Result<DeviceId, CloudError> {
         todo!("p3 PR-B: CloudHandle::approve")
     }
 
     /// Reject an `EnrollRequest` (§G.4 step 4): sealed `EnrollReject`.
-    pub(crate) async fn reject(&self, letter_id: LetterId) -> Result<(), CloudError> {
+    pub async fn reject(&self, letter_id: LetterId) -> Result<(), CloudError> {
         todo!("p3 PR-B: CloudHandle::reject")
     }
 
     /// Revoke a peer (§G.5): `Revoke` entry; self ⇒ `use_logout`, the last
     /// active device ⇒ `last_device`.
-    pub(crate) async fn revoke(&self, target: DeviceId) -> Result<(), CloudError> {
+    pub async fn revoke(&self, target: DeviceId) -> Result<(), CloudError> {
         todo!("p3 PR-B: CloudHandle::revoke")
     }
 
     /// The `Profiles` op on a peer (§E.3: local profiles only).
-    pub(crate) async fn profiles(
+    pub async fn profiles(
         &self,
         device: DeviceId,
     ) -> Result<Vec<crate::cloud::session::ProfileInfo>, CloudError> {

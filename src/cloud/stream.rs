@@ -15,6 +15,12 @@ use super::link::CloudError;
 
 /// One open stream to a peer. The actor owns the other side of the pair
 /// (routed through the peer's `Mux`); this type is the thin channel end.
+impl std::fmt::Debug for CloudStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CloudStream")
+    }
+}
+
 pub struct CloudStream {
     tx: mpsc::Sender<StreamMsg>,
     rx: mpsc::Receiver<StreamMsg>,

@@ -175,7 +175,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 # MCP OAuth 2.1 (#19, src/mcp_auth.rs): one-shot localhost callback listener.
 # The `query` extractor URL-decodes auto (Linear `%3A`-encodes the auth code).
 # `ws` feature is for the default PeakBot WebSocket transport (src/ui/web/).
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "ws"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "ws", "json"] }
 # Cloud Mode CloudServe: `ServiceExt::oneshot` runs a tunnelled op through the
 # same in-process router the HTTP routes use (already in the tree via axum).
 tower = { version = "0.5", default-features = false, features = ["util"] }

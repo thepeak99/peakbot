@@ -40,6 +40,11 @@ pub struct CloudDef {
 pub struct CloudConfig {
     pub relay: Endpoint,
     pub state_dir: PathBuf,
+    /// Name on this device's card (green phase: the hostname) — the card is
+    /// built from the seed + name + platform (design gap: not specified).
+    pub device_name: String,
+    /// Card platform byte (spec §4.1; 1 = desktop, 4 = phone in the vectors).
+    pub platform: u8,
 }
 
 /// Absent ⇒ `Ok(None)` (CloudState::Disabled, the actor is not spawned);
@@ -55,6 +60,8 @@ pub fn parse_cloud(def: Option<&CloudDef>) -> Result<Option<CloudConfig>, Vec<Re
     let relay = crate::config::remote::parse_endpoint(&def.relay, def.ca.as_deref())?;
     Ok(Some(CloudConfig {
         relay,
+        device_name: "device".to_string(),
+        platform: 1,
         state_dir: dirs::data_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("peakbot")

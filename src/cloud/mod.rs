@@ -25,7 +25,7 @@ pub mod keyring;
 
 pub use config::{CloudConfig, CloudDef};
 pub use link::{
-    CloudError, CloudHandle, CloudState, CloudStateKind, DeviceInfo, EnrollRequestInfo,
-    InboundHook, LogoutReason, TrustError, spawn,
+    CloudError, CloudHandle, CloudState, CloudStateKind, DeviceInfo, EnrollRequestInfo, FlowError,
+    InboundHook, LogoutOutcome, LogoutReason, TrustError, spawn,
 };
 pub use store::{Seed, SeedStore, SessionToken};
