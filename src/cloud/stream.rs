@@ -68,7 +68,7 @@ impl Sink<StreamMsg> for CloudStream {
         })
     }
 
-    fn start_send(mut self: Pin<&mut Self>, item: StreamMsg) -> Result<(), Self::Error> {
+    fn start_send(self: Pin<&mut Self>, item: StreamMsg) -> Result<(), Self::Error> {
         self.tx.try_send(item).map_err(|_| CloudError::Reset(4))
     }
 

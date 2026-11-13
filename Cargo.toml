@@ -35,6 +35,8 @@ host = [
     "dep:clap",
     "dep:open",
     "dep:libc",
+    "dep:keyring",
+    "dep:dbus-secret-service",
 ]
 
 [[bin]]
@@ -239,6 +241,21 @@ sha2 = "0.10"
 # portable-pty) — this only adds a dependency edge, no new crate.
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true }
+
+# Cloud Mode (p3-design §C): the OS keyring (host only). Pinned exactly — the
+# platform-native backend is selected per target so the other platforms'
+# native crates (security-framework, windows-sys) never build here.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "=3.6.3", optional = true, default-features = false, features = ["apple-native"] }
+
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "=3.6.3", optional = true, default-features = false, features = ["windows-native"] }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+keyring = { version = "=3.6.3", optional = true, default-features = false, features = ["sync-secret-service", "crypto-rust"] }
+# Same crate keyring pulls in, promoted: build libdbus from the vendored
+# source instead of the system libdbus-1-dev (absent on headless servers).
+dbus-secret-service = { version = "=4.1.0", optional = true, features = ["vendored"] }
 
 # Android-only TLS roots: reqwest 0.13's `rustls-platform-verifier` panics at
 # runtime on Android (needs a JVM Context, reqwest#2968), so src/http.rs roots

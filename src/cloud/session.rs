@@ -17,11 +17,15 @@ pub struct Session {
     pub phase: Phase,
 }
 
+// Two-variant skeletons: boxing the ~400-byte handshake state for a lint
+// would complicate the flow phase that replaces them.
+#[allow(clippy::large_enum_variant)]
 pub enum Phase {
     Handshaking(Handshaking),
     Open { established_at: u64 },
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum Handshaking {
     Initiator(Initiator),
     Responder(Responder),
