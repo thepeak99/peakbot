@@ -20,7 +20,7 @@ async fn pipe_active_to_active() {
     let head = cloud::chain::entry_hash(&g[0]);
     enroll_add(&t, &token, 1, head, &mut a, &mut b).await;
 
-    let payload: Vec<u8> = (0u8..).cycle().take(1000).collect();
+    let payload: Vec<u8> = (0u8..=255).cycle().take(1000).collect();
     a.send(ToRelay::Pipe {
         to: b.id,
         bytes: payload.clone(),
@@ -67,7 +67,7 @@ async fn routing_isolation_between_accounts() {
     let token_y = t.login("acct-y").await;
     let mut a = FakeDevice::new(1);
     enroll_genesis(&t, &token_x, &mut a).await;
-    let mut c = FakeDevice::new(1);
+    let mut c = FakeDevice::new(11); // distinct id: one DeviceId on two accounts is newest-wins (§4.3)
     enroll_genesis(&t, &token_y, &mut c).await;
 
     // Pipe/Post to another account's device id → NOT_PERMITTED (design §4.5).
@@ -188,7 +188,6 @@ async fn pipe_unreachable_when_target_offline() {
 }
 
 #[tokio::test]
-#[allow(clippy::never_loop)] // bounded retry: the loop exits on the first Unreachable
 async fn slow_consumer_closed() {
     let t = TestRelay::spawn().await;
     let token = t.login("r7").await;
@@ -208,23 +207,27 @@ async fn slow_consumer_closed() {
 
     b.stall(); // B stops reading
     let frame: Vec<u8> = vec![0u8; 1_048_576]; // ~1 MiB payload
-    let mut got_unreachable = false;
+    // Live Pipes are silent (design §4.5): send the whole budget (≤ 200
+    // frames), then drain A until a ChainFetch sentinel. B's full outbox must
+    // have closed B (1013/EOF) and at least one Pipe must read Unreachable{B}.
     for _ in 0..200 {
         a.send(ToRelay::Pipe {
             to: b.id,
             bytes: frame.clone(),
         })
         .await;
+    }
+    a.send(ToRelay::ChainFetch { from_seq: 0 }).await;
+    let mut unreachable_seen = false;
+    loop {
         match a.recv().await {
-            FromRelay::Unreachable { to } if to == b.id => {
-                got_unreachable = true;
-                break;
-            }
-            other => panic!("expected Unreachable, got {other:?}"),
+            FromRelay::Chain { .. } => break,
+            FromRelay::Unreachable { to } if to == b.id => unreachable_seen = true,
+            other => panic!("unexpected {other:?}"),
         }
     }
     assert!(
-        got_unreachable,
+        unreachable_seen,
         "Unreachable for the stalled target within 200 iterations"
     );
 
