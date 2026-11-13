@@ -21,6 +21,22 @@ html.light {
   --color-zinc-50: oklch(14.1% 0.005 285.823); /* was 950 */
 }
 
+/* Phone-only light remap (64rem = 1024px, so desktop light keeps its tokens):
+   the mock's light palette — pure-white bg, sky-700 links, emerald accents.
+   Settings restores the originals so it stays visually untouched. */
+@media (width < 64rem) {
+  html.light {
+    --color-zinc-950: #ffffff;
+    --color-sky-400: #0369a1;
+    --color-emerald-400: #047857;
+  }
+  html.light [data-testid="settings-view"] {
+    --color-zinc-950: oklch(98.5% 0 0);
+    --color-sky-400: oklch(74.6% 0.16 232.661);
+    --color-emerald-400: oklch(76.5% 0.177 163.223);
+  }
+}
+
 /* Per-profile accent palette (remote-profiles T2). The server resolves each
    profile's colour (RP8); these vars only paint it. Dark is the default:
    bright -400 tones read on the zinc-950/900 tab bar; light uses -600 tones

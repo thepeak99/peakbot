@@ -322,7 +322,7 @@ export function ChatList({
 
       {machineUi && machineOpen && (
         <Sheet title="Machine" onClose={closeMachine}>
-          <div className="px-2 pb-3">
+          <div className="flex flex-col gap-0.5 px-4 pb-2 pt-0.5">
             <MachineOption
               machine="all"
               label="All machines"
@@ -350,7 +350,7 @@ export function ChatList({
 
       {machineUi && pickerOpen && (
         <Sheet title="New chat on…" onClose={closePicker}>
-          <div className="px-2 pb-3">
+          <div className="flex flex-col gap-0.5 px-4 pb-2 pt-0.5">
             {machines.map((m) => (
               <button
                 key={m.id ?? "local"}
@@ -365,12 +365,16 @@ export function ChatList({
                   setPickerOpen(false);
                   onNew(m.profiles[0]);
                 }}
-                className="flex min-h-12 w-full cursor-pointer items-center gap-3 rounded-lg px-3 py-2 text-left transition-colors hover:bg-zinc-800/70 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
+                className="flex min-h-14 w-full cursor-pointer items-center gap-3 rounded-[14px] px-2.5 py-2 text-left transition-colors hover:bg-zinc-800/70 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
               >
                 <Dot online={m.online} />
-                <span className="min-w-0 flex-1 truncate text-[15px] text-zinc-100">{m.name}</span>
-                <span className="text-xs text-zinc-500">
-                  {!m.online ? "offline" : m.id === null ? "local" : "remote"}
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-[15px] font-semibold text-zinc-100">
+                    {m.name}
+                  </span>
+                  <span className="block text-xs text-zinc-500">
+                    {!m.online ? "offline" : m.id === null ? "local" : "remote"}
+                  </span>
                 </span>
               </button>
             ))}
@@ -560,12 +564,14 @@ function Dot({ online, testid }: { online: boolean; testid?: string }) {
       data-testid={testid}
       data-online={online}
       aria-hidden="true"
-      className={`h-2 w-2 shrink-0 rounded-full ${online ? "bg-emerald-400" : "bg-zinc-600"}`}
+      // The light theme paints the emerald #16a34a (same as the chats-conn dot).
+      className={`h-2 w-2 shrink-0 rounded-full ${online ? "bg-emerald-400 light:bg-[#16a34a]" : "bg-zinc-600"}`}
     />
   );
 }
 
 // One row of the Machine sheet: dot, name, sub, count and a ✓ when picked.
+// Offline machines are untappable (the All option passes online).
 function MachineOption({
   machine,
   label,
@@ -589,21 +595,24 @@ function MachineOption({
       data-testid="machine-option"
       data-machine={machine}
       aria-pressed={pressed}
+      disabled={!online}
       onClick={onPick}
-      className="flex min-h-12 w-full cursor-pointer items-center gap-3 rounded-lg px-3 py-2 text-left transition-colors hover:bg-zinc-800/70"
+      className="flex min-h-14 w-full cursor-pointer items-center gap-3 rounded-[14px] px-2.5 py-2 text-left transition-colors hover:bg-zinc-800/70 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
     >
       <Dot online={online} />
       <span className="min-w-0 flex-1">
-        <span className="block truncate text-[15px] text-zinc-100">{label}</span>
+        <span className="block truncate text-[15px] font-semibold text-zinc-100">{label}</span>
         <span data-testid="machine-option-sub" className="block text-xs text-zinc-500">
           {sub}
         </span>
       </span>
-      <span data-testid="machine-option-count" className="text-sm text-zinc-400">
+      <span data-testid="machine-option-count" className="font-mono text-[12.5px] font-medium text-zinc-500">
         {count}
       </span>
       <span aria-hidden="true" className={`w-4 text-emerald-400 ${pressed ? "" : "invisible"}`}>
-        ✓
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M5 12.5l4.5 4.5L19 7.5" />
+        </svg>
       </span>
     </button>
   );

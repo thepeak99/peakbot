@@ -366,12 +366,11 @@ describe("ChatList machines — M7: All tags every row", () => {
 
 describe("ChatList machines — M8: an offline machine", () => {
   it("grey dot, 'offline' sub, the offline empty state, and a disabled FAB", async () => {
+    // A35 (batch 5) made the offline sheet option untappable, so the offline
+    // state is reached through the persisted selection the machine had while
+    // it was online (the M5 path), not a fresh pick in the sheet.
+    window.localStorage.setItem(MACHINE_KEY, JSON.stringify({ v: 1, kind: "one", id: WB }));
     const el = await render({ machineStatus: STATUS_WB_DOWN });
-    await openMachineSheet(el);
-    const wb = option(machineDialog()!, WB);
-    expect(wb.querySelector<HTMLElement>('[data-testid="machine-option-sub"]')!.textContent).toBe("offline");
-
-    await pressMachine(machineDialog()!, WB);
     expect(pill(el)!.textContent).toContain("10.0.0.5");
     expect(pill(el)!.textContent).not.toContain(":7823");
     expect(
@@ -386,6 +385,11 @@ describe("ChatList machines — M8: an offline machine", () => {
 
     const fab = el.querySelector<HTMLElement>('button[aria-label="New chat"]')!;
     expect(fab.hasAttribute("disabled"), "the FAB is disabled").toBe(true);
+
+    // The sheet still lists the machine with its 'offline' sub.
+    await openMachineSheet(el);
+    const wb = option(machineDialog()!, WB);
+    expect(wb.querySelector<HTMLElement>('[data-testid="machine-option-sub"]')!.textContent).toBe("offline");
   });
 });
 
