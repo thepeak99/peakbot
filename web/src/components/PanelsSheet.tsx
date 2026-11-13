@@ -7,6 +7,7 @@
 import type { JSX } from "react";
 import { Sheet } from "./Sheet";
 import type { DrawerTab } from "./TabbedDrawer";
+import { IB, IBI_HI } from "./phoneUi";
 
 export interface PanelsButtonProps {
   /** Running background tasks + open todos, summed over visible tabs. */
@@ -21,25 +22,27 @@ export function PanelsButton({ count, onOpen }: PanelsButtonProps): JSX.Element 
       data-testid="panels-button"
       aria-label="Open panels"
       onClick={onOpen}
-      className="relative flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded text-zinc-400 transition-colors hover:text-zinc-200"
+      className={IB}
     >
-      <svg
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="2"
-        strokeLinecap="round"
-        aria-hidden
-        className="h-5 w-5"
-      >
-        <path d="M4 8h8M18 8h2M4 16h2M12 16h8" />
-        <circle cx="15" cy="8" r="2.5" />
-        <circle cx="9" cy="16" r="2.5" />
-      </svg>
+      <span className={IBI_HI}>
+        <svg
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.9"
+          strokeLinecap="round"
+          aria-hidden
+          className="h-5 w-5"
+        >
+          <path d="M4 8h8M18 8h2M4 16h2M12 16h8" />
+          <circle cx="15" cy="8" r="2.5" />
+          <circle cx="9" cy="16" r="2.5" />
+        </svg>
+      </span>
       {count > 0 && (
         <span
           data-testid="panels-badge"
-          className="absolute -right-1 -top-1 min-w-4 rounded-full bg-sky-600 px-1 text-center font-mono text-[10px] leading-4 text-white"
+          className="absolute right-0 top-px h-[18px] min-w-[18px] rounded-[9px] bg-sky-600 px-[5px] text-center font-mono text-[11px] font-semibold leading-[18px] text-white shadow-[0_0_0_2px_var(--color-zinc-950)]"
         >
           {count}
         </span>

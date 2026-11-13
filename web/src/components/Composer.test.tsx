@@ -1989,7 +1989,7 @@ describe("Composer — phone (phone: true)", () => {
     const box = el.querySelector(".rounded-xl");
     expect(box, "the composer pill renders").not.toBeNull();
     expect(
-      note!.parentElement?.contains(box) && note === note.parentElement!.firstElementChild,
+      note!.parentElement?.contains(box) && note === note!.parentElement!.firstElementChild,
       "the note is the first child of the wrapper, above the pill",
     ).toBe(true);
     expect(box!.contains(note), "the note is NOT inside the pill").toBe(false);

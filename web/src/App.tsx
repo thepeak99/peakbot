@@ -392,6 +392,8 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
     supportsVision: state?.supports_vision ?? true,
     settingsEnabled,
     stopPending: state?.stop_pending ?? false,
+    // One switch, decided once: the phone composer face (fidelity batch 1).
+    phone: !isDesktop,
     uploadLimits: state?.upload_limits ?? DEFAULT_UPLOAD_LIMITS,
   };
 

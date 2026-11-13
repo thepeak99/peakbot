@@ -46,11 +46,16 @@ html.light {
   --profile-pink: #db2777;
 }
 
+/* `light:` — the html.light theme (portaled sheets included). */
+@custom-variant light (&:where(.light, .light *));
+
 /* Bottom-sheet entrance (mobile redesign): the sheet slides up from below
    the viewport on mount. `@theme` makes `animate-sheet-in` a utility; the
    components gate it with `motion-safe:`. */
 @theme {
   --animate-sheet-in: sheet-in 0.25s ease-out;
+  /* 26px sheet/pill radius — the mock's only r26 (sheet top, composer pill). */
+  --radius-sheet: 26px;
 
   @keyframes sheet-in {
     from {

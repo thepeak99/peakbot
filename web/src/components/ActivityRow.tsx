@@ -7,6 +7,8 @@
 // the box: an optional label plus tappable task / todo counts that open their
 // panel. Without `counts` it is today's desktop row, unchanged.
 
+import type { JSX } from "react";
+import { Fragment } from "react";
 import type { WireChatMessage, WireRole } from "../state";
 
 // Display glyphs only — mirrors ROLE_META in Message.tsx, which is keyed by
@@ -54,6 +56,56 @@ export function ActivityRow({ line, counts }: { line: ActivityLine; counts?: Sta
   const subRole = step?.source?.kind === "sub_agent" ? step.source.role : undefined;
 
   if (counts) {
+    // The mock's .actline: a lead group (dot/glyph + "·" sub prefix + label,
+    // one .wk segment — no "·" inside it) then the count segments, joined
+    // by "·" separators. Every piece stays a direct child of the row root
+    // so the label is addressable there.
+    const lead =
+      line.kind !== "idle" ? (
+        <Fragment key="lead">
+          {line.kind === "working" ? (
+            // .pulse — 8px amber dot with the 4px halo (proto:173-174).
+            <span
+              aria-hidden
+              className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-amber-500 shadow-[0_0_0_4px_rgba(245,158,11,0.2)]"
+            />
+          ) : (
+            <span aria-hidden>{step ? GLYPH[step.role] : "✦"}</span>
+          )}
+          {subRole && <span className="shrink-0">🧩 {subRole} ·</span>}
+          {/* .wk face: 13px amber for both working and the kept step line. */}
+          <span
+            data-testid="activity-label"
+            className="min-w-0 truncate text-[13px] text-amber-500"
+            title={line.kind === "step" ? label : undefined}
+          >
+            {line.kind === "step" ? label : "working…"}
+          </span>
+        </Fragment>
+      ) : null;
+    const countSegs: JSX.Element[] = [];
+    if (counts.tasks > 0) {
+      countSegs.push(
+        <CountButton
+          key="tasks"
+          testId="activity-tasks"
+          name="Open Tasks panel"
+          text={`⏳ ${counts.tasks} ${counts.tasks === 1 ? "task" : "tasks"}`}
+          onClick={() => counts.onOpen("tasks")}
+        />,
+      );
+    }
+    if (counts.todosTotal > 0) {
+      countSegs.push(
+        <CountButton
+          key="todos"
+          testId="activity-todos"
+          name="Open Todo panel"
+          text={`☑ ${counts.todosDone}/${counts.todosTotal} todos`}
+          onClick={() => counts.onOpen("todo")}
+        />,
+      );
+    }
     return (
       <div
         data-testid="activity-row"
@@ -62,38 +114,18 @@ export function ActivityRow({ line, counts }: { line: ActivityLine; counts?: Sta
         aria-live="polite"
         className="flex min-h-8 flex-nowrap items-center gap-1.5 overflow-hidden whitespace-nowrap px-3.5 text-[11px] leading-none text-zinc-500"
       >
-        {line.kind !== "idle" && (
-          <>
-            {line.kind === "step" && <span aria-hidden>{step ? GLYPH[step.role] : "✦"}</span>}
-            {line.kind === "working" && (
-              <span aria-hidden className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-amber-400" />
+        {lead}
+        {countSegs.map((seg, i) => (
+          <Fragment key={seg.key ?? i}>
+            {(i > 0 || lead) && (
+              // .acsep — the 11px --bd2 "·" between segments (proto:204).
+              <span aria-hidden className="shrink-0 text-[11px] text-zinc-700">
+                ·
+              </span>
             )}
-            {subRole && <span className="shrink-0">🧩 {subRole} ·</span>}
-            <span
-              data-testid="activity-label"
-              className={`min-w-0 truncate ${line.kind === "working" ? "text-amber-400" : ""}`}
-              title={line.kind === "step" ? label : undefined}
-            >
-              {line.kind === "step" ? label : "working…"}
-            </span>
-          </>
-        )}
-        {counts.tasks > 0 && (
-          <CountButton
-            testId="activity-tasks"
-            name="Open Tasks panel"
-            text={`⏳ ${counts.tasks} ${counts.tasks === 1 ? "task" : "tasks"}`}
-            onClick={() => counts.onOpen("tasks")}
-          />
-        )}
-        {counts.todosTotal > 0 && (
-          <CountButton
-            testId="activity-todos"
-            name="Open Todo panel"
-            text={`☑ ${counts.todosDone}/${counts.todosTotal} todos`}
-            onClick={() => counts.onOpen("todo")}
-          />
-        )}
+            {seg}
+          </Fragment>
+        ))}
       </div>
     );
   }
@@ -142,7 +174,7 @@ function CountButton({
       data-testid={testId}
       aria-label={name}
       onClick={onClick}
-      className="h-8 shrink-0 cursor-pointer rounded-lg px-1.5 text-[11px] text-zinc-500 active:bg-zinc-800"
+      className="flex h-8 shrink-0 cursor-pointer items-center gap-1 rounded-lg px-1.5 text-[11.5px] text-zinc-400 active:bg-zinc-800"
     >
       {text}
     </button>
