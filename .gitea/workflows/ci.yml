@@ -74,6 +74,15 @@ jobs:
           # crate joins the workspace) — the ci job never needs
           # webkit, and the mobile crate is checked in the `desktop` job.
           cargo test --locked
+      # The root gate above only covers default-members (the root crate), so
+      # the workspace crates are tested explicitly here (design §7 task 12,
+      # R5: peakbot-cloud had no CI step before; peakbot-relay is RED until
+      # its implementation lands).
+      - name: Rust checks (cloud + relay workspace crates)
+        run: |
+          cargo clippy --locked -p peakbot-cloud -p peakbot-relay --all-targets -- -D warnings
+          cargo test --locked -p peakbot-cloud
+          cargo test --locked -p peakbot-relay
       # Local edition: the core without the `host` feature, as phones embed
       # it. The canary test exists only in that build, so anything but
       # `1 passed` means `host` leaked back in through a dependency edge.
