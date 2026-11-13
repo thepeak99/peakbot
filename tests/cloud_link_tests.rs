@@ -42,7 +42,7 @@ use peakbot::cloud::{
 };
 use url::Url;
 
-use cloud_common::devices::{self, card_a, card_b, id_a, id_b};
+use cloud_common::devices::{self, card_b, id_a, id_b};
 use cloud_common::fake_relay::FakeRelay;
 
 const TIMEOUT: Duration = Duration::from_secs(20);
@@ -103,7 +103,6 @@ fn no_redirect_client() -> reqwest::Client {
         .build()
         .expect("client")
 }
-
 
 /// Drive the PKCE login to completion without a browser: GET the auth URL
 /// (302 → fake IdP), mint a code via `issue_code`, and hit the loopback
@@ -173,7 +172,7 @@ async fn fresh_link_starts_logged_out_never() {
     let fake = FakeRelay::spawn().await;
     let dir = tempfile::tempdir().expect("tmp");
     let (handle, _store) = spawn_device(1, "Laptop", &fake, dir.path().to_path_buf(), None);
-    let mut rx = handle.state();
+    let rx = handle.state();
     let s = wait_state(rx.clone(), |s| matches!(s, CloudState::LoggedOut { .. })).await;
     assert_eq!(
         s,
@@ -188,7 +187,7 @@ async fn login_drives_the_pkce_flow_and_redeems() {
     let fake = FakeRelay::spawn().await;
     let dir = tempfile::tempdir().expect("tmp");
     let (handle, store) = spawn_device(1, "Laptop", &fake, dir.path().to_path_buf(), None);
-    let mut rx = handle.state();
+    let rx = handle.state();
 
     // Capture the auth URL to pin the PKCE S256 shape (G.1 step 2).
     let (url_tx, mut url_rx) = tokio::sync::mpsc::unbounded_channel::<Url>();
@@ -244,7 +243,9 @@ async fn login_drives_the_pkce_flow_and_redeems() {
     // → invalid_grant → login Err). The token is stored once the background
     // listener finishes (G.1 step 2: login returns the URL immediately).
     let _tok = wait_token(&store).await;
-    let s = is_active(&mut rx).await;
+    // Await the state the assertion below expects, not Active (which an
+    // empty account never reaches — that burned the full 20 s TIMEOUT).
+    let s = wait_state(rx.clone(), |s| matches!(s, CloudState::Pending { .. })).await;
     // First device on an empty account: Pending (genesis not yet run).
     assert!(
         matches!(
@@ -271,7 +272,7 @@ async fn pre_hello_chainfetch_precedes_hello() {
     .await
     .expect("login");
     // Give the actor a moment to run the connect sequence (D.2).
-    let mut rx = handle.state();
+    let rx = handle.state();
     let _ = wait_state(rx.clone(), |s| {
         matches!(s, CloudState::Pending { .. } | CloudState::Active { .. })
     })
@@ -373,7 +374,7 @@ async fn a_different_genesis_pin_trusts_and_sends_no_hello() {
     })
     .await
     .expect("login");
-    let mut rx = handle.state();
+    let rx = handle.state();
     let s = wait_state(rx.clone(), |s| {
         matches!(
             s,
@@ -520,7 +521,7 @@ async fn token_401_deletes_the_token_and_keeps_the_seed() {
     })
     .await
     .expect("login");
-    let mut rx = handle.state();
+    let rx = handle.state();
     let _ = wait_state(rx.clone(), |s| matches!(s, CloudState::Pending { .. })).await;
 
     let tok = token_of(&store).expect("a token after login");
@@ -644,8 +645,9 @@ async fn profiles_op_round_trips_between_two_links() {
 
     // A opens Op::Profiles to B.
     let mut stream_a = handle_a.open(id_b(), Op::Profiles).await.expect("open A→B");
+    // Profiles is a non-Attach op (mux S4): Chunk/Head, never Frame.
     stream_a
-        .send(StreamMsg::Frame("hello-from-a".into()))
+        .send(StreamMsg::Chunk(b"hello-from-a".to_vec()))
         .await
         .expect("send");
 
@@ -661,18 +663,34 @@ async fn profiles_op_round_trips_between_two_links() {
         .await
         .expect("B reads")
         .expect("a frame");
-    assert_eq!(got, StreamMsg::Frame("hello-from-a".into()));
+    assert_eq!(got, StreamMsg::Chunk(b"hello-from-a".to_vec()));
 
-    // Round-trip: B answers, A reads it.
+    // Round-trip: B answers (Head then Chunk, S4), A reads it.
     stream_b
-        .send(StreamMsg::Frame("pong-from-b".into()))
+        .send(StreamMsg::Head {
+            status: 200,
+            content_type: "text/plain".into(),
+            length: None,
+        })
+        .await
+        .expect("B sends head");
+    stream_b
+        .send(StreamMsg::Chunk(b"pong-from-b".to_vec()))
         .await
         .expect("B sends");
+    let head = tokio::time::timeout(TIMEOUT, stream_a.next())
+        .await
+        .expect("A reads head")
+        .expect("a head");
+    assert!(
+        matches!(head, StreamMsg::Head { status: 200, .. }),
+        "{head:?}"
+    );
     let back = tokio::time::timeout(TIMEOUT, stream_a.next())
         .await
         .expect("A reads")
         .expect("a frame");
-    assert_eq!(back, StreamMsg::Frame("pong-from-b".into()));
+    assert_eq!(back, StreamMsg::Chunk(b"pong-from-b".to_vec()));
 }
 
 // ── G.7: simultaneous handshake tie-break ──────────────────────────────────

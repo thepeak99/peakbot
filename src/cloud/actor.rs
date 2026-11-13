@@ -25,17 +25,15 @@ use cloud::{
     frames::{
         self, FrameReceiver, FrameSender, Inner, Mux, MuxEvent, Op, RecvOutcome, Role, StreamMsg,
     },
-    handshake::{
-        self, Close, Data, Hs1, Hs2, Hs3, Initiator, PipeMsg, SessionKeys,
-    },
+    handshake::{self, Close, Data, Hs1, Hs2, Hs3, Initiator, PipeMsg, SessionKeys},
 };
+use futures::{SinkExt as _, StreamExt as _};
 use perma_crypto::v1;
 use rand_core::{CryptoRng, RngCore};
 use rustls::pki_types::pem::PemObject as _;
-use futures::{SinkExt as _, StreamExt as _};
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use tokio_tungstenite::tungstenite::Message as TMsg;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use url::Url;
 
@@ -85,8 +83,15 @@ fn now_secs() -> u64 {
 /// Outbound stream traffic from the per-stream forwarder tasks, plus the
 /// drop signal (`Gone`: the caller dropped its `CloudStream`).
 pub enum ActorOut {
-    Out { peer: DeviceId, stream: u32, msg: StreamMsg },
-    Gone { peer: DeviceId, stream: u32 },
+    Out {
+        peer: DeviceId,
+        stream: u32,
+        msg: StreamMsg,
+    },
+    Gone {
+        peer: DeviceId,
+        stream: u32,
+    },
 }
 
 /// How a connect + live run ended (drives the top-level phase).
@@ -219,9 +224,7 @@ fn reason_for_cloud_err(e: cloud::Error) -> u8 {
 
 /// Close reason → the `Reset` code a local stream gets for it.
 fn reset_for_reason(reason: u8) -> u16 {
-    if reason == constants::close_reason::PROTOCOL
-        || reason == constants::close_reason::TRUST
-    {
+    if reason == constants::close_reason::PROTOCOL || reason == constants::close_reason::TRUST {
         constants::reset::PROTOCOL
     } else {
         constants::reset::INTERNAL
@@ -334,10 +337,10 @@ async fn dial(cfg: &CloudConfig, token: &SessionToken) -> Result<Ws, DialErr> {
     let (scheme, tls) = match &cfg.relay {
         Endpoint::LoopbackPlain { .. } => ("ws".to_string(), None),
         Endpoint::Tls {
-            trust: Trust::System, ..
+            trust: Trust::System,
+            ..
         } => {
-            let c = crate::http::system_tls_config()
-                .map_err(|e| DialErr::Io(e.to_string()))?;
+            let c = crate::http::system_tls_config().map_err(|e| DialErr::Io(e.to_string()))?;
             ("wss".to_string(), Some(Arc::new(c)))
         }
         Endpoint::Tls {
@@ -366,7 +369,9 @@ async fn dial(cfg: &CloudConfig, token: &SessionToken) -> Result<Ws, DialErr> {
         .map_err(|e| DialErr::Io(e.to_string()))?;
     let header = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.as_str()))
         .map_err(|e| DialErr::Io(e.to_string()))?;
-    request.headers_mut().insert(reqwest::header::AUTHORIZATION, header);
+    request
+        .headers_mut()
+        .insert(reqwest::header::AUTHORIZATION, header);
     match tokio_tungstenite::client_async(request, stream).await {
         Ok((ws, _)) => Ok(ws),
         Err(tokio_tungstenite::tungstenite::Error::Http(resp))
@@ -402,7 +407,12 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
@@ -411,7 +421,12 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
@@ -493,7 +508,10 @@ async fn fetch_all(
     let mut all = Vec::new();
     let mut from = from;
     loop {
-        if send_to_relay(ws, &ToRelay::ChainFetch { from_seq: from }).await.is_err() {
+        if send_to_relay(ws, &ToRelay::ChainFetch { from_seq: from })
+            .await
+            .is_err()
+        {
             return None;
         }
         let batch = loop {
@@ -527,12 +545,10 @@ enum PreHelloErr {
 }
 
 async fn pre_hello(actor: &mut Actor, ws: &mut Ws, live: &mut Live) -> Result<(), PreHelloErr> {
-    let nonce = loop {
-        match next_relay(ws).await {
-            Some(FromRelay::Challenge { nonce }) => break nonce,
-            Some(_) => return Err(PreHelloErr::Dropped("no Challenge".into())),
-            None => return Err(PreHelloErr::Dropped("socket closed".into())),
-        }
+    let nonce = match next_relay(ws).await {
+        Some(FromRelay::Challenge { nonce }) => nonce,
+        Some(_) => return Err(PreHelloErr::Dropped("no Challenge".into())),
+        None => return Err(PreHelloErr::Dropped("socket closed".into())),
     };
     let from = actor
         .chain_cache
@@ -544,7 +560,7 @@ async fn pre_hello(actor: &mut Actor, ws: &mut Ws, live: &mut Live) -> Result<()
         None => {
             return Err(PreHelloErr::Dropped(
                 "socket closed during chain fetch".into(),
-            ))
+            ));
         }
     };
     let chain = match (actor.chain_cache.take(), actor.pin) {
@@ -613,12 +629,10 @@ async fn pre_hello(actor: &mut Actor, ws: &mut Ws, live: &mut Live) -> Result<()
     if send_to_relay(ws, &hello).await.is_err() {
         return Err(PreHelloErr::Dropped("socket closed".into()));
     }
-    let (head_seq, pending) = loop {
-        match next_relay(ws).await {
-            Some(FromRelay::Welcome { head_seq, pending }) => break (head_seq, pending),
-            Some(_) => return Err(PreHelloErr::Dropped("no Welcome".into())),
-            None => return Err(PreHelloErr::Dropped("socket closed".into())),
-        }
+    let (head_seq, pending) = match next_relay(ws).await {
+        Some(FromRelay::Welcome { head_seq, pending }) => (head_seq, pending),
+        Some(_) => return Err(PreHelloErr::Dropped("no Welcome".into())),
+        None => return Err(PreHelloErr::Dropped("socket closed".into())),
     };
     // Welcome may be ahead of us (a delta arrived while we were Hello-ing).
     if let (Some(c), Some(h)) = (&chain, head_seq)
@@ -660,9 +674,7 @@ impl Actor {
             (Some(c), true) => chain::extend(None, &entries, Some(c.genesis)),
             (None, true) => chain::extend(None, &entries, self.pin),
             (Some(c), false) => chain::sync(&c, &entries),
-            (None, false) => {
-                return Err(TrustError::ChainInvalid("no chain to sync".into()))
-            }
+            (None, false) => return Err(TrustError::ChainInvalid("no chain to sync".into())),
         }
         .map_err(trust_from_chain_err)?;
         if full {
@@ -705,19 +717,10 @@ impl Actor {
         head_seq: u64,
         state: &watch::Sender<CloudState>,
     ) -> Option<RunEnd> {
-        let full = match &self.chain_cache {
-            Some(c) => head_seq <= c.head.seq,
-            None => true,
-        };
-        let from = if full {
-            0
-        } else {
-            self.chain_cache
-                .as_ref()
-                .expect("full ⇒ cache is None")
-                .head
-                .seq
-                .saturating_add(1)
+        // A head at or below ours cannot extend the cache: refetch from 0.
+        let (full, from) = match &self.chain_cache {
+            Some(c) if head_seq > c.head.seq => (false, c.head.seq.saturating_add(1)),
+            _ => (true, 0),
         };
         let Some(entries) = fetch_all(ws, from, &mut Some(&mut live.pending_msgs)).await else {
             return Some(RunEnd::Dropped("socket closed during resync".into(), false));
@@ -794,21 +797,24 @@ impl Actor {
             return;
         }
         // Tie-break (G.7): the LOWER DeviceId stays initiator.
-        let carry = live.sessions.remove(&from);
-        if let Some(s) = &carry
-            && self.id.id < from
-            && !matches!(&s.phase, Phase::Handshaking(Handshaking::Responder(_)))
-        {
+        let we_win = self.id.id < from
+            && live.sessions.get(&from).is_some_and(|s| {
+                !matches!(&s.phase, Phase::Handshaking(Handshaking::Responder(_)))
+            });
+        if we_win {
             // We win (initiator, or established session as initiator):
             // refuse the duplicate; the peer will respond to OUR Hs1.
-            live.sessions.insert(from, carry.expect("just checked"));
             self.send_close(ws, from, h1.sid, constants::close_reason::PROTOCOL)
                 .await;
             return;
         }
         // We lose (or no session): become the responder, carrying our
         // queued opens over (they are re-bound once the session opens).
-        let queued = carry.map(|s| s.queued).unwrap_or_default();
+        let queued = live
+            .sessions
+            .remove(&from)
+            .map(|s| s.queued)
+            .unwrap_or_default();
         self.start_responder(live, ws, from, h1, queued).await;
     }
 
@@ -833,9 +839,12 @@ impl Actor {
         };
         let mut fetched: Vec<Vec<u8>> = Vec::new();
         if h1.head.seq > chain.head.seq {
-            let Some(delta) =
-                fetch_all(ws, chain.head.seq.saturating_add(1), &mut Some(&mut live.pending_msgs))
-                    .await
+            let Some(delta) = fetch_all(
+                ws,
+                chain.head.seq.saturating_add(1),
+                &mut Some(&mut live.pending_msgs),
+            )
+            .await
             else {
                 fail_all(queued);
                 return;
@@ -857,7 +866,10 @@ impl Actor {
                 }
             }
         }
-        let chain = self.chain_cache.as_ref().expect("chain");
+        let Some(chain) = self.chain_cache.as_ref() else {
+            fail_all(queued);
+            return;
+        };
         // The bridge: `check_head`'s fetch callback is a sync `Fn`, so it
         // answers from the pre-fetched batch (handed out once). Scoped so
         // the non-Send `Cell` never lives across an await.
@@ -871,20 +883,13 @@ impl Actor {
                 }
             };
             let mut rng = Os;
-            handshake::Responder::on_hs1(
-                chain,
-                self.id.id,
-                from,
-                h1,
-                &fetch,
-                &self.id.sk,
-                &mut rng,
-            )
+            handshake::Responder::on_hs1(chain, self.id.id, from, h1, &fetch, &self.id.sk, &mut rng)
         };
         let (resp, hs2) = match outcome {
             Ok(v) => v,
             Err(e) => {
-                self.send_close(ws, from, h1.sid, reason_for_cloud_err(e)).await;
+                self.send_close(ws, from, h1.sid, reason_for_cloud_err(e))
+                    .await;
                 for (_, out) in queued {
                     let _ = out.send(Err(CloudError::Reset(reset_for_reason(
                         constants::close_reason::PROTOCOL,
@@ -930,9 +935,12 @@ impl Actor {
             return;
         };
         if h2.head.seq > chain.head.seq {
-            let Some(delta) =
-                fetch_all(ws, chain.head.seq.saturating_add(1), &mut Some(&mut live.pending_msgs))
-                    .await
+            let Some(delta) = fetch_all(
+                ws,
+                chain.head.seq.saturating_add(1),
+                &mut Some(&mut live.pending_msgs),
+            )
+            .await
             else {
                 self.close_session(live, ws, from, constants::close_reason::PROTOCOL)
                     .await;
@@ -953,9 +961,8 @@ impl Actor {
         }
         // The bridge: our chain is already synced, so `check_head`'s F2
         // branch runs without a fetch; a further move ⇒ StaleChain.
-        let fetch = |_from_seq: u64| -> cloud::Result<Vec<Vec<u8>>> {
-            Err(cloud::Error::StaleChain)
-        };
+        let fetch =
+            |_from_seq: u64| -> cloud::Result<Vec<Vec<u8>>> { Err(cloud::Error::StaleChain) };
         let mut rng = Os;
         let hs3 = {
             let Some(s) = live.sessions.get_mut(&from) else {
@@ -1086,16 +1093,15 @@ impl Actor {
         from: DeviceId,
         d: &Data,
     ) -> Option<u8> {
-        let Some(s) = live.sessions.get_mut(&from) else {
-            return None;
-        };
+        let s = live.sessions.get_mut(&from)?;
         let Phase::Open(o) = &mut s.phase else {
             return None;
         };
         match o.rx.open(d) {
             Ok(RecvOutcome::Dropped) => None,
             Ok(RecvOutcome::Inner(inner)) => {
-                let claim = if matches!(&inner.msg, StreamMsg::Open(op) if s.claim.as_ref().is_some_and(|(c, _)| c == op)) {
+                let claim = if matches!(&inner.msg, StreamMsg::Open(op) if s.claim.as_ref().is_some_and(|(c, _)| c == op))
+                {
                     s.claim.take()
                 } else {
                     None
@@ -1107,9 +1113,7 @@ impl Actor {
                     }
                     Err(e) => {
                         if let Some((_, out)) = claim {
-                            let _ = out.send(Err(CloudError::Reset(
-                                constants::reset::PROTOCOL,
-                            )));
+                            let _ = out.send(Err(CloudError::Reset(constants::reset::PROTOCOL)));
                         }
                         Some(reason_for_cloud_err(e))
                     }
@@ -1230,10 +1234,8 @@ impl Actor {
                 };
                 match o.tx.seal(&frames::encode_inner(&inner)) {
                     Ok(d) => {
-                        if ended {
-                            if let Some(side) = o.streams.get_mut(&stream) {
-                                side.ended = true;
-                            }
+                        if let Some(side) = o.streams.get_mut(&stream).filter(|_| ended) {
+                            side.ended = true;
                         }
                         for ev in events {
                             if let MuxEvent::Closed(id) | MuxEvent::Reset(id, _) = ev {
@@ -1328,13 +1330,7 @@ impl Actor {
 
     /// Close one session: `Close` to the peer, streams get a `Reset`,
     /// queued opens fail.
-    async fn close_session(
-        &mut self,
-        live: &mut Live,
-        ws: &mut Ws,
-        peer: DeviceId,
-        reason: u8,
-    ) {
+    async fn close_session(&mut self, live: &mut Live, ws: &mut Ws, peer: DeviceId, reason: u8) {
         let Some(s) = live.sessions.remove(&peer) else {
             return;
         };
@@ -1410,7 +1406,10 @@ impl Actor {
     ) {
         match live.sessions.get_mut(&device) {
             None => {
-                let chain = self.chain_cache.as_ref().expect("active ⇒ chain").clone();
+                let Some(chain) = self.chain_cache.clone() else {
+                    let _ = out.send(Err(CloudError::NotActive(CloudStateKind::Connecting)));
+                    return;
+                };
                 let mut rng = Os;
                 match Initiator::start(&chain, self.id.id, device, &self.id.sk, &mut rng) {
                     Ok((init, hs1)) => {
@@ -1562,9 +1561,7 @@ impl Actor {
         state: &watch::Sender<CloudState>,
     ) -> Option<RunEnd> {
         match msg {
-            FromRelay::ChainChanged { head_seq } => {
-                self.resync(live, ws, head_seq, state).await
-            }
+            FromRelay::ChainChanged { head_seq } => self.resync(live, ws, head_seq, state).await,
             FromRelay::Pipe { from, bytes } => {
                 self.on_pipe(live, ws, from, bytes, state).await;
                 None
@@ -1596,9 +1593,9 @@ impl Actor {
                 None
             }
             // Out of band while live (handled in the pre-Hello phase).
-            FromRelay::Challenge { .. }
-            | FromRelay::Welcome { .. }
-            | FromRelay::Chain { .. } => None,
+            FromRelay::Challenge { .. } | FromRelay::Welcome { .. } | FromRelay::Chain { .. } => {
+                None
+            }
         }
     }
 
@@ -1612,15 +1609,13 @@ impl Actor {
     ) -> Option<RunEnd> {
         match cmd {
             CloudCmd::Open { device, op, out } => {
-                if live.pending || self.chain_cache.is_none() {
-                    let _ = out.send(Err(CloudError::NotActive(CloudStateKind::Pending)));
-                } else if !self
+                let known = self
                     .chain_cache
                     .as_ref()
-                    .expect("active ⇒ chain")
-                    .active
-                    .contains_key(&device)
-                {
+                    .map(|c| c.active.contains_key(&device));
+                if live.pending || known.is_none() {
+                    let _ = out.send(Err(CloudError::NotActive(CloudStateKind::Pending)));
+                } else if known == Some(false) {
                     let _ = out.send(Err(CloudError::UnknownDevice));
                 } else {
                     self.start_open(live, ws, device, op, out).await;
@@ -1633,25 +1628,21 @@ impl Actor {
                 } else {
                     // G.2 step 2: re-fetch first — the account may no
                     // longer be empty (a concurrent genesis won).
-                    let Some(entries) =
-                        fetch_all(ws, 0, &mut Some(&mut live.pending_msgs)).await
+                    let Some(entries) = fetch_all(ws, 0, &mut Some(&mut live.pending_msgs)).await
                     else {
                         let _ = out.send(Err(CloudError::Offline));
                         return None;
                     };
                     if entries.is_empty() {
                         let mut rng = Os;
-                        let entry = match enroll::genesis_entry(
-                            &self.id.card,
-                            &self.id.sk,
-                            &mut rng,
-                        ) {
-                            Ok(e) => e,
-                            Err(e) => {
-                                let _ = out.send(Err(CloudError::Io(e.to_string())));
-                                return None;
-                            }
-                        };
+                        let entry =
+                            match enroll::genesis_entry(&self.id.card, &self.id.sk, &mut rng) {
+                                Ok(e) => e,
+                                Err(e) => {
+                                    let _ = out.send(Err(CloudError::Io(e.to_string())));
+                                    return None;
+                                }
+                            };
                         let raw = entry.encode();
                         if send_to_relay(ws, &ToRelay::EnrollGenesis { entry: raw })
                             .await

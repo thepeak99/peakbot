@@ -17,10 +17,8 @@
 #[path = "cloud_common/mod.rs"]
 mod cloud_common;
 
-use std::time::Duration;
-
 use cloud::frames::{Op, StreamMsg};
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use peakbot::cloud::enroll::{EnrollAttempt, EnrollError};
 use peakbot::cloud::{CloudState, LogoutOutcome, LogoutReason, SeedStore, TrustError};
 use url::Url;

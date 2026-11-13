@@ -44,6 +44,9 @@ pub enum Phase {
     Open(Open),
 }
 
+// Boxing the 400-byte `Initiator` would only move the allocation onto the
+// per-handshake path; there is at most one per peer.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Handshaking {
     Initiator(Initiator),

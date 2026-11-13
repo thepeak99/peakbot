@@ -9,7 +9,6 @@
 //! `sign_hello` → `Hello`/`HelloPending` → `Welcome` → run loop.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use cloud::{DeviceId, LetterId, frames::Op, sas::SasWords};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -174,8 +173,8 @@ pub struct CloudHandle {
     /// The relay origin (login URLs, logout POST).
     base: Url,
     store: Arc<dyn SeedStore>,
-    /// This device's id (derived from the seed; never `None` post-spawn).
-    device_id: DeviceId,
+    /// This device's id (derived from the seed; `None` if the identity failed).
+    device_id: Option<DeviceId>,
     /// One login listener at a time (G.1 step 5): the only lock, and it's
     /// outside the actor.
     login_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
@@ -229,10 +228,7 @@ impl CloudHandle {
     /// a browser. A second login cancels the first (G.1 step 5).
     pub async fn login(&self, open_browser: impl FnOnce(Url)) -> Result<(), CloudError> {
         let mut slot = self.login_task.lock().await;
-        if slot.is_some()
-            && self.state.borrow().kind()
-                != CloudStateKind::LoggedOut
-        {
+        if slot.is_some() && self.state.borrow().kind() != CloudStateKind::LoggedOut {
             return Err(CloudError::Flow(FlowError::AlreadyLoggedIn));
         }
         if let Some(t) = slot.take() {
@@ -269,12 +265,13 @@ impl CloudHandle {
             .send(CloudCmd::Logout { out })
             .await
             .map_err(|_| CloudError::Io("the cloud actor stopped".into()))?;
-        rx.await.map_err(|_| CloudError::Io("the cloud actor stopped".into()))?
+        rx.await
+            .map_err(|_| CloudError::Io("the cloud actor stopped".into()))?
     }
 
     /// This device's id (derived from the seed).
     pub fn device_id(&self) -> Option<DeviceId> {
-        Some(self.device_id)
+        self.device_id
     }
 
     /// `last_login_error` of the API state (G.1 step 5): set by a failed
@@ -295,7 +292,8 @@ impl CloudHandle {
             .send(CloudCmd::Open { device, op, out })
             .await
             .map_err(|_| CloudError::Io("the cloud actor stopped".into()))?;
-        rx.await.map_err(|_| CloudError::Io("the cloud actor stopped".into()))?
+        rx.await
+            .map_err(|_| CloudError::Io("the cloud actor stopped".into()))?
     }
 
     /// Genesis for an empty account (§G.2).
@@ -309,7 +307,8 @@ impl CloudHandle {
             .send(CloudCmd::Genesis { out })
             .await
             .map_err(|_| CloudError::Io("the cloud actor stopped".into()))?;
-        rx.await.map_err(|_| CloudError::Io("the cloud actor stopped".into()))?
+        rx.await
+            .map_err(|_| CloudError::Io("the cloud actor stopped".into()))?
     }
 
     /// Approve an `EnrollRequest` (§G.4): `Add` at head+1.
@@ -345,38 +344,31 @@ pub fn spawn(
     store: Arc<dyn SeedStore>,
     inbound: Option<InboundHook>,
 ) -> CloudHandle {
-    // The seed is the single source of identity (§C): create one if absent.
-    let seed = match store.load_seed() {
-        Ok(Some(s)) => s,
-        Ok(None) => {
-            let mut bytes = [0u8; 64];
-            if getrandom::fill(&mut bytes).is_err() {
-                // A CSPRNG failure is unrecoverable for identity: derive
-                // from wall-clock nanos (spawn is infallible by the seam).
-                let t = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0);
-                for (i, b) in bytes.iter_mut().enumerate() {
-                    *b = (t >> ((i % 8) * 8)) as u8;
-                }
-            }
-            let s = Seed::new(bytes);
-            if store.store_seed(&s).is_err() {
-                panic!("cloud: cannot persist a fresh seed");
-            }
-            s
-        }
-        Err(e) => panic!("cloud: cannot read the seed store: {e}"),
-    };
-    let id = match actor::Identity::new(&seed, &cfg.device_name, cfg.platform) {
-        Ok(id) => id,
-        Err(e) => panic!("cloud: cannot derive the identity from the seed: {e}"),
-    };
     let origin = cfg.relay.origin().clone();
-    let public = PublicState::new(&cfg.state_dir, &origin);
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
-    // The initial published state: a stored token means we connect at once.
+    let handle = |state_rx, device_id| CloudHandle {
+        cmd: cmd_tx.clone(),
+        state: state_rx,
+        base: origin.clone(),
+        store: store.clone(),
+        device_id,
+        login_task: Arc::new(tokio::sync::Mutex::new(None)),
+        last_login_error: Arc::new(std::sync::Mutex::new(None)),
+    };
+    let id = match load_identity(&cfg, &*store) {
+        Ok(id) => id,
+        Err(e) => {
+            // spawn() is infallible by the seam: an identity failure is a
+            // terminal state and no actor runs (open() then reports Io).
+            tracing::error!(error = %e, "cloud identity unavailable");
+            let (_tx, state_rx) = watch::channel(CloudState::Trust(TrustError::ChainInvalid(
+                format!("identity: {e}"),
+            )));
+            return handle(state_rx, None);
+        }
+    };
+    let public = PublicState::new(&cfg.state_dir, &origin);
+    // A stored token means we connect at once.
     let initial = if store.load_token().ok().flatten().is_some() {
         CloudState::Connecting {
             attempt: 0,
@@ -388,16 +380,24 @@ pub fn spawn(
         }
     };
     let (state_tx, state_rx) = watch::channel(initial);
-    let handle = CloudHandle {
-        cmd: cmd_tx.clone(),
-        state: state_rx,
-        base: origin.clone(),
-        store: store.clone(),
-        device_id: id.id,
-        login_task: Arc::new(tokio::sync::Mutex::new(None)),
-        last_login_error: Arc::new(std::sync::Mutex::new(None)),
-    };
+    let h = handle(state_rx, Some(id.id));
     let (actor, out_rx) = actor::Actor::new(cfg, store, public, inbound, id);
     tokio::spawn(actor::run(actor, cmd_rx, out_rx, state_tx));
-    handle
+    h
+}
+
+/// The seed is the single source of identity (§C): create one if absent.
+/// A failing OS RNG is an error, never a weak fallback seed.
+fn load_identity(cfg: &CloudConfig, store: &dyn SeedStore) -> Result<actor::Identity, String> {
+    let seed = match store.load_seed().map_err(|e| e.to_string())? {
+        Some(s) => s,
+        None => {
+            let mut bytes = [0u8; 64];
+            getrandom::fill(&mut bytes).map_err(|e| e.to_string())?;
+            let s = Seed::new(bytes);
+            store.store_seed(&s).map_err(|e| e.to_string())?;
+            s
+        }
+    };
+    actor::Identity::new(&seed, &cfg.device_name, cfg.platform)
 }

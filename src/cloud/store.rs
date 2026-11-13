@@ -60,8 +60,16 @@ pub trait SeedStore: Send + Sync + 'static {
     fn store_seed(&self, seed: &Seed) -> io::Result<()>;
     fn load_token(&self) -> io::Result<Option<SessionToken>>;
     fn store_token(&self, token: &SessionToken) -> io::Result<()>;
-    /// Delete the token ONLY (a 401 on `/ws`, §C: seed + pin survive).
-    fn clear_token(&self) -> io::Result<()>;
+    /// Delete the token ONLY (a 401 on `/ws`, §C: seed + pin survive). The
+    /// default keeps the seed across a full wipe; stores override it.
+    fn clear_token(&self) -> io::Result<()> {
+        let seed = self.load_seed()?;
+        self.wipe()?;
+        match seed {
+            Some(s) => self.store_seed(&s),
+            None => Ok(()),
+        }
+    }
     fn wipe(&self) -> io::Result<()>;
 }
 

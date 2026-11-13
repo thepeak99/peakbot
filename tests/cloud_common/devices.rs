@@ -178,12 +178,5 @@ pub fn b64url_decode_len(s: &str) -> usize {
     }
     let n = s.len();
     let rem = n % 4;
-    (n * 3) / 4
-        - if rem == 2 {
-            1
-        } else if rem == 3 {
-            0
-        } else {
-            0
-        }
+    (n * 3) / 4 - usize::from(rem == 2)
 }

@@ -48,7 +48,9 @@ pub fn plan_login(
     let mut sb = [0u8; 32];
     rng.fill_bytes(&mut sb);
     let state = b64url(&sb);
-    let mut url = base.join("login").map_err(|e| CloudError::Io(e.to_string()))?;
+    let mut url = base
+        .join("login")
+        .map_err(|e| CloudError::Io(e.to_string()))?;
     url.query_pairs_mut()
         .append_pair("code_challenge", &challenge)
         .append_pair("code_challenge_method", "S256")
@@ -75,9 +77,11 @@ pub async fn listener(
     store: Arc<dyn SeedStore>,
     last_login_error: Arc<std::sync::Mutex<Option<String>>>,
 ) {
-    let result =
-        tokio::time::timeout(Duration::from_secs(300), accept_one(base, tcp, &plan, &cmd, &store))
-            .await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(300),
+        accept_one(base, tcp, &plan, &cmd, &store),
+    )
+    .await;
     match result {
         Ok(Ok(())) => {
             // A fresh successful login clears the previous failure.
@@ -117,7 +121,9 @@ async fn accept_one(
             continue;
         }
         let params: std::collections::HashMap<String, String> =
-            form_urlencoded::parse(query.as_bytes()).into_owned().collect();
+            form_urlencoded::parse(query.as_bytes())
+                .into_owned()
+                .collect();
         if params.get("state") != Some(&plan.state) {
             // A stray request must not kill the flow (G.1 step 3).
             respond(&mut stream, 400, "Bad Request", "state mismatch").await;
@@ -180,7 +186,9 @@ pub async fn redeem_token(
     plan: &LoginPlan,
     code: &str,
 ) -> Result<SessionToken, CloudError> {
-    let url = base.join("token").map_err(|e| CloudError::Io(e.to_string()))?;
+    let url = base
+        .join("token")
+        .map_err(|e| CloudError::Io(e.to_string()))?;
     let resp = reqwest::Client::new()
         .post(url)
         .json(&serde_json::json!({ "code": code, "code_verifier": plan.verifier }))
@@ -193,8 +201,10 @@ pub async fn redeem_token(
             resp.status()
         )));
     }
-    let body: serde_json::Value =
-        resp.json().await.map_err(|e| CloudError::Io(e.to_string()))?;
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| CloudError::Io(e.to_string()))?;
     let token = body
         .get("token")
         .and_then(|t| t.as_str())
@@ -205,7 +215,9 @@ pub async fn redeem_token(
 /// `POST {base}/logout` with Bearer, best effort, 5 s (the relay endpoint
 /// is idempotent). A failure must NOT stop the local wipe (p3-design §G.6).
 pub async fn logout_post(base: &Url, token: &SessionToken) -> Result<(), CloudError> {
-    let url = base.join("logout").map_err(|e| CloudError::Io(e.to_string()))?;
+    let url = base
+        .join("logout")
+        .map_err(|e| CloudError::Io(e.to_string()))?;
     let req = reqwest::Client::new()
         .post(url)
         .header("Authorization", format!("Bearer {}", token.as_str()))

@@ -30,6 +30,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+/// A stored letter: (from, letter_id, sealed).
+type Mail = (DeviceId, LetterId, Vec<u8>);
+
 /// One in-flight `/login` flow (relay-design §4.1).
 struct Flow {
     challenge: String,
@@ -52,7 +55,7 @@ struct Inner {
     /// `HelloPending` cards: DeviceId ⇒ card bytes (until Add/Genesis).
     pending_cards: std::sync::Mutex<HashMap<DeviceId, Vec<u8>>>,
     /// Offline letter mailboxes: DeviceId ⇒ (from, letter_id, sealed).
-    mailboxes: std::sync::Mutex<HashMap<DeviceId, Vec<(DeviceId, LetterId, Vec<u8>)>>>,
+    mailboxes: std::sync::Mutex<HashMap<DeviceId, Vec<Mail>>>,
     /// Per-connection stop flags: token ⇒ flag.
     conns: std::sync::Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// Decoded ToRelay messages, in order (the "no Hello on chain Err"
@@ -62,6 +65,8 @@ struct Inner {
     /// `Connecting` state).
     ws_gate: AtomicBool,
     ws_gate_released: tokio::sync::Notify,
+    /// Bumped to wake idle sockets whose `stop` flag was just set.
+    drops: tokio::sync::watch::Sender<u64>,
     next_letter: std::sync::atomic::AtomicU64,
     /// Next N `ChainAppend`s answer `CONFLICT` without storing.
     conflicts: std::sync::atomic::AtomicU32,
@@ -163,6 +168,7 @@ impl FakeRelay {
             msgs: Default::default(),
             ws_gate: AtomicBool::new(false),
             ws_gate_released: tokio::sync::Notify::new(),
+            drops: tokio::sync::watch::channel(0).0,
             next_letter: std::sync::atomic::AtomicU64::new(1),
             conflicts: std::sync::atomic::AtomicU32::new(0),
             fail_logout: AtomicBool::new(false),
@@ -219,6 +225,7 @@ impl FakeRelay {
         for stop in self.inner.conns.lock().expect("conns").values() {
             stop.store(true, Ordering::SeqCst);
         }
+        self.inner.drops.send_modify(|n| *n += 1);
     }
 
     /// Is this token still accepted by `/ws`?
@@ -447,19 +454,10 @@ async fn logout(State(inner): State<Arc<Inner>>, headers: HeaderMap) -> StatusCo
                 .remove(&token)
                 .is_some()
             {
-                if let Some(id) = inner
-                    .tokens
-                    .lock()
-                    .expect("tokens")
-                    .iter()
-                    .map(|(_, d)| *d)
-                    .next()
-                {
-                    let _ = id;
-                }
                 if let Some(stop) = inner.conns.lock().expect("conns").remove(&token) {
                     stop.store(true, Ordering::SeqCst);
                 }
+                inner.drops.send_modify(|n| *n += 1);
             }
             // 204 even when the token is unknown (idempotent, no oracle).
             StatusCode::NO_CONTENT
@@ -502,6 +500,7 @@ async fn conn(inner: Arc<Inner>, token: String, mut ws: WebSocket) {
         .await;
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<cloud::codec::FromRelay>();
+    let mut drops = inner.drops.subscribe();
     let mut id: Option<DeviceId> = None;
     let origin = {
         let mut addr = inner.tokens.lock().expect("tokens");
@@ -519,6 +518,8 @@ async fn conn(inner: Arc<Inner>, token: String, mut ws: WebSocket) {
             break;
         }
         tokio::select! {
+            // `drop_all_sockets` / `logout` flip `stop`; wake an IDLE socket too.
+            _ = drops.changed() => {}
             maybe_msg = ws.recv() => {
                 let Some(Ok(Message::Binary(bytes))) = maybe_msg else {
                     break;
@@ -570,6 +571,8 @@ fn remove_socket(inner: &Arc<Inner>, id: &DeviceId) {
     inner.sockets.lock().expect("sockets").remove(id);
 }
 
+// One call site; the per-connection state is passed positionally on purpose.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     inner: &Arc<Inner>,
     origin: &str,
@@ -619,7 +622,7 @@ async fn dispatch(
             inner.deliver_mail(&device);
         }
         ToRelay::HelloPending { card, sig } => {
-            inner.log(&format!("HelloPending"));
+            inner.log("HelloPending");
             let card = match DeviceCard::parse(&card) {
                 Ok(c) => c,
                 Err(_) => {
@@ -706,7 +709,7 @@ async fn dispatch(
             inner.log("ChainAppend");
             if inner
                 .conflicts
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok()
             {
                 let _ = out_tx.send(FromRelay::Error {
@@ -714,12 +717,12 @@ async fn dispatch(
                 });
                 return;
             }
-            let Some(sender) = *id else {
+            if id.is_none() {
                 let _ = out_tx.send(FromRelay::Error {
                     code: constants::relay_error::NOT_PERMITTED,
                 });
                 return;
-            };
+            }
             let e = match ChainEntry::parse(&entry) {
                 Ok(e) => e,
                 Err(_) => {
@@ -772,10 +775,8 @@ async fn dispatch(
                         .remove(&c.device_id());
                 }
             }
-            if e.op == cloud::chain::ChainOp::Revoke {
-                if let Some(target) = e.target {
-                    inner.mailboxes.lock().expect("mailboxes").remove(&target);
-                }
+            if let (cloud::chain::ChainOp::Revoke, Some(target)) = (e.op, e.target) {
+                inner.mailboxes.lock().expect("mailboxes").remove(&target);
             }
             entries.push(entry);
             drop(entries);
