@@ -53,11 +53,7 @@ pub fn approve_entry<R: CryptoRng>(
 }
 
 /// The `EnrollReject` letter body (G.4 step 4).
-pub fn reject_letter(
-    now: u64,
-    from: cloud::DeviceId,
-    to: cloud::DeviceId,
-) -> LetterBody {
+pub fn reject_letter(now: u64, from: cloud::DeviceId, to: cloud::DeviceId) -> LetterBody {
     todo!("p3 PR-B: reject_letter")
 }
 

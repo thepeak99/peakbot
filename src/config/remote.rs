@@ -103,6 +103,7 @@ pub struct RemoteProfile {
 /// One §4.4 violation of a `remote:` block: the field the error is keyed
 /// at and the locked message. `Config::parse` prefixes the path with
 /// `profiles.<n>.remote`.
+#[derive(Debug)]
 pub struct RemoteFieldError {
     pub field: &'static str,
     pub message: String,

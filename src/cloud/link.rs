@@ -75,11 +75,19 @@ pub struct EnrollRequestInfo {
 #[derive(Debug, Clone, PartialEq)]
 pub enum CloudState {
     Disabled,
-    LoggedOut { reason: LogoutReason },
-    Connecting { attempt: u32, last_error: Option<String> },
+    LoggedOut {
+        reason: LogoutReason,
+    },
+    Connecting {
+        attempt: u32,
+        last_error: Option<String>,
+    },
     /// `empty_account`: chain fetch returned 0 entries → genesis allowed.
     /// `sas`: `Some` once our `EnrollRequest` is posted (head frozen, §5.5).
-    Pending { empty_account: bool, sas: Option<SasWords> },
+    Pending {
+        empty_account: bool,
+        sas: Option<SasWords>,
+    },
     Active {
         devices: Vec<DeviceInfo>,
         requests: Vec<EnrollRequestInfo>,
@@ -147,19 +155,29 @@ pub enum CloudCmd {
         out: tokio::sync::oneshot::Sender<Result<(), CloudError>>,
     },
     TokenStored(SessionToken),
-    Logout { out: tokio::sync::oneshot::Sender<Result<(), CloudError>> },
+    Logout {
+        out: tokio::sync::oneshot::Sender<Result<(), CloudError>>,
+    },
     Open {
         device: DeviceId,
         op: Op,
         out: tokio::sync::oneshot::Sender<Result<CloudStream, CloudError>>,
     },
-    Genesis { out: tokio::sync::oneshot::Sender<Result<DeviceId, CloudError>> },
+    Genesis {
+        out: tokio::sync::oneshot::Sender<Result<DeviceId, CloudError>>,
+    },
     Approve {
         letter_id: LetterId,
         out: tokio::sync::oneshot::Sender<Result<DeviceId, CloudError>>,
     },
-    Reject { letter_id: LetterId, out: tokio::sync::oneshot::Sender<Result<(), CloudError>> },
-    Revoke { target: DeviceId, out: tokio::sync::oneshot::Sender<Result<(), CloudError>> },
+    Reject {
+        letter_id: LetterId,
+        out: tokio::sync::oneshot::Sender<Result<(), CloudError>>,
+    },
+    Revoke {
+        target: DeviceId,
+        out: tokio::sync::oneshot::Sender<Result<(), CloudError>>,
+    },
     Profiles {
         device: DeviceId,
         out: tokio::sync::oneshot::Sender<Vec<crate::cloud::session::ProfileInfo>>,
@@ -212,7 +230,10 @@ impl CloudHandle {
     }
 
     /// The `Profiles` op on a peer (§E.3: local profiles only).
-    pub(crate) async fn profiles(&self, device: DeviceId) -> Result<Vec<crate::cloud::session::ProfileInfo>, CloudError> {
+    pub(crate) async fn profiles(
+        &self,
+        device: DeviceId,
+    ) -> Result<Vec<crate::cloud::session::ProfileInfo>, CloudError> {
         todo!("p3 PR-B: CloudHandle::profiles")
     }
 }
@@ -220,7 +241,11 @@ impl CloudHandle {
 /// Spawn the process-wide actor (p3-design §D.6 / B8). Both editions;
 /// Local passes `inbound = None`. No `general.cloud` ⇒ the caller does not
 /// spawn (state `Disabled` is the config-level absence).
-pub fn spawn(cfg: CloudConfig, store: Arc<dyn SeedStore>, inbound: Option<InboundHook>) -> CloudHandle {
+pub fn spawn(
+    cfg: CloudConfig,
+    store: Arc<dyn SeedStore>,
+    inbound: Option<InboundHook>,
+) -> CloudHandle {
     let _ = (&cfg, &store, inbound);
     todo!("p3 PR-B: CloudLink actor (socket, chain sync, sessions, reconnect)")
 }

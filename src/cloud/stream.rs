@@ -25,7 +25,11 @@ pub struct CloudStream {
 
 impl CloudStream {
     pub fn new(tx: mpsc::Sender<StreamMsg>, rx: mpsc::Receiver<StreamMsg>) -> Self {
-        Self { tx, rx, ended: false }
+        Self {
+            tx,
+            rx,
+            ended: false,
+        }
     }
 
     pub(crate) fn mark_ended(&mut self) {
@@ -36,7 +40,10 @@ impl CloudStream {
 impl Stream for CloudStream {
     type Item = StreamMsg;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
         self.rx.poll_recv(cx)
     }
 }
@@ -44,7 +51,10 @@ impl Stream for CloudStream {
 impl Sink<StreamMsg> for CloudStream {
     type Error = CloudError;
 
-    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+    fn poll_ready(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
         std::task::Poll::Ready(if self.tx.is_closed() {
             Err(CloudError::Reset(4))
         } else {
@@ -53,16 +63,20 @@ impl Sink<StreamMsg> for CloudStream {
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: StreamMsg) -> Result<(), Self::Error> {
-        self.tx
-            .try_send(item)
-            .map_err(|_| CloudError::Reset(4))
+        self.tx.try_send(item).map_err(|_| CloudError::Reset(4))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
         std::task::Poll::Ready(Ok(()))
     }
 
-    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+    fn poll_close(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
         std::task::Poll::Ready(Ok(()))
     }
 }

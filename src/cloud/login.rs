@@ -47,7 +47,11 @@ pub async fn run_login(
 
 /// Redeem `code` against `{base}/token` with `plan.verifier` (the fake
 /// relay asserts the S256 relationship server-side).
-pub async fn redeem_token(base: &Url, plan: &LoginPlan, code: &str) -> Result<SessionToken, CloudError> {
+pub async fn redeem_token(
+    base: &Url,
+    plan: &LoginPlan,
+    code: &str,
+) -> Result<SessionToken, CloudError> {
     todo!("p3 PR-B: redeem_token")
 }
 

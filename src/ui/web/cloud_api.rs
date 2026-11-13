@@ -23,9 +23,9 @@
 
 #![allow(unused_variables)]
 
+use crate::cloud::CloudHandle;
 use axum::Router;
 use cloud::DeviceId;
-use crate::cloud::CloudHandle;
 
 /// The router state. `handle: None` ⇔ no `general.cloud` (every route
 /// 404s `cloud_disabled`). `settings_enabled` is the boot-bound
@@ -47,7 +47,9 @@ pub fn router(state: CloudApiState) -> Router {
 #[serde(rename_all = "snake_case")]
 pub enum CloudStateDto {
     Disabled,
-    LoggedOut { reason: String },
+    LoggedOut {
+        reason: String,
+    },
     Connecting {
         attempt: u32,
         last_error: Option<String>,
@@ -60,7 +62,9 @@ pub enum CloudStateDto {
         devices: Vec<DeviceDto>,
         requests: Vec<RequestDto>,
     },
-    Trust { trust_error: String },
+    Trust {
+        trust_error: String,
+    },
 }
 
 /// `{ "id": hex, "name": str, "platform": str, "online": true|false|null,

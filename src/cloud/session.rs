@@ -19,9 +19,7 @@ pub struct Session {
 
 pub enum Phase {
     Handshaking(Handshaking),
-    Open {
-        established_at: u64,
-    },
+    Open { established_at: u64 },
 }
 
 pub enum Handshaking {
