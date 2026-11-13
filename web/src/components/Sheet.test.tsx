@@ -10,8 +10,9 @@
 //   * Detents (flag): opens at medium (55%), draggable grabber/header,
 //     `data-detent` + `style.height`, `data-dragging` while dragging; the pure
 //     math is sheetDrag.ts (P4) — here only the wiring.
-//   * Non-detents: no grabber, no height, no detent, header not draggable;
-//     `above` rides the sheet's top edge, outside the clipped panel.
+//   * Non-detents: a grabber that does not drag (A26), no height, no detent,
+//     header not draggable; `above` rides the sheet's top edge, outside the
+//     clipped panel.
 //
 // RED before implementation: `./Sheet` does not exist yet, so this file
 // fails at import — the right reason (feature absent).
@@ -36,6 +37,11 @@ let originalInnerHeight: number;
 let nowSpy: MockInstance<() => number>;
 
 beforeEach(() => {
+  // A failed assertion in a RED test can leave a portal behind (its unmount
+  // never runs); start every test on a clean body.
+  document.body
+    .querySelectorAll<HTMLElement>('[data-testid="sheet"]')
+    .forEach((el) => el.closest(".fixed.inset-0")?.remove());
   // The §3 reference numbers use innerHeight 844 (medium 464, large 776).
   originalInnerHeight = window.innerHeight;
   Object.defineProperty(window, "innerHeight", { configurable: true, value: 844 });
@@ -454,12 +460,23 @@ describe("Sheet — S7: a pointerdown on Done does not start a drag", () => {
 // ─── S8: non-detents ──────────────────────────────────────────────────────
 
 describe("Sheet — S8: non-detents sheets", () => {
-  it("have no grabber, no height and no detent", async () => {
+  it("show a grabber that does not drag, with no height and no detent", async () => {
     await mount();
     const el = dialog();
-    expect(document.body.querySelector('[data-testid="sheet-grabber"]')).toBeNull();
+    const grabber = document.body.querySelector<HTMLElement>('[data-testid="sheet-grabber"]');
+    expect(grabber, "the grabber renders on every sheet (A26)").not.toBeNull();
     expect(el.style.height, "content height, not a detent").toBe("");
     expect(el.hasAttribute("data-detent")).toBe(false);
+    // A press-and-move on the grabber drags nothing on a non-detent sheet.
+    await act(async () => {
+      nowSpy.mockReturnValue(0);
+      grabber!.dispatchEvent(pointer("pointerdown", 400));
+    });
+    await act(async () => {
+      grabber!.dispatchEvent(pointer("pointermove", 100));
+    });
+    expect(el.hasAttribute("data-dragging"), "no drag state from the grabber").toBe(false);
+    expect(el.style.height, "no inline height").toBe("");
     await unmount();
   });
 
@@ -491,6 +508,37 @@ describe("Sheet — S8: non-detents sheets", () => {
     expect(above.parentElement!.parentElement).toBe(el);
     const header = el.querySelector<HTMLElement>('[data-testid="sheet-header"]')!;
     expect(header.contains(above), "the panel does not clip the above slot").toBe(false);
+    await unmount();
+  });
+});
+
+// ─── S9: batch 4 sheet chrome (A25, A40, X4) ──────────────────────────────
+
+describe("Sheet — S9: the sheet chrome", () => {
+  /** The clipped panel — the header's parent (the above slot's sibling). */
+  const panel = (): HTMLElement =>
+    document.body.querySelector<HTMLElement>('[data-testid="sheet-header"]')!.parentElement!;
+
+  it("the panel carries the 26px sheet radius token class (A25)", async () => {
+    await mount();
+    expect(panel().classList.contains("rounded-t-sheet"), "rounded-t-sheet").toBe(true);
+    expect(panel().classList.contains("rounded-t-2xl"), "no old 2xl radius").toBe(false);
+    await unmount();
+  });
+
+  it("the panel carries the bottom safe-area inset (X4)", async () => {
+    await mount();
+    // The safe-area env() class IS the contract (the gesture bar clearance).
+    expect(panel().className).toContain("pb-[env(safe-area-inset-bottom)]");
+    await unmount();
+  });
+
+  it("the backdrop has the light variant class (A40)", async () => {
+    await mount();
+    const backdrop = document.body.querySelector<HTMLElement>('[data-testid="sheet-backdrop"]')!;
+    expect(backdrop, "the backdrop renders").not.toBeNull();
+    expect(backdrop.className, "the dark dim").toContain("bg-black/55");
+    expect(backdrop.className, "the light dim").toContain("light:bg-black/40");
     await unmount();
   });
 });

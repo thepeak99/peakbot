@@ -1216,3 +1216,101 @@ describe("App mobile sheet — B32: the fresh-chat empty state", () => {
     expect(hint!.classList.contains("lg:hidden"), "the hint is phone-only").toBe(true);
   });
 });
+
+// ═══ C17 — the Bash pill badge is desktop-only (batch 4, 4.23) ════════════
+
+describe("App mobile sheet — C17: the Bash pill badge", () => {
+  const withBash = (): AppState =>
+    withTabs({
+      bash_panel: {
+        kind: "running",
+        command: "cargo test",
+        pid: 4242,
+        started_at: T,
+        tail: ["running 12 tests"],
+      },
+    } as Partial<AppState>);
+
+  it("the Bash pill has no badge on a phone while bash runs", async () => {
+    hoisted.agent = makeAgent(withBash());
+    mount();
+    await flush();
+    click(must("panels-button"));
+    await flush();
+    const bashPill = document.body.querySelector('[data-testid="panels-pill"][data-tab="bash"]');
+    expect(bashPill, "the Bash pill renders").not.toBeNull();
+    expect(
+      bashPill!.querySelector('[data-testid="panels-pill-badge"]'),
+      "no badge on the phone (proto:470)",
+    ).toBeNull();
+  });
+
+  it("the drawer keeps the Bash badge (desktop lock)", async () => {
+    desktopWidth = true;
+    setShell("browser");
+    hoisted.agent = makeAgent(withBash());
+    mount();
+    await flush();
+    const bashTab = [...host.querySelectorAll<HTMLElement>('aside [role="tab"]')].find((t) =>
+      (t.textContent ?? "").includes("Bash"),
+    );
+    expect(bashTab, "the Bash rail handle renders").toBeDefined();
+    const badge = [...bashTab!.querySelectorAll("span")].find(
+      (s) => s.textContent?.trim() === "1",
+    );
+    expect(badge, "the desktop drawer keeps the Bash badge").toBeDefined();
+  });
+});
+
+// ═══ X6 — Watch in the Agents sheet closes the sheet (batch 4, 4.22) ══════
+
+describe("App mobile sheet — X6: Watch in the Agents sheet", () => {
+  const subMsg: WireChatMessage = {
+    role: "agent",
+    content: "found the bug",
+    timestamp: T,
+    source: { kind: "sub_agent", role: "researcher" },
+  };
+
+  /** The banner's own "Clear" — the composer carries a second watch note
+   * with its own Clear, which must not satisfy these assertions. */
+  const bannerClear = (): HTMLButtonElement | undefined =>
+    [...host.querySelectorAll("button")].find(
+      (b) =>
+        b.textContent?.trim() === "Clear" &&
+        !b.closest('[data-testid="composer"]') &&
+        !b.closest("footer, .border-t") &&
+        (b.closest("div")?.textContent ?? "").includes("Watching"),
+    );
+
+  it("closes the sheet and shows the banner", async () => {
+    hoisted.agent = makeAgent(
+      stateFor("c1", {
+        chat: {
+          messages: [{ role: "user", content: "dig in", timestamp: T }, subMsg],
+          auto_scroll: true,
+          scroll_offset: 0,
+        },
+      } as Partial<AppState>),
+    );
+    mount();
+    await flush();
+    click(must("panels-button"));
+    await flush();
+    click(document.body.querySelector('[data-testid="panels-pill"][data-tab="agents"]')!);
+    await flush();
+    const panel = panelsDialog()!.querySelector('[role="tabpanel"]')!;
+    const rows = [...panel.querySelectorAll<HTMLElement>("li")];
+    const row = rows.find((r) => (r.textContent ?? "").includes("researcher"));
+    const watch = row?.querySelector<HTMLButtonElement>("button");
+    expect(watch, "the researcher row carries the Watch pill").not.toBeNull();
+    expect(watch!.textContent, "the pill reads Watch").toContain("Watch");
+
+    click(watch!);
+    await flush();
+    expect(panelsDialog(), "the sheet closes on Watch").toBeNull();
+    const clear = bannerClear();
+    expect(clear, "the watch banner renders with its Clear").toBeDefined();
+    expect(clear!.closest("div")!.textContent).toContain("Watching researcher");
+  });
+});
