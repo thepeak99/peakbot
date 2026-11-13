@@ -97,24 +97,35 @@ describe("ChatHeader — H1–H6", () => {
     expect(onBack).toHaveBeenCalledTimes(1);
   });
 
-  it("H2: the back badge is present iff badge", async () => {
-    let el = await render({ badge: false });
-    expect(el.querySelector('[data-testid="chat-back-badge"]')).toBeNull();
-
-    el = await render({ badge: true });
-    expect(el.querySelector('[data-testid="chat-back-badge"]')).not.toBeNull();
+  // Reverses H2 / batch 1 keep-R B3 (user decision after device testing): the
+  // "other chat has news" dot on the back button is REMOVED. The `badge`
+  // prop is cast through `unknown` because the builder may delete it.
+  it("H2: the back button renders NO badge dot, whether badge is false or true", async () => {
+    for (const badge of [false, true]) {
+      const el = await render({ badge });
+      expect(
+        el.querySelector('[data-testid="chat-back-badge"]'),
+        `no chat-back-badge testid when badge=${badge}`,
+      ).toBeNull();
+      const back = el.querySelector('button[data-testid="chat-back"]')!;
+      expect(back, "the back button itself still renders").not.toBeNull();
+      expect(
+        back.querySelector(".rounded-full"),
+        `no round dot of any kind inside the back button when badge=${badge}`,
+      ).toBeNull();
+      expect(
+        back.querySelector("span"),
+        "the back button holds only the chevron svg and the label text",
+      ).toBeNull();
+    }
   });
 
-  it("the back badge stays when badge is true (batch 1 keep-R, B3)", async () => {
+  it("the back button still reads '‹ Chats' (chevron svg + label) when badge is true", async () => {
     const el = await render({ badge: true });
-    const dot = el.querySelector('[data-testid="chat-back-badge"]');
-    expect(dot, "the unread/running dot is kept on the back button").not.toBeNull();
-    // It stays a DOT: 8px round, and it sits inside the back button (the
-    // batch 1 restyle moves it onto the chevron, never deletes it).
-    expect(dot!.classList.contains("h-2")).toBe(true);
-    expect(dot!.classList.contains("w-2")).toBe(true);
-    expect(dot!.classList.contains("rounded-full")).toBe(true);
-    expect(el.querySelector('button[data-testid="chat-back"]')!.contains(dot)).toBe(true);
+    const back = el.querySelector('button[data-testid="chat-back"]')!;
+    expect(back.querySelector("svg"), "the chevron stays").not.toBeNull();
+    expect((back.textContent ?? "").trim()).toBe("Chats");
+    expect(back.getAttribute("aria-label")).toBe("Back to chats");
   });
 
   it("H3: the title truncates and the subtitle hosts the selector node", async () => {
@@ -130,18 +141,23 @@ describe("ChatHeader — H1–H6", () => {
     expect(subtitle.textContent).toContain("home › team › sonnet");
   });
 
-  it("H3: the machine prefix renders iff machine is set", async () => {
-    let el = await render({ machine: null });
-    expect(el.querySelector('[data-testid="chat-machine"]'), "no prefix for a local chat").toBeNull();
-
-    el = await render({ machine: "home-server.local:7823" });
-    const prefix = el.querySelector('[data-testid="chat-machine"]');
-    expect(prefix, "a remote chat shows the machine").not.toBeNull();
-    expect(prefix!.textContent).toBe("home-server.local:7823 ·");
-    expect(
-      el.querySelector('[data-testid="chat-subtitle"]')!.contains(prefix!),
-      "the prefix is part of the subtitle",
-    ).toBe(true);
+  // Reverses H3 (user decision): the host appears only inside the pill (the
+  // selector node), never as a separate prefix in the subtitle.
+  it("H3: no machine prefix renders in the subtitle, for a local OR a remote chat", async () => {
+    for (const machine of [null, "home-server.local:7823"]) {
+      const el = await render({ machine });
+      expect(
+        el.querySelector('[data-testid="chat-machine"]'),
+        `no chat-machine prefix when machine=${String(machine)}`,
+      ).toBeNull();
+      const subtitle = el.querySelector('[data-testid="chat-subtitle"]')!;
+      expect(subtitle.textContent ?? "", "the host text is not in the subtitle").not.toContain("home-server");
+      expect(subtitle.textContent ?? "", "no dangling '·' separator outside the pill").not.toMatch(/·\s*$/);
+      expect(
+        subtitle.querySelector('[data-testid="selection-chip"]'),
+        "the pill (selector) still renders in the subtitle",
+      ).not.toBeNull();
+    }
   });
 
   it("H3: an empty selector renders no chip and no crash (before the first state)", async () => {

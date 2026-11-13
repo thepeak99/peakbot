@@ -2018,3 +2018,109 @@ describe("Composer — desktop lock (R1): phone absent keeps the old contract", 
     ).toBeNull();
   });
 });
+
+// ─── Fix 1 (device polish): icons on the phone attach menu ───────────────
+//
+// The phone's "+" menu showed text only. The mock (prototype.html:191-197,
+// 416-420) gives every row an icon before its label (📷 / 🖼️ / 📎 in a 24px
+// `.ai` box). The shipped menu's existing contract — trimmed textContent is
+// EXACTLY the label — means the icon must carry no text, so it is an
+// aria-hidden inline <svg>. The menu is SHARED with desktop (it is gated by the
+// Android UA, not by `phone`), so `phone: false` must keep today's output.
+//
+// RED until the icons land: the rows contain no <svg> yet.
+
+const ATTACH_LABELS = ["Take a photo", "Choose from gallery", "Pick a file"] as const;
+
+async function openPhoneAttachMenu(phone: boolean): Promise<HTMLElement> {
+  mockUA(ANDROID_UA);
+  const el = await mount({ ...makeProps(), phone } as unknown as ComposerProps);
+  await click(attachButtonOf(el)!);
+  expect(menuOf(el), "the attach menu opens on Android").not.toBeNull();
+  return el;
+}
+
+describe("Composer — phone attach menu icons (phone: true)", () => {
+  it("each of the 3 menuitems has an aria-hidden svg icon BEFORE its label text", async () => {
+    const el = await openPhoneAttachMenu(true);
+    const items = menuItemsOf(el);
+    expect(items, "still exactly three items").toHaveLength(3);
+
+    items.forEach((item, i) => {
+      const svg = item.querySelector("svg");
+      expect(svg, `"${ATTACH_LABELS[i]}" has an svg icon`).not.toBeNull();
+      expect(svg!.getAttribute("aria-hidden"), "the icon is decorative").toBe("true");
+      expect(
+        (svg!.textContent ?? "").trim(),
+        "the icon carries no text, so the label stays exact",
+      ).toBe("");
+      expect(
+        item.firstChild === svg || item.firstChild!.contains(svg!),
+        `the icon is the first thing in "${ATTACH_LABELS[i]}", before the label`,
+      ).toBe(true);
+      expect(
+        svg!.querySelector("path, circle, rect, line, polyline, polygon"),
+        "the svg actually draws something",
+      ).not.toBeNull();
+    });
+  });
+
+  it("the three icons are distinct (camera / image / paperclip, not one glyph repeated)", async () => {
+    const el = await openPhoneAttachMenu(true);
+    const drawn = menuItemsOf(el).map((b) => b.querySelector("svg")?.innerHTML ?? "");
+    expect(drawn.every((d) => d.length > 0), "every row has a drawn icon").toBe(true);
+    expect(new Set(drawn).size, "three different drawings").toBe(3);
+  });
+
+  it("labels stay exactly 'Take a photo', 'Choose from gallery', 'Pick a file' in order", async () => {
+    const el = await openPhoneAttachMenu(true);
+    expect(menuItemsOf(el).map((b) => (b.textContent ?? "").trim())).toEqual([...ATTACH_LABELS]);
+    expect(menuItemsOf(el).map((b) => b.getAttribute("data-testid"))).toEqual([
+      "attach-menu-camera",
+      "attach-menu-gallery",
+      "attach-menu-file",
+    ]);
+    expect(menuItemsOf(el).every((b) => b.getAttribute("role") === "menuitem")).toBe(true);
+  });
+
+  it.each([
+    [0, "camera", "Take a photo"],
+    [1, "gallery", "Choose from gallery"],
+    [2, "plain", "Pick a file"],
+  ] as const)("clicking the icon of row %i (%s: %s) still fires only that item's input and closes the menu", async (idx, which, _label) => {
+    mockUA(ANDROID_UA);
+    const el = await mount({ ...makeProps(), phone: true } as unknown as ComposerProps);
+    const [plain, camera, gallery] = fileInputs(el);
+    expect(fileInputs(el), "plain, camera and gallery inputs").toHaveLength(3);
+    const clicks = {
+      plain: vi.spyOn(plain, "click"),
+      camera: vi.spyOn(camera, "click"),
+      gallery: vi.spyOn(gallery, "click"),
+    };
+    await click(attachButtonOf(el)!);
+
+    const svg = menuItemsOf(el)[idx].querySelector("svg");
+    expect(svg, "the icon exists to click").not.toBeNull();
+    await click(svg as unknown as HTMLElement); // bubbles to the button's onClick
+
+    for (const k of ["plain", "camera", "gallery"] as const) {
+      expect(clicks[k], `${k} input click count`).toHaveBeenCalledTimes(k === which ? 1 : 0);
+    }
+    expect(menuOf(el), "the menu closes after picking").toBeNull();
+  });
+});
+
+describe("Composer — desktop lock: the shared attach menu is unchanged without phone", () => {
+  it("phone absent/false (Android UA): rows are text-only — no svg, no icon wrapper — with today's classes", async () => {
+    const el = await openPhoneAttachMenu(false);
+    const items = menuItemsOf(el);
+    expect(items.map((b) => (b.textContent ?? "").trim())).toEqual([...ATTACH_LABELS]);
+    for (const item of items) {
+      expect(item.querySelector("svg"), "no icon on the non-phone menu").toBeNull();
+      expect(item.children.length, "the row is just its label text").toBe(0);
+      expect(item.classList.contains("block"), "today's block row").toBe(true);
+      expect(item.classList.contains("px-4")).toBe(true);
+      expect(item.classList.contains("py-3")).toBe(true);
+    }
+  });
+});

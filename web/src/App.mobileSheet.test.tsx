@@ -809,23 +809,83 @@ describe("App mobile sheet — H: the header selection chip", () => {
     expect(dialogNamed("Selection")).not.toBeNull();
   });
 
-  it("a remote chat prefixes the subtitle with the machine name (C15, C23)", async () => {
+  // Reverses C15/C23 (user decision after device testing): the subtitle was
+  // "10.2.0.48 · [pill: default on 10.2.0.4…]" — the host twice. Only the pill
+  // stays, as in the mock.
+  it("a remote chat shows NO host prefix outside the pill — the subtitle is just the pill (C15, C23 reversed)", async () => {
     hoisted.agent = makeAgent(
       stateFor("c1", { catalog: WIRE_CATALOG_REMOTE, selection: sel("home") } as unknown as Partial<AppState>),
     );
     mount();
     await flush();
-    // Batch 2, item 2.20 (A39): the display name is the host without the port.
-    expect(must("chat-machine").textContent).toBe("home-server.local ·");
+    expect(tid("chat-machine"), "no separate machine prefix element").toBeNull();
+    const subtitle = must("chat-subtitle");
+    const pill = must("selection-chip");
+    expect(subtitle.contains(pill), "the pill lives in the subtitle").toBe(true);
+    expect(subtitle.textContent ?? "", "no host text outside the pill").not.toContain("home-server.local");
+    expect(
+      subtitle.textContent,
+      "every character of the subtitle text belongs to the pill",
+    ).toBe(pill.textContent);
+    expect(pill.textContent, "the pill still shows the remote profile name").toContain("home");
   });
 
-  it("a local chat has no machine prefix", async () => {
+  it("a remote chat whose profile name carries the host shows that host exactly once (in the pill)", async () => {
+    const catalog = [
+      ...WIRE_CATALOG_LOCAL,
+      { ...WIRE_CATALOG_REMOTE[1], name: "default on home-server.local" },
+    ];
+    hoisted.agent = makeAgent(
+      stateFor("c1", {
+        catalog,
+        selection: sel("default on home-server.local"),
+      } as unknown as Partial<AppState>),
+    );
+    mount();
+    await flush();
+    const subtitle = must("chat-subtitle");
+    const pill = must("selection-chip");
+    expect(pill.textContent).toContain("default on home-server.local");
+    expect(
+      (subtitle.textContent ?? "").split("home-server.local").length - 1,
+      "the host appears once in the subtitle, not twice",
+    ).toBe(1);
+    expect(tid("chat-machine")).toBeNull();
+  });
+
+  it("a local chat has no machine prefix and its subtitle is just the pill", async () => {
     hoisted.agent = makeAgent(
       stateFor("c1", { catalog: WIRE_CATALOG_REMOTE, selection: sel("dev") } as unknown as Partial<AppState>),
     );
     mount();
     await flush();
     expect(tid("chat-machine")).toBeNull();
+    const subtitle = must("chat-subtitle");
+    const pill = must("selection-chip");
+    expect(subtitle.textContent, "no text outside the pill").toBe(pill.textContent);
+    expect(pill.textContent).toContain("dev");
+  });
+
+  // Reverses the kept back-dot (batch 1 keep-R, B3): the user wants it gone.
+  it("the ‹ Chats back button shows NO dot even when another chat is running or unread", async () => {
+    const other: ConversationSummary = {
+      id: "c2",
+      name: "Other chat",
+      updated_at: T,
+      message_count: 3,
+      model: "m",
+      active: false,
+      running: true,
+    };
+    hoisted.agent = makeAgent(
+      stateFor("c1", { catalog: WIRE_CATALOG_LOCAL, selection: sel("dev") } as unknown as Partial<AppState>),
+      { conversations: [{ ...other, id: "c1", name: "This chat", running: false, active: true }, other] },
+    );
+    mount();
+    await flush();
+    const back = must("chat-back");
+    expect(tid("chat-back-badge"), "no back-badge dot while another chat is running").toBeNull();
+    expect(back.querySelector(".rounded-full"), "no dot of any kind on the back button").toBeNull();
   });
 
   it("the browser shell keeps the chip in the bottom bar (C14, C26)", async () => {
