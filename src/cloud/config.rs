@@ -62,9 +62,8 @@ pub fn parse_cloud(def: Option<&CloudDef>) -> Result<Option<CloudConfig>, Vec<Re
         relay,
         device_name: "device".to_string(),
         platform: 1,
-        state_dir: dirs::data_dir()
+        state_dir: crate::paths::app_data_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join("peakbot")
             .join("cloud"),
     }))
 }
