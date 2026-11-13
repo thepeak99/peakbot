@@ -61,19 +61,6 @@ export function relativeTime(updatedAt: string, now: Date): string {
   return `${d.getDate()} ${MONTHS[d.getMonth()]} ${d.getFullYear()}`;
 }
 
-// Join the count/model/relative segments with " · ", dropping any that are
-// empty (0 messages, no model, unparseable timestamp) rather than printing
-// them blank.
-export function metaLine(chat: ConversationSummary, now: Date): string {
-  const parts: string[] = [];
-  const n = chat.message_count;
-  if (n > 0) parts.push(`${n} ${n === 1 ? "msg" : "msgs"}`);
-  if (chat.model) parts.push(chat.model);
-  const rel = relativeTime(chat.updated_at, now);
-  if (rel) parts.push(rel);
-  return parts.join(" · ");
-}
-
 export function filterChats(
   list: readonly ConversationSummary[],
   query: string,
@@ -240,12 +227,12 @@ export function machineOf(
   return catalog.find((p) => p.name === profile)?.machine ?? null;
 }
 
-/** null → "This device"; else the origin's host (a non-default port stays,
- * so two servers on one host stay distinct). The id is server-normalised,
- * so no try/catch. */
+/** null → "This device"; else the origin's hostname, display-only (ids and
+ * filters keep the full origin, so two servers on one host differ only in
+ * port and show the same name). The id is server-normalised, so no try/catch. */
 export function machineName(id: MachineId): string {
   if (id === null) return LOCAL_MACHINE_NAME;
-  return new URL(id).host;
+  return new URL(id).hostname;
 }
 
 /** One entry per distinct catalog machine: local first (only if any local

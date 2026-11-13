@@ -1,5 +1,5 @@
 // The mobile Chats home screen (design §4.1, PR1): a full-screen overlay with
-// a "Chats" header (logo, connection dot, theme/settings), a search
+// a "Chats" header (connection dot, theme/settings), a search
 // field, profile filter chips, and grouped chat rows. With ≥ 2 machines the
 // header gains a machine pill (design §2.5/§2.7): a Machine sheet, a
 // "New chat on…" FAB picker, machine-filtered chips/rows, row tags and the
@@ -17,13 +17,14 @@ import {
   groupChats,
   machineName,
   machineOf,
+  relativeTime,
   resolveFilter,
-  metaLine,
   type ChatRow,
   type MachineFilter,
   type Range,
 } from "../chatList";
 import { loadMachineFilter, saveMachineFilter } from "../mobileStorage";
+import { IB, IBI, MTAG } from "./phoneUi";
 import { Sheet } from "./Sheet";
 import { ThemeToggle } from "./ThemeToggle";
 
@@ -132,15 +133,23 @@ export function ChatList({
 
   const headerActions = (
     <>
-      <ThemeToggle />
+      <span
+        data-testid="chats-conn"
+        aria-label={connected ? "connected" : "offline"}
+        className={`mx-1.5 h-2 w-2 shrink-0 rounded-full ${
+          connected ? "bg-emerald-400 light:bg-[#16a34a]" : "bg-zinc-500"
+        }`}
+      />
+      <ThemeToggle phone />
       {onOpenSettings && (
         <button
           type="button"
           onClick={onOpenSettings}
           title="Settings"
           aria-label="Settings"
-          className="flex h-6 w-6 cursor-pointer items-center justify-center rounded text-zinc-500 transition-colors hover:text-zinc-300"
+          className={IB}
         >
+          <span className={IBI}>
           <svg
             viewBox="0 0 24 24"
             fill="none"
@@ -148,27 +157,14 @@ export function ChatList({
             strokeWidth="2"
             strokeLinecap="round"
             strokeLinejoin="round"
-            className="h-4 w-4"
+            className="h-5 w-5"
           >
             <circle cx="12" cy="12" r="3" />
             <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
           </svg>
+          </span>
         </button>
       )}
-      <span
-        data-testid="chats-conn"
-        aria-label={connected ? "connected" : "offline"}
-        className="flex items-center gap-1.5 text-xs"
-      >
-        <span
-          className={`h-1.5 w-1.5 rounded-full ${
-            connected ? "bg-emerald-400" : "bg-zinc-600"
-          }`}
-        />
-        <span className="hidden sm:inline">
-          {connected ? "connected" : "offline"}
-        </span>
-      </span>
     </>
   );
 
@@ -183,34 +179,25 @@ export function ChatList({
       {/* The header is sticky by construction: only the list below scrolls.
           Plain zinc utilities, like the TopBar/ChatHeader — the theme layer
           remaps them for the light theme. */}
-      <header className="shrink-0 border-b border-zinc-800 bg-zinc-950/95 px-4 pt-[env(safe-area-inset-top)]">
+      <header className="shrink-0 px-4 pt-[env(safe-area-inset-top)]">
         {machineUi ? (
           // 3-column grid: title left, machine pill centred, actions right.
-          // At 360 px the logo hides and the pill truncates.
-          <div className="grid grid-cols-[1fr_auto_1fr] items-center py-2.5">
-            <div className="flex min-w-0 items-center gap-2.5">
-              <img src="/logo_shifu.png" alt="" className="hidden h-8 w-8 shrink-0 rounded-full sm:block" />
-              <h1 className="truncate text-2xl font-bold tracking-tight">Chats</h1>
-            </div>
+          <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2 pb-2.5 pt-3.5">
+            <h1 className="min-w-0 truncate text-[26px] font-bold tracking-[-0.02em]">Chats</h1>
             <MachinePill
               label={filter.kind === "all" ? "All machines" : (selectedMachine?.name ?? "")}
-              online={
-                filter.kind === "all"
-                  ? machines.every((m) => m.online)
-                  : (selectedMachine?.online ?? false)
-              }
+              online={filter.kind === "all" ? true : (selectedMachine?.online ?? false)}
               onOpen={() => setMachineOpen(true)}
             />
-            <div className="flex shrink-0 items-center justify-end gap-3">{headerActions}</div>
+            <div className="flex items-center justify-self-end gap-0.5">{headerActions}</div>
           </div>
         ) : (
-          <div className="flex items-center gap-2.5 py-2.5">
-            <img src="/logo_shifu.png" alt="" className="h-8 w-8 shrink-0 rounded-full" />
-            <h1 className="text-2xl font-bold tracking-tight">Chats</h1>
-            <div className="ml-auto flex shrink-0 items-center gap-3">{headerActions}</div>
+          <div className="flex items-center gap-2 pb-2.5 pt-3.5">
+            <h1 className="text-[26px] font-bold tracking-[-0.02em]">Chats</h1>
+            <div className="ml-auto flex shrink-0 items-center gap-0.5">{headerActions}</div>
           </div>
         )}
-        <div className="relative mt-1">
+        <div className="relative">
           <svg
             aria-hidden="true"
             viewBox="0 0 24 24"
@@ -219,7 +206,7 @@ export function ChatList({
             strokeWidth="2"
             strokeLinecap="round"
             strokeLinejoin="round"
-            className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500"
+            className="pointer-events-none absolute left-3 top-1/2 h-[18px] w-[18px] -translate-y-1/2 text-zinc-500"
           >
             <circle cx="11" cy="11" r="7" />
             <path d="m21 21-4.35-4.35" />
@@ -230,21 +217,21 @@ export function ChatList({
             placeholder="Search chats"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            className="h-11 w-full rounded-lg border border-zinc-800 bg-zinc-900 pl-9 pr-9 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-zinc-600"
+            className="h-11 w-full rounded-[14px] border border-zinc-800 bg-zinc-900 pl-[38px] pr-9 text-[15px] text-zinc-100 placeholder-zinc-500 outline-none focus:border-zinc-600"
           />
           {query !== "" && (
             <button
               type="button"
               aria-label="Clear search"
               onClick={() => setQuery("")}
-              className="absolute right-2 top-1/2 flex h-6 w-6 -translate-y-1/2 cursor-pointer items-center justify-center rounded-full bg-zinc-800 text-xs text-zinc-300 transition-colors hover:bg-zinc-700"
+              className="absolute right-2 top-1/2 flex h-[22px] w-[22px] -translate-y-1/2 cursor-pointer items-center justify-center rounded-[11px] bg-zinc-800 text-xs text-zinc-300 transition-colors hover:bg-zinc-700"
             >
               ✕
             </button>
           )}
         </div>
         <div
-          className="flex gap-2 overflow-x-auto py-2.5"
+          className="flex gap-2 overflow-x-auto pb-1.5 pt-2.5"
           role="group"
           aria-label="Filter by profile"
         >
@@ -260,7 +247,6 @@ export function ChatList({
               label={p.name}
               profile={p.name}
               color={p.color}
-              remote={p.origin === "remote"}
               pressed={activeProfile === p.name}
               onSelect={setSelected}
             />
@@ -276,7 +262,7 @@ export function ChatList({
           </div>
         )}
       </header>
-      <div className="flex-1 overflow-y-auto overscroll-contain pb-24">
+      <div className="flex-1 overflow-y-auto overscroll-contain pb-[calc(env(safe-area-inset-bottom)+88px)] pt-1.5">
         {!loaded ? (
           <div
             data-testid="chat-loading"
@@ -291,18 +277,20 @@ export function ChatList({
         ) : sections.length === 0 ? (
           <div
             data-testid="chat-empty"
-            className="px-4 py-8 text-center text-sm text-zinc-500"
+            className="px-6 py-8 text-center text-sm text-zinc-500"
           >
-            {offline
-              ? `${selectedMachine.name} is offline`
-              : searching
-                ? `No chats match “${query.trim()}”`
+            {searching
+              ? `No chats match “${query.trim()}”`
+              : selectedMachine
+                ? offline
+                  ? `${selectedMachine.name} is offline`
+                  : `No chats on ${selectedMachine.name} yet`
                 : "No chats yet"}
           </div>
         ) : (
           sections.map((s) => (
           <section key={s.kind} data-testid="chat-section" data-kind={s.kind}>
-            <h2 className="px-4 pb-1.5 pt-4 text-[11px] font-semibold uppercase tracking-[0.14em] text-zinc-500">
+            <h2 className="px-[22px] pb-2 pt-4 text-[11px] font-semibold uppercase tracking-[0.08em] text-zinc-500">
               {s.label}
             </h2>
             {s.rows.map((r) => (
@@ -325,9 +313,11 @@ export function ChatList({
         aria-label="New chat"
         disabled={fabDisabled}
         onClick={() => (machineUi && filter.kind === "all" ? setPickerOpen(true) : onNew(fabProfile))}
-        className="absolute bottom-[calc(1.25rem+env(safe-area-inset-bottom))] right-4 z-10 flex h-14 w-14 cursor-pointer items-center justify-center rounded-2xl bg-emerald-600 pb-1 text-3xl font-light text-white shadow-lg transition-colors hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
+        className="absolute bottom-[calc(1.75rem+env(safe-area-inset-bottom))] right-5 z-10 flex h-14 w-14 cursor-pointer items-center justify-center rounded-[19px] bg-emerald-600 text-white shadow-[0_8px_20px_rgba(5,150,105,0.4)] transition-colors hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
       >
-        +
+        <svg aria-hidden="true" width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+          <path d="M12 5v14M5 12h14" />
+        </svg>
       </button>
 
       {machineUi && machineOpen && (
@@ -337,7 +327,7 @@ export function ChatList({
               machine="all"
               label="All machines"
               sub="local + remote"
-              online={machines.every((m) => m.online)}
+              online={true}
               count={conversations.length}
               pressed={filter.kind === "all"}
               onPick={() => chooseMachine({ kind: "all" })}
@@ -391,21 +381,18 @@ export function ChatList({
   );
 }
 
-// One profile filter chip. The pressed chip carries the emerald border
-// (mock: "All" and the picked profile); a remote profile shows its badge
-// inline, like the row badge.
+// One profile filter chip: dot + label. The pressed chip carries the emerald
+// border (mock: "All" and the picked profile).
 function Chip({
   label,
   profile,
   color,
-  remote = false,
   pressed,
   onSelect,
 }: {
   label: string;
   profile: string;
   color?: TabColor;
-  remote?: boolean;
   pressed: boolean;
   onSelect(profile: string): void;
 }) {
@@ -416,10 +403,10 @@ function Chip({
       data-profile={profile}
       aria-pressed={pressed}
       onClick={() => onSelect(profile)}
-      className={`flex h-9 shrink-0 cursor-pointer items-center gap-1.5 rounded-full border px-3 text-sm transition-colors ${
+      className={`flex h-10 shrink-0 cursor-pointer items-center gap-1.5 rounded-full border px-3.5 text-[13.5px] transition-colors ${
         pressed
-          ? "border-emerald-700 bg-emerald-950/40 text-emerald-300"
-          : "border-zinc-800 bg-zinc-900/60 text-zinc-300 hover:border-zinc-700"
+          ? "border-emerald-600 bg-emerald-600/13 font-semibold text-emerald-400"
+          : "border-zinc-800 bg-zinc-900 text-zinc-400 hover:border-zinc-700"
       }`}
     >
       {color && (
@@ -430,18 +417,13 @@ function Chip({
         />
       )}
       <span className="whitespace-nowrap">{label}</span>
-      {remote && (
-        <span className="shrink-0 rounded bg-zinc-800 px-1 text-[10px] text-zinc-400">
-          remote
-        </span>
-      )}
     </button>
   );
 }
 
-// One chat row: a 4px profile-colour bar at the left edge, the title (+ the
-// machine tag in All mode) over the muted meta line. The whole row is the
-// single 44px-minimum chat-open tap target.
+// One chat row: a 3px profile-colour bar at the left edge, the title over a
+// `profile · [machine tag] · time` second line. The whole row is the single
+// 60px-minimum chat-open tap target.
 function Row({
   row,
   now,
@@ -467,52 +449,33 @@ function Row({
   const color = profile?.color;
   const running = chat.running === true;
   const live = chat.active && !running;
+  const rel = relativeTime(chat.updated_at, now);
   return (
-    <div
-      data-testid="chat-row"
-      data-convo={chat.id}
-      className={running ? "bg-amber-950/40" : live ? "bg-emerald-950/40" : ""}
-    >
+    <div data-testid="chat-row" data-convo={chat.id}>
       <button
         type="button"
         data-testid="chat-open"
         onClick={() => onOpen(chat.id, chat.profile ?? null)}
-        className="relative flex min-h-11 w-full cursor-pointer flex-col items-start px-4 py-2.5 text-left transition-colors hover:bg-zinc-900/60"
+        className="relative flex min-h-[60px] w-full cursor-pointer flex-col items-start gap-1 py-[13px] pl-[22px] pr-[18px] text-left transition-colors hover:bg-zinc-900/60"
       >
         {color && (
           <span
             data-testid="chat-bar"
             aria-hidden="true"
-            className="absolute inset-y-0 left-0 w-1"
+            className="absolute bottom-[10px] left-0 top-[10px] w-[3px] rounded-[2px]"
             style={{ backgroundColor: `var(--profile-${color})` }}
           />
         )}
-        <span className="flex w-full items-center gap-2 pl-1.5">
-          <span
-            className={`min-w-0 truncate text-[15px] ${
-              running
-                ? "font-semibold text-amber-200"
-                : live
-                  ? "font-semibold text-emerald-200"
-                  : "font-medium text-zinc-100"
-            }`}
-          >
+        <span className="flex w-full items-center gap-2">
+          <span className="min-w-0 truncate text-[15px] font-semibold tracking-[-0.01em] text-zinc-100">
             <Title name={chat.name} matches={row.titleMatches} />
           </span>
-          {machineTag !== undefined && (
-            <span
-              data-testid="chat-machine-tag"
-              className="max-w-[40%] shrink-0 truncate rounded bg-zinc-800 px-1 text-[10px] text-zinc-400"
-            >
-              {machineTag}
-            </span>
-          )}
-          <span className="ml-auto flex shrink-0 items-center gap-1.5 pl-1.5">
+          <span className="ml-auto flex shrink-0 items-center gap-2">
             {running && (
               <span
                 data-testid="chat-status-running"
                 aria-label="running"
-                className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-amber-400 border-t-transparent"
+                className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-amber-500 border-t-transparent"
               />
             )}
             {live && (
@@ -530,8 +493,14 @@ function Row({
             )}
           </span>
         </span>
-        <span className="mt-0.5 w-full truncate pl-1.5 text-xs text-zinc-500">
-          {metaLine(chat, now)}
+        <span className="flex w-full min-w-0 items-center text-xs text-zinc-500">
+          {chat.profile && <span className="truncate">{chat.profile}</span>}
+          {machineTag !== undefined && (
+            <span data-testid="chat-machine-tag" className={`ml-1.5 ${MTAG}`}>
+              {machineTag}
+            </span>
+          )}
+          {rel && <span className="shrink-0">&nbsp;·&nbsp;{rel}</span>}
         </span>
       </button>
     </div>
@@ -574,13 +543,13 @@ function MachinePill({
       data-testid="machine-pill"
       aria-label="Choose machine"
       onClick={onOpen}
-      className="flex h-9 max-w-[45vw] cursor-pointer items-center gap-1.5 rounded-full border border-zinc-800 bg-zinc-900/60 px-3 text-sm text-zinc-200 transition-colors hover:border-zinc-700"
+      className="flex h-[34px] max-w-[45vw] cursor-pointer items-center gap-[7px] rounded-full border border-zinc-800 bg-zinc-900 px-3 text-[13px] font-medium text-zinc-300 transition-colors hover:border-zinc-700"
     >
       <Dot online={online} testid="machine-pill-dot" />
       <span className="truncate">{label}</span>
-      <span aria-hidden="true" className="text-zinc-500">
-        ▾
-      </span>
+      <svg aria-hidden="true" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" className="shrink-0 text-zinc-500">
+        <path d="M6 9l6 6 6-6" />
+      </svg>
     </button>
   );
 }
