@@ -25,7 +25,6 @@ import {
   groupChats,
   machineName,
   machineOf,
-  metaLine,
   relativeTime,
   resolveFilter,
   type Activity,
@@ -167,21 +166,8 @@ describe("relativeTime", () => {
   });
 });
 
-describe("metaLine", () => {
-  it("assembles count, model and relative time", () => {
-    expect(
-      metaLine(row("a", { message_count: 24, updated_at: L(2026, 11, 10, 18, 59, 40) }), NOW),
-    ).toBe("24 msgs · sonnet · just now");
-  });
-
-  it("singularises one message", () => {
-    expect(metaLine(row("a", { message_count: 1 }), NOW)).toBe("1 msg · sonnet · 7h ago");
-  });
-
-  it("drops the relative segment when unparseable", () => {
-    expect(metaLine(row("a", { updated_at: "" }), NOW)).toBe("3 msgs · sonnet");
-  });
-});
+// `metaLine` is deleted in batch 2 (plan 2.15): the row's second line is
+// built in the component from `profile · [machine tag] · relativeTime`.
 
 // ─── §3.3 search + profile filter ──────────────────────────────────────────
 
@@ -369,18 +355,17 @@ describe("machineName", () => {
     expect(machineName(null)).toBe("This device");
   });
 
-  it("a remote origin is its host, keeping a non-default port", () => {
-    expect(machineName("https://h:7823")).toBe("h:7823");
-    expect(machineName("https://10.0.0.5:7823")).toBe("10.0.0.5:7823");
+  // Batch 2, item 2.20 (A39): display-only host WITHOUT the port. Ids and
+  // filters still use the full origin; two servers on one host (different
+  // ports) show the same name — the documented trade-off (§9 Q3).
+  it("shows the host without the port", () => {
+    expect(machineName("https://h:7823")).toBe("h");
+    expect(machineName("https://10.0.0.5:7823")).toBe("10.0.0.5");
   });
 
   it("a default-port origin is the bare host", () => {
     expect(machineName("https://h")).toBe("h");
     expect(machineName("https://bot.example.ts.net")).toBe("bot.example.ts.net");
-  });
-
-  it("two servers on one host stay distinct by port", () => {
-    expect(machineName("https://h:7823")).not.toBe(machineName("https://h:7824"));
   });
 });
 
@@ -402,7 +387,7 @@ describe("deriveMachines", () => {
 
   it("names come from machineName", () => {
     const got = deriveMachines(CAT, []);
-    expect(got.map((m) => m.name)).toEqual(["This device", "home-server.local:7823", "10.0.0.5:7823"]);
+    expect(got.map((m) => m.name)).toEqual(["This device", "home-server.local", "10.0.0.5"]);
   });
 
   it("no local entry when the catalog has no local profile", () => {

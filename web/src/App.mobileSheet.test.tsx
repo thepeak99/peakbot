@@ -799,7 +799,8 @@ describe("App mobile sheet — H: the header selection chip", () => {
     );
     mount();
     await flush();
-    expect(must("chat-machine").textContent).toBe("home-server.local:7823 ·");
+    // Batch 2, item 2.20 (A39): the display name is the host without the port.
+    expect(must("chat-machine").textContent).toBe("home-server.local ·");
   });
 
   it("a local chat has no machine prefix", async () => {

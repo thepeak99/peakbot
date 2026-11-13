@@ -139,6 +139,7 @@ afterEach(() => {
   container = null;
   window.localStorage.clear();
   vi.restoreAllMocks();
+  vi.useRealTimers();
   window.history.replaceState(null, "", "/");
 });
 
@@ -176,6 +177,12 @@ const tag = (el: HTMLElement, id: string): HTMLElement | null =>
   el.querySelector<HTMLElement>(
     `[data-testid="chat-row"][data-convo="${id}"] [data-testid="chat-machine-tag"]`,
   );
+
+const rowEl = (el: HTMLElement, id: string): HTMLElement => {
+  const r = el.querySelector<HTMLElement>(`[data-testid="chat-row"][data-convo="${id}"]`);
+  expect(r, `row ${id} must render`).not.toBeNull();
+  return r!;
+};
 
 // ─── M1: single-machine installs see nothing new ─────────────────────────
 
@@ -248,13 +255,16 @@ describe("ChatList machines — M3: the Machine sheet", () => {
     expect(local.querySelector<HTMLElement>('[data-testid="machine-option-sub"]')!.textContent).toBe("local");
     expect(local.querySelector<HTMLElement>('[data-testid="machine-option-count"]')!.textContent).toBe("2");
 
-    // Each remote: its host name, sub "remote", its rows.
+    // Each remote: its host name (2.20: without the port), sub "remote",
+    // its rows.
     const hs = option(dlg!, HS);
-    expect(hs.textContent).toContain("home-server.local:7823");
+    expect(hs.textContent).toContain("home-server.local");
+    expect(hs.textContent).not.toContain(":7823");
     expect(hs.querySelector<HTMLElement>('[data-testid="machine-option-sub"]')!.textContent).toBe("remote");
     expect(hs.querySelector<HTMLElement>('[data-testid="machine-option-count"]')!.textContent).toBe("1");
     const wb = option(dlg!, WB);
-    expect(wb.textContent).toContain("10.0.0.5:7823");
+    expect(wb.textContent).toContain("10.0.0.5");
+    expect(wb.textContent).not.toContain(":7823");
     expect(wb.querySelector<HTMLElement>('[data-testid="machine-option-count"]')!.textContent).toBe("1");
   });
 });
@@ -280,8 +290,9 @@ describe("ChatList machines — M4: selecting a machine", () => {
     );
     expect(chips, "chips are All + the machine's profiles").toEqual(["", "home-dev"]);
 
-    // The pill shows the machine name.
-    expect(pill(el)!.textContent).toContain("home-server.local:7823");
+    // The pill shows the machine name (2.20: host without the port).
+    expect(pill(el)!.textContent).toContain("home-server.local");
+    expect(pill(el)!.textContent).not.toContain(":7823");
 
     // The choice is persisted (the v1 shape from design §2.3).
     expect(JSON.parse(window.localStorage.getItem(MACHINE_KEY) ?? "null")).toEqual({
@@ -298,7 +309,8 @@ describe("ChatList machines — M5: the choice survives a remount", () => {
   it("a fresh mount reads the stored machine", async () => {
     window.localStorage.setItem(MACHINE_KEY, JSON.stringify({ v: 1, kind: "one", id: WB }));
     const el = await render();
-    expect(pill(el)!.textContent).toContain("10.0.0.5:7823");
+    expect(pill(el)!.textContent).toContain("10.0.0.5");
+    expect(pill(el)!.textContent).not.toContain(":7823");
     expect(el.querySelector('[data-testid="chat-row"][data-convo="c-wb"]'), "its row shows").not.toBeNull();
     expect(el.querySelector('[data-testid="chat-row"][data-convo="c-local-1"]')).toBeNull();
   });
@@ -328,7 +340,8 @@ describe("ChatList machines — M6: a chip on another machine resets to All", ()
     ).toBeNull();
     const allChip = el.querySelector<HTMLElement>('button[data-testid="chat-filter"][data-profile=""]');
     expect(allChip!.getAttribute("aria-pressed"), "the chip filter resets to All").toBe("true");
-    expect(pill(el)!.textContent, "the machine selection is kept").toContain("10.0.0.5:7823");
+    expect(pill(el)!.textContent, "the machine selection is kept").toContain("10.0.0.5");
+    expect(pill(el)!.textContent).not.toContain(":7823");
   });
 });
 
@@ -341,9 +354,11 @@ describe("ChatList machines — M7: All tags every row", () => {
       const t = tag(el, id);
       expect(t, `row ${id} has a tag in All mode`).not.toBeNull();
     }
+    // Decision 4 (A38): the local machine's label is "This device".
     expect(tag(el, "c-local-1")!.textContent).toBe("This device");
-    expect(tag(el, "c-hs")!.textContent).toContain("home-server.local:7823");
-    expect(tag(el, "c-wb")!.textContent).toContain("10.0.0.5:7823");
+    // 2.20: remote tags are the host without the port.
+    expect(tag(el, "c-hs")!.textContent).toBe("home-server.local");
+    expect(tag(el, "c-wb")!.textContent).toBe("10.0.0.5");
   });
 });
 
@@ -357,7 +372,8 @@ describe("ChatList machines — M8: an offline machine", () => {
     expect(wb.querySelector<HTMLElement>('[data-testid="machine-option-sub"]')!.textContent).toBe("offline");
 
     await pressMachine(machineDialog()!, WB);
-    expect(pill(el)!.textContent).toContain("10.0.0.5:7823");
+    expect(pill(el)!.textContent).toContain("10.0.0.5");
+    expect(pill(el)!.textContent).not.toContain(":7823");
     expect(
       pill(el)!.querySelector<HTMLElement>('[data-testid="machine-pill-dot"]')!.getAttribute("data-online"),
       "the pill dot greys for the selected offline machine",
@@ -366,7 +382,7 @@ describe("ChatList machines — M8: an offline machine", () => {
     // Its rows are already absent (the server drops them): the empty state.
     const empty = el.querySelector<HTMLElement>('[data-testid="chat-empty"]');
     expect(empty, "the offline empty state renders").not.toBeNull();
-    expect(empty!.textContent).toContain("10.0.0.5:7823 is offline");
+    expect(empty!.textContent).toBe("10.0.0.5 is offline");
 
     const fab = el.querySelector<HTMLElement>('button[aria-label="New chat"]')!;
     expect(fab.hasAttribute("disabled"), "the FAB is disabled").toBe(true);
@@ -487,5 +503,49 @@ describe("ChatList machines — M14: no row 'remote' badge", () => {
       );
       expect(badges, `row ${id} has no remote badge`).toEqual([]);
     }
+  });
+});
+
+// ─── B2: the batch-2 (fidelity) contracts ──────────────────────────────────
+
+describe("ChatList machines — B2: the row's second line (A20/A21)", () => {
+  it("the second line reads profile, then the machine tag, then the time", async () => {
+    // Pin the clock: the row's updated_at is 7h before ⇒ "7h ago" in any TZ.
+    const now = new Date(2026, 10, 10, 19, 0, 0);
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    const convo = {
+      ...row("c-hs", "home-dev"),
+      updated_at: new Date(now.getTime() - 7 * 3_600_000).toISOString(),
+    };
+    const el = await render({ conversations: [convo] });
+    const meta = rowEl(el, "c-hs").querySelector("button")!.lastElementChild as HTMLElement;
+    const parts = [...meta.children].map((c) => c.textContent);
+    // profile · [machine tag] · time — the tag moves into the second line
+    // (A20), the line is kept (A21). 2.20: the tag is the bare host.
+    expect(parts).toEqual(["home-dev", "home-server.local", "\u00A0·\u00A07h ago"]);
+    // The old "N msgs · model" meta is dropped (§9 Q2).
+    expect(meta.textContent).not.toContain("msgs");
+    expect(meta.textContent).not.toContain("sonnet");
+  });
+});
+
+describe("ChatList machines — B2: the All machines pill dot (A8)", () => {
+  it("the All machines pill dot is online while a machine is offline", async () => {
+    const el = await render({ machineStatus: STATUS_WB_DOWN });
+    const dot = pill(el)!.querySelector<HTMLElement>('[data-testid="machine-pill-dot"]');
+    expect(dot, "the pill dot renders").not.toBeNull();
+    expect(dot!.getAttribute("data-online"), "All stays emerald (proto:1140)").toBe("true");
+  });
+});
+
+describe("ChatList machines — B2: the online empty state (A37)", () => {
+  it("an online machine with no chats shows 'No chats on ‹name› yet'", async () => {
+    const el = await render({ conversations: [row("c-local-1", LOCAL)] });
+    await openMachineSheet(el);
+    await pressMachine(machineDialog()!, HS);
+    const empty = el.querySelector<HTMLElement>('[data-testid="chat-empty"]');
+    expect(empty, "the empty state renders").not.toBeNull();
+    expect(empty!.textContent).toBe("No chats on home-server.local yet");
   });
 });
