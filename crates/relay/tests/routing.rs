@@ -176,7 +176,7 @@ async fn pipe_unreachable_when_target_offline() {
         &mut b,
     )
     .await;
-    b.close_code().await; // B goes offline
+    b.go_offline().await; // B goes offline
 
     a.send(ToRelay::Pipe {
         to: b.id,

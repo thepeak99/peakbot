@@ -31,7 +31,7 @@ async fn letter_pushed_live_and_replayed_until_ack() {
     // Live push.
     expect_letter(&p.recv().await, a.id, lid, &sealed);
     // No ack: disconnect + reconnect ⇒ replayed.
-    p.close_code().await;
+    p.go_offline().await;
     let mut p2 = FakeDevice::new(2);
     p2.connect(&t.ws_url(), &token).await;
     p2.hello_pending(&t.origin()).await;
@@ -39,7 +39,7 @@ async fn letter_pushed_live_and_replayed_until_ack() {
     expect_letter(&p2.recv().await, a.id, lid, &sealed);
     // Ack ⇒ gone.
     p2.send(ToRelay::Ack { letter_id: lid }).await;
-    p2.close_code().await;
+    p2.go_offline().await;
     let mut p3 = FakeDevice::new(2);
     p3.connect(&t.ws_url(), &token).await;
     p3.hello_pending(&t.origin()).await;
@@ -57,7 +57,7 @@ async fn letter_delivered_on_connect() {
     let lid = post_to(&mut a, p.id, sealed.clone()).await;
     expect_letter(&p.recv().await, a.id, lid, &sealed);
     // Recipient offline: the letter stays stored and is delivered on connect.
-    p.close_code().await;
+    p.go_offline().await;
     let mut p2 = FakeDevice::new(2);
     p2.connect(&t.ws_url(), &token).await;
     p2.hello_pending(&t.origin()).await;
@@ -129,7 +129,7 @@ async fn pending_reconnect_keeps_letters_and_expiry() {
     let sealed: Vec<u8> = vec![4; 16];
     let lid = post_to(&mut a, p.id, sealed.clone()).await;
     expect_letter(&p.recv().await, a.id, lid, &sealed);
-    p.close_code().await;
+    p.go_offline().await;
     // Reconnect: the row (and letter) survive.
     let mut p2 = FakeDevice::new(2);
     p2.connect(&t.ws_url(), &token).await;
@@ -149,6 +149,8 @@ async fn post_rate_limited_31st() {
     for i in 0..peakbot_relay::limits::POSTS_PER_MINUTE {
         let lid = post_to(&mut a, p.id, vec![i as u8; 8]).await;
         expect_letter(&p.recv().await, a.id, lid, &[i as u8; 8]);
+        // Ack each letter: MAILBOX_FULL (8 per recipient, §6.4) would otherwise fire before the 31st-post rate limit.
+        p.send(ToRelay::Ack { letter_id: lid }).await;
     }
     post_to(&mut a, p.id, vec![0xff; 8]).await;
     expect_error(&a.recv().await, relay_error::RATE_LIMITED).await;
@@ -218,7 +220,7 @@ async fn ack_by_non_recipient_ignored() {
     expect_letter(&p.recv().await, a.id, lid, &sealed);
     // A (the sender) acks: not the recipient ⇒ ignored, letter stays.
     a.send(ToRelay::Ack { letter_id: lid }).await;
-    p.close_code().await;
+    p.go_offline().await;
     let mut p2 = FakeDevice::new(2);
     p2.connect(&t.ws_url(), &token).await;
     p2.hello_pending(&t.origin()).await;

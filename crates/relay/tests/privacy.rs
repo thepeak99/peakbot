@@ -53,6 +53,8 @@ async fn db_contains_no_pipe_plaintext() {
     .await;
 
     let delivered = marker();
+    // Enrolling C broadcast ChainChanged{2} to B too (design §4.4 step 5).
+    expect_chain_changed(&b.recv().await, 2).await;
     let unreachable = marker();
     let stored = marker();
 
@@ -67,7 +69,7 @@ async fn db_contains_no_pipe_plaintext() {
         other => panic!("expected Pipe, got {other:?}"),
     }
     // 2) A → C pipe carrying `unreachable`: C goes offline first.
-    c.close_code().await;
+    c.go_offline().await;
     a.send(ToRelay::Pipe {
         to: c.id,
         bytes: unreachable.clone().into_bytes(),

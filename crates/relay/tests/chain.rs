@@ -106,11 +106,12 @@ async fn add_only_for_pending() {
     expect_chain_changed(&a.recv().await, 1).await;
     expect_chain_changed(&s.recv().await, 1).await;
     // Active now: s can ChainAppend.
+    let stranger2 = FakeDevice::new(4); // distinct from `s` (seed 3): re-adding s fails extend first (§4.4 step 3)
     let e2 = entry(
         2,
         cloud::chain::entry_hash(&e.encode()),
         ChainOp::Add,
-        Some(stranger.card.clone()),
+        Some(stranger2.card.clone()),
         None,
         &s,
     );
@@ -224,9 +225,15 @@ async fn concurrent_append_exactly_one_wins() {
     let head0 = cloud::chain::entry_hash(&g[0]);
     enroll_add(&t, &token, 1, head0, &mut a, &mut b).await;
 
-    // Two active sockets append seq 2 simultaneously.
-    let p1 = FakeDevice::new(3);
-    let p2 = FakeDevice::new(4);
+    // Two active sockets append seq 2 simultaneously. Each Add needs a live
+    // pending row (design §4.4 step 3), so both targets connect pending first.
+    let mut p1 = FakeDevice::new(3);
+    let mut p2 = FakeDevice::new(4);
+    for p in [&mut p1, &mut p2] {
+        p.connect(&t.ws_url(), &token).await;
+        p.hello_pending(&t.origin()).await;
+        expect_welcome(&p.recv().await, Some(1), true).await;
+    }
     let g2 = fetch_chain(&mut a, 0).await;
     let head1 = cloud::chain::entry_hash(g2.last().unwrap());
     let e1 = entry(2, head1, ChainOp::Add, Some(p1.card.clone()), None, &a);
@@ -241,21 +248,35 @@ async fn concurrent_append_exactly_one_wins() {
             entry: raw2.clone()
         }),
     );
-    let r1 = a.recv().await;
-    let r2 = b.recv().await;
-    let (changed, conflict) = match (&r1, &r2) {
-        (FromRelay::ChainChanged { .. }, FromRelay::Error { code })
-        | (FromRelay::Error { code }, FromRelay::ChainChanged { .. }) => {
-            assert_eq!(*code, relay_error::CONFLICT, "loser gets CONFLICT");
-            (&r1, &r2)
+    // Design §4.4 step 5: the loser also gets the winner's ChainChanged{2}, and
+    // its order against its CONFLICT is racy. Drain each socket up to a
+    // ChainFetch sentinel and count (no sleeps).
+    let (mut conflicts, mut changed) = (0, 0);
+    for d in [&mut a, &mut b] {
+        d.send(ToRelay::ChainFetch { from_seq: 0 }).await;
+        loop {
+            match d.recv().await {
+                FromRelay::Chain { entries } => {
+                    assert_eq!(entries.len(), 3, "one row at seq 2");
+                    break;
+                }
+                FromRelay::ChainChanged { head_seq } => {
+                    assert_eq!(head_seq, 2);
+                    changed += 1;
+                }
+                FromRelay::Error { code } => {
+                    assert_eq!(code, relay_error::CONFLICT, "loser gets CONFLICT");
+                    conflicts += 1;
+                }
+                other => panic!("unexpected {other:?}"),
+            }
         }
-        _ => panic!("one ChainChanged + one CONFLICT, got ({r1:?}, {r2:?})"),
-    };
-    let _ = (changed, conflict);
-
-    // Exactly one row at seq 2.
-    let all = fetch_chain(&mut a, 0).await;
-    assert_eq!(all.len(), 3, "one row at seq 2");
+    }
+    assert_eq!(conflicts, 1, "exactly one append loses with CONFLICT");
+    assert_eq!(
+        changed, 2,
+        "both sockets see ChainChanged{{2}} exactly once"
+    );
 }
 
 #[tokio::test]

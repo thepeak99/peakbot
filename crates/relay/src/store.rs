@@ -5,8 +5,12 @@
 //! Pass A: open/migrations, accounts, sessions, sweep, reset-account.
 //! Pass B: chain cache, fetch, hello_pending, append, post, ack, letters_for.
 
-use cloud::chain::VerifiedChain;
+use cloud::card::DeviceCard;
+use cloud::chain::{ChainEntry, ChainOp, VerifiedChain, extend};
+use cloud::codec;
+use cloud::constants::{MAX_CHAIN_BATCH, MAX_PENDING_DEVICES, MAX_PENDING_LETTERS, TTL_LETTER};
 use cloud::{DeviceId, LetterId};
+use rusqlite::OptionalExtension as _;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -19,8 +23,7 @@ pub type AccountId = i64;
 #[non_exhaustive]
 pub struct Store {
     conn: rusqlite::Connection,
-    // The pass-B chain cache (design §3.3); loaded lazily and swapped on append.
-    #[allow(dead_code)] // pass B
+    // The chain cache (design §3.3); loaded lazily and swapped on append.
     chains: HashMap<AccountId, VerifiedChain>,
 }
 
@@ -44,22 +47,29 @@ impl Db {
     }
 
     /// Run `f` under the single store lock, off the async runtime.
+    /// A cancelled task (runtime teardown) is an error, not a panic.
     pub async fn run<T: Send + 'static>(
         &self,
         f: impl FnOnce(&mut Store) -> T + Send + 'static,
-    ) -> T {
+    ) -> Result<T, DbError> {
         let db = self.0.clone();
-        // A panic in SQL code is a bug: crash loudly (design §3.4).
+        // A panic in SQL code is a bug: propagate it (design §3.4).
         match tokio::task::spawn_blocking(move || {
             f(&mut db.lock().unwrap_or_else(|p| p.into_inner()))
         })
         .await
         {
-            Ok(v) => v,
+            Ok(v) => Ok(v),
             Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-            Err(_) => panic!("store task cancelled"),
+            Err(_) => Err(DbError::Cancelled),
         }
     }
+}
+
+/// The store task was cancelled (runtime shutdown); not a SQL failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbError {
+    Cancelled,
 }
 
 /// `Store::open` failure (design §5.5).
@@ -81,6 +91,10 @@ pub enum Reject {
     MailboxFull,
     TooManyPending,
     BadHello,
+    /// Session gone at Hello time (design §4.3).
+    Unauthorized,
+    /// DB failure or a corrupt stored chain: fail closed (design §6.3).
+    Internal,
 }
 
 /// Result of a committed `append` (design §5.5).
@@ -284,29 +298,136 @@ impl Store {
     }
 
     /// Lazy load + cache of the account's verified chain (design §3.3, §6.2).
-    pub fn chain(&mut self, acct: AccountId) -> Option<&VerifiedChain> {
-        let _ = acct;
-        todo!("P2 pass B: lazy load via cloud::chain::extend + cache")
+    /// `None` = empty account (not cached). A stored chain that fails
+    /// `extend` is `Corrupt`: fail closed, no repair (design §6.3).
+    pub fn chain(&mut self, acct: AccountId) -> Result<Option<&VerifiedChain>, Reject> {
+        if !self.chains.contains_key(&acct) {
+            match read_chain(&self.conn, acct)? {
+                Some(c) => {
+                    self.chains.insert(acct, c);
+                }
+                None => return Ok(None),
+            }
+        }
+        Ok(self.chains.get(&acct))
     }
 
-    /// ≤ `cloud::constants::MAX_CHAIN_BATCH` rows with `seq >= from_seq`.
-    pub fn fetch(&self, acct: AccountId, from_seq: u64) -> Vec<Vec<u8>> {
-        let _ = (acct, from_seq);
-        todo!("P2 pass B")
+    /// Routing check: `id` is an active device of `acct` (design §4.5).
+    pub fn is_active(&mut self, acct: AccountId, id: DeviceId) -> Result<bool, Reject> {
+        Ok(self
+            .chain(acct)?
+            .is_some_and(|c| c.active.contains_key(&id)))
+    }
+
+    /// ≤ `MAX_CHAIN_BATCH` rows with `seq >= from_seq`; a short batch means
+    /// "caught up" (design §4.2).
+    pub fn fetch(&self, acct: AccountId, from_seq: u64) -> Result<Vec<Vec<u8>>, Reject> {
+        read_rows(
+            &self.conn,
+            acct,
+            i64::try_from(from_seq).unwrap_or(i64::MAX),
+        )
+    }
+
+    /// Both Hellos in one place (design §4.3): session re-check, signature
+    /// over the connection's nonce, then chain membership / pending row.
+    pub fn hello(
+        &mut self,
+        acct: AccountId,
+        session: [u8; 32],
+        req: HelloReq,
+        origin: &str,
+        nonce: [u8; 32],
+        now: u64,
+    ) -> Result<HelloOk, Reject> {
+        if !self.session_live(session, now) {
+            return Err(Reject::Unauthorized);
+        }
+        match req {
+            HelloReq::Active { device, sig } => {
+                let chain = self.chain(acct)?.ok_or(Reject::BadHello)?;
+                let card = chain.active.get(&device).ok_or(Reject::BadHello)?;
+                let pk = card.public_key().map_err(|_| Reject::BadHello)?;
+                codec::verify_hello(&pk, &codec::hello_tbs(origin, nonce, device, 0), &sig)
+                    .map_err(|_| Reject::BadHello)?;
+                Ok(HelloOk {
+                    id: device,
+                    head_seq: Some(chain.head.seq),
+                    role: Role::Active,
+                    card: None,
+                })
+            }
+            HelloReq::Pending { card, sig } => {
+                let card = DeviceCard::parse(&card).map_err(|_| Reject::BadHello)?;
+                let id = card.device_id();
+                let pk = card.public_key().map_err(|_| Reject::BadHello)?;
+                codec::verify_hello(&pk, &codec::hello_tbs(origin, nonce, id, 1), &sig)
+                    .map_err(|_| Reject::BadHello)?;
+                self.hello_pending(acct, &card, now)?;
+                Ok(HelloOk {
+                    id,
+                    head_seq: self.chain(acct)?.map(|c| c.head.seq),
+                    role: Role::Pending,
+                    card: Some(card.encode()),
+                })
+            }
+        }
     }
 
     /// `HelloPending` registration with the §4.3 P2-edit refresh rule.
+    /// Returns the (absolute) expiry of the pending row.
     pub fn hello_pending(
         &mut self,
         acct: AccountId,
-        card: &cloud::card::DeviceCard,
+        card: &DeviceCard,
         now: u64,
     ) -> Result<u64, Reject> {
-        let _ = (acct, card, now);
-        todo!("P2 pass B: R2 membership check + MAX_PENDING_DEVICES cap")
+        let id = card.device_id();
+        if self
+            .chain(acct)?
+            .is_some_and(|c| c.active.contains_key(&id) || c.revoked.contains(&id))
+        {
+            return Err(Reject::BadHello);
+        }
+        let row: Option<(i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT account_id, expires_at FROM pending_devices WHERE device_id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        // Same live row: keep it (and its mailbox); the 15-min window is absolute.
+        if let Some((a, exp)) = row
+            && a == acct
+            && exp as u64 > now
+        {
+            return Ok(exp as u64);
+        }
+        let others: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pending_devices
+             WHERE account_id = ?1 AND device_id != ?2 AND expires_at > ?3",
+            rusqlite::params![acct, id, now as i64],
+            |r| r.get(0),
+        )?;
+        if others as usize >= MAX_PENDING_DEVICES {
+            return Err(Reject::TooManyPending);
+        }
+        let expires = now + TTL_LETTER;
+        let tx = self.conn.transaction()?;
+        // Never INSERT OR REPLACE: its implicit delete would cascade the mailbox.
+        tx.execute("DELETE FROM pending_devices WHERE device_id = ?1", [id])?;
+        tx.execute(
+            "INSERT INTO pending_devices (device_id, account_id, card, expires_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![id, acct, card.encode(), expires as i64],
+        )?;
+        tx.commit()?;
+        Ok(expires)
     }
 
-    /// `ChainAppend` / `EnrollGenesis` in one `BEGIN IMMEDIATE` (design §4.4, §6.3).
+    /// `ChainAppend` (`genesis_card = None`) / `EnrollGenesis` (the socket's
+    /// HelloPending card) in one `BEGIN IMMEDIATE` (design §4.4, §6.3).
     pub fn append(
         &mut self,
         acct: AccountId,
@@ -314,8 +435,88 @@ impl Store {
         genesis_card: Option<&[u8]>,
         now: u64,
     ) -> Result<Appended, Reject> {
-        let _ = (acct, entry, genesis_card, now);
-        todo!("P2 pass B: extend() + compare-and-set + cache swap")
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let cur = match self.chains.get(&acct) {
+            Some(c) => Some(c.clone()),
+            None => read_chain(&tx, acct)?,
+        };
+        let raw = [entry.to_vec()];
+        let (parsed, next) = match genesis_card {
+            Some(gc) => {
+                if cur.is_some() {
+                    return Err(Reject::Conflict);
+                }
+                let e = ChainEntry::parse(entry).map_err(|_| Reject::InvalidEntry)?;
+                if e.card.as_deref() != Some(gc) {
+                    return Err(Reject::NotPermitted);
+                }
+                let next = extend(None, &raw, None).map_err(|_| Reject::InvalidEntry)?;
+                (e, next)
+            }
+            None => {
+                let cur = cur.ok_or(Reject::Conflict)?;
+                let e = ChainEntry::parse(entry).map_err(|_| Reject::InvalidEntry)?;
+                // Compare-and-set on the head seq; a fork at the right seq fails in `extend`.
+                if cur.head.seq.checked_add(1) != Some(e.seq) {
+                    return Err(Reject::Conflict);
+                }
+                let genesis = cur.genesis;
+                let next =
+                    extend(Some(cur), &raw, Some(genesis)).map_err(|_| Reject::InvalidEntry)?;
+                (e, next)
+            }
+        };
+        let (mut added, mut revoked) = (None, None);
+        match (parsed.op, genesis_card.is_some()) {
+            (ChainOp::Genesis, true) => {
+                let id = card_id(parsed.card.as_deref())?;
+                tx.execute("DELETE FROM pending_devices WHERE device_id = ?1", [id])?;
+                added = Some(id);
+            }
+            (ChainOp::Add, false) => {
+                let id = card_id(parsed.card.as_deref())?;
+                let live: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM pending_devices
+                     WHERE device_id = ?1 AND account_id = ?2 AND expires_at > ?3",
+                    rusqlite::params![id, acct, now as i64],
+                    |r| r.get(0),
+                )?;
+                if live == 0 {
+                    return Err(Reject::NotPermitted);
+                }
+                tx.execute("DELETE FROM pending_devices WHERE device_id = ?1", [id])?;
+                added = Some(id);
+            }
+            (ChainOp::Revoke, false) => {
+                let t = parsed.target.ok_or(Reject::InvalidEntry)?;
+                tx.execute("DELETE FROM letters WHERE active_id = ?1", [t])?;
+                revoked = Some(t);
+            }
+            _ => return Err(Reject::InvalidEntry),
+        }
+        // The PK (account_id, seq) is the last compare-and-set guard.
+        tx.execute(
+            "INSERT INTO chain_entries (account_id, seq, bytes) VALUES (?1, ?2, ?3)",
+            rusqlite::params![acct, parsed.seq as i64, entry],
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::SqliteFailure(i, _)
+                if i.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                Reject::Conflict
+            }
+            other => other.into(),
+        })?;
+        tx.commit()?;
+        let head_seq = next.head.seq;
+        self.chains.insert(acct, next);
+        Ok(Appended {
+            head_seq,
+            revoked,
+            added,
+        })
     }
 
     /// Letter insert with the mailbox caps (design §4.6, §6.4).
@@ -328,20 +529,98 @@ impl Store {
         sealed: &[u8],
         now: u64,
     ) -> Result<(), Reject> {
-        let _ = (acct, from, to, id, sealed, now);
-        todo!("P2 pass B")
+        let (me, role) = from;
+        let chain = self.chain(acct)?;
+        let in_chain = |d: &DeviceId| chain.is_some_and(|c| c.active.contains_key(d));
+        // Pending → active device, or active → a live pending device of the account.
+        let (pending_id, active_id, to_pending) = match role {
+            Role::Pending if in_chain(&to) => (me, to, 0),
+            Role::Active if in_chain(&me) => (to, me, 1),
+            _ => return Err(Reject::NotPermitted),
+        };
+        let live: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pending_devices
+             WHERE device_id = ?1 AND account_id = ?2 AND expires_at > ?3",
+            rusqlite::params![pending_id, acct, now as i64],
+            |r| r.get(0),
+        )?;
+        if live == 0 {
+            return Err(Reject::NotPermitted);
+        }
+        let recipient = if to_pending == 1 {
+            pending_id
+        } else {
+            active_id
+        };
+        let held: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM letters l
+             JOIN pending_devices p ON p.device_id = l.pending_id
+             WHERE p.expires_at > ?2
+               AND ((l.to_pending = 1 AND l.pending_id = ?1) OR (l.to_pending = 0 AND l.active_id = ?1))",
+            rusqlite::params![recipient, now as i64],
+            |r| r.get(0),
+        )?;
+        if held as usize >= MAX_PENDING_LETTERS {
+            return Err(Reject::MailboxFull);
+        }
+        self.conn
+            .execute(
+                "INSERT INTO letters (id, pending_id, active_id, to_pending, sealed)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![id, pending_id, active_id, to_pending, sealed],
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::SqliteFailure(i, _)
+                    if i.code == rusqlite::ErrorCode::ConstraintViolation =>
+                {
+                    Reject::NotPermitted
+                }
+                other => other.into(),
+            })?;
+        Ok(())
     }
 
     /// Recipient-only, idempotent, silent (design §4.6).
-    pub fn ack(&mut self, me: DeviceId, id: LetterId) {
-        let _ = (me, id);
-        todo!("P2 pass B")
+    pub fn ack(&mut self, me: DeviceId, id: LetterId) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "DELETE FROM letters WHERE id = ?1
+             AND ((to_pending = 1 AND pending_id = ?2) OR (to_pending = 0 AND active_id = ?2))",
+            rusqlite::params![id, me],
+        )?;
+        Ok(())
     }
 
     /// Un-acked letters for `me`, oldest first; expired pending ⇒ none (design §6.4).
-    pub fn letters_for(&self, me: DeviceId, now: u64) -> Vec<(DeviceId, LetterId, Vec<u8>)> {
-        let _ = (me, now);
-        todo!("P2 pass B")
+    pub fn letters_for(
+        &self,
+        me: DeviceId,
+        now: u64,
+    ) -> Result<Vec<(DeviceId, LetterId, Vec<u8>)>, Reject> {
+        let mut stmt = self.conn.prepare(
+            "SELECT l.id, l.to_pending, l.pending_id, l.active_id, l.sealed FROM letters l
+             JOIN pending_devices p ON p.device_id = l.pending_id
+             WHERE p.expires_at > ?2
+               AND ((l.to_pending = 1 AND l.pending_id = ?1) OR (l.to_pending = 0 AND l.active_id = ?1))
+             ORDER BY l.rowid",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![me, now as i64], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+                r.get::<_, Vec<u8>>(3)?,
+                r.get::<_, Vec<u8>>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, to_pending, pending, active, sealed) = row?;
+            let from = if to_pending == 1 { active } else { pending };
+            if let (Ok(id), Ok(from)) = (LetterId::try_from(id), DeviceId::try_from(from)) {
+                out.push((from, id, sealed));
+            }
+        }
+        Ok(out)
     }
 
     /// Sweeper transaction (design §4.7): expired pending + sessions. Returns
@@ -367,6 +646,74 @@ impl Store {
         tx.commit()?;
         Ok(expired)
     }
+}
+
+/// A device's Hello as received (design §4.3).
+pub enum HelloReq {
+    Active { device: DeviceId, sig: Vec<u8> },
+    Pending { card: Vec<u8>, sig: Vec<u8> },
+}
+
+/// A verified Hello: who the socket is, its role, and the chain head to
+/// greet with (the HelloPending card is kept for the `EnrollGenesis` check).
+pub struct HelloOk {
+    pub id: DeviceId,
+    pub head_seq: Option<u64>,
+    pub role: Role,
+    pub card: Option<Vec<u8>>,
+}
+
+impl From<rusqlite::Error> for Reject {
+    fn from(_: rusqlite::Error) -> Self {
+        Reject::Internal
+    }
+}
+
+/// Device id of a CE card carried by a chain entry.
+fn card_id(card: Option<&[u8]>) -> Result<DeviceId, Reject> {
+    let raw = card.ok_or(Reject::InvalidEntry)?;
+    Ok(DeviceCard::parse(raw)
+        .map_err(|_| Reject::InvalidEntry)?
+        .device_id())
+}
+
+/// ≤ `MAX_CHAIN_BATCH` stored entries with `seq >= from_seq`, in order.
+fn read_rows(
+    conn: &rusqlite::Connection,
+    acct: AccountId,
+    from: i64,
+) -> Result<Vec<Vec<u8>>, Reject> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT bytes FROM chain_entries WHERE account_id = ?1 AND seq >= ?2
+         ORDER BY seq LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![acct, from, MAX_CHAIN_BATCH as i64], |r| {
+        r.get::<_, Vec<u8>>(0)
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Re-verify the whole stored chain (the cache is equivalent to this, §6.2).
+/// Rows that fail `extend` mean disk corruption: `Internal`, fail closed.
+fn read_chain(
+    conn: &rusqlite::Connection,
+    acct: AccountId,
+) -> Result<Option<VerifiedChain>, Reject> {
+    let mut all: Vec<Vec<u8>> = Vec::new();
+    loop {
+        let batch = read_rows(conn, acct, all.len() as i64)?;
+        let n = batch.len();
+        all.extend(batch);
+        if n < MAX_CHAIN_BATCH {
+            break;
+        }
+    }
+    if all.is_empty() {
+        return Ok(None);
+    }
+    extend(None, &all, None)
+        .map(Some)
+        .map_err(|_| Reject::Internal)
 }
 
 /// Socket role inside the Hub (design §3.3).

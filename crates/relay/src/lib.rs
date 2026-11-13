@@ -6,12 +6,10 @@
 //! Pipe bytes between live sockets of the same account. All protocol logic
 //! comes from the `cloud` crate.
 //!
-//! Pass A (config, store sessions, OIDC, HTTP routes, `/ws` upgrade auth) is
-//! implemented. `conn` is a pass-B placeholder: it only sends the Challenge.
+//! Pass A (config, store sessions, OIDC, HTTP routes, `/ws` upgrade auth)
+//! and pass B (conn state machine, chain append, mailbox) are implemented.
 
 pub mod config;
-// Pass-B placeholder: the conn state machine lands there.
-#[allow(dead_code, unused_variables)]
 pub mod conn;
 pub mod http;
 pub mod hub;
@@ -26,6 +24,20 @@ use std::time::Duration;
 use rand_core::TryRngCore as _;
 use subtle::ConstantTimeEq as _;
 use tokio::sync::watch;
+
+/// The log filter for `serve` and the test capture: `base` (e.g. `RUST_LOG`)
+/// plus WebSocket-library targets forced off, because tungstenite logs whole
+/// frame payloads at TRACE, which would leak Pipe/letter bytes (design §4.9).
+pub fn log_filter(base: &str) -> tracing_subscriber::EnvFilter {
+    let mut f = tracing_subscriber::EnvFilter::try_new(base)
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    for d in ["tungstenite=off", "tokio_tungstenite=off"] {
+        if let Ok(d) = d.parse() {
+            f = f.add_directive(d);
+        }
+    }
+    f
+}
 
 /// Unix seconds; a clock before the epoch reads as 0 (fails closed on expiry).
 pub(crate) fn now_secs() -> u64 {
@@ -107,13 +119,14 @@ pub async fn serve(
 /// One sweeper pass (design §4.7), shared by the timer and `sweep_at`.
 async fn sweep(db: &store::Db, hub: &hub::Hub, logins: &http::Logins, now: u64) {
     match db.run(move |s| s.sweep(now)).await {
-        Ok(expired) => {
+        Ok(Ok(expired)) => {
             // A pending socket must always have a pending row.
             for id in expired {
                 hub.close_pending(id, 1008);
             }
         }
-        Err(e) => tracing::error!(error = %e, "sweep failed"),
+        Ok(Err(e)) => tracing::error!(error = %e, "sweep failed"),
+        Err(e) => tracing::error!(?e, "sweep task failed"),
     }
     logins.purge(now);
 }

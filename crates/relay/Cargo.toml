@@ -69,3 +69,5 @@ rand = "0.9"
 # design §9.1, R8 fallback: keys generated in-test).
 p256 = { version = "0.13", features = ["ecdsa", "ecdh"] }
 rsa = { version = "0.9" }
+# Raise the soft RLIMIT_NOFILE in the test harness (socket_cap_returns_503).
+libc = "0.2"

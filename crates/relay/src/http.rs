@@ -272,9 +272,9 @@ async fn callback(
     };
     let (iss, sub) = (identity.issuer, identity.subject);
     let account = match st.db.run(move |s| s.upsert_account(&iss, &sub)).await {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::error!(error = %e, "login: account upsert failed");
+        Ok(Ok(a)) => a,
+        _ => {
+            tracing::error!("login: account upsert failed");
             return denied();
         }
     };
@@ -346,12 +346,13 @@ async fn token(
     };
     let hash = sha256(&raw);
     let account = grant.account;
-    if let Err(e) = st
-        .db
-        .run(move |s| s.create_session(account, hash, now))
-        .await
-    {
-        tracing::error!(error = %e, "token: session insert failed");
+    if !matches!(
+        st.db
+            .run(move |s| s.create_session(account, hash, now))
+            .await,
+        Ok(Ok(()))
+    ) {
+        tracing::error!("token: session insert failed");
         return text(StatusCode::INTERNAL_SERVER_ERROR, "session error");
     }
     tracing::info!(account, "session created");
@@ -379,12 +380,9 @@ async fn logout(State(st): State<AppState>, headers: HeaderMap) -> Response {
     let Some(hash) = bearer_hash(&headers) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    match st.db.run(move |s| s.revoke_session(hash)).await {
-        Ok(()) => {}
-        Err(e) => {
-            tracing::error!(error = %e, "logout: revoke failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
+    if !matches!(st.db.run(move |s| s.revoke_session(hash)).await, Ok(Ok(()))) {
+        tracing::error!("logout: revoke failed");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     st.hub.close_session(hash, 1008);
     StatusCode::NO_CONTENT.into_response()
@@ -402,7 +400,7 @@ async fn ws(
     };
     let now = now_secs();
     // Slides the expiry (design §6.1).
-    let Some(account) = st.db.run(move |s| s.session(hash, now)).await else {
+    let Ok(Some(account)) = st.db.run(move |s| s.session(hash, now)).await else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
     let permit = match st.hub.permit(account) {
@@ -415,9 +413,12 @@ async fn ws(
         Err(rejection) => return rejection.into_response(),
     };
     let cap = 1 + cloud::constants::MAX_ENVELOPE_PIPE;
+    let (db, hub, origin) = (st.db.clone(), st.hub.clone(), st.origin.clone());
     let shutdown = st.shutdown.clone();
     upgrade
         .max_message_size(cap)
         .max_frame_size(cap)
-        .on_upgrade(move |socket| crate::conn::run_conn(socket, permit, account, hash, shutdown))
+        .on_upgrade(move |socket| {
+            crate::conn::run_conn(socket, permit, account, hash, db, hub, origin, shutdown)
+        })
 }

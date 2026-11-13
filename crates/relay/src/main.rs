@@ -42,10 +42,9 @@ async fn main() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::Serve { config } => {
             tracing_subscriber::fmt()
-                .with_env_filter(
-                    tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-                )
+                .with_env_filter(peakbot_relay::log_filter(
+                    &std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
+                ))
                 .init();
             let cfg = peakbot_relay::config::Config::from_file(&config)
                 .map_err(|e| anyhow::anyhow!("config: {e:?}"))?;

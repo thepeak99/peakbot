@@ -130,6 +130,43 @@ impl Hub {
         });
     }
 
+    /// The role of a live conn of `acct`, if any (routing: chain first, then
+    /// the Hub — design §6.2).
+    pub fn conn_role(&self, id: DeviceId, acct: AccountId) -> Option<Role> {
+        lock(&self.0)
+            .conns
+            .get(&id)
+            .filter(|c| c.account == acct)
+            .map(|c| c.role)
+    }
+
+    /// One message to every live conn of the account (ChainChanged, §4.4).
+    /// `Full` ⇒ close 1013 + remove (the one backpressure rule, §6.2).
+    /// Returns false when the appender's own send did not land.
+    pub fn broadcast(&self, acct: AccountId, self_id: DeviceId, msg: FromRelay) -> bool {
+        let mut g = lock(&self.0);
+        let mut self_ok = false;
+        let mut drop = Vec::new();
+        for (id, conn) in g.conns.iter_mut().filter(|(_, c)| c.account == acct) {
+            match conn.tx.try_send(msg.clone()) {
+                Ok(()) => {
+                    if *id == self_id {
+                        self_ok = true;
+                    }
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    conn.close.send_replace(Some(1013));
+                    drop.push(*id);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => drop.push(*id),
+            }
+        }
+        for id in drop {
+            g.conns.remove(&id);
+        }
+        self_ok
+    }
+
     /// Close a registered Pending socket whose pending row expired (§4.7).
     pub fn close_pending(&self, id: DeviceId, code: u16) {
         let mut g = lock(&self.0);

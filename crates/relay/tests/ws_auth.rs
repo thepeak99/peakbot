@@ -292,18 +292,19 @@ async fn socket_cap_returns_503() {
     // sockets the upgrade is refused with HTTP 503. The cap is global while
     // `MAX_SOCKETS_PER_ACCOUNT` is per account, so fill it with many accounts
     // at the per-account cap: 128 × 32 = 4096, then one more.
+    // Raw sockets (no per-device ML-DSA keygen): the ramp must finish inside
+    // the 30 s Hello window or sockets are evicted and the cap is never reached.
     let t = TestRelay::spawn().await;
     let per_acct = peakbot_relay::limits::MAX_SOCKETS_PER_ACCOUNT;
     let accounts = peakbot_relay::limits::MAX_SOCKETS / per_acct;
-    let mut open: Vec<FakeDevice> = Vec::with_capacity(peakbot_relay::limits::MAX_SOCKETS);
-    for a in 0..accounts as u64 {
+    let mut open = Vec::with_capacity(peakbot_relay::limits::MAX_SOCKETS);
+    for a in 0..accounts {
         let token = t.login(&format!("global-cap-{a}")).await;
-        for i in 0..per_acct as u64 {
-            let mut d = FakeDevice::new(100_000 + a * 100 + i);
-            d.connect(&t.ws_url(), &token).await;
-            open.push(d);
+        for _ in 0..per_acct {
+            open.push(t.raw_ws(&token).await);
         }
     }
+    assert_eq!(open.len(), peakbot_relay::limits::MAX_SOCKETS);
     let overflow = t.login("global-cap-overflow").await;
     let r = t.ws_status(Some(&overflow)).await;
     assert_eq!(

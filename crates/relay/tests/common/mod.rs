@@ -427,6 +427,31 @@ pub struct TestRelay {
 }
 
 impl TestRelay {
+    /// Raise the soft RLIMIT_NOFILE toward the hard limit so the test process
+    /// can hold `MAX_SOCKETS` loopback sockets (client + server fd each).
+    /// Fails loudly when the hard limit is too low — never passes vacuously.
+    fn raise_fd_limit() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let need = (peakbot_relay::limits::MAX_SOCKETS * 2 + 256) as libc::rlim_t;
+            unsafe {
+                let mut lim: libc::rlimit = std::mem::zeroed();
+                libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim);
+                if lim.rlim_cur < need {
+                    lim.rlim_cur = need.min(lim.rlim_max);
+                    let rc = libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+                    let _ = rc; // the re-read below reports the effective value
+                    libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim);
+                }
+                assert!(
+                    lim.rlim_cur as usize >= need as usize,
+                    "socket_cap test cannot run: soft RLIMIT_NOFILE is {} but the test needs >= {need} (raise the hard limit)",
+                    lim.rlim_cur
+                );
+            }
+        });
+    }
+
     /// Bind `127.0.0.1:0`, build the `Config` in code (loopback http allowed),
     /// temp DB + secret file, and `serve` (design §9.1).
     pub async fn spawn() -> Self {
@@ -434,6 +459,7 @@ impl TestRelay {
     }
 
     pub async fn spawn_idp(idp: FakeIdp) -> Self {
+        Self::raise_fd_limit();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let tmp = tempfile::tempdir().unwrap();
@@ -476,6 +502,24 @@ impl TestRelay {
 
     pub fn url(&self) -> String {
         format!("http://{}", self.handle().addr)
+    }
+
+    /// A bare authed `/ws` client: no keys, no Hello. Used to fill socket caps
+    /// without paying ML-DSA keygen per device.
+    pub async fn raw_ws(
+        &self,
+        token: &str,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+    {
+        let mut req = self.ws_url().into_client_request().expect("ws request");
+        req.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {token}").parse().expect("header value"),
+        );
+        let (ws, _) = tokio_tungstenite::connect_async(req)
+            .await
+            .expect("raw ws connect");
+        ws
     }
 
     pub fn ws_url(&self) -> String {
@@ -850,6 +894,18 @@ impl FakeDevice {
         self.stalled = true;
     }
 
+    /// Go offline: send Close and wait for EOF. The relay unregisters the
+    /// device before it drops the socket, so EOF proves the device is gone.
+    pub async fn go_offline(&mut self) {
+        if let Some(mut ws) = self.ws.take() {
+            let _ = ws.close(None).await;
+            let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(Ok(_)) = ws.next().await {}
+            })
+            .await;
+        }
+    }
+
     async fn next_raw_stream(
         ws: &mut tokio_tungstenite::WebSocketStream<
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -999,6 +1055,8 @@ pub async fn add_devices(
         expect_chain_changed(&active.recv().await, s).await;
         expect_chain_changed(&d.recv().await, s).await;
         cur = cloud::chain::entry_hash(&raw);
+        // Drop the socket: 256 live ones would exceed MAX_SOCKETS_PER_ACCOUNT (§6.5).
+        d.ws = None;
         out.push(d);
     }
     (out, cur)
@@ -1099,7 +1157,8 @@ impl LogCapture {
     pub fn install() -> Self {
         let buf = Arc::new(Mutex::new(Vec::new()));
         let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
+            // The production filter at TRACE: dependency frame logs stay off.
+            .with_env_filter(peakbot_relay::log_filter("trace"))
             .with_ansi(false)
             .with_writer(Writer(buf.clone()))
             .try_init();
