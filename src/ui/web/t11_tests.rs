@@ -137,7 +137,7 @@ fn state_for(yaml: &str) -> (XdgHome, WsState) {
         models: Arc::new(Vec::new()),
         active_alias: "local".into(),
         session_ttl: Duration::from_secs(3600),
-        uploads: uploads,
+        uploads,
     };
     (home, state)
 }

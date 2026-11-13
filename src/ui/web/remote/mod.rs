@@ -305,9 +305,10 @@ impl StdError for RemoteError {}
 
 /// Who a failure is about: L, H (`host:port`) and the bare host the TLS
 /// name check and `--tls-name` use. Exists before the `Client` does, so the
-/// bootstrap can report errors too.
+/// bootstrap can report errors too. `pub` because `Client::peer()` hands
+/// it out (the `remote` module itself stays private to `web`).
 #[derive(Debug, Clone)]
-struct Peer {
+pub struct Peer {
     profile: String,
     host_port: String,
     host: String,

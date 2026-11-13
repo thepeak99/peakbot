@@ -868,7 +868,6 @@ async fn serve_socket<Si, St, E>(
     Si: Sink<Message> + Unpin + Send + 'static,
     St: futures::Stream<Item = Result<Message, E>> + Unpin + Send + 'static,
 {
-
     // Bounded FIFO (32) for ordered frames + a 1-deep coalescing `watch`
     // slot for `state` snapshots. Per-socket memory is ~3 payload-sized
     // allocations regardless of peer behaviour — see `src/ui/outbound.rs`

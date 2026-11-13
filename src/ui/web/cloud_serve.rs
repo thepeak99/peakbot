@@ -64,17 +64,11 @@ pub(super) async fn serve_op(state: &WsState, op: PeerOp) -> Response {
 fn build_request(op: PeerOp) -> Option<Request<Body>> {
     let (method, uri, body) = match op {
         PeerOp::List => (Method::GET, "/api/conversations".to_string(), None),
-        PeerOp::Kill { id } => (
-            Method::POST,
-            format!("/api/conversations/{id}/kill"),
-            None,
-        ),
+        PeerOp::Kill { id } => (Method::POST, format!("/api/conversations/{id}/kill"), None),
         PeerOp::GetImage { id } => (Method::GET, format!("/images/{}", enc(&id)), None),
-        PeerOp::GetUpload { convo, id } => (
-            Method::GET,
-            format!("/api/uploads/{convo}/{id}"),
-            None,
-        ),
+        PeerOp::GetUpload { convo, id } => {
+            (Method::GET, format!("/api/uploads/{convo}/{id}"), None)
+        }
         PeerOp::Upload {
             convo,
             name,
@@ -88,7 +82,9 @@ fn build_request(op: PeerOp) -> Option<Request<Body>> {
     };
     let builder = Request::builder().method(method).uri(uri);
     let built = match body {
-        Some((ct, bytes)) => builder.header(header::CONTENT_TYPE, ct).body(Body::from(bytes)),
+        Some((ct, bytes)) => builder
+            .header(header::CONTENT_TYPE, ct)
+            .body(Body::from(bytes)),
         None => builder.body(Body::empty()),
     };
     built.ok()
@@ -278,7 +274,7 @@ profiles:
                 .map_err(|_| unreachable!("outbound channel closed mid-test"))
         }
         fn start_send(mut self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
-            self.tx.start_send(item);
+            let _ = self.tx.start_send(item);
             Ok(())
         }
         fn poll_flush(
@@ -348,7 +344,7 @@ profiles:
         let (host_out, from_host) = mpsc::channel::<Message>(64);
         let task = tokio::spawn(serve_socket(
             OutSink { tx: host_out },
-            host_in.map(|m| Ok::<_, Infallible>(m)),
+            host_in.map(Ok::<_, Infallible>),
             state,
             principal,
         ));

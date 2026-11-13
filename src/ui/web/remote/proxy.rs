@@ -80,9 +80,7 @@ async fn under_r(req: Request<Body>) -> Response {
         // The GET tail is parsed ONCE into a typed target at the boundary
         // (p3-design §F.4): an unparseable tail is a local 404 and the
         // upstream is never contacted.
-        [profile, tail @ ..]
-            if method == Method::GET && !tail.is_empty() =>
-        {
+        [profile, tail @ ..] if method == Method::GET && !tail.is_empty() => {
             match GetTarget::parse(&tail.join("/")) {
                 Some(target) => get_target(profile, target).await,
                 None => not_found().await,
@@ -161,9 +159,18 @@ fn upstream_response(upstream: Upstream) -> Response {
         .and_then(|s| s.parse::<u64>().ok());
     // The allowlist values outlive the body move (p3-design §F.3).
     let allowlisted: [(header::HeaderName, Option<reqwest::header::HeaderValue>); 4] = [
-        (header::CONTENT_TYPE, upstream.headers.get(header::CONTENT_TYPE).cloned()),
-        (header::CONTENT_LENGTH, upstream.headers.get(header::CONTENT_LENGTH).cloned()),
-        (header::CACHE_CONTROL, upstream.headers.get(header::CACHE_CONTROL).cloned()),
+        (
+            header::CONTENT_TYPE,
+            upstream.headers.get(header::CONTENT_TYPE).cloned(),
+        ),
+        (
+            header::CONTENT_LENGTH,
+            upstream.headers.get(header::CONTENT_LENGTH).cloned(),
+        ),
+        (
+            header::CACHE_CONTROL,
+            upstream.headers.get(header::CACHE_CONTROL).cloned(),
+        ),
         (
             header::CONTENT_DISPOSITION,
             upstream.headers.get(header::CONTENT_DISPOSITION).cloned(),
