@@ -4,7 +4,7 @@
 # on the root crate only — the mobile crate is always addressed with `-p`.
 # `desktop/` stays its own workspace (desktop and mobile bump Tauri independently).
 [workspace]
-members = [".", "crates/cloud", "mobile/src-tauri"]
+members = [".", "crates/cloud", "crates/relay", "mobile/src-tauri"]
 default-members = ["."]
 
 [package]
