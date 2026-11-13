@@ -1970,6 +1970,7 @@ mod tests {
             origin: "repo".to_string(),
             overrides_global: true,
             color: TabColor::derived("dev"),
+            machine: None,
             agents: vec![AgentInfo {
                 name: "team".to_string(),
                 model: "sonnet".to_string(),
@@ -1995,6 +1996,11 @@ mod tests {
         assert_eq!(v["catalog"][0]["overrides_global"], true);
         assert_eq!(v["catalog"][0]["agents"][0]["name"], "team");
         assert_eq!(v["catalog"][0]["agents"][0]["model"], "sonnet");
+        assert!(
+            v["catalog"][0]["machine"].is_null(),
+            "a local entry's machine is an explicit null on the wire: {}",
+            v["catalog"][0]
+        );
         assert_eq!(
             v["catalog"][0]["agents"][0]["subagents"][0]["name"],
             "researcher"

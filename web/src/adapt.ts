@@ -168,12 +168,14 @@ export function adaptSubAgent(s: AppState): SubAgentRun | null {
 
 /** The catalog (profiles → agents → sub-agents) this install declares,
  * mapped from the wire's snake_case to the view's camelCase. An absent
- * field (old snapshot) normalises to `[]`, the safe default. */
+ * field (old snapshot) normalises to `[]`, the safe default; an absent
+ * `machine` (old server) normalises to `null` (this device). */
 export function adaptCatalog(s: AppState): CatalogProfile[] {
   return (s.catalog ?? []).map((p) => ({
     name: p.name,
     origin: p.origin,
     overridesGlobal: p.overrides_global,
+    machine: p.machine ?? null,
     agents: p.agents.map((a) => ({
       name: a.name,
       model: a.model,
@@ -389,6 +391,22 @@ export function todosFromMessages(messages: WireChatMessage[]): TodoItem[] {
  * surface when the panel is already narrowed to one lane. */
 export function flatTree(items: TodoItem[]): TodoNode[] {
   return items.map((item) => ({ item, children: [] }));
+}
+
+/** Rows the Todo panel renders (parents + their children); `open` is
+ * pending | inProgress, so `cancelled`/`completed` count as done. */
+export function todoCounts(nodes: TodoNode[]): { open: number; total: number } {
+  let open = 0;
+  let total = 0;
+  const count = (item: TodoItem): void => {
+    total += 1;
+    if (item.status === "pending" || item.status === "inProgress") open += 1;
+  };
+  for (const node of nodes) {
+    count(node.item);
+    for (const child of node.children) count(child);
+  }
+  return { open, total };
 }
 
 function isDelegateCall(m: WireChatMessage): boolean {

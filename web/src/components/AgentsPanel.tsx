@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { CatalogAgent, ViewFilter } from "../types";
+import { ACTION_PILL, PANEL_HEAD, PANEL_SUB, PANEL_TITLE, ROW } from "./phoneUi";
 
 // The "Agents" side panel, two clearly-separated sections:
 //   1. Roster — the *configured* cast of the bound agent (main agent +
@@ -51,6 +52,7 @@ export function AgentsPanel({
   roster,
   laneCalls,
   laneMessages,
+  phone = false,
 }: {
   /** The agent this conversation is bound to (resolved from the catalog by
    * `selection`), or null when nothing is bound / the wire predates the
@@ -67,6 +69,8 @@ export function AgentsPanel({
   /** Lane → transcript message count (messagesByLane), shared with the
    * Session cards so both panels report the same figure. */
   laneMessages: Record<string, number>;
+  /** Phone sheet face: one flat list of Watch rows (no roster, no captions). */
+  phone?: boolean;
 }) {
   // Group the per-call roster by role: one row per agent, its delegations
   // nested underneath. The role total comes from `laneMessages` (shared with
@@ -95,6 +99,63 @@ export function AgentsPanel({
       if (!next.delete(role)) next.add(role);
       return next;
     });
+
+  if (phone) {
+    // One flat list: pseudo-views, then each role with its delegations (when
+    // there are several) directly beneath it.
+    const rows: { id: ViewFilter; label: string; sub: string; title: string }[] = [
+      ...VIEW_ENTRIES.map((e) => ({ id: e.id, label: e.label, sub: e.hint, title: e.hint })),
+      ...groups.flatMap((g) => [
+        {
+          id: g.role,
+          label: g.role,
+          sub: `${g.total} msg${laneCalls[g.role] === undefined ? "" : ` · ${laneCalls[g.role]} calls`}`,
+          title: `Watch every turn ${g.role} took (${g.calls.length} delegation${g.calls.length === 1 ? "" : "s"})`,
+        },
+        ...(g.calls.length > 1
+          ? g.calls.map((c) => ({
+              id: c.key,
+              label: `${g.role} · call ${c.n}`,
+              sub: `${c.count} msg`,
+              title: `Watch only delegation ${c.n} of ${g.role}`,
+            }))
+          : []),
+      ]),
+    ];
+    return (
+      <section>
+        <div className={PANEL_HEAD}>
+          <h3 className={PANEL_TITLE}>Agents</h3>
+          <span className={PANEL_SUB}>{groups.length}</span>
+        </div>
+        <ul>
+          {rows.map((r) => {
+            const on = r.id === active;
+            return (
+              <li key={r.id} className={ROW}>
+                <span
+                  className={`h-2.5 w-2.5 shrink-0 rounded-full ${on ? "bg-sky-400" : "bg-zinc-600"}`}
+                />
+                <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                  <b className="truncate text-[14.5px] font-semibold text-zinc-100">{r.label}</b>
+                  <small className="text-[11.5px] text-zinc-500">{r.sub}</small>
+                </div>
+                <button
+                  type="button"
+                  aria-pressed={on}
+                  title={r.title}
+                  onClick={() => onSelect(r.id)}
+                  className={`${ACTION_PILL} ${on ? "bg-sky-600 text-white" : "bg-sky-400/14 text-sky-400"}`}
+                >
+                  {on ? "Watching" : "Watch"}
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      </section>
+    );
+  }
 
   return (
     <section>

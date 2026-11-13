@@ -900,3 +900,200 @@ async fn http_kill_is_local_only_and_never_contacts_a_remote() {
     );
     assert_eq!(a.rec.count(), 0, "no remote was contacted");
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Machine statuses on `conversations_list` (mobile redesign R7/R8)
+//
+// One `{id, online}` per DISTINCT remote origin (id = the origin
+// `ProfileInfo.machine` carries, no trailing slash); this device is
+// implicit. A dial error, 401, bad answer or the LIST_TIMEOUT all mean
+// `online: false`. No remotes ⇒ no `machines` key at all.
+// ═══════════════════════════════════════════════════════════════════════
+
+/// The `machines` array of a `conversations_list` frame as sorted
+/// `(id, online)` pairs; panics when the key is absent.
+fn machines_of(list: &Value) -> Vec<(String, bool)> {
+    let mut out: Vec<(String, bool)> = list["machines"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the frame carries `machines`: {list}"))
+        .iter()
+        .map(|m| {
+            (
+                m["id"].as_str().expect("machine id").to_string(),
+                m["online"].as_bool().expect("machine online"),
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+// R7: one healthy remote and one that refuses connections.
+#[tokio::test]
+async fn machines_lists_each_origin_with_online_true_for_up_and_false_for_unreachable() {
+    let b = FakeRemote::start(T_REMOTE_B).await;
+    let dead = dead_url();
+    let env = LocalEnv::start(
+        &[(L, &dead, T_REMOTE, "dev"), (L2, &b.url, T_REMOTE_B, "web")],
+        None,
+    )
+    .await;
+    let mut ws = connect_local(&env).await;
+
+    let list = request_list(&mut ws).await;
+
+    let mut expected = vec![(dead.clone(), false), (b.url.clone(), true)];
+    expected.sort();
+    assert_eq!(machines_of(&list), expected, "frame: {list}");
+}
+
+// R7: the status ids are origins without a trailing slash.
+#[tokio::test]
+async fn machine_ids_are_origins_without_a_trailing_slash() {
+    let (a, b, env) = two_remotes().await;
+    let mut ws = connect_local(&env).await;
+
+    let list = request_list(&mut ws).await;
+
+    for (id, online) in machines_of(&list) {
+        assert!(!id.ends_with('/'), "no trailing slash: {id}");
+        assert!(online, "both fakes are healthy: {id}");
+    }
+    let ids: Vec<String> = machines_of(&list).into_iter().map(|(i, _)| i).collect();
+    assert!(ids.contains(&a.url) && ids.contains(&b.url), "ids: {ids:?}");
+}
+
+// R7: a hanging remote is offline within LIST_TIMEOUT; the reply is still bounded.
+#[tokio::test]
+async fn hanging_remote_is_reported_offline_within_the_list_timeout() {
+    let (a, b, env) = two_remotes().await;
+    a.set_list_mode(ListMode::Hang);
+    let mut ws = connect_local(&env).await;
+    let started = Instant::now();
+
+    let list = request_list(&mut ws).await;
+
+    assert!(started.elapsed() < BOUND, "took {:?}", started.elapsed());
+    let mut expected = vec![(a.url.clone(), false), (b.url.clone(), true)];
+    expected.sort();
+    assert_eq!(machines_of(&list), expected, "frame: {list}");
+}
+
+// R7: a non-2xx answer, garbage, or a stale token (401) are all "offline".
+#[tokio::test]
+async fn failing_and_unauthorised_remotes_are_reported_offline() {
+    let r500 = FakeRemote::start(T_REMOTE).await;
+    r500.set_list_mode(ListMode::Status(500));
+    let garbage = FakeRemote::start(T_REMOTE_B).await;
+    garbage.set_list_mode(ListMode::Garbage);
+    let stale = FakeRemote::start("the-real-token-xyz").await;
+    let env = LocalEnv::start(
+        &[
+            ("r500", &r500.url, T_REMOTE, "dev"),
+            ("garbage", &garbage.url, T_REMOTE_B, "dev"),
+            ("stale", &stale.url, "stale-token-in-config", "dev"),
+        ],
+        None,
+    )
+    .await;
+    let mut ws = connect_local(&env).await;
+
+    let list = request_list(&mut ws).await;
+
+    let got = machines_of(&list);
+    assert_eq!(got.len(), 3, "one status per origin: {got:?}");
+    assert!(
+        got.iter().all(|(_, online)| !online),
+        "every failure mode is offline: {got:?}"
+    );
+}
+
+// R7: a relay socket gets the same statuses (the list is answered locally).
+#[tokio::test]
+async fn machines_are_reported_on_a_relay_socket_too() {
+    let (a, b, env) = two_remotes().await;
+    b.set_list_mode(ListMode::Status(500));
+    let mut ws = connect_relay(&env, L).await;
+
+    let list = request_list(&mut ws).await;
+
+    let mut expected = vec![(a.url.clone(), true), (b.url.clone(), false)];
+    expected.sort();
+    assert_eq!(machines_of(&list), expected, "frame: {list}");
+}
+
+// R8: two profiles on one origin are ONE machine.
+#[tokio::test]
+async fn two_profiles_on_one_origin_yield_exactly_one_machine_entry() {
+    let a = FakeRemote::start(T_REMOTE).await;
+    let env = LocalEnv::start(
+        &[
+            ("p1", &a.url, T_REMOTE, "dev"),
+            ("p2", &a.url, T_REMOTE, "ops"),
+        ],
+        None,
+    )
+    .await;
+    let mut ws = connect_local(&env).await;
+
+    let list = request_list(&mut ws).await;
+
+    assert_eq!(machines_of(&list), vec![(a.url.clone(), true)], "{list}");
+}
+
+// R8: no remote profiles ⇒ the `machines` key is absent (byte-identical to
+// today's frame for single-machine installs).
+#[tokio::test]
+async fn no_remote_profiles_means_no_machines_key() {
+    let env = LocalEnv::start(&[], None).await;
+    let mut ws = connect_local(&env).await;
+
+    let list = request_list(&mut ws).await;
+
+    assert!(
+        list.get("machines").is_none(),
+        "no remotes ⇒ the key is omitted: {list}"
+    );
+}
+
+// R8: a broken global config means no remotes known ⇒ no `machines` key.
+#[tokio::test]
+async fn broken_global_config_means_no_machines_key() {
+    let a = FakeRemote::start(T_REMOTE).await;
+    let env = LocalEnv::start(&[(L, &a.url, T_REMOTE, "dev")], None).await;
+    std::fs::write(env.config_path(), "providers: [this is: not valid").expect("break config");
+    let mut ws = connect_local(&env).await;
+
+    let list = request_list(&mut ws).await;
+
+    assert!(list.get("machines").is_none(), "no config ⇒ none: {list}");
+}
+
+// R8: the kill reply carries the machine statuses too.
+async fn kill_reply_carries_machines(kind: Kind) {
+    let (a, b, env) = two_remotes().await;
+    a.set_rows(vec![row(
+        &uid(1),
+        "on A",
+        "2026-01-05T12:00:00Z",
+        Some("dev"),
+    )]);
+    b.set_list_mode(ListMode::Status(500));
+    let mut ws = socket(&env, &kind).await;
+
+    let reply = kill(&mut ws, &uid(1), Some(L)).await;
+
+    let mut expected = vec![(a.url.clone(), true), (b.url.clone(), false)];
+    expected.sort();
+    assert_eq!(machines_of(&reply), expected, "kill reply: {reply}");
+}
+
+#[tokio::test]
+async fn kill_reply_carries_machines_on_a_local_socket() {
+    kill_reply_carries_machines(Kind::Local).await;
+}
+
+#[tokio::test]
+async fn kill_reply_carries_machines_on_a_relay_socket() {
+    kill_reply_carries_machines(Kind::Relay).await;
+}

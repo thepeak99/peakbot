@@ -17,10 +17,10 @@ function Pill({ label, value }: { label: string; value: string }) {
 // at startup, so this string always matches the binary that served the page.
 export function WelcomeBanner({ welcome }: { welcome: Welcome }) {
   return (
-    <div className="rounded-lg border border-zinc-800 bg-gradient-to-b from-zinc-900/80 to-zinc-950/40 p-4">
+    <div className="rounded-lg border border-zinc-800 bg-gradient-to-b from-zinc-900/80 to-zinc-950/40 p-4 max-lg:rounded-[14px] max-lg:bg-none max-lg:bg-zinc-900 max-lg:p-3.5">
       <div className="mb-3 flex items-center gap-2">
         <span className="text-lg">✦</span>
-        <h2 className="text-base font-semibold text-zinc-100">Welcome to Shifu</h2>
+        <h2 className="text-base font-semibold text-zinc-100 max-lg:text-[15px]">Welcome to Shifu</h2>
         <span className="rounded bg-emerald-950/60 px-1.5 py-0.5 text-[10px] font-medium text-emerald-400">
           ready
         </span>
@@ -33,7 +33,7 @@ export function WelcomeBanner({ welcome }: { welcome: Welcome }) {
           </span>
         )}
       </div>
-      <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 text-xs sm:grid-cols-3">
+      <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 text-xs sm:grid-cols-3 max-lg:text-[12.5px]">
         <Pill label="provider" value={welcome.provider} />
         <Pill label="model" value={welcome.model} />
         <Pill label="max tokens" value={welcome.maxTokens.toLocaleString()} />

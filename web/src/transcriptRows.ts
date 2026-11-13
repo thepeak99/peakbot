@@ -36,3 +36,14 @@ export function estimateRowHeight(m: WireChatMessage): number {
   const base = CHROME + (thinkingChars > 0 ? THINKING_CHROME : 0) + LINE * lines;
   return Math.min(MAX, Math.max(MIN, base));
 }
+
+// First non-empty, trimmed line of the server-preformatted content — the
+// thought line for tool calls, so a row reads like the step itself.
+export function firstLine(content: string | undefined): string {
+  if (!content) return "";
+  for (const line of content.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed !== "") return trimmed;
+  }
+  return "";
+}

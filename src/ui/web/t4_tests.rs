@@ -931,13 +931,10 @@ async fn local_session_state_catalog_includes_remote_entries() {
         "the colour is resolved (RP8): {remote}"
     );
 
-    // §7: no token, URL or fingerprint on the wire.
+    // §7: no token or fingerprint on the wire. The normalised origin
+    // (`machine`) IS carried — the mobile-redesign contract (R1/R2).
     let wire = state.to_string();
     assert!(!wire.contains("pito"), "the token reaches the SPA");
-    assert!(
-        !wire.contains("10.2.0.48"),
-        "the remote URL reaches the SPA"
-    );
 }
 
 /// A remote entry's configured `ui.color` is what the SPA catalogue

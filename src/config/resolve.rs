@@ -216,8 +216,8 @@ impl Catalog {
     /// The wire projection for Settings and AppState (§8.7), in catalog
     /// order (repo first). `inherited` is derived, not stored (Z4). Remote
     /// entries carry `origin: "remote"`, `agents: []` (the relay fills them
-    /// for the active remote tab, §6.3) and a resolved colour — and never
-    /// the token, URL or fingerprint.
+    /// for the active remote tab, §6.3), a resolved colour and the machine
+    /// origin (`machine`) — never the token or the CA pin.
     pub fn infos(&self) -> Vec<ProfileInfo> {
         self.entries
             .iter()
@@ -229,6 +229,7 @@ impl Catalog {
                     overrides_global: false,
                     agents: Vec::new(),
                     color: r.color,
+                    machine: Some(r.endpoint.origin_without_slash()),
                 },
             })
             .collect()
@@ -281,6 +282,12 @@ pub struct ProfileInfo {
     pub agents: Vec<AgentInfo>,
     /// Always set (RP8): `ui.color`, else derived from the name.
     pub color: TabColor,
+    /// The server this profile runs on: `None` = this one; a remote's
+    /// normalised origin (`scheme://host[:port]`) — never its token or pin.
+    /// Serialised always (`null` for local); a missing key deserialises to
+    /// `None` (serde's Option rule), so an older remote's AppState still
+    /// parses in the relay.
+    pub machine: Option<String>,
 }
 
 /// The wire projection of an agent (§8.7).
@@ -1422,6 +1429,7 @@ fn profile_info(p: &ResolvedProfile) -> ProfileInfo {
         ),
         agents: p.agents.iter().map(agent_info).collect(),
         color: p.color,
+        machine: None,
     }
 }
 
@@ -2747,7 +2755,10 @@ profiles:
     /// §7: no secret reaches a Debug print or an error. The file-layer
     /// `RemoteDef`, the whole `Config`, every parse error and the wire
     /// projection (`infos()` → AppState.catalog → the SPA) carry neither the
-    /// token nor the URL.
+    /// token nor the CA pin. The wire projection DOES carry the normalised
+    /// origin (`machine`) — the mobile-redesign contract (R1/R2): the origin
+    /// is not a secret (a token/userinfo is unexpressible, parse rejects
+    /// both), so it is allowed on the wire.
     #[test]
     fn token_never_reaches_debug_errors_or_the_wire_projection() {
         use crate::config::file::ConfigFile;
@@ -2771,14 +2782,9 @@ profiles:
         }
 
         let wire = serde_json::to_string(&cfg.catalog.infos()).expect("infos serialise");
-        for secret in [
-            "pito",
-            "s3cret",
-            "9c1e",
-            "10.2.0.48",
-            "bot.example.ts.net",
-            "3f9a0123",
-        ] {
+        // The origin (`machine`) is allowed on the wire (mobile-redesign R1);
+        // the token and the CA pin are not (R2).
+        for secret in ["pito", "s3cret", "9c1e", "3f9a0123"] {
             assert!(
                 !wire.contains(secret),
                 "the wire projection leaks {secret}: {wire}"
@@ -3224,6 +3230,85 @@ profiles:
         assert_eq!(dev.origin, "global");
         assert_eq!(dev.agents.len(), 1);
         assert_eq!(dev.agents[0].name, "team");
+    }
+
+    /// R1: a remote entry's `machine` is its normalised origin
+    /// (`scheme://host[:port]`, no trailing slash); a local entry's is `None`.
+    #[test]
+    fn infos_carry_the_machine_origin_for_remotes_and_none_for_local() {
+        let cfg = parse(GLOBAL_YAML, None).expect("fixture must parse");
+        let infos = cfg.catalog.infos();
+        let machine = |name: &str| {
+            infos
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("{name} in infos"))
+                .machine
+                .clone()
+        };
+        assert_eq!(machine("home-dev"), Some("https://10.2.0.48:7823".into()));
+        assert_eq!(
+            machine("vps-web"),
+            Some("https://bot.example.ts.net".into()),
+            "no trailing slash, default port stays implicit"
+        );
+        assert_eq!(machine("sandbox"), Some("http://127.0.0.1:7824".into()));
+        assert_eq!(machine("dev"), None, "a local profile runs on this device");
+    }
+
+    /// R1: `machine` is the same string `RemoteRef.origin` uses, so the SPA's
+    /// machine id and the `conversations_list` status id match by construction.
+    #[test]
+    fn infos_machine_equals_the_endpoint_origin_without_slash() {
+        let cfg = parse(GLOBAL_YAML, None).expect("fixture must parse");
+        let remote = cfg.catalog.remote("home-dev").expect("home-dev is remote");
+        let info = cfg
+            .catalog
+            .infos()
+            .into_iter()
+            .find(|p| p.name == "home-dev")
+            .expect("home-dev in infos");
+        assert_eq!(info.machine, Some(remote.endpoint.origin_without_slash()));
+    }
+
+    /// R2: a local profile serialises `"machine": null` (key present); a
+    /// remote's JSON carries the origin and never the token or the CA pin.
+    #[test]
+    fn profile_info_json_has_machine_null_for_local_and_no_secrets_for_remote() {
+        let cfg = parse(GLOBAL_YAML, None).expect("fixture must parse");
+        let infos = cfg.catalog.infos();
+
+        let dev = infos.iter().find(|p| p.name == "dev").expect("dev");
+        let dev_json = serde_json::to_value(dev).expect("serialise");
+        let obj = dev_json.as_object().expect("object");
+        assert!(
+            obj.contains_key("machine"),
+            "key must be present: {dev_json}"
+        );
+        assert!(
+            obj["machine"].is_null(),
+            "local machine is null: {dev_json}"
+        );
+
+        let home = infos.iter().find(|p| p.name == "home-dev").expect("home");
+        let home_json = serde_json::to_value(home).expect("serialise");
+        assert_eq!(home_json["machine"], "https://10.2.0.48:7823");
+        let text = home_json.to_string();
+        assert!(!text.contains("pito"), "the token must not leak: {text}");
+        assert!(
+            !text.contains("sha256:"),
+            "the CA pin must not leak: {text}"
+        );
+    }
+
+    /// R3: an older remote's `ProfileInfo` (no `machine` key) still parses —
+    /// the relay deserialises remote AppState frames.
+    #[test]
+    fn profile_info_json_without_machine_deserializes_to_none() {
+        let json = r#"{"name":"dev","origin":"global","overrides_global":false,"agents":[],"color":"teal"}"#;
+        let info: ProfileInfo = serde_json::from_str(json).expect("old shape must parse");
+        assert_eq!(info.machine, None);
+        assert_eq!(info.name, "dev");
     }
 
     /// §4.2: the catalog keeps ONE ordered list of `CatalogEntry` — repo

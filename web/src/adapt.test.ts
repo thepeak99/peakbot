@@ -12,6 +12,7 @@ import {
   flatTree,
   messagesByLane,
   parseCallKey,
+  todoCounts,
   todoTree,
   todosFromMessages,
   viewLabel,
@@ -801,7 +802,7 @@ describe("adapt_catalog_selection", () => {
       {
         name: "dev",
         origin: "repo",
-        overridesGlobal: true,
+        overridesGlobal: true, machine: null,
         agents: [
           {
             name: "team",
@@ -817,7 +818,7 @@ describe("adapt_catalog_selection", () => {
       {
         name: "dev",
         origin: "global",
-        overridesGlobal: false,
+        overridesGlobal: false, machine: null,
         agents: [{ name: "team", model: "sonnet", subagents: [] }],
       },
     ]);
@@ -965,5 +966,126 @@ describe("conversationHasTurns", () => {
   it("is true once a user or agent message exists", () => {
     expect(conversationHasTurns([m("system"), m("user")])).toBe(true);
     expect(conversationHasTurns([m("agent")])).toBe(true);
+  });
+});
+
+// ─── P3: todoCounts (mobile-redesign design §2.4) ─────────────────────────
+//
+// `todoCounts(nodes)` counts the rows the Todo panel renders — parents plus
+// their nested children — and splits them into `open` (pending | inProgress)
+// and `total`. `cancelled`/`completed` count as done (not open).
+
+describe("todoCounts", () => {
+  const node = (
+    id: number,
+    text: string,
+    status: "pending" | "inProgress" | "completed" | "cancelled",
+    children: { id: number; text: string; status: "pending" | "inProgress" | "completed" | "cancelled" }[] = [],
+  ): TodoNode => ({ item: { id, text, status }, children });
+
+  it("counts parents and their children; open is pending|inProgress only", () => {
+    const nodes = [
+      node(1, "a", "pending", [{ id: 11, text: "a1", status: "inProgress" }]),
+      node(2, "b", "completed"),
+      node(3, "c", "cancelled", [
+        { id: 31, text: "c1", status: "pending" },
+        { id: 32, text: "c2", status: "completed" },
+      ]),
+    ];
+    // total = 3 parents + 3 children = 6; open = a, a1, c1 = 3.
+    expect(todoCounts(nodes)).toEqual({ open: 3, total: 6 });
+  });
+
+  it("cancelled and completed are not open", () => {
+    const nodes = [node(1, "a", "cancelled"), node(2, "b", "completed")];
+    expect(todoCounts(nodes)).toEqual({ open: 0, total: 2 });
+  });
+
+  it("an empty tree is 0/0", () => {
+    expect(todoCounts([])).toEqual({ open: 0, total: 0 });
+  });
+
+  it("a fully open single node is 1/1", () => {
+    expect(todoCounts([node(1, "a", "inProgress")])).toEqual({ open: 1, total: 1 });
+  });
+});
+
+// ─── W1: adaptCatalog normalises `machine` (mobile-redesign §2.2) ────────
+//
+// The wire `ProfileInfo.machine` is `string | null | absent` (absent on old
+// servers). `adaptCatalog` must normalise it to the view's `machine`
+// (`MachineId = string | null`): absent → `null` (this device), a present
+// origin kept verbatim.
+
+describe("adaptCatalog — machine normalisation (W1)", () => {
+  const base = {
+    chat: { messages: [] },
+    todo: { visible: false, items: [] },
+    stats: {
+      total_input_tokens: 0,
+      total_output_tokens: 0,
+      total_api_calls: 0,
+      total_cost: 0,
+      model: "m",
+      provider_name: "p",
+      model_alias: "a",
+    },
+    context: {
+      current_usage: 0,
+      window_size: 1000,
+      compaction_enabled: true,
+      compaction_threshold: 0.8,
+    },
+    conversation: null,
+    is_running: false,
+    is_loading: false,
+    welcome: null,
+    exit_requested: false,
+    bg: { recent_summaries: [] },
+    bash_panel: { kind: "idle" },
+  } as unknown as AppState;
+
+  it("absent machine normalises to null (this device)", () => {
+    const catalog = [
+      {
+        name: "dev",
+        origin: "global",
+        overrides_global: false,
+        agents: [{ name: "team", model: "sonnet", subagents: [] }],
+      },
+    ];
+    const state = { ...base, catalog } as unknown as AppState;
+    const adapted = adaptCatalog(state);
+    expect(adapted[0].machine).toBeNull();
+  });
+
+  it("a present remote origin is kept verbatim", () => {
+    const catalog = [
+      {
+        name: "dev on home-server",
+        origin: "remote",
+        overrides_global: false,
+        agents: [],
+        machine: "https://home-server.local:7823",
+      },
+    ];
+    const state = { ...base, catalog } as unknown as AppState;
+    const adapted = adaptCatalog(state);
+    expect(adapted[0].machine).toBe("https://home-server.local:7823");
+  });
+
+  it("an explicit null machine stays null", () => {
+    const catalog = [
+      {
+        name: "dev",
+        origin: "global",
+        overrides_global: false,
+        agents: [],
+        machine: null,
+      },
+    ];
+    const state = { ...base, catalog } as unknown as AppState;
+    const adapted = adaptCatalog(state);
+    expect(adapted[0].machine).toBeNull();
   });
 });

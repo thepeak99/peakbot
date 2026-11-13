@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import * as rows from "./transcriptRows";
 import { estimateRowHeight } from "./transcriptRows";
 import type { WireChatMessage } from "./state";
 
@@ -128,5 +129,32 @@ describe("estimateRowHeight", () => {
     };
     expect(() => estimateRowHeight(weird)).not.toThrow();
     expect(estimateRowHeight(weird)).toBeGreaterThanOrEqual(MIN);
+  });
+});
+
+// Batch 3, item 3.2 (X2): `firstLine` moves verbatim from ActivityRow.tsx
+// into transcriptRows.ts (now two call sites: ActivityRow and the phone tool
+// row). Behaviour is the contract, so the cases mirror the old private fn.
+// `firstLine` is reached through the namespace until 3.2 exports it, so the
+// file typechecks today and the cases fail as "not a function" (RED).
+const firstLine = (rows as unknown as { firstLine: (c?: string) => string }).firstLine;
+
+describe("firstLine", () => {
+  it("returns the first line, trimmed", () => {
+    expect(firstLine("  Read /etc/hosts  \nsecond")).toBe("Read /etc/hosts");
+  });
+
+  it("skips leading blank and whitespace-only lines", () => {
+    expect(firstLine("\n   \n\t\nreal line\nnext")).toBe("real line");
+  });
+
+  it("returns '' for undefined, empty and all-whitespace content", () => {
+    expect(firstLine(undefined)).toBe("");
+    expect(firstLine("")).toBe("");
+    expect(firstLine("  \n \n")).toBe("");
+  });
+
+  it("keeps unicode and a single line as is", () => {
+    expect(firstLine("日本語 ✓")).toBe("日本語 ✓");
   });
 });

@@ -1,4 +1,8 @@
-// Tests for `components/TabbedDrawer.tsx` — pointer-events layering.
+// Tests for `components/TabbedDrawer.tsx` — pointer-events layering and the
+// desktop-only contract (mobile redesign: below 1024px the Panels sheet
+// replaces the drawer, so the component no longer special-cases phones —
+// no media query, no tap-outside overlay, and `bottom-0` instead of the
+// phone-only `bottom-14`).
 //
 // The drawer <aside> is `fixed right-0 top-14 bottom-14` and is as wide as
 // handle rail + 288px body even while closed (the body is only slid/hidden
@@ -9,7 +13,7 @@
 //   - body (tabpanel), open   → `pointer-events-auto` (content stays usable)
 // Class names ARE the layout contract (jsdom has no layout engine).
 
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { TabbedDrawer, type DrawerTab } from "./TabbedDrawer";
@@ -19,12 +23,16 @@ beforeAll(() => {
     .IS_REACT_ACT_ENVIRONMENT = true;
 });
 
-// `useMediaQuery` needs `window.matchMedia`, which jsdom lacks.
+// The component must not query the viewport at all; the stub is a spy so a
+// regression (re-adding useMediaQuery) is visible. jsdom has no matchMedia.
 let originalMatchMedia: typeof window.matchMedia | undefined;
+const matchMediaSpy = vi.fn();
 beforeEach(() => {
   originalMatchMedia = window.matchMedia;
-  window.matchMedia = (media: string): MediaQueryList =>
-    ({
+  matchMediaSpy.mockClear();
+  window.matchMedia = (media: string): MediaQueryList => {
+    matchMediaSpy(media);
+    return {
       matches: false,
       media,
       onchange: null,
@@ -33,7 +41,8 @@ beforeEach(() => {
       addEventListener: () => {},
       removeEventListener: () => {},
       dispatchEvent: () => false,
-    }) as unknown as MediaQueryList;
+    } as unknown as MediaQueryList;
+  };
 });
 
 const tabs: DrawerTab[] = [
@@ -73,7 +82,7 @@ afterEach(() => {
 
 const has = (el: Element | null, cls: string): boolean => !!el && el.classList.contains(cls);
 
-describe("TabbedDrawer — pointer-events layering (mobile)", () => {
+describe("TabbedDrawer — pointer-events layering", () => {
   it("closed: the <aside> is pointer-events-none and the handle rail is pointer-events-auto", async () => {
     const el = await mount(null);
     expect(has(el.querySelector("aside"), "pointer-events-none")).toBe(true);
@@ -105,5 +114,43 @@ describe("TabbedDrawer — pointer-events layering (mobile)", () => {
       tab.click();
     });
     expect(calls).toEqual(["a"]);
+  });
+});
+
+describe("TabbedDrawer — desktop-only (the sheet owns phones)", () => {
+  it("does not query the viewport (no media query inside the drawer)", async () => {
+    await mount("a");
+    expect(matchMediaSpy, "the drawer is rendered only ≥1024px, so it never asks").not.toHaveBeenCalled();
+  });
+
+  it("open: no tap-outside overlay is rendered", async () => {
+    const el = await mount("a");
+    expect(el.querySelector(".fixed.inset-0.z-30"), "no transparent overlay").toBeNull();
+    expect(el.querySelector("[aria-hidden].fixed.inset-0")).toBeNull();
+  });
+
+  it("open: clicking elsewhere never closes it (a persistent side rail)", async () => {
+    const calls: Array<string | null> = [];
+    await mount("a", (a) => calls.push(a));
+    await act(async () => {
+      document.body.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    });
+    expect(calls, "only handles and Esc close the desktop drawer").toEqual([]);
+  });
+
+  it("the <aside> is anchored to the bottom edge (bottom-0, not the phone bottom-14)", async () => {
+    const el = await mount(null);
+    const aside = el.querySelector("aside")!;
+    expect(aside.classList.contains("bottom-0")).toBe(true);
+    expect(aside.classList.contains("bottom-14")).toBe(false);
+  });
+
+  it("Esc still closes the drawer", async () => {
+    const calls: Array<string | null> = [];
+    await mount("a", (a) => calls.push(a));
+    await act(async () => {
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    });
+    expect(calls).toEqual([null]);
   });
 });

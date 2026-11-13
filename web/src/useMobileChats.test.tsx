@@ -84,9 +84,8 @@ type Api = {
   screen: "chats" | "conversation";
   loaded: boolean;
   unread: ReadonlySet<string>;
-  backBadge: boolean;
   open(convo: string, profile: string | null): void;
-  newChat(): void;
+  newChat(profile: string | null): void;
   showChats(): void;
 };
 
@@ -359,20 +358,34 @@ describe("useMobileChats — navigation (N1–N13)", () => {
     expect(pushSpy).toHaveBeenCalledTimes(1);
   });
 
-  it("N8: newChat() re-attaches to null and pushes a marker", async () => {
+  it("N8: newChat(null) re-attaches to (null, null) and pushes a marker", async () => {
     const agent = makeAgent({ convo: "c1" });
     await renderHook(agent, vi.fn());
     await toChats();
 
     const pushSpy = vi.spyOn(window.history, "pushState");
     await act(async () => {
-      A().newChat();
+      A().newChat(null);
     });
 
     expect(agent.switchConvo).toHaveBeenCalledTimes(1);
     expect(agent.switchConvo).toHaveBeenCalledWith(null, null);
     expect(A().screen).toBe("conversation");
     expect(pushSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("N8: newChat('dev') re-attaches to (null, 'dev') — a new chat on that profile", async () => {
+    const agent = makeAgent({ convo: "c1" });
+    await renderHook(agent, vi.fn());
+    await toChats();
+
+    await act(async () => {
+      A().newChat("dev");
+    });
+
+    expect(agent.switchConvo).toHaveBeenCalledTimes(1);
+    expect(agent.switchConvo).toHaveBeenCalledWith(null, "dev");
+    expect(A().screen).toBe("conversation");
   });
 
   it("N9: an OS Back on the list issues no history call; the popstate is ignored", async () => {
@@ -505,8 +518,6 @@ describe("useMobileChats — polling and activity (P1–P6)", () => {
     expect(A().loaded).toBe(true);
     // c2 is running but was not running before → no unread edge yet.
     expect([...A().unread]).toEqual([]);
-    // c2 is running and unbound → the back button shows a badge.
-    expect(A().backBadge).toBe(true);
 
     // c2's turn finishes while we view c1 → unread.
     agent.conversations = [convoRow("c1"), convoRow("c2", { running: false })];

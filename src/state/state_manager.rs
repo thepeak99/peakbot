@@ -4103,6 +4103,7 @@ mod tests {
             origin: "global".to_string(),
             overrides_global: false,
             color: TabColor::derived("dev"),
+            machine: None,
             agents: vec![AgentInfo {
                 name: "team".to_string(),
                 model: "opus-5".to_string(),
@@ -11037,6 +11038,7 @@ mod tests {
                 overrides_global: true,
                 color: TabColor::derived("dev"),
                 agents: Vec::new(),
+                machine: None,
             },
             ProfileInfo {
                 name: "default".to_string(),
@@ -11044,6 +11046,7 @@ mod tests {
                 overrides_global: false,
                 color: TabColor::derived("default"),
                 agents: Vec::new(),
+                machine: None,
             },
         ]);
         let state = sm.get_state();

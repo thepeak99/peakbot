@@ -106,7 +106,7 @@ talk to — a starting `model:`, an optional `persona:`/`prompt:`, and optional
 `subagents:` (an agent without subagents is a plain single-agent setup).
 
 Selection is per conversation: `/profile <name>` and `/agent <name>` (web: the
-selection chip in the top bar (bottom bar on phones): Profile › Agent › Team ›
+selection chip in the top bar (bottom bar in a phone browser; the chat header in the phone app): Profile › Agent › Team ›
 Model drill-down; per-member model override before the first message). Both
 lock once the conversation has started; `/new`
 keeps the selection, and a fresh session starts at the first profile's first

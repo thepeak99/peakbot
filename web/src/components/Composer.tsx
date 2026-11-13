@@ -37,6 +37,7 @@
 // to `readClipboardImage()` (WebKit Bug 218519). On Android 📎 opens a menu
 // (camera / gallery / file); elsewhere it opens the OS dialog.
 
+import type { JSX } from "react";
 import { useCallback, useEffect, useRef, useState, useLayoutEffect } from "react";
 import { isAndroid } from "../platform";
 import { isDesktop, readClipboardImage } from "../desktop";
@@ -50,12 +51,58 @@ import { AttachmentChip, NO_VISION, visionWarning } from "./AttachmentChip";
 // its content up to a hard cap, past which it scrolls internally. Values are px.
 const MIN_H = 40; // one text row — roughly line-height + vertical padding
 const MAX_H = 192; // ~6 rows — beyond this the textarea scrolls internally
+// Phone face (mobile fidelity batch 1, mock .ta): one 16px/22px row, 118px cap.
+const PHONE_MIN_H = 44;
+const PHONE_MAX_H = 118;
 
 // Pressing a button moves focus off the textarea, collapsing the soft keyboard;
 // the layout jump then cancels the tap. Cancel the focus change on both the
 // pointer event and the compat mousedown (Android Chrome focuses on the latter).
 const preventFocusSteal = (e: { preventDefault: () => void }) => e.preventDefault();
 const keepTextareaFocus = { onPointerDown: preventFocusSteal, onMouseDown: preventFocusSteal };
+
+// The attach menu's rows in order: label, the input it fires, and the
+// phone's stroke icon (mock .amenu: camera / image / paperclip in a 24px
+// box). Desktop (no `phone`) renders the rows text-only, as before.
+const ATTACH_ITEMS: {
+  testid: string;
+  label: string;
+  ref: "file" | "camera" | "gallery";
+  icon: JSX.Element;
+}[] = [
+  {
+    testid: "attach-menu-camera",
+    label: "Take a photo",
+    ref: "camera",
+    icon: (
+      <>
+        <path d="M20 8h-2.35A4.5 4.5 0 0 0 13.2 5.6H10.8A4.5 4.5 0 0 0 6.35 8H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-9a2 2 0 0 0-2-2Z" />
+        <circle cx="12" cy="14" r="3.5" />
+      </>
+    ),
+  },
+  {
+    testid: "attach-menu-gallery",
+    label: "Choose from gallery",
+    ref: "gallery",
+    icon: (
+      <>
+        <rect x="3" y="4" width="18" height="16" rx="2" />
+        <circle cx="9" cy="10" r="1.6" />
+        <path d="M3 17l4.5-4.5L12 17l3-3 6 6" />
+      </>
+    ),
+  },
+  {
+    testid: "attach-menu-file",
+    label: "Pick a file",
+    ref: "file",
+    // The existing desktop Attach path — same paperclip, new menu.
+    icon: (
+      <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+    ),
+  },
+];
 
 // Inert default so the Composer works standalone (no upload plumbing).
 const NO_ATTACHMENTS: Attachments = {
@@ -107,6 +154,10 @@ export interface ComposerProps {
   stopPending?: boolean;
   /** Parked tab: stay mounted (keeps text and palette state) but not shown. */
   hidden?: boolean;
+  /** Phone face (mobile fidelity batch 1): the mock's composer look and
+   * copy. Derived once in App as `!isDesktop`; false (the default) renders
+   * today's desktop DOM exactly. */
+  phone?: boolean;
   /** Single-composer shells (mobile + plain browser) only: park the
    * half-typed text per bound conversation — `null` = a fresh, not-yet-named
    * chat, a later `null` → id is that chat getting its server id (not a
@@ -132,8 +183,12 @@ export function Composer({
   settingsEnabled = true,
   stopPending = false,
   hidden = false,
+  phone = false,
   draftKey,
 }: ComposerProps) {
+  // Phone face gets its own height budget (mock .ta 16/22, 118px cap).
+  const MIN_H_P = phone ? PHONE_MIN_H : MIN_H;
+  const MAX_H_P = phone ? PHONE_MAX_H : MAX_H;
   const [text, setText] = useState("");
   const [selected, setSelected] = useState(0);
   const [dismissed, setDismissed] = useState(false);
@@ -148,6 +203,8 @@ export function Composer({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cameraInputRef = useRef<HTMLInputElement>(null);
   const galleryInputRef = useRef<HTMLInputElement>(null);
+  // The three attach inputs in menu order, so the menu can drive a pick by row.
+  const attachInputRefs = { file: fileInputRef, camera: cameraInputRef, gallery: galleryInputRef };
   const attachButtonRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -160,8 +217,8 @@ export function Composer({
     const el = textareaRef.current;
     if (!el || hidden) return;
     el.style.height = "auto";
-    el.style.height = `${Math.min(Math.max(el.scrollHeight, MIN_H), MAX_H)}px`;
-  }, [text, hidden]);
+    el.style.height = `${Math.min(Math.max(el.scrollHeight, MIN_H_P), MAX_H_P)}px`;
+  }, [text, hidden, MIN_H_P, MAX_H_P]);
 
   // Palette shows only while typing a bare command name (`/foo`, no space).
   const query = text.startsWith("/") && !text.includes(" ") ? text.slice(1) : null;
@@ -320,11 +377,17 @@ export function Composer({
   // Single placeholder, no embedded instructions. Touch/desktop parity —
   // gestures and key bindings live in the hint row below (desktop only).
   // While watching a sub-agent lane it names the real recipient instead.
+  // The phone face (mock) reads "Message" / "Queue a message…" instead of
+  // "Type a message…".
   const placeholder = !connected
     ? "Connecting…"
     : watchingRole
       ? "Message the orchestrator…"
-      : "Type a message…";
+      : phone
+        ? isRunning
+          ? "Queue a message…"
+          : "Message"
+        : "Type a message…";
 
   // Content half of `canSend`, split out because it also picks which running
   // controls are mounted: empty box → icon-only Pause/Stop, content → the
@@ -351,9 +414,37 @@ export function Composer({
       : "Stop";
 
   return (
-    <div hidden={hidden} className="border-t border-zinc-800 bg-zinc-950 p-3 pr-12">
+    // The phone face drops the band's border/background and pads out the
+    // bottom safe area (mock .cmpw 8/12 + .safeb sabot+10) — the max-lg:
+    // overrides win below 1024, desktop keeps the band untouched.
+    <div
+      hidden={hidden}
+      data-testid={phone ? "composer" : undefined}
+      className="border-t border-zinc-800 bg-zinc-950 p-3 lg:pr-12 max-lg:border-t-0 max-lg:bg-transparent max-lg:px-3 max-lg:pt-2 max-lg:pb-[calc(env(safe-area-inset-bottom)+18px)]"
+    >
       <div className="mx-auto max-w-3xl">
         <div className="relative">
+          {/* Kept feature (user decision 1): the watching note. On the phone
+              it sits above the pill as a 12px muted line (mock .sub face)
+              with a --link "Clear"; on desktop it stays inside the box,
+              unchanged. */}
+          {phone && watchingRole && (
+            <div
+              data-testid="composer-watch-note"
+              className="flex items-center gap-1.5 px-3 pb-1.5 text-xs text-zinc-500"
+            >
+              <span>
+                🧩 Watching <span className="font-semibold text-zinc-300">{watchingRole}</span>{" "}
+                — your message goes to the orchestrator
+              </span>
+              <button
+                onClick={onClearWatch}
+                className="ml-auto shrink-0 cursor-pointer text-xs font-semibold text-sky-400"
+              >
+                Clear
+              </button>
+            </div>
+          )}
           {showPalette && (
             <div className="absolute bottom-full left-0 z-20 mb-2 max-h-72 w-full overflow-y-auto rounded-lg border border-zinc-800 bg-zinc-900 py-1 shadow-xl">
               {matches.map((c, i) => (
@@ -384,46 +475,60 @@ export function Composer({
               role="menu"
               aria-label="Attach"
               data-testid="attach-menu"
-              className="absolute bottom-full left-0 z-20 mb-2 w-56 rounded-lg border border-zinc-800 bg-zinc-900 py-1 shadow-xl"
+              // Phone: the mock's .amenu (s1 surface, bd2 border, r16, soft
+              // shadow, 6px padding). Non-phone keeps the shared look.
+              className={
+                phone
+                  ? "absolute bottom-full left-0 z-20 mb-2 w-56 rounded-2xl border border-zinc-700 bg-zinc-900 p-1.5 shadow-[0_12px_32px_rgba(0,0,0,0.45)]"
+                  : "absolute bottom-full left-0 z-20 mb-2 w-56 rounded-lg border border-zinc-800 bg-zinc-900 py-1 shadow-xl"
+              }
             >
-              <button
-                type="button"
-                role="menuitem"
-                data-testid="attach-menu-camera"
-                {...keepTextareaFocus}
-                onClick={() => pick(cameraInputRef)}
-                className="block w-full px-4 py-3 text-left text-sm text-zinc-200 hover:bg-zinc-800"
-              >
-                Take a photo
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                data-testid="attach-menu-gallery"
-                {...keepTextareaFocus}
-                onClick={() => pick(galleryInputRef)}
-                className="block w-full px-4 py-3 text-left text-sm text-zinc-200 hover:bg-zinc-800"
-              >
-                Choose from gallery
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                data-testid="attach-menu-file"
-                {...keepTextareaFocus}
-                onClick={() => pick(fileInputRef)}
-                className="block w-full px-4 py-3 text-left text-sm text-zinc-200 hover:bg-zinc-800"
-              >
-                Pick a file
-              </button>
+              {ATTACH_ITEMS.map(({ testid, label, ref, icon }) => (
+                <button
+                  key={testid}
+                  type="button"
+                  role="menuitem"
+                  data-testid={testid}
+                  {...keepTextareaFocus}
+                  onClick={() => pick(attachInputRefs[ref])}
+                  className={
+                    phone
+                      ? "flex h-11 w-[212px] items-center gap-2.5 rounded-[11px] px-3 text-left text-[14.5px] text-zinc-200 active:bg-zinc-800"
+                      : "block w-full px-4 py-3 text-left text-sm text-zinc-200 hover:bg-zinc-800"
+                  }
+                >
+                  {phone && (
+                    // .ai — a 24px centred icon box in front of the label.
+                    <span className="grid w-6 place-items-center">
+                      <svg
+                        aria-hidden
+                        width="20"
+                        height="20"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="1.8"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      >
+                        {icon}
+                      </svg>
+                    </span>
+                  )}
+                  {label}
+                </button>
+              ))}
             </div>
           )}
 
-          <div className="flex flex-col gap-2 rounded-xl border border-zinc-800 bg-zinc-900 p-2 focus-within:border-zinc-700">
+          {/* Phone face: the mock's single 52px pill (r26, bd2 border, 3px
+              padding, soft shadow) — max-lg: only, the desktop box is
+              untouched. */}
+          <div className="flex flex-col gap-2 rounded-xl border border-zinc-800 bg-zinc-900 p-2 focus-within:border-zinc-700 max-lg:min-h-[52px] max-lg:gap-0 max-lg:rounded-sheet max-lg:border-zinc-700 max-lg:p-[3px] max-lg:shadow-[0_2px_10px_rgba(0,0,0,0.25)] max-lg:light:shadow-[0_2px_10px_rgba(0,0,0,0.06)] max-lg:focus-within:border-zinc-700">
             {/* Inside the box (not the desktop-only hint row below) so it also
                 shows on touch: selecting a role filters the transcript, it does
                 not re-route input. */}
-            {watchingRole && (
+            {!phone && watchingRole && (
               <div className="flex items-center gap-1.5 px-1 pt-0.5 text-[11px] text-zinc-400">
                 {/* Zinc, not sky: the palette's zinc ramp is the one thing light
                     mode remaps, so a sky tint here would be unreadable on the
@@ -443,7 +548,7 @@ export function Composer({
             )}
 
             {attachments.pending.length > 0 && (
-              <div className="flex flex-wrap items-start gap-2 px-1 pt-1">
+              <div className="flex flex-wrap items-start gap-2 px-1 pt-1 max-lg:px-2.5 max-lg:pt-2">
                 {attachments.pending.map((chip) => (
                   <AttachmentChip
                     key={chip.key}
@@ -463,7 +568,7 @@ export function Composer({
               </p>
             )}
 
-            <div className="flex items-end gap-2">
+            <div className="flex items-end gap-2 max-lg:gap-0.5">
               <input
                 ref={fileInputRef}
                 type="file"
@@ -501,18 +606,23 @@ export function Composer({
                 {...(android ? keepTextareaFocus : {})}
                 title="Attach files"
                 aria-label="Attach files"
-                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 disabled:cursor-not-allowed disabled:opacity-40"
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 disabled:cursor-not-allowed disabled:opacity-40 max-lg:h-11 max-lg:w-11 max-lg:rounded-full max-lg:text-zinc-400"
               >
                 <svg
                   viewBox="0 0 24 24"
                   fill="none"
                   stroke="currentColor"
-                  strokeWidth="2"
+                  strokeWidth={phone ? 1.8 : 2}
                   strokeLinecap="round"
                   strokeLinejoin="round"
-                  className="h-5 w-5"
+                  className="h-5 w-5 max-lg:h-6 max-lg:w-6"
                 >
-                  <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+                  {phone ? (
+                    // The mock's round "+" attach (proto:406-408).
+                    <path d="M12 5v14M5 12h14" />
+                  ) : (
+                    <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+                  )}
                 </svg>
               </button>
               <textarea
@@ -524,8 +634,8 @@ export function Composer({
                 onKeyDown={onKeyDown}
                 onPaste={onPaste}
                 placeholder={placeholder}
-                style={{ minHeight: MIN_H, maxHeight: MAX_H }}
-                className="flex-1 resize-none overflow-y-auto bg-transparent px-2 py-1.5 text-sm text-zinc-100 placeholder-zinc-600 outline-none disabled:cursor-not-allowed"
+                style={{ minHeight: MIN_H_P, maxHeight: MAX_H_P }}
+                className="flex-1 resize-none overflow-y-auto bg-transparent px-2 py-1.5 text-sm text-zinc-100 placeholder-zinc-600 outline-none disabled:cursor-not-allowed max-lg:px-1.5 max-lg:py-[11px] max-lg:text-base max-lg:leading-[22px] max-lg:placeholder-zinc-500"
               />
               {isRunning && !hasContent ? (
                 // Empty box mid-turn: icon-only controls — labels would leave
@@ -546,11 +656,32 @@ export function Composer({
                           : "Resume sub-agent"
                       }
                       aria-label={subAgent.pause === "running" ? "Pause" : "Resume"}
-                      className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-amber-950/70 text-amber-300 hover:bg-amber-900/70"
+                      className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-amber-950/70 text-amber-300 hover:bg-amber-900/70 max-lg:m-px max-lg:mr-0.5 max-lg:h-[42px] max-lg:w-[42px] max-lg:rounded-full max-lg:bg-amber-500/14 max-lg:text-amber-400"
                     >
-                      <span className="text-xs leading-none">
-                        {subAgent.pause === "running" ? "⏸" : "▶"}
-                      </span>
+                      {phone ? (
+                        // The mock's face: an 18px two-bar icon while running,
+                        // a 10.5px "Resume" word while paused (proto:547, 184).
+                        subAgent.pause === "running" ? (
+                          <svg
+                            aria-hidden
+                            width="18"
+                            height="18"
+                            viewBox="0 0 24 24"
+                            fill="currentColor"
+                          >
+                            <rect x="6" y="5" width="4" height="14" rx="1.2" />
+                            <rect x="14" y="5" width="4" height="14" rx="1.2" />
+                          </svg>
+                        ) : (
+                          <span className="text-[10.5px] font-bold tracking-[0.02em]">
+                            Resume
+                          </span>
+                        )
+                      ) : (
+                        <span className="text-xs leading-none">
+                          {subAgent.pause === "running" ? "⏸" : "▶"}
+                        </span>
+                      )}
                     </button>
                   )}
                   <button
@@ -558,22 +689,22 @@ export function Composer({
                     onClick={onStop}
                     title={stopLabel}
                     aria-label={stopLabel}
-                    className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-red-950/70 hover:bg-red-900/70 ${
+                    className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-red-950/70 hover:bg-red-900/70 max-lg:m-px max-lg:h-[42px] max-lg:w-[42px] max-lg:rounded-full max-lg:bg-red-600/18 ${
                       // A graceful stop is armed: a subtle pulse + ring on the
                       // existing red surface says "press again to stop now".
                       stopPending ? "animate-pulse ring-2 ring-red-500/60" : ""
                     }`}
                   >
-                    <span className="h-2.5 w-2.5 rounded-[2px] bg-red-400" />
+                    <span className="h-2.5 w-2.5 rounded-[2px] bg-red-400 max-lg:h-3.5 max-lg:w-3.5 max-lg:rounded-[3px] max-lg:bg-red-600" />
                   </button>
                 </>
-              ) : (
+              ) : phone && !hasContent ? null : (
                 <button
                   {...keepTextareaFocus}
                   onClick={submit}
                   disabled={!canSend}
                   title={sendBlockedReason}
-                  className="rounded-lg bg-emerald-700 px-3.5 py-1.5 text-sm font-medium text-white hover:bg-emerald-600 disabled:opacity-40"
+                  className="rounded-lg bg-emerald-700 px-3.5 py-1.5 text-sm font-medium text-white hover:bg-emerald-600 disabled:opacity-40 max-lg:m-px max-lg:h-[42px] max-lg:shrink-0 max-lg:rounded-[21px] max-lg:bg-emerald-700 max-lg:px-5 max-lg:py-0 max-lg:text-[15px] max-lg:font-semibold"
                 >
                   {actionLabel}
                 </button>

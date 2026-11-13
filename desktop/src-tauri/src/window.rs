@@ -16,6 +16,11 @@ use crate::commands::ActionTx;
 
 pub const MAIN_LABEL: &str = "main";
 
+/// Minimum window size: the width matches the web `lg` breakpoint (1024px), so the
+/// window can never fall into the phone layout.
+const MIN_WIDTH: f64 = 1024.0;
+const MIN_HEIGHT: f64 = 600.0;
+
 /// The init script that tags this window's origin as the desktop shell. Byte-for-byte
 /// the mobile init-script's `peakbotShell` definition with `"desktop"` in place of
 /// `"mobile"`. Injected on every load, including the remote
@@ -29,7 +34,7 @@ pub fn create_main(app: &AppHandle, nav: Arc<RwLock<Option<String>>>) -> tauri::
         tauri::WebviewWindowBuilder::new(app, MAIN_LABEL, WebviewUrl::App("index.html".into()))
             .title("PeakBot")
             .inner_size(1200.0, 800.0)
-            .min_inner_size(800.0, 500.0)
+            .min_inner_size(MIN_WIDTH, MIN_HEIGHT)
             // Tauri re-runs init scripts on every load in this window, so one
             // call covers the bundled page and the remote :7823 web UI alike.
             .initialization_script(SHELL_MARKER_SCRIPT)
@@ -157,5 +162,42 @@ mod shell_marker_tests {
             !SHELL_MARKER_SCRIPT.contains("{value:'mobile'}"),
             "desktop must not carry the mobile marker; got: {SHELL_MARKER_SCRIPT}"
         );
+    }
+}
+
+// ─── window minimum size (option D) ─────────────────────────────────────
+//
+// The SPA breaks at the 1024px web breakpoint (below it the phone layout
+// renders), so the desktop window must never be resizable into it: the
+// minimum is 1024×600 and the layout is always wide.
+//
+// RED before implementation: MIN_WIDTH / MIN_HEIGHT do not exist yet, so
+// this module fails to compile. `create_main` must size the window through
+// the constants (`.min_inner_size(MIN_WIDTH, MIN_HEIGHT)`).
+
+#[cfg(test)]
+mod min_size_tests {
+    use super::{MIN_HEIGHT, MIN_WIDTH};
+
+    /// The web breakpoint (web/src/App.tsx): below 1024px the SPA renders
+    /// the phone layout, so the window must never be able to shrink there.
+    const WEB_BREAKPOINT_WIDTH: f64 = 1024.0;
+
+    #[test]
+    fn min_width_is_1024() {
+        assert_eq!(MIN_WIDTH, 1024.0);
+    }
+
+    #[test]
+    fn min_height_is_600() {
+        assert_eq!(MIN_HEIGHT, 600.0);
+    }
+
+    #[test]
+    fn min_width_never_dips_below_the_web_breakpoint() {
+        // const block: clippy denies `assert!` on constant expressions outside one.
+        const {
+            assert!(MIN_WIDTH >= WEB_BREAKPOINT_WIDTH);
+        }
     }
 }

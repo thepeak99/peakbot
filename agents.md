@@ -262,7 +262,7 @@ OAuth notes: first connect opens the browser; tokens cached under `~/.cache/peak
 | `/pause` | Pause the running sub-agent at its next step (Ctrl+P in TUI) |
 | `/resume` | Resume a paused sub-agent (Ctrl+P in TUI) |
 | `/model [alias]` | List / switch models (starts a new conversation) |
-| `/profile [name]` | List / select a profile (first turn only; web: selection chip — top bar, or bottom bar on phones) |
+| `/profile [name]` | List / select a profile (first turn only; web: selection chip — top bar, or bottom bar in a phone browser; the chat header in the phone app) |
 | `/agent [name]` | List / select an agent within the active profile (first turn only) |
 | `/cd [path]` | Show / change session cwd (re-binds to the target's default agent) |
 | `/new`, `/load`, `/conversations` | Conversation management |
@@ -317,6 +317,8 @@ else).
 | `--profile <name>` | — | Pins a global profile: every conversation runs under it, `/profile` is refused, repo files are ignored, settings API disabled |
 
 **Sticky sessions** (#118): a conversation is addressed as `?convo=<uuid>`; a live session (StateManager + controller loop) stays bound to it independently of any socket. Reconnects and multiple tabs re-attach to the same running session. A session is reaped only when **fully idle** — no sockets, agent not mid-turn, no live `bash_bg` children — for `general.web.session_ttl_secs` (default 600; `reaper_tick_secs` 60). See `src/ui/web/registry.rs`. Killing a live session (✕ on a conversation row) is refused while a turn runs — Stop first; running turns, including delegations, continue with no browser attached.
+
+**Phone layout** (below 1024 px, browser or app): the chat is full width and the side panels open as a bottom sheet from a header button instead of the right-edge rail, with inline task/todo counts next to "working…". The phone app's Chats screen has a machine selector when remote servers exist.
 
 **Turn-end feed**: `GET /api/notify/stream` (token-gated like every route) is a Server-Sent Events stream with one `data:` JSON frame per finished agent turn in **any** conversation this server owns: `{"type":"turn_end","convo":…,"title":…|null,"outcome":"ok"|"error"|"stopped","source":"user"|"background","ts":<unix ms>}`, plus a `:` keepalive every 15 s. No message content; slash commands emit nothing; relayed remote-profile conversations are reported by their own server. The stream is not a session socket: it never attaches, creates or keeps alive a session (the reaper ignores it). No replay: events missed while disconnected are gone; slow readers drop events. `general.notifications.enabled: false` → no events, 404. In-process consumers subscribe to `SessionDeps::turn_ends` (`src/notify.rs`); the one publisher is `StateManager::end_turn`, called by the controller with the outcome. Ctrl+C drains open connections for at most 3 s (plain HTTP and TLS alike).
 
@@ -634,7 +636,7 @@ profiles:
 Selection is per-conversation: `(profile, agent)`, persisted on the conversation, and **locked after the first turn** (flipping `delegate` or the profile mid-conversation desyncs the tool list from wire history).
 
 - **`/profile <name>`** / **`/agent <name>`** — pick before the first turn; the name is the **rest of the line** (spaces work), case-sensitive.
-- **Web UI** — the selection chip in the top bar (bottom bar on phones) opens a Profile › Agent › Team › Model drill-down (repo profiles first) with per-member model override before the first message; it locks after the first message. The Agents tab shows the configured roster.
+- **Web UI** — the selection chip in the top bar (bottom bar in a phone browser; the chat header in the phone app) opens a Profile › Agent › Team › Model drill-down (repo profiles first) with per-member model override before the first message; it locks after the first message. The Agents tab shows the configured roster.
 - **`/new`** keeps the current selection; a fresh session starts at the first profile's first agent.
 - **`/cd <dir>`** starts a fresh conversation bound for the target tree. If the target has repo profiles you land on its first profile's first agent, unless you're already on one of them (kept, re-read). Without repo profiles your profile is kept, or you get the first profile if it isn't configured there. The model follows the new agent, subagent model overrides reset when the agent changes, and an `ℹ Switched to …` line says so.
 - **`--profile <name>`** pins a global profile: every conversation runs under it, `/profile` is refused, and repo files are ignored.

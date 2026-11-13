@@ -43,6 +43,7 @@ interface FakeAgent {
   activeAlias: string;
   conversations: ConversationSummary[];
   conversationsError: string | null;
+  machines: { id: string; online: boolean }[];
   commands: unknown[];
   dirListing: null;
   recentDirs: string[];
@@ -90,6 +91,7 @@ function makeAgent(state: AppState | null, over: Partial<FakeAgent> = {}): FakeA
     activeAlias: "",
     conversations: [],
     conversationsError: null,
+    machines: [],
     commands: [],
     dirListing: null,
     recentDirs: [],

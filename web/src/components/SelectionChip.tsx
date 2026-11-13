@@ -15,8 +15,14 @@
 // drops the ▾, and never opens. Esc steps back out of the Model pane first,
 // then closes (both preventDefault, so Settings' Esc handler stays open);
 // mousedown outside closes.
+//
+// `sheet` (the phone header's subtitle): the trigger is the bordered subtitle
+// pill and the sheet shows three pressable groups (Profile/Agent/Model) at
+// once; the proven sub-agent drill stays behind "Team models ›". The Sheet
+// owns Esc/Back/backdrop, so the chip's own dismissal is off; Agent and
+// Model picks bind, toast and close (mock behaviour, Q4).
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { boundAgentOf } from "../adapt";
 import { chipAction, select } from "../state";
 import type { CatalogAgent } from "../types";
@@ -33,7 +39,9 @@ import {
   type TeamState,
 } from "../teamModels";
 import type { SelectionChipProps } from "../settings/contract";
+import { PILL_OFF, PILL_ON } from "./phoneUi";
 import { AgentPane, ModelPane, ProfilePane, TeamPane } from "./SelectionPanes";
+import { Sheet } from "./Sheet";
 
 // The popover's drill state. The Model pane can't be open without a member,
 // so the illegal state is unrepresentable.
@@ -55,6 +63,43 @@ function memberLabel(member: Member, agent: CatalogAgent): string {
   return member.kind === "orchestrator" ? agent.name : member.name;
 }
 
+// The sheet's segmented groups (C16): one pressable pill per option, all
+// three groups at once. Module-level only to keep the sheet JSX readable.
+function SegGroup({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <section>
+      <h3 className="px-0.5 pb-2 text-[11px] font-semibold uppercase tracking-[0.08em] text-zinc-500">{label}</h3>
+      <div className="flex flex-wrap gap-2">{children}</div>
+    </section>
+  );
+}
+
+function SegPill({
+  testid,
+  on,
+  onClick,
+  children,
+}: {
+  testid: string;
+  on: boolean;
+  onClick(): void;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      data-testid={testid}
+      aria-pressed={on}
+      onClick={onClick}
+      className={`flex h-11 flex-none cursor-pointer items-center rounded-[22px] border px-[18px] text-[14.5px] ${
+        on ? PILL_ON : PILL_OFF
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
 export function SelectionChip({
   catalog,
   selection,
@@ -66,6 +111,7 @@ export function SelectionChip({
   onToast,
   dropUp = false,
   onReattach,
+  sheet = false,
 }: SelectionChipProps) {
   const [open, setOpen] = useState(false);
   const [nav, setNav] = useState<Nav>({ pane: "profile" });
@@ -74,6 +120,9 @@ export function SelectionChip({
   const [browsed, setBrowsed] = useState<string | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
 
+  // Stable: the Sheet's back layer re-pushes on a new identity.
+  const close = useCallback(() => setOpen(false), []);
+
   // Locking while the popover is open closes it (read-only state).
   useEffect(() => {
     if (locked && open) setOpen(false);
@@ -81,9 +130,10 @@ export function SelectionChip({
 
   // Esc (step back from Model, else close; always preventDefault) and
   // mousedown-outside, only while open. Deps carry `nav` so the Esc handler
-  // sees the current pane.
+  // sees the current pane. Off in sheet mode: the portal would make every
+  // in-sheet click "outside" rootRef, and the Sheet owns dismissal.
   useEffect(() => {
-    if (!open) return;
+    if (!open || sheet) return;
     function onKey(e: KeyboardEvent) {
       if (e.key !== "Escape") return;
       e.preventDefault();
@@ -99,7 +149,7 @@ export function SelectionChip({
       window.removeEventListener("keydown", onKey);
       document.removeEventListener("mousedown", onDown);
     };
-  }, [open, nav]);
+  }, [open, nav, sheet]);
 
   // Nothing to show: no selection (old server / before first frame) or an
   // empty catalog.
@@ -114,6 +164,9 @@ export function SelectionChip({
   const profileList = pinnedProfile ? [pinnedProfile] : catalog;
   const browsedName = browsed ?? selection.profile;
   const browsedProfile = profileList.find((p) => p.name === browsedName) ?? profileList[0];
+  // A remote profile whose agents are unknown offers one bare pill (AgentPane
+  // rule), the remote resolves its own agent on attach.
+  const bareRemote = browsedProfile.origin === "remote" && browsedProfile.agents.length === 0;
 
   // The agent the Team/Model panes apply to: the bound agent when browsing
   // the bound profile, else the browsed profile's first agent. A non-bound
@@ -136,6 +189,9 @@ export function SelectionChip({
     activeAlias === "" || (boundAgent != null && activeAlias === boundAgent.model)
       ? "default"
       : "overridden";
+  // The separators and the ▾ are muted on the desktop chip; the sheet's
+  // subtitle pill keeps them in the base colour (the model separator is `·`).
+  const sep = sheet ? "" : "text-zinc-600";
 
   const toggle = () => {
     if (locked) return;
@@ -191,7 +247,8 @@ export function SelectionChip({
       send(selectFrameFor(browsedProfile.name, teamAgent!, next));
       onToast?.(toastMsg);
     }
-    setNav({ pane: "team" });
+    if (sheet) setOpen(false);
+    else setNav({ pane: "team" });
   };
 
   const pickModel = (alias: string) => {
@@ -228,20 +285,175 @@ export function SelectionChip({
   const mobileTitle =
     nav.pane === "model" && memberView ? `Model · ${memberView.label}` : nav.pane.charAt(0).toUpperCase() + nav.pane.slice(1);
 
+  const panes = (
+    <>
+      {/* Mobile header: one pane at a time, ‹ Back steps up the drill. */}
+      <div className="hidden max-[800px]:flex shrink-0 items-center gap-1.5 border-b border-zinc-800 py-1 pl-1 pr-2">
+        {nav.pane !== "profile" ? (
+          <button
+            data-testid="selection-back"
+            type="button"
+            onClick={back}
+            className="flex shrink-0 items-center gap-1 rounded-md px-2 py-1.5 text-xs text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
+          >
+            ‹ Back
+          </button>
+        ) : (
+          <span className="shrink-0 px-1" />
+        )}
+        <span className="text-[10px] uppercase tracking-wide text-zinc-500">{mobileTitle}</span>
+      </div>
+
+      <div className={`w-44 shrink-0 border-r border-zinc-800 py-1.5 max-[800px]:w-full ${nav.pane !== "profile" ? HIDDEN_NARROW : ""}`}>
+        <div data-testid="selection-title-profile" className={TITLE_CLS}>
+          Profile
+        </div>
+        <ProfilePane
+          profiles={profileList}
+          selectedProfile={selection.profile}
+          browsed={browsedProfile.name}
+          pinned={pinned}
+          onBrowse={browse}
+        />
+      </div>
+
+      <div className={`w-60 shrink-0 border-r border-zinc-800 py-1.5 max-[800px]:w-full ${nav.pane !== "agent" ? HIDDEN_NARROW : ""}`}>
+        <div data-testid="selection-title-agent" className={TITLE_CLS}>
+          Agent
+        </div>
+        <AgentPane profile={browsedProfile} selection={selection} onPick={pickAgent} />
+      </div>
+
+      <div className={`max-h-[calc(100vh-7rem)] w-64 shrink-0 overflow-y-auto py-1.5 max-[800px]:w-full ${nav.pane !== "team" ? HIDDEN_NARROW : ""}`}>
+        <div data-testid="selection-title-team" className={TITLE_CLS}>
+          Team
+        </div>
+        <TeamPane
+          members={teamViews}
+          openMember={nav.pane === "model" ? nav.member : null}
+          showResetAll={anyOverride(team)}
+          onPickMember={pickMember}
+          onResetAll={resetAll}
+        />
+      </div>
+
+      {nav.pane === "model" && memberView && (
+        // Overlays the Profile column at 801–1099 px (it's chosen by then),
+        // a fourth column at ≥1100, static full width at ≤800.
+        <div className="absolute inset-y-0 left-0 z-10 w-56 overflow-y-auto border-r border-zinc-800 bg-zinc-900 py-1.5 min-[1100px]:static min-[1100px]:z-auto min-[1100px]:w-60 min-[1100px]:border-l min-[1100px]:border-r-0 max-[800px]:static max-[800px]:inset-auto max-[800px]:z-auto max-[800px]:w-full max-[800px]:border-r-0">
+          <div data-testid="selection-title-model" className={TITLE_CLS}>
+            Model · {memberView.label}
+          </div>
+          <ModelPane
+            member={memberView}
+            models={models}
+            onPick={pickModel}
+            onReset={resetMember}
+          />
+        </div>
+      )}
+    </>
+  );
+
+  // The sheet face (C16): Profile browses (stays open); Agent and Model bind,
+  // toast and close. Sub-agent overrides keep the drill behind "Team models ›".
+  const segments = (
+    <div data-testid="selection-segments" className="flex flex-col gap-4 px-4 pb-2 pt-0.5">
+      <SegGroup label="Profile">
+        {profileList.map((p) => (
+          <SegPill
+            key={p.name}
+            testid={`selection-profile-${p.name}`}
+            on={p.name === browsedProfile.name}
+            onClick={() => browse(p.name)}
+          >
+            {p.origin === "repo" && "📁 "}
+            {p.name}
+          </SegPill>
+        ))}
+      </SegGroup>
+      <SegGroup label="Agent">
+        {bareRemote ? (
+          <SegPill
+            testid="selection-agent-remote"
+            on={browsedProfile.name === selection.profile && selection.agent === ""}
+            onClick={() => {
+              pickAgent("");
+              close();
+            }}
+          >
+            {browsedProfile.name}
+          </SegPill>
+        ) : (
+          browsedProfile.agents.map((a) => (
+            <SegPill
+              key={a.name}
+              testid={`selection-agent-${a.name}`}
+              on={browsedProfile.name === selection.profile && a.name === selection.agent}
+              onClick={() => {
+                pickAgent(a.name);
+                close();
+              }}
+            >
+              {a.name}
+            </SegPill>
+          ))
+        )}
+      </SegGroup>
+      {teamAgent && models.length > 0 && (
+        <SegGroup label="Model">
+          {models.map((m) => (
+            <SegPill
+              key={m.alias}
+              testid={`selection-model-${m.alias}`}
+              on={m.alias === teamViews[0].effective}
+              onClick={() =>
+                applyTeam(
+                  withModel(teamAgent, team, { kind: "orchestrator" }, m.alias),
+                  `Next conversation: ${teamAgent.name} on ${m.alias}`,
+                )
+              }
+            >
+              {m.alias}
+            </SegPill>
+          ))}
+        </SegGroup>
+      )}
+      {teamAgent && teamAgent.subagents.length > 0 && (
+        <button
+          data-testid="selection-team-models"
+          type="button"
+          onClick={() => setNav({ pane: "team" })}
+          className="flex h-11 items-center self-start px-0.5 text-[15px] font-semibold text-sky-400"
+        >
+          Team models ›
+        </button>
+      )}
+    </div>
+  );
+
   return (
-    <div className="relative" ref={rootRef}>
+    <div className={sheet ? "relative min-w-0" : "relative"} ref={rootRef}>
       <button
         data-testid="selection-chip"
         type="button"
         disabled={locked}
         title={locked ? "Locked after the first message" : "Switch profile / agent / team model"}
         onClick={toggle}
-        className="flex items-center gap-1 rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1 text-xs text-zinc-300 transition-colors hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-zinc-900"
+        className={
+          sheet
+            ? "flex h-[26px] max-w-full items-center gap-1.5 rounded-full border border-zinc-800 bg-zinc-900 px-3 text-xs text-zinc-400 transition-colors hover:text-zinc-200 disabled:cursor-default disabled:hover:text-zinc-400"
+            : "flex items-center gap-1 rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1 text-xs text-zinc-300 transition-colors hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-zinc-900"
+        }
       >
-        {locked && <span aria-hidden>🔒</span>}
+        {locked && (
+          <span aria-hidden className={sheet ? "text-[11px] leading-none" : undefined}>
+            🔒
+          </span>
+        )}
         {selectedProfile?.origin === "repo" && <span aria-hidden>📁</span>}
         <span
-          className="max-w-[9rem] truncate xl:max-w-[16rem]"
+          className={sheet ? "min-w-0 truncate" : "max-w-[9rem] truncate xl:max-w-[16rem]"}
           title={`${selection.profile} › ${selection.agent} › ${chipModel}`}
         >
           {selectedProfile?.color && (
@@ -252,12 +464,12 @@ export function SelectionChip({
               style={{ backgroundColor: `var(--profile-${selectedProfile.color})` }}
             />
           )}
-          {selection.profile} <span className="text-zinc-600">›</span> {selection.agent}{" "}
-          <span className="text-zinc-600">›</span>{" "}
+          {selection.profile} <span className={sep}>›</span> {selection.agent}{" "}
+          <span className={sep}>{sheet ? "·" : "›"}</span>{" "}
           <span
             data-testid="selection-chip-model"
             data-state={chipModelState}
-            className={chipModelState === "overridden" ? "font-medium text-zinc-100" : "text-zinc-600"}
+            className={chipModelState === "overridden" ? "font-medium text-zinc-100" : sep}
           >
             {chipModel}
           </span>
@@ -271,10 +483,26 @@ export function SelectionChip({
             </span>
           )}
         </span>
-        {!locked && <span className="text-zinc-600">▾</span>}
+        {!locked && <span className={sep}>▾</span>}
       </button>
 
-      {open && !locked && (
+      {open && !locked && sheet && (
+        <Sheet title="Selection" onClose={close}>
+          {nav.pane === "profile" || nav.pane === "agent" ? (
+            segments
+          ) : (
+            <div
+              data-testid="selection-popover"
+              data-pane={nav.pane}
+              className="relative flex max-[800px]:flex-col"
+            >
+              {panes}
+            </div>
+          )}
+        </Sheet>
+      )}
+
+      {open && !locked && !sheet && (
         <div
           data-testid="selection-popover"
           data-pane={nav.pane}
@@ -282,71 +510,7 @@ export function SelectionChip({
             dropUp ? "bottom-full mb-1" : "top-full mt-1"
           }`}
         >
-          {/* Mobile header: one pane at a time, ‹ Back steps up the drill. */}
-          <div className="hidden max-[800px]:flex shrink-0 items-center gap-1.5 border-b border-zinc-800 py-1 pl-1 pr-2">
-            {nav.pane !== "profile" ? (
-              <button
-                data-testid="selection-back"
-                type="button"
-                onClick={back}
-                className="flex shrink-0 items-center gap-1 rounded-md px-2 py-1.5 text-xs text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
-              >
-                ‹ Back
-              </button>
-            ) : (
-              <span className="shrink-0 px-1" />
-            )}
-            <span className="text-[10px] uppercase tracking-wide text-zinc-500">{mobileTitle}</span>
-          </div>
-
-          <div className={`w-44 shrink-0 border-r border-zinc-800 py-1.5 ${nav.pane !== "profile" ? HIDDEN_NARROW : ""}`}>
-            <div data-testid="selection-title-profile" className={TITLE_CLS}>
-              Profile
-            </div>
-            <ProfilePane
-              profiles={profileList}
-              selectedProfile={selection.profile}
-              browsed={browsedProfile.name}
-              pinned={pinned}
-              onBrowse={browse}
-            />
-          </div>
-
-          <div className={`w-60 shrink-0 border-r border-zinc-800 py-1.5 ${nav.pane !== "agent" ? HIDDEN_NARROW : ""}`}>
-            <div data-testid="selection-title-agent" className={TITLE_CLS}>
-              Agent
-            </div>
-            <AgentPane profile={browsedProfile} selection={selection} onPick={pickAgent} />
-          </div>
-
-          <div className={`max-h-[calc(100vh-7rem)] w-64 shrink-0 overflow-y-auto py-1.5 ${nav.pane !== "team" ? HIDDEN_NARROW : ""}`}>
-            <div data-testid="selection-title-team" className={TITLE_CLS}>
-              Team
-            </div>
-            <TeamPane
-              members={teamViews}
-              openMember={nav.pane === "model" ? nav.member : null}
-              showResetAll={anyOverride(team)}
-              onPickMember={pickMember}
-              onResetAll={resetAll}
-            />
-          </div>
-
-          {nav.pane === "model" && memberView && (
-            // Overlays the Profile column at 801–1099 px (it's chosen by then),
-            // a fourth column at ≥1100, static full width at ≤800.
-            <div className="absolute inset-y-0 left-0 z-10 w-56 overflow-y-auto border-r border-zinc-800 bg-zinc-900 py-1.5 min-[1100px]:static min-[1100px]:z-auto min-[1100px]:w-60 min-[1100px]:border-l min-[1100px]:border-r-0 max-[800px]:static max-[800px]:inset-auto max-[800px]:z-auto max-[800px]:w-full max-[800px]:border-r-0">
-              <div data-testid="selection-title-model" className={TITLE_CLS}>
-                Model · {memberView.label}
-              </div>
-              <ModelPane
-                member={memberView}
-                models={models}
-                onPick={pickModel}
-                onReset={resetMember}
-              />
-            </div>
-          )}
+          {panes}
         </div>
       )}
     </div>

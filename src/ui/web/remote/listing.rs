@@ -1,12 +1,14 @@
 //! Remote-profiles T7 — the merged conversation list and kill routing
 //! (design §5.6). Both socket kinds are answered here, locally, never
 //! forwarded: the local rows plus one `GET /api/conversations` per
-//! DISTINCT remote server (concurrent, each ≤ LIST_TIMEOUT). A remote row
-//! is kept only when its `profile` P matches a local remote profile L on
-//! that server, and it is re-tagged with L (RP4 makes the match unique);
-//! everything else — other profiles, profile-less legacy rows — is
-//! dropped. A failing server or a broken global config contributes no
-//! rows: no error marker, and the reply never takes longer than 2 s.
+//! DISTINCT remote server (concurrent, each ≤ LIST_TIMEOUT), and one
+//! `{origin, online}` status per server (the mobile redesign's `machines`).
+//! A remote row is kept only when its `profile` P matches a local remote
+//! profile L on that server, and it is re-tagged with L (RP4 makes the
+//! match unique); everything else — other profiles, profile-less legacy
+//! rows — is dropped. A failing server or a broken global config
+//! contributes no rows and is reported offline: no error marker, and the
+//! reply never takes longer than 2 s.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -15,21 +17,48 @@ use super::DIRECTORY;
 use crate::ui::web::KILL_RUNNING_MSG;
 use crate::ui::web::conversations::local_rows;
 use crate::ui::web::registry::{KillOutcome, SessionRegistry};
-use crate::ui::wire::ConversationSummaryWire;
+use crate::ui::wire::{ConversationSummaryWire, MachineStatusWire, OutboundMessage};
 use uuid::Uuid;
 
 /// §5.6 / §5.12 "list: remote down": the reply never waits past this per
 /// remote server.
 const LIST_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Local rows + every reachable remote's rows, merged by `updated_at` desc.
-pub(crate) async fn merged_items(registry: &SessionRegistry) -> Vec<ConversationSummaryWire> {
+/// The merged list answer: local rows + every reachable remote's rows,
+/// plus one status per distinct origin. This device is implicit — the
+/// SPA's `null` machine — so no "local" entry rides the wire.
+pub(crate) struct Listing {
+    pub(crate) items: Vec<ConversationSummaryWire>,
+    pub(crate) machines: Vec<MachineStatusWire>,
+}
+
+impl Listing {
+    /// The `conversations_list` reply frame (empty `machines` is omitted,
+    /// keeping a no-remote frame byte-identical to the pre-redesign one).
+    pub(crate) fn into_frame(self, error: Option<String>) -> OutboundMessage {
+        OutboundMessage::ConversationsList {
+            items: self.items,
+            machines: self.machines,
+            error,
+        }
+    }
+}
+
+/// Local rows + every reachable remote's rows, merged by `updated_at`
+/// desc, plus one status per distinct origin in BTreeMap order (the SPA
+/// re-orders by catalog). `online` is true iff the list answered within
+/// LIST_TIMEOUT — a dial error, a 401, any list failure or the timeout
+/// all mean offline.
+pub(crate) async fn merged_listing(registry: &SessionRegistry) -> Listing {
     let mut items = local_rows(registry);
 
     // §5.11: a fresh global-config parse on every request; a broken file
-    // means no remote rows.
+    // means no remote rows and no known machines.
     let Ok(refs) = DIRECTORY.remotes() else {
-        return items;
+        return Listing {
+            items,
+            machines: Vec::new(),
+        };
     };
 
     // One fetch per distinct server (RP4): origin → (target profile P →
@@ -42,7 +71,7 @@ pub(crate) async fn merged_items(registry: &SessionRegistry) -> Vec<Conversation
             .insert(r.target.clone(), r.name.clone());
     }
 
-    let fetches = servers.into_values().map(|targets| {
+    let fetches = servers.into_iter().map(|(origin, targets)| {
         // Any profile's client reaches that server (the token is the
         // server's), so one of its names picks the client.
         let client_name = targets
@@ -52,34 +81,40 @@ pub(crate) async fn merged_items(registry: &SessionRegistry) -> Vec<Conversation
             .expect("a server has ≥1 profile");
         async move {
             // The bound covers the client build too (a first-use CA
-            // bootstrap must not push the reply past LIST_TIMEOUT).
-            let rows = tokio::time::timeout(LIST_TIMEOUT, async {
-                let Ok(client) = DIRECTORY.client(&client_name).await else {
-                    return Vec::new();
-                };
-                client.list().await.unwrap_or_default()
-            })
-            .await
-            .unwrap_or_default();
-            rows.into_iter()
+            // bootstrap must not push the reply past LIST_TIMEOUT); a
+            // failure at any step is a `None`, which reports offline.
+            let fetched: Option<Vec<ConversationSummaryWire>> =
+                tokio::time::timeout(LIST_TIMEOUT, async {
+                    let Ok(client) = DIRECTORY.client(&client_name).await else {
+                        return None;
+                    };
+                    client.list().await.ok()
+                })
+                .await
+                .ok()
+                .flatten();
+            let online = fetched.is_some();
+            let rows = fetched
+                .into_iter()
+                .flatten()
                 .filter_map(|mut row| {
                     targets.get(row.profile.as_deref()?).map(|local_name| {
                         row.profile = Some(local_name.clone());
                         row
                     })
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (origin, rows, online)
         }
     });
 
-    items.extend(
-        futures::future::join_all(fetches)
-            .await
-            .into_iter()
-            .flatten(),
-    );
+    let mut machines = Vec::new();
+    for (origin, rows, online) in futures::future::join_all(fetches).await {
+        machines.push(MachineStatusWire { id: origin, online });
+        items.extend(rows);
+    }
     items.sort_by_key(|row| std::cmp::Reverse(parse_updated_at(&row.updated_at)));
-    items
+    Listing { items, machines }
 }
 
 /// `kill_session{convo, profile}` (design §5.6), routed by `profile`: a
@@ -92,7 +127,7 @@ pub(crate) async fn answer_kill(
     registry: &SessionRegistry,
     convo: &str,
     profile: Option<&str>,
-) -> Option<(Vec<ConversationSummaryWire>, Option<String>)> {
+) -> Option<(Listing, Option<String>)> {
     let Ok(id) = Uuid::parse_str(convo) else {
         return None;
     };
@@ -108,8 +143,8 @@ pub(crate) async fn answer_kill(
     }) else {
         // The local path, unchanged: KILL_RUNNING_MSG on a refused kill.
         let refused = registry.kill(id) == KillOutcome::Running;
-        let items = merged_items(registry).await;
-        return Some((items, refused.then(|| KILL_RUNNING_MSG.to_string())));
+        let listing = merged_listing(registry).await;
+        return Some((listing, refused.then(|| KILL_RUNNING_MSG.to_string())));
     };
 
     let error = match DIRECTORY.client(&remote_name).await {
@@ -119,8 +154,8 @@ pub(crate) async fn answer_kill(
         },
         Err(e) => Some(e.to_string()),
     };
-    let items = merged_items(registry).await;
-    Some((items, error))
+    let listing = merged_listing(registry).await;
+    Some((listing, error))
 }
 
 /// RFC 3339 → instant for the merge sort; an unparseable stamp sorts first.

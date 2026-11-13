@@ -1321,8 +1321,8 @@ fn dispatch_inbound(
             let registry = registry.clone();
             let out_tx = out_tx.clone();
             tokio::spawn(async move {
-                let items = remote::listing::merged_items(&registry).await;
-                let _ = out_tx.send(OutboundMessage::ConversationsList { items, error: None });
+                let listing = remote::listing::merged_listing(&registry).await;
+                let _ = out_tx.send(listing.into_frame(None));
             });
             true
         }
@@ -1336,10 +1336,10 @@ fn dispatch_inbound(
             let registry = registry.clone();
             let out_tx = out_tx.clone();
             tokio::spawn(async move {
-                if let Some((items, error)) =
+                if let Some((listing, error)) =
                     remote::listing::answer_kill(&registry, &convo, profile.as_deref()).await
                 {
-                    let _ = out_tx.send(OutboundMessage::ConversationsList { items, error });
+                    let _ = out_tx.send(listing.into_frame(error));
                 }
             });
             true
