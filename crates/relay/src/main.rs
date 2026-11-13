@@ -40,11 +40,51 @@ enum Cmd {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Serve { .. } => {
-            todo!("P2 task 11: tracing init (RUST_LOG, default info) + peakbot_relay::serve")
+        Cmd::Serve { config } => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                )
+                .init();
+            let cfg = peakbot_relay::config::Config::from_file(&config)
+                .map_err(|e| anyhow::anyhow!("config: {e:?}"))?;
+            let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
+            let handle = peakbot_relay::serve(cfg, listener).await?;
+            tracing::info!(addr = %handle.addr, "relay listening");
+            tokio::signal::ctrl_c().await?;
+            handle.shutdown().await;
+            Ok(())
         }
-        Cmd::ResetAccount { .. } => {
-            todo!("P2 task 11: peakbot_relay::reset_account; exit 0/1/2, print counts")
+        Cmd::ResetAccount {
+            config,
+            issuer,
+            subject,
+        } => {
+            use peakbot_relay::store::ResetError;
+            let cfg = peakbot_relay::config::Config::from_file(&config)
+                .map_err(|e| anyhow::anyhow!("config: {e:?}"))?;
+            match peakbot_relay::reset_account(&cfg.db, &issuer, &subject) {
+                Ok(r) => {
+                    println!(
+                        "reset: {} chain entries, {} pending devices, {} letters, {} sessions deleted",
+                        r.chain_entries, r.pending_devices, r.letters, r.sessions
+                    );
+                    Ok(())
+                }
+                Err(ResetError::Locked) => {
+                    eprintln!("relay is running — stop it, then retry");
+                    std::process::exit(2);
+                }
+                Err(ResetError::NoSuchAccount) => {
+                    eprintln!("no such account");
+                    std::process::exit(1);
+                }
+                Err(ResetError::Db(e)) => {
+                    eprintln!("db error: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }

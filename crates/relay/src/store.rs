@@ -155,12 +155,13 @@ UPDATE schema_version SET version = 1;
 /// Map a rusqlite failure: `SQLITE_BUSY` under the exclusive lock is the
 /// "another relay owns the DB" condition (design §1).
 fn map_open_err(e: rusqlite::Error) -> OpenError {
-    if let rusqlite::Error::SqliteFailure(info, _) = &e {
-        if info.code == rusqlite::ErrorCode::DatabaseBusy
-            || info.code == rusqlite::ErrorCode::DatabaseLocked
-        {
-            return OpenError::Locked;
-        }
+    if let rusqlite::Error::SqliteFailure(info, _) = &e
+        && matches!(
+            info.code,
+            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+        )
+    {
+        return OpenError::Locked;
     }
     OpenError::Db(e.to_string())
 }

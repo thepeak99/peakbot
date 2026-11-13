@@ -231,10 +231,10 @@ impl RedirectUri {
             }
             return Err(RedirectUriError::Rejected);
         }
-        if let Some(s) = app_scheme {
-            if u.scheme() == s {
-                return Ok(RedirectUri::App(u));
-            }
+        if let Some(s) = app_scheme
+            && u.scheme() == s
+        {
+            return Ok(RedirectUri::App(u));
         }
         Err(RedirectUriError::Rejected)
     }

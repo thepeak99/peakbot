@@ -133,10 +133,10 @@ impl Hub {
     /// Close a registered Pending socket whose pending row expired (§4.7).
     pub fn close_pending(&self, id: DeviceId, code: u16) {
         let mut g = lock(&self.0);
-        if g.conns.get(&id).is_some_and(|c| c.role == Role::Pending) {
-            if let Some(c) = g.conns.remove(&id) {
-                c.close.send_replace(Some(code));
-            }
+        if g.conns.get(&id).is_some_and(|c| c.role == Role::Pending)
+            && let Some(c) = g.conns.remove(&id)
+        {
+            c.close.send_replace(Some(code));
         }
     }
 }

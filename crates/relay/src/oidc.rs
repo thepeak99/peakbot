@@ -274,7 +274,7 @@ fn select_key<'a>(
     let candidates = jwks
         .keys
         .iter()
-        .filter(|j| kid.map_or(true, |k| j.common.key_id.as_deref() == Some(k)))
+        .filter(|j| kid.is_none_or(|k| j.common.key_id.as_deref() == Some(k)))
         .filter(|j| jwk_matches(j, kty))
         .collect::<Vec<_>>();
     if candidates.is_empty() {
@@ -288,10 +288,10 @@ fn select_key<'a>(
 
 fn jwk_matches(jwk: &Jwk, kty: &str) -> bool {
     use jsonwebtoken::jwk::{KeyAlgorithm, PublicKeyUse};
-    if let Some(use_) = &jwk.common.public_key_use {
-        if !matches!(use_, PublicKeyUse::Signature) {
-            return false;
-        }
+    if let Some(use_) = &jwk.common.public_key_use
+        && !matches!(use_, PublicKeyUse::Signature)
+    {
+        return false;
     }
     if let Some(alg) = &jwk.common.key_algorithm {
         let want = match kty {
@@ -302,11 +302,11 @@ fn jwk_matches(jwk: &Jwk, kty: &str) -> bool {
             return false;
         }
     }
-    match (&jwk.algorithm, kty) {
-        (jsonwebtoken::jwk::AlgorithmParameters::RSA(_), "RSA") => true,
-        (jsonwebtoken::jwk::AlgorithmParameters::EllipticCurve(_), "EC") => true,
-        _ => false,
-    }
+    use jsonwebtoken::jwk::AlgorithmParameters as P;
+    matches!(
+        (&jwk.algorithm, kty),
+        (P::RSA(_), "RSA") | (P::EllipticCurve(_), "EC")
+    )
 }
 
 /// Discovery document (design §5.3); only the fields the relay consumes.
