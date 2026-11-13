@@ -20,6 +20,33 @@ use uuid::Uuid;
 
 use super::{WsState, conversations, images, uploads};
 
+/// Cloud Mode inbound ops (p3-design §E.1/§E.2): the `InboundHook` target.
+/// Holds no state of its own — it only translates a peer's `Op` onto the
+/// same code paths a browser/token client hits (one task per stream).
+pub(crate) struct CloudServe;
+
+impl CloudServe {
+    /// One task per peer stream (§E.2 table): `Attach` → `serve_socket`
+    /// with `Principal::CloudPeer` (relayed forced, Shutdown dropped);
+    /// `Profiles` → the LOCAL profile list only (§E.3); `List`/`Kill`/
+    /// `Get`/`Upload` → `serve_op`. Upload bytes are counted and the
+    /// stream `Reset(TOO_LARGE)`s past `general.uploads.max_file_mb`
+    /// (§E.4), before the router.
+    pub(crate) fn accept(
+        state: WsState,
+        peer: cloud::DeviceId,
+        op: cloud::frames::Op,
+        stream: crate::cloud::stream::CloudStream,
+    ) {
+        // One task per stream (§E.2). The skeleton's `todo!()` runs inside
+        // the spawned task so a panic cannot take the CloudLink actor down.
+        tokio::spawn(async move {
+            let _ = (state, peer, op, stream);
+            todo!("P3 PR-C: CloudServe::accept (§E.2 op dispatch)")
+        });
+    }
+}
+
 /// The non-Attach ops (mirrors `cloud::Op` minus `Attach`/`Profiles`, §E.2).
 #[derive(Debug)]
 pub(super) enum PeerOp {

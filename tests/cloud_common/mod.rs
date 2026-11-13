@@ -21,4 +21,6 @@
 
 pub mod devices;
 pub mod fake_relay;
+#[cfg(feature = "host")]
+pub mod host;
 pub mod rig;

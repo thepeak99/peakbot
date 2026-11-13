@@ -83,6 +83,11 @@ mod t10_tests;
 #[derive(Debug)]
 pub enum WsStream {
     Direct(tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>),
+    /// The Cloud Mode tunnel (p3-design §F.2): `Frame(s)` ↔ `Text(s)`,
+    /// `End` → stream end, `Reset(code)` → Io error; outgoing `Ping`/`Pong`
+    /// are swallowed (the session layer keeps liveness), `Binary` is a bug
+    /// (the attach protocol is text-only), `Close` → `End`.
+    Cloud(crate::cloud::stream::CloudStream),
 }
 
 impl Stream for WsStream {
@@ -90,6 +95,8 @@ impl Stream for WsStream {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.get_mut() {
             Self::Direct(inner) => Pin::new(inner).poll_next(cx),
+            // §F.2 mapping: Frame ↔ Text, End → None, Reset → Io error.
+            Self::Cloud(_) => todo!("P3 PR-C: WsStream::Cloud Stream mapping (§F.2)"),
         }
     }
 }
@@ -99,21 +106,26 @@ impl Sink<TMsg> for WsStream {
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         match self.get_mut() {
             Self::Direct(inner) => Pin::new(inner).poll_ready(cx),
+            Self::Cloud(_) => todo!("P3 PR-C: WsStream::Cloud Sink mapping (§F.2)"),
         }
     }
     fn start_send(self: Pin<&mut Self>, item: TMsg) -> Result<(), Self::Error> {
         match self.get_mut() {
             Self::Direct(inner) => Pin::new(inner).start_send(item),
+            // §F.2: Text → Frame; Ping/Pong swallowed; Binary → Protocol; Close → End.
+            Self::Cloud(_) => todo!("P3 PR-C: WsStream::Cloud Sink mapping (§F.2)"),
         }
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         match self.get_mut() {
             Self::Direct(inner) => Pin::new(inner).poll_flush(cx),
+            Self::Cloud(_) => todo!("P3 PR-C: WsStream::Cloud Sink mapping (§F.2)"),
         }
     }
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         match self.get_mut() {
             Self::Direct(inner) => Pin::new(inner).poll_close(cx),
+            Self::Cloud(_) => todo!("P3 PR-C: WsStream::Cloud Sink mapping (§F.2)"),
         }
     }
 }
@@ -158,12 +170,28 @@ pub struct Upstream {
 
 enum UpstreamBody {
     Direct(reqwest::Response),
+    /// The Cloud Mode tunnel body (§F.3): the first message must be
+    /// `Head{status,content_type,length}` (else `RemoteError::Protocol`
+    /// semantics — surfaced as a reqwest error here), then `Chunk`s,
+    /// `End` ends, `Reset` → error.
+    Cloud(crate::cloud::stream::CloudStream),
 }
 
 impl Upstream {
+    /// The Cloud Mode body constructor (§F.3): the first message the stream
+    /// yields must be `Head{status,content_type,length}` — anything else is
+    /// a protocol fault. `bytes_stream()` then yields the `Chunk`s.
+    pub fn from_cloud(stream: crate::cloud::stream::CloudStream) -> Self {
+        let _ = stream;
+        todo!("P3 PR-C: Upstream::from_cloud (§F.3)")
+    }
+
     pub fn bytes_stream(self) -> BoxStream<'static, Result<Bytes, reqwest::Error>> {
         match self.body {
             UpstreamBody::Direct(resp) => Box::pin(resp.bytes_stream()),
+            UpstreamBody::Cloud(_) => {
+                todo!("P3 PR-C: UpstreamBody::Cloud bytes_stream (§F.3)")
+            }
         }
     }
 }
@@ -240,6 +268,15 @@ pub enum RemoteError {
     Config {
         message: String,
     },
+    /// Cloud Mode (p3-design §F.7, new in PR-C): the trust chain rejected
+    /// the connection (`Reset(TRUST)` / `Close{TRUST}` / `TrustError`).
+    /// HTTP 502 with its text, like `Auth`.
+    Trust(String),
+    /// Cloud Mode (§F.7): `UnknownDevice` — the same generic 404 an
+    /// unknown remote profile gets.
+    NotFound {
+        name: String,
+    },
 }
 
 /// Android 17 drops LAN dials silently without the "Nearby devices" grant; name the fix.
@@ -297,8 +334,19 @@ impl fmt::Display for RemoteError {
                 f,
                 "config.yaml has an error, so remote profiles are unavailable: {message}"
             ),
+            // §F.7 user texts (locked strings land with the green phase).
+            Self::Trust(e) => write!(f, "cloud trust failure: {e} — re-check devices"),
+            Self::NotFound { name } => write!(f, "no such remote: {name}"),
         }
     }
+}
+
+/// The §F.7 mapping `CloudError` → `RemoteError` (PR-C, where `Trust` is
+/// first used): offline → `Down("device offline")`, trust refusals →
+/// `Auth`/`Trust`, `UnknownDevice` → `NotFound`.
+pub fn from_cloud(err: &crate::cloud::CloudError, name: &str) -> RemoteError {
+    let _ = (err, name);
+    todo!("P3 PR-C: CloudError → RemoteError mapping (§F.7)")
 }
 
 impl StdError for RemoteError {}
@@ -764,6 +812,14 @@ impl DirectClient {
 /// in PR-C. Nothing above the transport learns which one it holds.
 pub enum Client {
     Direct(DirectClient),
+    /// Cloud Mode (p3-design §F.1): a profile on a paired device, dialed
+    /// through the verified chain (`handle.open(device, Op::Attach)` →
+    /// `WsStream::Cloud`). Nothing above the transport learns this exists.
+    Cloud {
+        handle: crate::cloud::CloudHandle,
+        device: cloud::DeviceId,
+        profile: String,
+    },
 }
 
 impl Client {
@@ -774,30 +830,51 @@ impl Client {
     fn direct(&self) -> &DirectClient {
         match self {
             Self::Direct(d) => d,
+            _ => panic!("Client::direct on a Cloud client (PR-C arms must match)"),
         }
     }
 
     /// The connection policy the timeout/auth errors carry (§F.1 `peer()`).
+    /// Cloud: `"profile@device"`, `CLOUD_OP_TIMEOUT` (the same default as a
+    /// remote profile's `timeout` — no new config knob).
     pub fn peer(&self) -> &Peer {
-        &self.direct().peer
+        match self {
+            Self::Direct(d) => &d.peer,
+            Self::Cloud { .. } => todo!("P3 PR-C: Client::Cloud peer (§F.1)"),
+        }
     }
 
+    /// Dial the transport (§F.1): `Direct` = today's WS upgrade; `Cloud` =
+    /// `handle.open(device, Op::Attach)` → `WsStream::Cloud` (the `relayed`
+    /// argument is ignored on the wire — CloudServe forces it, §E.1).
     pub async fn dial(&self) -> Result<WsStream, RemoteError> {
-        self.direct().dial().await
+        match self {
+            Self::Direct(d) => d.dial().await,
+            Self::Cloud { .. } => todo!("P3 PR-C: Client::Cloud dial (§F.1/§F.2)"),
+        }
     }
 
     pub async fn list(&self) -> Result<Vec<ConversationSummaryWire>, RemoteError> {
-        self.direct().list().await
+        match self {
+            Self::Direct(d) => d.list().await,
+            Self::Cloud { .. } => todo!("P3 PR-C: Client::Cloud list (§F.1)"),
+        }
     }
 
     pub async fn kill(&self, id: &Uuid) -> Result<Option<String>, RemoteError> {
-        self.direct().kill(id).await
+        match self {
+            Self::Direct(d) => d.kill(id).await,
+            Self::Cloud { .. } => todo!("P3 PR-C: Client::Cloud kill (§F.1)"),
+        }
     }
 
     /// The typed `GET` at the `/r/` boundary (p3-design §F.4): `Direct`
-    /// renders `path()` to a URL; `Cloud` (PR-C) maps to `Op::Get(…)`.
+    /// renders `path()` to a URL; `Cloud` maps to `Op::Get(…)`.
     pub async fn get(&self, target: GetTarget) -> Result<Upstream, RemoteError> {
-        self.direct().get(&target.path()).await
+        match self {
+            Self::Direct(d) => d.get(&target.path()).await,
+            Self::Cloud { .. } => todo!("P3 PR-C: Client::Cloud get (§F.1/§F.4)"),
+        }
     }
 
     pub async fn post_upload(
@@ -807,9 +884,10 @@ impl Client {
         content_type: Option<HeaderValue>,
         body: reqwest::Body,
     ) -> Result<Upstream, RemoteError> {
-        self.direct()
-            .post_upload(convo, name, content_type, body)
-            .await
+        match self {
+            Self::Direct(d) => d.post_upload(convo, name, content_type, body).await,
+            Self::Cloud { .. } => todo!("P3 PR-C: Client::Cloud upload (§F.1)"),
+        }
     }
 }
 
@@ -817,6 +895,10 @@ impl fmt::Debug for Client {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Direct(d) => d.fmt(f),
+            Self::Cloud { profile, .. } => f
+                .debug_struct("Client::Cloud")
+                .field("profile", profile)
+                .finish_non_exhaustive(),
         }
     }
 }
@@ -830,11 +912,58 @@ type ClientCache = HashMap<String, (Arc<RemoteProfile>, Arc<Client>)>;
 pub struct Directory {
     clients: Mutex<ClientCache>,
     opts: ClientOpts,
+    /// The process-wide Cloud Mode handle (PR-C, §F.5): `None` when
+    /// `general.cloud` is absent (no `profile@device` names resolvable).
+    /// Set once at boot wiring; the LazyLock global picks it up.
+    cloud: Option<crate::cloud::CloudHandle>,
+}
+
+/// The `/r/{name}` URL segment, parsed at the boundary (§F.5): split on
+/// the LAST `@`. No `@` → `Profile` (profile names cannot contain `@` —
+/// already validated in config — so a `profile@device` can never collide
+/// with a config name). `device` is a slug `[a-z0-9-]{1,32}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteName {
+    Profile(String),
+    Cloud { profile: String, device: String },
+}
+
+impl RemoteName {
+    /// Parse a URL segment (percent-decoded) into a name. §F.5: last `@`.
+    pub fn parse(segment: &str) -> Self {
+        let _ = segment;
+        todo!("P3 PR-C: RemoteName::parse (§F.5, split on last @)")
+    }
 }
 
 impl Directory {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            cloud: crate::cloud::boot_handle(),
+            ..Self::default()
+        }
+    }
+
+    /// Test/edge seam: a Directory bound to a specific cloud handle
+    /// (the LazyLock global binds the boot handle at construction).
+    pub fn with_cloud(mut self, cloud: Option<crate::cloud::CloudHandle>) -> Self {
+        self.cloud = cloud;
+        self
+    }
+
+    /// The cloud handle this directory resolves `profile@device` with
+    /// (single source of truth: the verified chain in `CloudState`).
+    pub fn cloud(&self) -> Option<&crate::cloud::CloudHandle> {
+        self.cloud.as_ref()
+    }
+
+    /// §F.5: resolve a name to a `Client`. `Profile` = today's
+    /// `client(name)`; `Cloud` = state must be `Active` (else `Down`/
+    /// `Trust`) → slug lookup in `devices` (missing → `NotFound`) →
+    /// `Client::Cloud`. Self is never listed.
+    pub async fn resolve(&self, name: &RemoteName) -> Result<Client, RemoteError> {
+        let _ = name;
+        todo!("P3 PR-C: Directory::resolve (§F.5)")
     }
 
     pub async fn client(&self, name: &str) -> Result<Arc<Client>, RemoteError> {

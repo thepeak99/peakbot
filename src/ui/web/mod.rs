@@ -94,6 +94,13 @@ mod cloud_serve;
 // /api/cloud/* (p3-design §H): both editions, merged inside the token
 // layer by WebUi::router (B7/B8).
 pub mod cloud_api;
+/// PR-C: the controller's transport types, public for the e2e harness and
+/// the Local embed (the `remote` module itself stays private).
+pub mod remote_types {
+    pub use super::remote::{
+        Client, Directory, GetTarget, RemoteError, RemoteName, Upstream, WsStream, from_cloud,
+    };
+}
 mod images;
 mod notify;
 pub mod registry;
@@ -293,6 +300,27 @@ impl WebUi {
     pub fn with_cloud(mut self, cloud: Option<crate::cloud::CloudHandle>) -> Self {
         self.cloud = cloud;
         self
+    }
+
+    /// Per-core remote `Directory` (PR-C test/embed seam). The remote
+    /// routes read the process-global `DIRECTORY` today, so two cores in
+    /// ONE process would share one cloud handle. Green phase: store it in
+    /// `WsState` and have relay/proxy/listing prefer it over the global
+    /// (default = the global). The skeleton accepts and ignores it.
+    pub fn with_directory(self, directory: std::sync::Arc<remote::Directory>) -> Self {
+        let _ = directory;
+        self
+    }
+
+    /// The CloudServe inbound hook (p3-design §E): boot wiring passes it to
+    /// `cloud::spawn`. Host only — the Local edition has no CloudServe
+    /// (a phone answers every inbound with `Close{PROTOCOL}`, B8).
+    #[cfg(feature = "host")]
+    pub fn cloud_inbound(&self) -> Option<crate::cloud::InboundHook> {
+        let state = self.ws_state.clone();
+        Some(std::sync::Arc::new(move |peer, op, stream| {
+            cloud_serve::CloudServe::accept(state.clone(), peer, op, stream)
+        }))
     }
 
     /// H.3: the cloud mutations are gated by the same predicate as the

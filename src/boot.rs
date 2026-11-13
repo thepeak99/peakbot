@@ -147,6 +147,24 @@ pub fn web_boot(web: WebBoot, session: WebSession) -> anyhow::Result<WebUi> {
     ))
 }
 
+/// Boot wiring (p3-design §B, PR-C): `general.cloud` present ⇒ spawn the
+/// process-wide CloudLink (and publish it via `cloud::set_boot_handle` so
+/// the remote `Directory` can resolve `profile@device`); absent ⇒ `None`
+/// (the web API answers `cloud_disabled`). `state_dir` and `store` are
+/// injected: `paths::init_roots` is process-global, so per-core state is
+/// never derived from roots in tests. `inbound` = `WebUi::cloud_inbound()`
+/// (host) or `None` (Local edition).
+pub fn boot_cloud(
+    config: &Config,
+    state_dir: PathBuf,
+    device_name: &str,
+    store: Arc<dyn crate::cloud::SeedStore>,
+    inbound: Option<crate::cloud::InboundHook>,
+) -> Option<crate::cloud::CloudHandle> {
+    let _ = (config, state_dir, device_name, store, inbound);
+    todo!("P3 PR-C: boot wiring — spawn CloudLink when general.cloud is set")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

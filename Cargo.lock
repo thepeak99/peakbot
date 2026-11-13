@@ -5198,6 +5198,7 @@ dependencies = [
  "pdf_oxide",
  "peakbot",
  "peakbot-cloud",
+ "peakbot-relay",
  "percent-encoding",
  "perma-crypto",
  "portable-pty",
