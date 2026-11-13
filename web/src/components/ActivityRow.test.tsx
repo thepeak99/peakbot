@@ -270,6 +270,57 @@ describe("ActivityRow — AR5: tapping a count opens its panel", () => {
   });
 });
 
+describe("ActivityRow — AR8: the '·' separators (batch 1, B18)", () => {
+  // DOM order of the row's meaningful children: segment testids plus the
+  // '·' separators. Decorative children (the pulse dot, glyphs) carry no
+  // testid and no '·' text, so they drop out of the sequence.
+  const seqOf = (el: HTMLDivElement): string[] =>
+    [...q(el, "activity-row")!.children]
+      .map((c) => {
+        const id = (c as HTMLElement).getAttribute("data-testid");
+        if (id) return id;
+        return (c as HTMLElement).textContent?.trim() === "·" ? "·" : null;
+      })
+      .filter((x): x is string => x !== null);
+
+  it("a '·' separator (aria-hidden) sits between the label and each count, and between the counts", async () => {
+    const el = await mountLine(
+      { kind: "working" },
+      counts({ tasks: 2, todosDone: 1, todosTotal: 3 }),
+    );
+    expect(q(el, "activity-label"), "the working label renders").not.toBeNull();
+    const seps = Array.from(
+      q(el, "activity-row")!.querySelectorAll("span[aria-hidden]"),
+    ).filter((s) => (s.textContent ?? "").trim() === "·");
+    expect(seps.length, "one separator between each pair of segments").toBe(2);
+    seps.forEach((s) =>
+      expect(s.getAttribute("aria-hidden"), "the separators are aria-hidden").toBe("true"),
+    );
+    expect(seqOf(el), "the row reads label, ·, tasks, ·, todos").toEqual([
+      "activity-label",
+      "·",
+      "activity-tasks",
+      "·",
+      "activity-todos",
+    ]);
+  });
+
+  it("idle: a lone count stands alone, two counts keep exactly one '·' between them", async () => {
+    const lone = await mountLine({ kind: "idle" }, counts({ tasks: 2 }));
+    expect(seqOf(lone), "no separator around a lone count").toEqual(["activity-tasks"]);
+
+    const pair = await mountLine(
+      { kind: "idle" },
+      counts({ tasks: 2, todosDone: 1, todosTotal: 3 }),
+    );
+    expect(seqOf(pair), "the counts read tasks, ·, todos").toEqual([
+      "activity-tasks",
+      "·",
+      "activity-todos",
+    ]);
+  });
+});
+
 describe("ActivityRow — AR6/AR7: one compact row", () => {
   it("the line root is a single non-wrapping row (flex-nowrap + whitespace-nowrap)", async () => {
     const el = await mountLine({ kind: "working" }, counts({ tasks: 12, todosDone: 10, todosTotal: 11 }));

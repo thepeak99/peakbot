@@ -1894,3 +1894,127 @@ describe("Composer — hidden prop: textarea auto-grow", () => {
     expect(textareaOf(el).style.height).toBe("64px");
   });
 });
+
+// ─── Batch 1: the phone contract (phone: true) ───────────────────────────
+//
+// The `phone` prop (default false; App derives it as `!isDesktop`) switches
+// the shared Composer to the mock's phone face (fix-plan §3, items 1.2,
+// 1.12–1.20). The desktop contract above is untouched: `phone` false or
+// absent renders today's DOM exactly (R1).
+//
+// RED until the prop lands: `Composer` has no `phone` prop, the root has no
+// `data-testid="composer"`, the placeholder is "Type a message…" and an
+// idle empty box always shows a disabled Send — the phone assertions below
+// fail on that missing behaviour, not on setup.
+
+function phoneMount(props: ComposerProps): Promise<HTMLDivElement> {
+  return mount({ ...props, phone: true } as unknown as ComposerProps);
+}
+
+const composerRootTestid = (el: HTMLElement): HTMLElement | null =>
+  el.querySelector('[data-testid="composer"]');
+
+const textareaPlaceholder = (el: HTMLElement): string =>
+  el.querySelector("textarea")?.getAttribute("placeholder") ?? "";
+
+describe("Composer — phone (phone: true)", () => {
+  it("idle and empty: no Send button; typing shows a 'Send' button (B28)", async () => {
+    const el = await phoneMount(makeProps({ isRunning: false }));
+    expect(
+      buttonWithText(el, "Send"),
+      "an idle, empty phone composer shows no dispatch button",
+    ).toBeNull();
+    expect(buttonWithText(el, "Queue")).toBeNull();
+
+    await typeInto(el.querySelector("textarea")!, "hello");
+    expect(
+      buttonWithText(el, "Send"),
+      "typing text brings the 'Send' button back",
+    ).not.toBeNull();
+  });
+
+  it("placeholder reads 'Message' idle, 'Queue a message…' running, 'Connecting…' offline, 'Message the orchestrator…' while watching (B25)", async () => {
+    expect(textareaPlaceholder(await phoneMount(makeProps()))).toBe("Message");
+    expect(
+      textareaPlaceholder(await phoneMount(makeProps({ isRunning: true }))),
+    ).toBe("Queue a message…");
+    expect(
+      textareaPlaceholder(await phoneMount(makeProps({ connected: false }))),
+    ).toBe("Connecting…");
+    expect(
+      textareaPlaceholder(await phoneMount(makeProps({ watchingRole: "researcher" }))),
+    ).toBe("Message the orchestrator…");
+  });
+
+  it("running and empty: Pause/Stop by aria-label, no Send; running with text: a 'Queue' button (B26–B28)", async () => {
+    const props = makeProps({ isRunning: true, subAgent: subAgent("running") });
+    let el = await phoneMount(props);
+    expect(controlByName(el, "Pause"), "Pause is present while working").not.toBeNull();
+    expect(controlByName(el, "Stop"), "Stop is present while working").not.toBeNull();
+    expect(buttonWithText(el, "Send"), "no Send while running").toBeNull();
+    expect(buttonWithText(el, "Queue"), "no Queue while empty").toBeNull();
+
+    el = await phoneMount(props);
+    await typeInto(el.querySelector("textarea")!, "queue me");
+    expect(
+      buttonWithText(el, "Queue"),
+      "running with text shows the 'Queue' button",
+    ).not.toBeNull();
+    expect(controlByName(el, "Stop")).toBeNull();
+  });
+
+  it("the root carries the bottom safe-area inset (B29)", async () => {
+    const el = await phoneMount(makeProps());
+    const composer = composerRootTestid(el);
+    expect(
+      composer,
+      'the composer root carries data-testid="composer"',
+    ).not.toBeNull();
+    // The class IS the contract here (jsdom has no env() to resolve): the
+    // phone bottom padding is env(safe-area-inset-bottom) + 18px.
+    expect(
+      composer!.className,
+      "the composer region pads out the bottom safe area",
+    ).toContain("safe-area-inset-bottom");
+  });
+
+  it("the watch note renders outside the pill and its Clear calls onClearWatch (B30)", async () => {
+    const onClearWatch = vi.fn();
+    const el = await phoneMount(makeProps({ watchingRole: "researcher", onClearWatch }));
+    const note = el.querySelector('[data-testid="composer-watch-note"]');
+    expect(note, "the watching note renders on the phone").not.toBeNull();
+    expect(note!.textContent).toContain("your message goes to the orchestrator");
+    // Above the pill: the first child of the relative wrapper, not inside
+    // the input box.
+    const box = el.querySelector(".rounded-xl");
+    expect(box, "the composer pill renders").not.toBeNull();
+    expect(
+      note!.parentElement?.contains(box) && note === note.parentElement!.firstElementChild,
+      "the note is the first child of the wrapper, above the pill",
+    ).toBe(true);
+    expect(box!.contains(note), "the note is NOT inside the pill").toBe(false);
+
+    const clear = Array.from(note!.querySelectorAll("button")).find(
+      (b) => (b.textContent ?? "").trim() === "Clear",
+    );
+    expect(clear, "the note carries a 'Clear' button").not.toBeNull();
+    await click(clear!);
+    expect(onClearWatch).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── Batch 1: desktop lock (R1) ──────────────────────────────────────────
+
+describe("Composer — desktop lock (R1): phone absent keeps the old contract", () => {
+  it("without phone the placeholder stays 'Type a message…' and an empty idle box still shows a disabled 'Send'", async () => {
+    const el = await mount(makeProps());
+    expect(textareaPlaceholder(el)).toBe("Type a message…");
+    const send = buttonWithText(el, "Send");
+    expect(send, "the idle desktop box keeps its 'Send' button").not.toBeNull();
+    expect(send!.disabled, "with no content it is disabled, as today").toBe(true);
+    expect(
+      el.querySelector('[data-testid="composer"]'),
+      "no phone-only root testid on the desktop render",
+    ).toBeNull();
+  });
+});

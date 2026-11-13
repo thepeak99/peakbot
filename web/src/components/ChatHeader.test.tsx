@@ -105,6 +105,18 @@ describe("ChatHeader — H1–H6", () => {
     expect(el.querySelector('[data-testid="chat-back-badge"]')).not.toBeNull();
   });
 
+  it("the back badge stays when badge is true (batch 1 keep-R, B3)", async () => {
+    const el = await render({ badge: true });
+    const dot = el.querySelector('[data-testid="chat-back-badge"]');
+    expect(dot, "the unread/running dot is kept on the back button").not.toBeNull();
+    // It stays a DOT: 8px round, and it sits inside the back button (the
+    // batch 1 restyle moves it onto the chevron, never deletes it).
+    expect(dot!.classList.contains("h-2")).toBe(true);
+    expect(dot!.classList.contains("w-2")).toBe(true);
+    expect(dot!.classList.contains("rounded-full")).toBe(true);
+    expect(el.querySelector('button[data-testid="chat-back"]')!.contains(dot)).toBe(true);
+  });
+
   it("H3: the title truncates and the subtitle hosts the selector node", async () => {
     const el = await render({ title: "Fix the WS relay" });
     const title = el.querySelector('[data-testid="chat-title"]');
@@ -138,7 +150,7 @@ describe("ChatHeader — H1–H6", () => {
     expect(el.querySelector('[data-testid="selection-chip"]')).toBeNull();
   });
 
-  it("H4: state is offline (wins), then working, then connected", async () => {
+  it("H4: state is offline (wins), then working, then nothing when connected and idle", async () => {
     let el = await render({ connected: false, isRunning: true });
     let state = el.querySelector('[data-testid="chat-state"]');
     expect(state!.getAttribute("data-state"), "offline wins over working").toBe("offline");
@@ -155,9 +167,14 @@ describe("ChatHeader — H1–H6", () => {
     ).toContain("working…");
     expect(state!.querySelector(".animate-spin"), "the spinner renders").not.toBeNull();
 
+    // Batch 1 (B10): connected and idle renders NOTHING — the mock shows no
+    // state node, and the idle dot was never on the keep list (the offline
+    // text and the working spinner are).
     el = await render({ connected: true, isRunning: false });
-    state = el.querySelector('[data-testid="chat-state"]');
-    expect(state!.getAttribute("data-state")).toBe("connected");
+    expect(
+      el.querySelector('[data-testid="chat-state"]'),
+      "connected and idle renders no chat-state node",
+    ).toBeNull();
   });
 
   it("H5: the focus button reflects focusMode via aria-pressed and calls onToggleFocus", async () => {
@@ -182,7 +199,9 @@ describe("ChatHeader — H1–H6", () => {
     const header = el.querySelector("header");
     expect(header, "a header element must render").not.toBeNull();
     expect(header!.classList.contains("min-h-14")).toBe(true);
-    expect(header!.className).toContain("pt-[env(safe-area-inset-top)]");
+    // Batch 1 (B1): the top inset is the satop+10 calc, so the class carries
+    // env(safe-area-inset-top) without pinning the bare form.
+    expect(header!.className).toContain("safe-area-inset-top");
     expect(el.querySelector('button[aria-label="Settings"]'), "no gear").toBeNull();
     expect(el.querySelector('[data-testid="panels-button"]'), "no panels button without `panels`").toBeNull();
 
@@ -201,5 +220,26 @@ describe("ChatHeader — H1–H6", () => {
     const el = await render({ panels: { count: 0, onOpen: () => {} } });
     expect(el.querySelector('[data-testid="panels-button"]')).not.toBeNull();
     expect(el.querySelector('[data-testid="panels-badge"]')).toBeNull();
+  });
+
+  it("the right cluster order is state, focus, panels (batch 1, X3/B9)", async () => {
+    const el = await render({ isRunning: true, panels: { count: 1, onOpen: () => {} } });
+    const cluster = el.querySelector("header > div:last-of-type");
+    expect(cluster, "the right cluster is the header's last child").not.toBeNull();
+    // The three members in DOM order. The mock is [state][focus][panels]
+    // (proto:376-382); the header must follow it.
+    const names = [...cluster!.children].map((n) => {
+      const c = n as HTMLElement;
+      const id = c.getAttribute("data-testid");
+      if (id === "chat-state") return "state";
+      if (id === "panels-button") return "panels";
+      if (c.matches('button[aria-label="Focus mode"]')) return "focus";
+      return `?${c.tagName}`;
+    });
+    expect(names, "the cluster reads state, focus, panels").toEqual([
+      "state",
+      "focus",
+      "panels",
+    ]);
   });
 });
