@@ -63,6 +63,10 @@ struct Inner {
     ws_gate: AtomicBool,
     ws_gate_released: tokio::sync::Notify,
     next_letter: std::sync::atomic::AtomicU64,
+    /// Next N `ChainAppend`s answer `CONFLICT` without storing.
+    conflicts: std::sync::atomic::AtomicU32,
+    /// `POST /logout` answers 500 (the offline-logout case).
+    fail_logout: AtomicBool,
     // The relay origin string (Hello tbs input); set at spawn.
     origin: std::sync::Mutex<Option<String>>,
 }
@@ -160,6 +164,8 @@ impl FakeRelay {
             ws_gate: AtomicBool::new(false),
             ws_gate_released: tokio::sync::Notify::new(),
             next_letter: std::sync::atomic::AtomicU64::new(1),
+            conflicts: std::sync::atomic::AtomicU32::new(0),
+            fail_logout: AtomicBool::new(false),
             origin: std::sync::Mutex::new(None),
         });
         let app = router(inner.clone());
@@ -213,6 +219,25 @@ impl FakeRelay {
         for stop in self.inner.conns.lock().expect("conns").values() {
             stop.store(true, Ordering::SeqCst);
         }
+    }
+
+    /// Is this token still accepted by `/ws`?
+    pub fn token_valid(&self, token: &str) -> bool {
+        self.inner
+            .tokens
+            .lock()
+            .expect("tokens")
+            .contains_key(token)
+    }
+
+    /// The next `n` `ChainAppend`s answer `CONFLICT` (head moved race).
+    pub fn conflict_next_appends(&self, n: u32) {
+        self.inner.conflicts.store(n, Ordering::SeqCst);
+    }
+
+    /// Make `POST /logout` fail with 500 (offline-logout).
+    pub fn fail_logout(&self, on: bool) {
+        self.inner.fail_logout.store(on, Ordering::SeqCst);
     }
 
     /// Revoke a token (the 401 → `LoggedOut{Expired}` test).
@@ -410,6 +435,9 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
 }
 
 async fn logout(State(inner): State<Arc<Inner>>, headers: HeaderMap) -> StatusCode {
+    if inner.fail_logout.load(Ordering::SeqCst) {
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
     match bearer(&headers) {
         Some(token) => {
             if inner
@@ -676,6 +704,16 @@ async fn dispatch(
         }
         ToRelay::ChainAppend { entry } => {
             inner.log("ChainAppend");
+            if inner
+                .conflicts
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                let _ = out_tx.send(FromRelay::Error {
+                    code: constants::relay_error::CONFLICT,
+                });
+                return;
+            }
             let Some(sender) = *id else {
                 let _ = out_tx.send(FromRelay::Error {
                     code: constants::relay_error::NOT_PERMITTED,

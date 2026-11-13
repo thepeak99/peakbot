@@ -72,3 +72,40 @@ pub fn revoke_entry<R: CryptoRng>(
 pub fn sas_for(card: &[u8], frozen: &Head) -> sas::SasWords {
     todo!("p3 PR-B: sas_for")
 }
+
+/// Why an enrollment step was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrollError {
+    /// The chain head moved after the card was produced: revealing the SAS
+    /// against the new head would show words the approver cannot match
+    /// (spec §5.5). The caller must re-freeze and repost.
+    HeadMoved,
+}
+
+/// One pending device's enrollment attempt: the head is captured BEFORE
+/// anything is shown (spec §5.5, G.3 step 1) and the SAS is a pure
+/// function of `(card, frozen)`.
+#[derive(Debug, Clone)]
+pub struct EnrollAttempt {
+    frozen: Head,
+    card: Vec<u8>,
+    sas: sas::SasWords,
+}
+
+impl EnrollAttempt {
+    /// Freeze `chain.head` and compute the words for `card`.
+    pub fn freeze(chain: &VerifiedChain, card: &DeviceCard) -> Self {
+        todo!("p3 PR-B: EnrollAttempt::freeze")
+    }
+
+    /// The frozen head (the letter ships exactly this).
+    pub fn frozen(&self) -> Head {
+        todo!("p3 PR-B: EnrollAttempt::frozen")
+    }
+
+    /// Reveal the words, but only while `current` is still the frozen
+    /// head; a moved head is an error, not a silent re-derivation.
+    pub fn reveal(&self, current: &Head) -> Result<sas::SasWords, EnrollError> {
+        todo!("p3 PR-B: EnrollAttempt::reveal")
+    }
+}

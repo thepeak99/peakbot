@@ -21,3 +21,4 @@
 
 pub mod devices;
 pub mod fake_relay;
+pub mod rig;
