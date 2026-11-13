@@ -140,7 +140,8 @@ fn profiles_body(state: &WsState) -> Vec<u8> {
         })
         .map(|p| serde_json::json!({ "name": p.name, "color": p.color }))
         .collect();
-    serde_json::to_vec(&serde_json::json!({ "profiles": rows })).unwrap_or_default()
+    // The wire body is the bare array the actor parses (`Vec<ProfileInfo>`).
+    serde_json::to_vec(&rows).unwrap_or_default()
 }
 
 /// §E.4: buffer the peer's `Chunk`s until `End`, `Reset(TOO_LARGE)` as soon

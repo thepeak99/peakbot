@@ -978,8 +978,7 @@ async fn serve_socket<Si, St, E>(
     if let Some(p) = profile.as_deref() {
         let name = remote::RemoteName::parse(p);
         if let remote::RemoteName::Cloud {
-            profile: target,
-            ..
+            profile: target, ..
         } = &name
         {
             match state.directory.resolve(&name).await {
@@ -1522,7 +1521,14 @@ mod tests {
     #[test]
     fn inbound_pause_maps_to_pause_sub_agent_action() {
         let (tx, mut rx, out_tx, sm, registry) = dispatch_fixture();
-        let kept = dispatch_inbound(r#"{"type":"pause"}"#, &tx, &out_tx, &sm, &registry, &std::sync::Arc::new(remote::Directory::new()));
+        let kept = dispatch_inbound(
+            r#"{"type":"pause"}"#,
+            &tx,
+            &out_tx,
+            &sm,
+            &registry,
+            &std::sync::Arc::new(remote::Directory::new()),
+        );
         assert!(kept, "pause frame must keep the socket loop alive");
         assert!(
             matches!(rx.try_recv().unwrap(), UiAction::PauseSubAgent),
@@ -1533,7 +1539,14 @@ mod tests {
     #[test]
     fn inbound_resume_maps_to_resume_sub_agent_action() {
         let (tx, mut rx, out_tx, sm, registry) = dispatch_fixture();
-        let kept = dispatch_inbound(r#"{"type":"resume"}"#, &tx, &out_tx, &sm, &registry, &std::sync::Arc::new(remote::Directory::new()));
+        let kept = dispatch_inbound(
+            r#"{"type":"resume"}"#,
+            &tx,
+            &out_tx,
+            &sm,
+            &registry,
+            &std::sync::Arc::new(remote::Directory::new()),
+        );
         assert!(kept, "resume frame must keep the socket loop alive");
         assert!(
             matches!(rx.try_recv().unwrap(), UiAction::ResumeSubAgent),
@@ -1576,7 +1589,14 @@ mod tests {
         // landed between SendMessage and SwitchModel; Stop must not have
         // drifted.
         let (tx, mut rx, out_tx, sm, registry) = dispatch_fixture();
-        let kept = dispatch_inbound(r#"{"type":"stop"}"#, &tx, &out_tx, &sm, &registry, &std::sync::Arc::new(remote::Directory::new()));
+        let kept = dispatch_inbound(
+            r#"{"type":"stop"}"#,
+            &tx,
+            &out_tx,
+            &sm,
+            &registry,
+            &std::sync::Arc::new(remote::Directory::new()),
+        );
         assert!(kept);
         assert!(matches!(rx.try_recv().unwrap(), UiAction::RequestStop));
     }

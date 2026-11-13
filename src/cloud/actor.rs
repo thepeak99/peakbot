@@ -2180,48 +2180,53 @@ impl Actor {
                 return;
             }
         };
-        // The peer answers `Head, Chunk*, End` (mux S4); a `Reset` is a
-        // refusal (a `Close{TRUST}` maps to the PROTOCOL reset code).
-        let mut body = Vec::new();
-        let result =
-            tokio::time::timeout(Duration::from_secs(constants::HANDSHAKE_TIMEOUT), async {
-                let mut status = 0u16;
-                loop {
-                    match stream.next().await {
-                        Some(StreamMsg::Head { status: s, .. }) => status = s,
-                        Some(StreamMsg::Chunk(c)) => body.extend(c),
-                        Some(StreamMsg::End) => break,
-                        Some(StreamMsg::Reset(code)) => return Err(CloudError::Reset(code)),
-                        Some(_) => {}
-                        None => return Err(CloudError::Offline),
+        // The read-reply dance runs OFF the actor loop: while it awaits the
+        // peer's `Head`, the loop must stay free to forward the socket
+        // frames CloudServe answers with (D: one owner, never blocked).
+        tokio::spawn(async move {
+            // The peer answers `Head, Chunk*, End` (mux S4); a `Reset` is a
+            // refusal (a `Close{TRUST}` maps to the PROTOCOL reset code).
+            let mut body = Vec::new();
+            let result =
+                tokio::time::timeout(Duration::from_secs(constants::HANDSHAKE_TIMEOUT), async {
+                    let mut status = 0u16;
+                    loop {
+                        match stream.next().await {
+                            Some(StreamMsg::Head { status: s, .. }) => status = s,
+                            Some(StreamMsg::Chunk(c)) => body.extend(c),
+                            Some(StreamMsg::End) => break,
+                            Some(StreamMsg::Reset(code)) => return Err(CloudError::Reset(code)),
+                            Some(_) => {}
+                            None => return Err(CloudError::Offline),
+                        }
                     }
+                    if status != 200 {
+                        return Err(CloudError::Io(format!("peer answered {status}")));
+                    }
+                    Ok(())
+                })
+                .await;
+            match result {
+                Ok(Ok(())) => {
+                    let profiles: Vec<crate::cloud::session::ProfileInfo> =
+                        serde_json::from_slice(&body).unwrap_or_default();
+                    let _ = stream.send(StreamMsg::End).await;
+                    let _ = out.send(Ok(profiles));
                 }
-                if status != 200 {
-                    return Err(CloudError::Io(format!("peer answered {status}")));
+                Ok(Err(e)) => {
+                    let _ = stream
+                        .send(StreamMsg::Reset(constants::reset::CANCELLED))
+                        .await;
+                    let _ = out.send(Err(e));
                 }
-                Ok(())
-            })
-            .await;
-        match result {
-            Ok(Ok(())) => {
-                let profiles: Vec<crate::cloud::session::ProfileInfo> =
-                    serde_json::from_slice(&body).unwrap_or_default();
-                let _ = stream.send(StreamMsg::End).await;
-                let _ = out.send(Ok(profiles));
+                Err(_) => {
+                    let _ = stream
+                        .send(StreamMsg::Reset(constants::reset::CANCELLED))
+                        .await;
+                    let _ = out.send(Err(CloudError::Offline));
+                }
             }
-            Ok(Err(e)) => {
-                let _ = stream
-                    .send(StreamMsg::Reset(constants::reset::CANCELLED))
-                    .await;
-                let _ = out.send(Err(e));
-            }
-            Err(_) => {
-                let _ = stream
-                    .send(StreamMsg::Reset(constants::reset::CANCELLED))
-                    .await;
-                let _ = out.send(Err(CloudError::Offline));
-            }
-        }
+        });
     }
 
     /// G.4 step 3, the one retry: refetch (the `CONFLICT` says the head

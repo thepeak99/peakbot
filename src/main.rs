@@ -732,10 +732,62 @@ fn web_facts(
 /// Boot the web UI through the shared [`peakbot::boot::web_boot`] and serve
 /// it until Ctrl+C.
 async fn run_web(web: WebBoot, session: WebSession) -> Result<()> {
+    // PR-C §B: the cloud boot reads the same config the session carries.
+    let cloud_config = match &session {
+        WebSession::Ready(deps) => Some(deps.config.clone()),
+        WebSession::NeedsSetup { .. } => None,
+    };
     let mut ui = peakbot::boot::web_boot(web, session)?;
+    if let Some(config) = cloud_config
+        && let Some(handle) = peakbot::boot::boot_cloud(
+            &config,
+            cloud_state_dir()?,
+            &peakbot::boot::device_name(),
+            cloud_store(&config)?,
+            ui.cloud_inbound(),
+        )
+    {
+        ui = ui.with_cloud(Some(handle));
+    }
     ui.init().await?;
     ui.run().await?;
     ui.shutdown().await
+}
+
+/// `<data dir>/cloud` — the public chain/pin state (p3-design §C).
+fn cloud_state_dir() -> Result<std::path::PathBuf> {
+    let dir = peakbot::paths::app_data_dir()
+        .ok_or_else(|| anyhow::anyhow!("no data dir for the cloud state"))?;
+    Ok(dir.join("cloud"))
+}
+
+/// The boot-time store choice (p3-design §C): OS keyring first, the 0600
+/// file fallback when it is unavailable — never refuse (the headless
+/// server is the primary host use case).
+fn cloud_store(
+    config: &peakbot::config::Config,
+) -> Result<std::sync::Arc<dyn peakbot::cloud::SeedStore>> {
+    use peakbot::cloud::keyring;
+    let Some(def) = &config.general.cloud else {
+        // boot_cloud returns None before the store is touched; the store
+        // is never used, so any valid one will do.
+        return Ok(std::sync::Arc::new(keyring::FileSeedStore::new(
+            std::env::temp_dir(),
+        )));
+    };
+    let Ok(Some(cloud)) = peakbot::cloud::config::parse_cloud(Some(def)) else {
+        // Validated at load; a re-parse failure is a logic bug.
+        anyhow::bail!("general.cloud failed to re-parse");
+    };
+    let probed = keyring::probe(
+        &keyring::OsProbe,
+        &cloud.relay.origin_without_slash(),
+        &cloud_state_dir()?,
+    );
+    if let Some(w) = probed.warning {
+        eprintln!("{w}");
+    }
+    Ok(probed.store)
 }
 
 /// The `tracing` filter directives: `RUST_LOG` verbatim when set, else the mode's

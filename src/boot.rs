@@ -170,6 +170,24 @@ pub fn web_boot(web: WebBoot, session: WebSession) -> anyhow::Result<WebUi> {
     ))
 }
 
+/// The device's name on its card (green phase: the hostname, §B). The
+/// toolchain's `std::env::hostname` is unavailable, so: env vars, then
+/// `/etc/hostname`, then a fixed fallback.
+pub fn device_name() -> String {
+    for var in ["HOSTNAME", "COMPUTERNAME"] {
+        if let Ok(v) = std::env::var(var)
+            && !v.trim().is_empty()
+        {
+            return v.trim().to_string();
+        }
+    }
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "peakbot".to_string())
+}
+
 /// Boot wiring (p3-design §B, PR-C): `general.cloud` present ⇒ spawn the
 /// process-wide CloudLink (and publish it via `cloud::set_boot_handle` so
 /// the remote `Directory` can resolve `profile@device`); absent ⇒ `None`

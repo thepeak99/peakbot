@@ -5,10 +5,15 @@
 //! split-brain. If the keyring later errors, that is a CloudLink error
 //! state — no silent per-call fallback.
 //!
-//! Host-only (the Local edition gets a P5 phone-keystore impl).
+//! The OS keyring is host-only; the 0600 file fallback serves
+//! every edition (the Local phone is controller-only but still a
+//! device with an identity).
 
 use std::io;
-use std::path::{Path, PathBuf};
+#[cfg(feature = "host")]
+use std::path::Path;
+use std::path::PathBuf;
+#[cfg(feature = "host")]
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -16,6 +21,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 
 use super::store::{Seed, SeedStore, SessionToken, write_atomic_0600};
 
+#[cfg(feature = "host")]
 const SERVICE: &str = "peakbot";
 const SECRETS_FILE: &str = "secrets.json";
 
@@ -144,6 +150,7 @@ impl SeedStore for FileSeedStore {
     }
 }
 
+#[cfg(feature = "host")]
 /// The OS-keyring store: service `"peakbot"`, accounts
 /// `"cloud-seed:<relay origin>"` / `"cloud-token:<relay origin>"` (keying
 /// by origin so a relay change never reuses a token for the wrong relay).
@@ -152,6 +159,7 @@ pub struct KeyringSeedStore {
     pub origin: String,
 }
 
+#[cfg(feature = "host")]
 impl KeyringSeedStore {
     fn entry(&self, what: &str) -> io::Result<keyring::Entry> {
         let account = format!("{what}:{}", self.origin);
@@ -159,10 +167,12 @@ impl KeyringSeedStore {
     }
 }
 
+#[cfg(feature = "host")]
 fn keyring_io(e: keyring::Error) -> io::Error {
     io::Error::other(e.to_string())
 }
 
+#[cfg(feature = "host")]
 impl SeedStore for KeyringSeedStore {
     fn load_seed(&self) -> io::Result<Option<Seed>> {
         match self.entry("cloud-seed")?.get_password() {
@@ -213,6 +223,7 @@ impl SeedStore for KeyringSeedStore {
     }
 }
 
+#[cfg(feature = "host")]
 /// Which store the boot probe chose (p3-design §C: made ONCE at boot, so
 /// the two stores never split-brain).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,6 +232,7 @@ pub enum StoreKind {
     File,
 }
 
+#[cfg(feature = "host")]
 /// The seam through which tests mock keyring availability — the real OS
 /// keyring is never touched in tests. Production wires the `keyring`
 /// crate behind it (green phase); `Err` = unavailable (no Secret Service,
@@ -229,6 +241,7 @@ pub trait KeyringProbe {
     fn probe(&self) -> Result<(), String>;
 }
 
+#[cfg(feature = "host")]
 /// The boot-time choice + the one warning to print.
 pub struct Probed {
     pub store: std::sync::Arc<dyn SeedStore>,
@@ -238,6 +251,7 @@ pub struct Probed {
     pub warning: Option<String>,
 }
 
+#[cfg(feature = "host")]
 /// Probe the keyring through `probe`; unavailable ⇒ `FileSeedStore` in
 /// `dir` + the warning (never refuse: the headless server is the primary
 /// host use case).
@@ -263,6 +277,24 @@ pub fn probe(probe: &dyn KeyringProbe, origin: &str, dir: &Path) -> Probed {
                     path.display()
                 )),
             }
+        }
+    }
+}
+
+/// The production probe (green phase): a `NoEntry` answer proves the
+/// backend is reachable; anything else means "unavailable".
+#[cfg(feature = "host")]
+pub struct OsProbe;
+
+#[cfg(feature = "host")]
+impl KeyringProbe for OsProbe {
+    fn probe(&self) -> Result<(), String> {
+        match keyring::Entry::new(SERVICE, "peakbot-cloud") {
+            Ok(entry) => match entry.get_password() {
+                Ok(_) | Err(keyring::Error::NoEntry) => Ok(()),
+                Err(e) => Err(e.to_string()),
+            },
+            Err(e) => Err(e.to_string()),
         }
     }
 }

@@ -167,6 +167,7 @@ enum End {
 /// the browser's attach fields. `registry` only answers the local list.
 /// `client` is the resolved transport (direct or cloud, §F.1); `directory`
 /// answers the list/kill verbs with this core's cloud handle.
+#[allow(clippy::too_many_arguments)] // each arg is a distinct leg of the pump
 pub async fn run<L, E>(
     mut local: L,
     out_tx: OutboundTx,

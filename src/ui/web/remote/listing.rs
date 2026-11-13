@@ -56,7 +56,10 @@ pub(crate) type FetchFuture =
 /// re-orders by catalog). `online` is true iff the list answered within
 /// LIST_TIMEOUT — a dial error, a 401, any list failure or the timeout
 /// all mean offline.
-pub(crate) async fn merged_listing(directory: &Arc<Directory>, registry: &SessionRegistry) -> Listing {
+pub(crate) async fn merged_listing(
+    directory: &Arc<Directory>,
+    registry: &SessionRegistry,
+) -> Listing {
     let mut items = local_rows(registry);
 
     // §5.11: a fresh global-config parse on every request; a broken file

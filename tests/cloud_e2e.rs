@@ -492,7 +492,17 @@ async fn shutdown_from_a_cloud_peer_is_dropped_and_the_computer_keeps_serving() 
     s.send(StreamMsg::Frame(json!({"type":"shutdown"}).to_string()))
         .await
         .expect("send");
-    let f = raw_frame(&mut s).await.expect("the session survives");
+    // Skip benign post-ready frames (`state`, `models_available`) the
+    // server emits around the session, like the serve test (E-C2).
+    let mut f = None;
+    for _ in 0..8 {
+        let g = raw_frame(&mut s).await.expect("the session survives");
+        if g["type"] == "error" {
+            f = Some(g);
+            break;
+        }
+    }
+    let f = f.expect("the refusal frame");
     assert_eq!(f["type"], "error", "refused: {f}");
     assert!(f.to_string().contains("not allowed over Cloud Mode"), "{f}");
 

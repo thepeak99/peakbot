@@ -16,7 +16,6 @@ pub mod session;
 pub mod store;
 pub mod stream;
 
-#[cfg(feature = "host")]
 pub mod keyring;
 
 pub use config::{CloudConfig, CloudDef};
