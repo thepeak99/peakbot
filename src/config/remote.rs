@@ -114,7 +114,6 @@ const URL_SHAPE_MESSAGE: &str = "only scheme://host[:port] — put the token in 
 const URL_LOOPBACK_MESSAGE: &str =
     "remote profiles connect over HTTPS — http is allowed only for 127.0.0.1 / localhost";
 const TOKEN_MESSAGE: &str = "the remote's web token (as printed by its `?token=…` link)";
-const CA_MISSING_MESSAGE: &str = "pin the server's CA (`ca: sha256:…` from its pairing link) or use `ca: system` for a publicly trusted certificate";
 /// p3-design §B: the CA-missing message with the noun parameterised —
 /// remote profiles read "server's", `general.cloud` reads "relay's".
 pub(crate) fn ca_missing(noun: &str) -> String {
@@ -132,39 +131,12 @@ pub fn parse_remote(
     def: &RemoteDef,
     color: Option<TabColor>,
 ) -> Result<RemoteProfile, Vec<RemoteFieldError>> {
-    let mut errors: Vec<RemoteFieldError> = Vec::new();
-    let mut endpoint: Option<Endpoint> = None;
-
-    match parse_origin(&def.url) {
-        Ok(origin) => {
-            if origin.scheme() == "https" {
-                // RP2: https needs a pin or an explicit `system`.
-                match def.ca.as_deref().map(parse_ca) {
-                    Some(Ok(trust)) => endpoint = Some(Endpoint::Tls { origin, trust }),
-                    Some(Err(message)) => errors.push(RemoteFieldError {
-                        field: "ca",
-                        message,
-                    }),
-                    None => errors.push(RemoteFieldError {
-                        field: "ca",
-                        message: CA_MISSING_MESSAGE.to_string(),
-                    }),
-                }
-            } else if def.ca.is_some() {
-                // RP3: plaintext is loopback-only, and it has no CA.
-                errors.push(RemoteFieldError {
-                    field: "ca",
-                    message: CA_HTTP_MESSAGE.to_string(),
-                });
-            } else {
-                endpoint = Some(Endpoint::LoopbackPlain { origin });
-            }
-        }
-        Err(message) => errors.push(RemoteFieldError {
-            field: "url",
-            message,
-        }),
-    }
+    // Same url+ca rules as `general.cloud.relay`; only the noun differs.
+    let (endpoint, mut errors) =
+        match parse_endpoint(&def.url, def.ca.as_deref(), "url", "server's") {
+            Ok(endpoint) => (Some(endpoint), Vec::new()),
+            Err(errors) => (None, errors),
+        };
 
     if !cookie_safe_token(&def.token) {
         errors.push(RemoteFieldError {
@@ -202,18 +174,41 @@ pub fn parse_remote(
     }
 }
 
-/// The url+ca half of `parse_remote` (p3-design §B): the shared
-/// `scheme://host[:port]` + trust-decision validation for remote-profile
-/// endpoints AND `general.cloud.relay`. Collects one error per violation,
-/// keyed `relay` / `ca`. The skeleton defers to the same rules
-/// `parse_origin` / `parse_ca` implement; the green phase folds
-/// `parse_remote` onto this (DRY — the rule is necessarily the same).
+/// The url+ca half of `parse_remote` (p3-design §B), shared by remote
+/// profiles and `general.cloud.relay`: one rule, one code path. One error
+/// per violation, keyed `url_field` / `ca`; `ca_noun` ("server's" /
+/// "relay's") only words the missing-CA message.
 pub(crate) fn parse_endpoint(
     url: &str,
     ca: Option<&str>,
+    url_field: &'static str,
+    ca_noun: &str,
 ) -> Result<Endpoint, Vec<RemoteFieldError>> {
-    let _ = (url, ca);
-    todo!("p3 PR-B: extract the url+ca half of parse_remote")
+    let ca_error = |message: String| {
+        Err(vec![RemoteFieldError {
+            field: "ca",
+            message,
+        }])
+    };
+    let origin = parse_origin(url).map_err(|message| {
+        vec![RemoteFieldError {
+            field: url_field,
+            message,
+        }]
+    })?;
+    if origin.scheme() == "https" {
+        // RP2: https needs a pin or an explicit `system`.
+        match ca.map(parse_ca) {
+            Some(Ok(trust)) => Ok(Endpoint::Tls { origin, trust }),
+            Some(Err(message)) => ca_error(message),
+            None => ca_error(ca_missing(ca_noun)),
+        }
+    } else if ca.is_some() {
+        // RP3: plaintext is loopback-only, and it has no CA.
+        ca_error(CA_HTTP_MESSAGE.to_string())
+    } else {
+        Ok(Endpoint::LoopbackPlain { origin })
+    }
 }
 
 /// `scheme://host[:port]` only (row 4); http is loopback-only (row 3).

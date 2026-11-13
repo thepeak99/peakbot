@@ -55,9 +55,9 @@ pub fn parse_cloud(def: Option<&CloudDef>) -> Result<Option<CloudConfig>, Vec<Re
     let Some(def) = def else {
         return Ok(None);
     };
-    // p3-design §B: the url+ca half of parse_remote, shared (DRY — the rule
-    // is necessarily the same). The skeleton defers to the extracted helper.
-    let relay = crate::config::remote::parse_endpoint(&def.relay, def.ca.as_deref())?;
+    // Same rule as remote profiles by construction (p3-design §B).
+    let relay =
+        crate::config::remote::parse_endpoint(&def.relay, def.ca.as_deref(), "relay", "relay's")?;
     Ok(Some(CloudConfig {
         relay,
         device_name: "device".to_string(),
@@ -72,5 +72,7 @@ pub fn parse_cloud(def: Option<&CloudDef>) -> Result<Option<CloudConfig>, Vec<Re
 /// (p3-design §C): the first 12 lowercase hex chars (6 digest bytes) of the
 /// SHA-256 of the origin string without its trailing slash.
 pub fn origin_slug(origin: &Url) -> String {
-    todo!("p3 PR-B: origin_slug")
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(origin.as_str().trim_end_matches('/').as_bytes());
+    digest[..6].iter().map(|b| format!("{b:02x}")).collect()
 }
