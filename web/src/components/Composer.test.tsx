@@ -2089,7 +2089,7 @@ describe("Composer — phone attach menu icons (phone: true)", () => {
     [0, "camera", "Take a photo"],
     [1, "gallery", "Choose from gallery"],
     [2, "plain", "Pick a file"],
-  ] as const)("clicking the icon of row %i (%s: %s) still fires only that item's input and closes the menu", async (idx, which, _label) => {
+  ] as const)("clicking the icon of row %i (%s: %s) still fires only that item's input and closes the menu", async (idx, which, label) => {
     mockUA(ANDROID_UA);
     const el = await mount({ ...makeProps(), phone: true } as unknown as ComposerProps);
     const [plain, camera, gallery] = fileInputs(el);
@@ -2102,7 +2102,7 @@ describe("Composer — phone attach menu icons (phone: true)", () => {
     await click(attachButtonOf(el)!);
 
     const svg = menuItemsOf(el)[idx].querySelector("svg");
-    expect(svg, "the icon exists to click").not.toBeNull();
+    expect(svg, `the "${label}" icon exists to click`).not.toBeNull();
     await click(svg as unknown as HTMLElement); // bubbles to the button's onClick
 
     for (const k of ["plain", "camera", "gallery"] as const) {
