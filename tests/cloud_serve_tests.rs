@@ -29,17 +29,15 @@ use cloud_common::rig::{Dev, TIMEOUT};
 /// Next `Frame` text on an Attach stream (an Attach stream carries only
 /// `Frame`s; `Head`/`Chunk` there would be a protocol bug).
 async fn next_frame(stream: &mut CloudStream) -> Option<String> {
-    loop {
-        let msg = tokio::time::timeout(TIMEOUT, stream.next())
-            .await
-            .expect("timed out waiting for a tunnel frame")
-            .expect("the attach stream stayed open");
-        match msg {
-            StreamMsg::Frame(s) => return Some(s),
-            StreamMsg::End => return None,
-            StreamMsg::Reset(c) => panic!("attach stream reset: {c}"),
-            other => panic!("non-frame on an attach stream: {other:?}"),
-        }
+    let msg = tokio::time::timeout(TIMEOUT, stream.next())
+        .await
+        .expect("timed out waiting for a tunnel frame")
+        .expect("the attach stream stayed open");
+    match msg {
+        StreamMsg::Frame(s) => Some(s),
+        StreamMsg::End => None,
+        StreamMsg::Reset(c) => panic!("attach stream reset: {c}"),
+        other => panic!("non-frame on an attach stream: {other:?}"),
     }
 }
 
@@ -208,15 +206,17 @@ async fn cloud_peer_shutdown_is_dropped_and_session_continues() {
     s.send(StreamMsg::Frame(r#"{"type":"shutdown"}"#.into()))
         .await
         .expect("send shutdown");
-    // The server legitimately sends `models_available` right after `ready`;
-    // skip that benign frame, then the refusal must be the very next one.
-    let mut f = next_frame(&mut s)
-        .await
-        .expect("the session must survive the refused shutdown");
-    if f.contains("\"models_available\"") {
+    // The server legitimately sends benign handshake/snapshot frames
+    // (`models_available`, `state`) around `ready`; skip those (bounded),
+    // then the refusal must be the next frame of any other kind.
+    let mut f = String::new();
+    for _ in 0..8 {
         f = next_frame(&mut s)
             .await
             .expect("the session must survive the refused shutdown");
+        if !(f.contains("\"models_available\"") || f.starts_with(r#"{"type":"state""#)) {
+            break;
+        }
     }
     let v: serde_json::Value = serde_json::from_str(&f).expect("JSON frame");
     assert_eq!(v["type"], "error", "shutdown must be refused, got: {f}");
@@ -442,9 +442,7 @@ async fn upload_then_get_roundtrips_bytes_and_unknown_image_is_404() {
         payload.clone(),
     )
     .await;
-    eprintln!("DBG upload sent");
     let (status, _ct, body) = op_reply(&mut u).await;
-    eprintln!("DBG upload replied");
     assert_eq!(status, 200, "the upload succeeds");
     let att: serde_json::Value = serde_json::from_slice(&body).expect("upload JSON");
     let upload_id = att["id"].as_str().expect("the upload id").to_string();

@@ -33,9 +33,9 @@ use serde::Deserialize;
 use tokio::net::TcpStream;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::Error as WsError;
-use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::Message as TMsg;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::error::ProtocolError;
 use url::{Host, Url};
 use uuid::Uuid;
 
@@ -85,7 +85,7 @@ mod t10_tests;
 /// land above the transport without forking the callers (p3-design §F.2).
 #[derive(Debug)]
 pub enum WsStream {
-    Direct(tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>),
+    Direct(Box<tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>>),
     /// The Cloud Mode tunnel (p3-design §F.2): `Frame(s)` ↔ `Text(s)`,
     /// `End` → stream end, `Reset(code)` → Io error; outgoing `Ping`/`Pong`
     /// are swallowed (the session layer keeps liveness), `Binary` is a bug
@@ -131,18 +131,18 @@ impl Sink<TMsg> for WsStream {
             // §F.2: Text → Frame; Ping/Pong swallowed (the session layer
             // keeps liveness); Binary is a bug (text-only protocol);
             // Close → End.
-            (Self::Cloud(inner), TMsg::Text(t)) => {
-                Pin::new(inner)
-                    .start_send(StreamMsg::Frame(t.to_string()))
-                    .map_err(ws_sink_err)
-            }
+            (Self::Cloud(inner), TMsg::Text(t)) => Pin::new(inner)
+                .start_send(StreamMsg::Frame(t.to_string()))
+                .map_err(ws_sink_err),
             (Self::Cloud(_), TMsg::Ping(_) | TMsg::Pong(_)) => Ok(()),
-            (Self::Cloud(_), TMsg::Binary(_)) => Err(WsError::Protocol(ProtocolError::InvalidOpcode(2))),
+            (Self::Cloud(_), TMsg::Binary(_)) => {
+                Err(WsError::Protocol(ProtocolError::InvalidOpcode(2)))
+            }
             // Raw frames never leave tungstenite; the attach protocol is text-only.
             (Self::Cloud(_), TMsg::Frame(_)) => Ok(()),
-            (Self::Cloud(inner), TMsg::Close(_)) => {
-                Pin::new(inner).start_send(StreamMsg::End).map_err(ws_sink_err)
-            }
+            (Self::Cloud(inner), TMsg::Close(_)) => Pin::new(inner)
+                .start_send(StreamMsg::End)
+                .map_err(ws_sink_err),
         }
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -278,9 +278,7 @@ impl Upstream {
                 resp.bytes_stream()
                     .map(move |chunk| chunk.map_err(|e| peer.classify_reqwest(&e))),
             ),
-            UpstreamBody::Cloud { stream, head } => {
-                Box::pin(cloud_body(stream, head.is_some()))
-            }
+            UpstreamBody::Cloud { stream, head } => Box::pin(cloud_body(stream, head.is_some())),
         }
     }
 }
@@ -320,9 +318,7 @@ fn cloud_body(
                 }
                 Poll::Ready(Some(msg)) => match (msg, head) {
                     (StreamMsg::Head { .. }, false) => head = true,
-                    (StreamMsg::Chunk(c), true) => {
-                        return Poll::Ready(Some(Ok(Bytes::from(c))))
-                    }
+                    (StreamMsg::Chunk(c), true) => return Poll::Ready(Some(Ok(Bytes::from(c)))),
                     (StreamMsg::End, true) => {
                         done = true;
                         return Poll::Ready(None);
@@ -330,9 +326,7 @@ fn cloud_body(
                     (StreamMsg::End, false) => {
                         // End before the Head is a fault, not an end.
                         done = true;
-                        return Poll::Ready(Some(Err(cloud_fault(
-                            "End before the Head",
-                        ))));
+                        return Poll::Ready(Some(Err(cloud_fault("End before the Head"))));
                     }
                     (StreamMsg::Reset(code), _) => {
                         done = true;
@@ -518,9 +512,7 @@ pub fn from_cloud(err: &crate::cloud::CloudError, name: &str) -> RemoteError {
                 profile: name.to_string(),
             }
         }
-        CloudError::NotActive(kind) => {
-            cloud_down(name, &format!("cloud not connected ({kind:?})"))
-        }
+        CloudError::NotActive(kind) => cloud_down(name, &format!("cloud not connected ({kind:?})")),
         CloudError::Disabled => cloud_down(name, "cloud not connected (disabled)"),
         CloudError::UnknownDevice => RemoteError::NotFound {
             name: name.to_string(),
@@ -875,7 +867,7 @@ impl DirectClient {
         request.headers_mut().insert(COOKIE, self.cookie.clone());
         // tungstenite's defaults (64 MiB message / 16 MiB frame) are the §7 bounds.
         match tokio_tungstenite::client_async(request, stream).await {
-            Ok((ws, _response)) => Ok(WsStream::Direct(ws)),
+            Ok((ws, _response)) => Ok(WsStream::Direct(Box::new(ws))),
             Err(WsError::Http(response)) if response.status() == StatusCode::UNAUTHORIZED => {
                 Err(peer.auth())
             }
@@ -1239,9 +1231,7 @@ async fn cloud_head(
             content_type,
             length,
         }) => Ok((status, Some(content_type), length)),
-        Some(StreamMsg::Reset(code)) => {
-            Err(cloud_down(name, &reset_text(code)))
-        }
+        Some(StreamMsg::Reset(code)) => Err(cloud_down(name, &reset_text(code))),
         Some(_) | None => Err(cloud_down(name, "a cloud op reply must start with a Head")),
     }
 }
@@ -1354,9 +1344,7 @@ impl Directory {
                 };
                 let state = handle.state().borrow().clone();
                 match state {
-                    crate::cloud::CloudState::Trust(e) => {
-                        Err(RemoteError::Trust(format!("{e:?}")))
-                    }
+                    crate::cloud::CloudState::Trust(e) => Err(RemoteError::Trust(format!("{e:?}"))),
                     crate::cloud::CloudState::Active { devices, .. } => {
                         let self_id = handle.device_id();
                         let slugs = crate::cloud::link::device_slugs(&devices);

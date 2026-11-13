@@ -45,7 +45,6 @@ impl CloudServe {
 }
 
 async fn serve_stream(state: WsState, peer: cloud::DeviceId, op: Op, mut stream: CloudStream) {
-    eprintln!("DBG serve_stream op={op:?}");
     match op {
         Op::Attach => attach(state, peer, stream).await,
         Op::Profiles => {
@@ -190,10 +189,8 @@ async fn reply_with(state: &WsState, op: PeerOp, stream: &mut CloudStream) {
         length,
     };
     if stream.send(head).await.is_err() {
-        eprintln!("DBG reply_with head send FAILED");
         return;
     }
-    eprintln!("DBG reply_with head sent status={status}");
     let mut body = resp.into_body().into_data_stream();
     while let Some(chunk) = body.next().await {
         let Ok(bytes) = chunk else {

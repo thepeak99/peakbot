@@ -46,6 +46,10 @@ impl Listing {
     }
 }
 
+/// One summary fetch: (display name, rows, offline) in a join_all.
+pub(crate) type FetchFuture =
+    Pin<Box<dyn Future<Output = (String, Vec<ConversationSummaryWire>, bool)> + Send>>;
+
 /// Local rows + every reachable remote's rows, merged by `updated_at`
 /// desc, plus one status per distinct origin in BTreeMap order (the SPA
 /// re-orders by catalog). `online` is true iff the list answered within
@@ -75,9 +79,7 @@ pub(crate) async fn merged_listing(registry: &SessionRegistry) -> Listing {
 
     // One fetch per target (a distinct remote server, or a cloud device),
     // all in a single `join_all` (F.6: no new cap).
-    let mut fetches: Vec<
-        Pin<Box<dyn Future<Output = (String, Vec<ConversationSummaryWire>, bool)> + Send>>,
-    > = Vec::new();
+    let mut fetches: Vec<FetchFuture> = Vec::new();
     for (origin, targets) in servers {
         // Any profile's client reaches that server (the token is the
         // server's), so one of its names picks the client.
@@ -123,7 +125,10 @@ pub(crate) async fn merged_listing(registry: &SessionRegistry) -> Listing {
         let state = handle.state().borrow().clone();
         if let crate::cloud::CloudState::Active { devices, .. } = state {
             let self_id = handle.device_id();
-            for (device, slug) in devices.iter().zip(crate::cloud::link::device_slugs(&devices)) {
+            for (device, slug) in devices
+                .iter()
+                .zip(crate::cloud::link::device_slugs(&devices))
+            {
                 if Some(device.id) == self_id {
                     continue; // self is never listed (F.5)
                 }
@@ -137,11 +142,10 @@ pub(crate) async fn merged_listing(registry: &SessionRegistry) -> Listing {
                         device,
                         profile: String::new(),
                     };
-                    let fetched =
-                        tokio::time::timeout(LIST_TIMEOUT, client.list())
-                            .await
-                            .ok()
-                            .and_then(Result::ok);
+                    let fetched = tokio::time::timeout(LIST_TIMEOUT, client.list())
+                        .await
+                        .ok()
+                        .and_then(Result::ok);
                     let online = fetched.is_some();
                     let rows = fetched
                         .into_iter()

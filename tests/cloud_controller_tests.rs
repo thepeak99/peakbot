@@ -43,7 +43,10 @@ async fn login(dev: &Dev, fake: &FakeRelay) {
 }
 
 /// A (host) and B (controller), both Active on one fake relay.
-async fn enroll_pair(fake: &FakeRelay, host_inbound: Option<peakbot::cloud::InboundHook>) -> (Dev, Dev) {
+async fn enroll_pair(
+    fake: &FakeRelay,
+    host_inbound: Option<peakbot::cloud::InboundHook>,
+) -> (Dev, Dev) {
     let a = spawn_device(1, "Laptop", fake, host_inbound);
     let b = spawn_device(2, "Desktop", fake, None);
     login(&a, fake).await;
@@ -235,14 +238,11 @@ async fn upstream_cloud_body_without_a_head_is_a_protocol_error() {
         .expect("seed a Chunk first");
     let up = Upstream::from_cloud(CloudStream::new(tx, rx));
     let mut stream = up.bytes_stream();
-    let err = loop {
-        match stream.next().await {
-            Some(Ok(_)) => panic!("no bytes may flow before a Head"),
-            Some(Err(e)) => break e,
-            None => panic!("the stream ended without a Head — a protocol fault must be an error"),
-        }
-    };
-    let _ = err;
+    match stream.next().await {
+        Some(Ok(_)) => panic!("no bytes may flow before a Head"),
+        Some(Err(_)) => {}
+        None => panic!("the stream ended without a Head — a protocol fault must be an error"),
+    }
 }
 
 // ── §F.5: RemoteName / Directory ──────────────────────────────────────────

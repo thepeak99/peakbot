@@ -18,7 +18,6 @@ use peakbot::cloud::CloudStateKind;
 use peakbot::cloud::store::MemSeedStore;
 use peakbot::config::{Config, ParseCtx, Source};
 use peakbot::skills::SkillRegistry;
-use peakbot::ui::WebUi;
 use peakbot::ui::web::settings::TokenSource;
 
 use cloud_common::fake_relay::FakeRelay;
@@ -114,7 +113,7 @@ async fn boot_cloud_spawns_when_general_cloud_is_configured() {
             .expect("general.cloud present ⇒ the CloudLink is spawned at boot");
 
     let mut rx = handle.state();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             if rx.borrow().kind() != CloudStateKind::Disabled {
                 return;

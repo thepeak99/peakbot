@@ -591,7 +591,7 @@ pub async fn ws_connect(addr: SocketAddr) -> Ws {
     let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws?token={T_LOCAL}"))
         .await
         .expect("local ws upgrade");
-    WsStream::Direct(ws)
+    WsStream::Direct(Box::new(ws))
 }
 
 pub async fn ws_send(ws: &mut Ws, v: &Value) {
