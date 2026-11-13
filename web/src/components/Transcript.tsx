@@ -38,11 +38,13 @@ interface Props {
   drawerOpen: boolean;
   /** `/r/<L>` proxy prefix of the conversation's profile ("" = local). */
   base?: string;
+  /** Phone layout (< lg): rows render the mobile faces. Default = desktop. */
+  phone?: boolean;
   /** React 19: `ref` is a plain prop, no `forwardRef` wrapper needed. */
   ref?: Ref<TranscriptHandle>;
 }
 
-export function Transcript({ messages, drawerOpen, base = "", ref }: Props) {
+export function Transcript({ messages, drawerOpen, base = "", phone = false, ref }: Props) {
   // The hook counts the *filtered* messages, so "N new messages" is per-view.
   const { sectionRef, onScroll, pinned, unread, showTop, repin } =
     useTranscriptScroll(messages.length);
@@ -116,7 +118,7 @@ export function Transcript({ messages, drawerOpen, base = "", ref }: Props) {
       <section
         ref={sectionRef}
         onScroll={onScroll}
-        className="min-h-0 flex-1 overflow-y-auto lg:mr-12 px-4 py-4 sm:px-6 md:px-8"
+        className="min-h-0 flex-1 overflow-y-auto lg:mr-12 px-4 py-4 max-lg:pb-3 max-lg:pt-3.5 sm:px-6 md:px-8"
       >
         <div
           className="relative mx-auto w-full max-w-5xl"
@@ -136,7 +138,7 @@ export function Transcript({ messages, drawerOpen, base = "", ref }: Props) {
               className="absolute left-0 top-0 w-full pb-3"
               style={{ transform: `translateY(${vi.start}px)` }}
             >
-              <Message message={adaptMessage(messages[vi.index], base)} />
+              <Message message={adaptMessage(messages[vi.index], base)} phone={phone} />
             </div>
           ))}
         </div>

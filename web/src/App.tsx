@@ -481,18 +481,18 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
               scrolling element's only child must be the virtualizer's sized
               container, or the row offsets stop matching the scroll offset. */}
           {scopeLabel && (
-            <div className="lg:mr-12 px-4 pt-4 sm:px-6 md:px-8">
-              <div className="mx-auto flex max-w-5xl items-center justify-between rounded-md border border-sky-900/60 bg-sky-950/30 px-3 py-1.5 text-xs text-sky-300">
+            <div className="lg:mr-12 px-4 pt-4 max-lg:p-0 sm:px-6 md:px-8">
+              <div className="mx-auto flex max-w-5xl items-center justify-between rounded-md border border-sky-900/60 bg-sky-950/30 px-3 py-1.5 text-xs text-sky-300 max-lg:mx-0 max-lg:h-11 max-lg:max-w-none max-lg:gap-2 max-lg:rounded-none max-lg:border-0 max-lg:border-b max-lg:border-sky-400/35 max-lg:bg-sky-400/12 max-lg:px-4 max-lg:py-0 max-lg:text-[13.5px] max-lg:text-zinc-100 max-lg:light:bg-sky-700/8">
                 <span>
-                  👁 Watching <span className="font-medium">{scopeLabel}</span>
-                  <span className="ml-2 text-sky-500/70">
+                  👁 Watching <span className="font-medium max-lg:font-semibold max-lg:text-sky-400">{scopeLabel}</span>
+                  <span className="ml-2 text-sky-500/70 max-lg:hidden">
                     {visibleMessages.length} message
                     {visibleMessages.length === 1 ? "" : "s"}
                   </span>
                 </span>
                 <button
                   onClick={() => setView("global")}
-                  className="cursor-pointer rounded px-1.5 py-0.5 text-sky-400 hover:bg-sky-900/40"
+                  className="cursor-pointer rounded px-1.5 py-0.5 text-sky-400 hover:bg-sky-900/40 max-lg:h-8 max-lg:rounded-2xl max-lg:bg-sky-400/18 max-lg:px-3 max-lg:py-0 max-lg:text-[13px] max-lg:font-semibold"
                 >
                   Clear
                 </button>
@@ -506,6 +506,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
               messages={transcriptMessages}
               drawerOpen={drawerOpen}
               base={base}
+              phone={!isDesktop}
               ref={transcriptRef}
             />
           ) : (

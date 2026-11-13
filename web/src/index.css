@@ -197,6 +197,68 @@ html.light .markdown-body a {
   padding: 0.3rem 0.5rem;
 }
 
+/* Phone markdown (mock `code` / `.code`, proto:151, 165-171). Scoped to
+   `.md-phone`, which only the phone Message emits, so desktop is untouched.
+   The light inline-chip tint comes from the `html.light .markdown-body` rule. */
+.md-phone :not(pre) > code {
+  font-size: 12.5px;
+  background: rgb(255 255 255 / 0.09);
+  padding: 1px 5px;
+  border-radius: 5px;
+  color: inherit;
+}
+.md-phone .code-block {
+  margin: 0.5rem 0;
+  background: #0d1117;
+  border: 1px solid #27272a;
+  border-radius: 12px;
+  overflow: hidden;
+}
+html.light .md-phone .code-block {
+  border-color: #d4d4d8;
+}
+.md-phone .code-hdr {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 12px;
+  font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #8b949e;
+  border-bottom: 1px solid #21262d;
+}
+.md-phone .code-hdr button {
+  display: inline-flex;
+  cursor: pointer;
+  color: inherit;
+}
+.md-phone .code-block pre {
+  margin: 0;
+  background: transparent;
+  border-radius: 0;
+  padding: 10px 12px;
+  color: #e6edf3;
+  line-height: 1.55;
+}
+.md-phone pre code {
+  font-size: 12px;
+}
+/* Diff lines tint edge to edge: cancel the <pre>'s 12px side padding. */
+.md-phone .hljs-deletion,
+.md-phone .hljs-addition {
+  display: inline-block;
+  min-width: calc(100% + 24px);
+  margin: 0 -12px;
+  padding: 0 12px;
+}
+.md-phone .hljs-deletion {
+  color: #ffa198;
+  background: rgb(248 81 73 / 0.16);
+}
+.md-phone .hljs-addition {
+  color: #7ee787;
+  background: rgb(46 160 67 / 0.2);
+}
+
 /* Desktop conversation tab bar (issue #373). Uses the zinc theme vars, so the
    light-theme remap applies; the hex fallbacks cover vars Tailwind didn't emit. */
 .ctabbar { display: flex; align-items: stretch; height: 36px; flex: none;

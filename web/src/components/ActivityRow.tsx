@@ -10,6 +10,7 @@
 import type { JSX } from "react";
 import { Fragment } from "react";
 import type { WireChatMessage, WireRole } from "../state";
+import { firstLine } from "../transcriptRows";
 
 // Display glyphs only — mirrors ROLE_META in Message.tsx, which is keyed by
 // the adapted view roles, so importing it would cross the wire/view seam.
@@ -21,17 +22,6 @@ const GLYPH: Record<WireRole, string> = {
   system: "•",
   summary: "≡",
 };
-
-// First non-empty, trimmed line of the server-preformatted content — the
-// thought line for tool calls, so the row reads like the step itself.
-function firstLine(content: string | undefined): string {
-  if (!content) return "";
-  for (const line of content.split("\n")) {
-    const trimmed = line.trim();
-    if (trimmed !== "") return trimmed;
-  }
-  return "";
-}
 
 export type ActivityLine =
   /** Focus mode: the newest hidden step; null → "Thinking". */

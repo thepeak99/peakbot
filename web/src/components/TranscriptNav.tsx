@@ -19,7 +19,7 @@ interface Props {
 }
 
 const BUTTON =
-  "cursor-pointer rounded-full border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-300 shadow-xl transition-colors hover:bg-zinc-800 hover:text-zinc-100";
+  "cursor-pointer rounded-full border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-300 shadow-xl transition-colors hover:bg-zinc-800 hover:text-zinc-100 max-lg:h-9 max-lg:border-zinc-700 max-lg:bg-zinc-900/90 max-lg:px-3.5 max-lg:py-0 max-lg:text-[13px] max-lg:font-medium max-lg:shadow-[0_8px_24px_rgba(0,0,0,0.5)] max-lg:backdrop-blur";
 
 export function TranscriptNav({
   pinned,
