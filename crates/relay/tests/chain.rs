@@ -122,6 +122,63 @@ async fn add_only_for_pending() {
 }
 
 #[tokio::test]
+async fn re_add_active_device_rejected() {
+    // §4.4 step 3 + cloud C4: re-adding a device that is already active
+    // (its pending row was consumed by the first Add) must be refused and
+    // must not change the chain.
+    let t = TestRelay::spawn().await;
+    let token = t.login("c14").await;
+    let mut a = FakeDevice::new(1);
+    enroll_genesis(&t, &token, &mut a).await;
+    let mut b = FakeDevice::new(2);
+    let g = fetch_chain(&mut a, 0).await;
+    let head = cloud::chain::entry_hash(&g[0]);
+    enroll_add(&t, &token, 1, head, &mut a, &mut b).await;
+
+    // Re-add B at the next seq: refused (C4 → INVALID_ENTRY).
+    let all = fetch_chain(&mut a, 0).await;
+    let h1 = cloud::chain::entry_hash(all.last().unwrap());
+    let e = entry(2, h1, ChainOp::Add, Some(b.card.clone()), None, &a);
+    a.send(ToRelay::ChainAppend { entry: e.encode() }).await;
+    expect_error(&a.recv().await, relay_error::INVALID_ENTRY).await;
+
+    // Chain unchanged (head still 1) and the socket is still open.
+    let rest = fetch_chain(&mut a, 2).await;
+    assert!(rest.is_empty(), "no row at seq 2 after refused re-add");
+}
+
+#[tokio::test]
+async fn add_revoked_device_rejected() {
+    // A revoked device must never be re-added (resurrection): cloud C4
+    // refuses it in `extend`; the relay stores nothing and keeps the socket.
+    let t = TestRelay::spawn().await;
+    let token = t.login("c15").await;
+    let mut a = FakeDevice::new(1);
+    enroll_genesis(&t, &token, &mut a).await;
+    let mut b = FakeDevice::new(2);
+    let g = fetch_chain(&mut a, 0).await;
+    let head = cloud::chain::entry_hash(&g[0]);
+    enroll_add(&t, &token, 1, head, &mut a, &mut b).await;
+
+    // Revoke B (seq 2); B's socket closes 1008.
+    let all = fetch_chain(&mut a, 0).await;
+    let h1 = cloud::chain::entry_hash(all.last().unwrap());
+    let r = entry(2, h1, ChainOp::Revoke, None, Some(b.id), &a);
+    a.send(ToRelay::ChainAppend { entry: r.encode() }).await;
+    b.expect_close(1008).await;
+    expect_chain_changed(&a.recv().await, 2).await;
+
+    // Re-add the revoked B (seq 3): refused, chain unchanged.
+    let all = fetch_chain(&mut a, 0).await;
+    let h2 = cloud::chain::entry_hash(all.last().unwrap());
+    let e = entry(3, h2, ChainOp::Add, Some(b.card.clone()), None, &a);
+    a.send(ToRelay::ChainAppend { entry: e.encode() }).await;
+    expect_error(&a.recv().await, relay_error::INVALID_ENTRY).await;
+    let rest = fetch_chain(&mut a, 3).await;
+    assert!(rest.is_empty(), "no row at seq 3 after refused re-add of revoked");
+}
+
+#[tokio::test]
 async fn add_pending_of_other_account_not_permitted() {
     let t = TestRelay::spawn().await;
     let token_x = t.login("acct-cx").await;
