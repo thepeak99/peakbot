@@ -234,6 +234,9 @@ pub struct WebUi {
     reaper_tick: Duration,
     /// Boot-time facts for the settings surface (spec §6.9/§8.2).
     settings: settings::SettingsBoot,
+    /// The process-wide Cloud Mode handle (`general.cloud`); `None` until
+    /// boot wiring spawns it, so `/api/cloud/*` answers `cloud_disabled`.
+    cloud: Option<crate::cloud::CloudHandle>,
 }
 
 impl WebUi {
@@ -282,6 +285,27 @@ impl WebUi {
             extra_sans,
             reaper_tick: Duration::from_secs(web.reaper_tick_secs),
             settings,
+            cloud: None,
+        }
+    }
+
+    /// Attach the process-wide Cloud Mode handle (boot wiring, B8).
+    pub fn with_cloud(mut self, cloud: Option<crate::cloud::CloudHandle>) -> Self {
+        self.cloud = cloud;
+        self
+    }
+
+    /// H.3: the cloud mutations are gated by the same predicate as the
+    /// settings tab — visible for the boot-bound (pinned) profile. No deps
+    /// (needs_setup) means no profile filter applies.
+    fn settings_tab_visible(&self) -> bool {
+        let Some(deps) = &self.deps else {
+            return true;
+        };
+        match deps.config.catalog.start_bound(deps.profile_pin.as_deref()) {
+            Ok(b) => b.profile.tabs.contains(&"settings"),
+            // A relay-only config binds no local profile: nothing filters it.
+            Err(_) => true,
         }
     }
 
@@ -430,6 +454,13 @@ impl WebUi {
         if let Some(tx) = self.deps.as_ref().and_then(|d| d.turn_ends.clone()) {
             app = app.merge(notify::router(tx));
         }
+
+        // The Cloud Mode API (p3-design §H): inside the token layer, in both
+        // editions. Without a handle every route answers `cloud_disabled`.
+        app = app.merge(cloud_api::router(cloud_api::CloudApiState {
+            handle: self.cloud.clone(),
+            settings_enabled: self.settings_tab_visible(),
+        }));
 
         // The `/r/` proxy (remote-profiles §6.2): the three allowlisted
         // routes plus a catch-all 404 for everything else under `/r/`.
