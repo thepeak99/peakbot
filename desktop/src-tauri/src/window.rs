@@ -195,6 +195,9 @@ mod min_size_tests {
 
     #[test]
     fn min_width_never_dips_below_the_web_breakpoint() {
-        assert!(MIN_WIDTH >= WEB_BREAKPOINT_WIDTH);
+        // const block: clippy denies `assert!` on constant expressions outside one.
+        const {
+            assert!(MIN_WIDTH >= WEB_BREAKPOINT_WIDTH);
+        }
     }
 }
