@@ -106,6 +106,33 @@ pub struct Upstream {
     pub body: reqwest::Response,
 }
 
+/// The typed `GET` target at the `/r/{profile}/…` boundary (p3-design
+/// §F.4, task A6): the only two shapes the proxy forwards. The boundary
+/// parses the tail once into a `GetTarget`; anything that does not parse is
+/// a **local 404 — the upstream is never contacted** (this narrows the
+/// Direct path, which today forwards any shape: intended). `Direct` renders
+/// `path()` to a URL; `Cloud` (PR-C) maps to `Op::Get(…)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GetTarget {
+    /// `images/{id}` — the image cache's validated id (64 lower-hex + ext).
+    Image(String),
+    /// `api/uploads/{convo}/{id}` — both UUIDs.
+    Upload { convo: Uuid, id: Uuid },
+}
+
+impl GetTarget {
+    /// Parse the tail after `/r/{profile}/` (segments already
+    /// percent-decoded by the boundary) into a target. `None` → local 404.
+    pub fn parse(_path_after_r: &str) -> Option<GetTarget> {
+        todo!("P3 PR-A A6: the typed proxy boundary")
+    }
+
+    /// Render the target back to the upstream path (e.g. `/images/{id}`).
+    pub(crate) fn path(&self) -> String {
+        todo!("P3 PR-A A6: the typed proxy boundary")
+    }
+}
+
 /// A remote failure; `Display` is the §5.12 locked string. Carries
 /// `host:port` only — never a URL or the token (§7).
 #[derive(Debug)]

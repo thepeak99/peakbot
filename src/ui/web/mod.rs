@@ -87,6 +87,10 @@ use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
 
 mod conversations;
+// Cloud Mode inbound seam (p3-design §E): host-only — the phone is
+// controller-only (edition table, §A). PR-A: types + signatures only.
+#[cfg(feature = "host")]
+mod cloud_serve;
 mod images;
 mod notify;
 pub mod registry;
@@ -170,6 +174,34 @@ struct WsState {
     /// The upload store, cloned from `SessionDeps` at boot. Serves the
     /// `/api/uploads` routes merged into the main router.
     uploads: crate::attachments::UploadStore,
+}
+
+/// A Cloud Mode paired device's identity. PR-A placeholder for the
+/// `peakbot-cloud` crate's `DeviceId`; PR-B swaps in the crate type
+/// (p3-design §E.1) without touching `Principal`'s shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))] // the CloudServe caller lands in PR-C
+pub(crate) struct DeviceId([u8; 32]);
+
+impl DeviceId {
+    /// Fixture constructor; chain-derived ids arrive with PR-B.
+    pub(crate) const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+/// Who is on the other end of a served socket (p3-design §E.1). The token
+/// holder is trusted like the machine owner; a cloud peer reaches us over
+/// the E2E tunnel, so the SERVER decides: `relayed` is forced on (no
+/// chaining, no home-remote shortcut) and `shutdown` is refused
+/// server-side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum Principal {
+    /// Presented the `peakbot_token` (axum `/ws`).
+    Token,
+    /// A paired controller over the cloud tunnel.
+    CloudPeer(DeviceId),
 }
 
 /// `peakbot --web` — serves the embedded SPA and a `/ws` endpoint. `run`
@@ -805,6 +837,21 @@ pub(crate) async fn forward_state(
             _ = &mut *writer => return ForwardExit::WriterGone,
         }
     }
+}
+
+/// [`handle_socket`] over any transport that speaks axum WS `Message`s
+/// (p3-design §E.1 / spike §2a): the axum path passes the split socket,
+/// CloudServe (PR-C) adapts its `Frame(String)` stream to `Message::Text`.
+/// PR-A seam only — A1 moves the `handle_socket` body here and threads the
+/// `principal` (`relayed = principal_forces || frame.relayed`;
+/// `refused_for` drops a `CloudPeer` `shutdown` with one error frame).
+#[allow(dead_code)] // callers: the A1 body move + CloudServe (PR-C)
+async fn serve_socket<Si, St, E>(_sink: Si, _stream: St, _state: WsState, _principal: Principal)
+where
+    Si: Sink<Message> + Unpin + Send + 'static,
+    St: futures::Stream<Item = Result<Message, E>> + Unpin + Send + 'static,
+{
+    todo!("P3 PR-A A1: move the handle_socket body here with the principal")
 }
 
 /// Drive one browser connection. The first frame must be `Attach`, which
