@@ -89,24 +89,34 @@ impl SeedStore for KeyringSeedStore {
     }
 }
 
-/// The boot-time probe result (p3-design §C: "the choice is made once at
-/// boot, not per call").
-pub enum Probed {
-    Keyring(KeyringSeedStore),
-    File(FileSeedStore),
+/// Which store the boot probe chose (p3-design §C: made ONCE at boot, so
+/// the two stores never split-brain).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreKind {
+    Keyring,
+    File,
 }
 
-/// The boot-time choice (p3-design §C). `keyring_available` is the OS
-/// probe (green phase); tests inject `false` to force the file fallback —
-/// the real OS keyring is never touched in tests. `File` is the headless
-/// fallback with the one boot warning
-/// `⚠ no OS keyring (Secret Service unavailable); cloud identity stored in <path> (0600)`.
-pub fn probe(keyring_available: bool, origin: &str, dir: &Path) -> Probed {
-    if keyring_available {
-        Probed::Keyring(KeyringSeedStore {
-            origin: origin.to_string(),
-        })
-    } else {
-        Probed::File(FileSeedStore::new(dir))
-    }
+/// The seam through which tests mock keyring availability — the real OS
+/// keyring is never touched in tests. Production wires the `keyring`
+/// crate behind it (green phase); `Err` = unavailable (no Secret Service,
+/// locked keychain).
+pub trait KeyringProbe {
+    fn probe(&self) -> Result<(), String>;
+}
+
+/// The boot-time choice + the one warning to print.
+pub struct Probed {
+    pub store: std::sync::Arc<dyn SeedStore>,
+    pub kind: StoreKind,
+    /// `Some("⚠ no OS keyring (Secret Service unavailable); cloud identity
+    /// stored in <path> (0600)")` when the file fallback was chosen.
+    pub warning: Option<String>,
+}
+
+/// Probe the keyring through `probe`; unavailable ⇒ `FileSeedStore` in
+/// `dir` + the warning (never refuse: the headless server is the primary
+/// host use case).
+pub fn probe(probe: &dyn KeyringProbe, origin: &str, dir: &Path) -> Probed {
+    todo!("p3 PR-B: probe → KeyringSeedStore, else FileSeedStore + warning")
 }

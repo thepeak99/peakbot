@@ -116,3 +116,53 @@ impl SeedStore for MemSeedStore {
         Ok(())
     }
 }
+
+/// The two PUBLIC artifacts (p3-design §C): the pinned genesis hash (the
+/// trust anchor, TOFU at first login) and the cached verified chain
+/// (length-prefixed raw entries; re-verified with `chain::sync` from the
+/// pin on load, so a corrupt file means a refetch, never trust).
+/// Lives at `<state_dir>/<origin-slug>/{genesis,chain}`; both files 0600,
+/// written atomically (tmp + rename).
+pub struct PublicState {
+    dir: std::path::PathBuf,
+}
+
+impl PublicState {
+    /// `<state_dir>/<origin_slug(origin)>/`.
+    pub fn new(state_dir: &std::path::Path, origin: &url::Url) -> Self {
+        todo!("p3 PR-B: PublicState::new")
+    }
+
+    pub fn dir(&self) -> &std::path::Path {
+        &self.dir
+    }
+
+    pub fn save_genesis(&self, genesis: [u8; 32]) -> io::Result<()> {
+        todo!("p3 PR-B: save_genesis")
+    }
+
+    /// `Ok(None)` when absent; a wrong-length file is `InvalidData`.
+    pub fn load_genesis(&self) -> io::Result<Option<[u8; 32]>> {
+        todo!("p3 PR-B: load_genesis")
+    }
+
+    pub fn save_chain(&self, entries: &[Vec<u8>]) -> io::Result<()> {
+        todo!("p3 PR-B: save_chain")
+    }
+
+    /// Empty when absent; a truncated file is `InvalidData`.
+    pub fn load_chain(&self) -> io::Result<Vec<Vec<u8>>> {
+        todo!("p3 PR-B: load_chain")
+    }
+
+    /// Delete genesis + chain + the slug dir; idempotent.
+    pub fn wipe(&self) -> io::Result<()> {
+        todo!("p3 PR-B: PublicState::wipe")
+    }
+}
+
+/// Logout wipe (§G.6 step 3): seed + token in the store, then genesis +
+/// chain. Idempotent; continues past the first failure and reports it.
+pub fn wipe_all(store: &dyn SeedStore, public: &PublicState) -> io::Result<()> {
+    todo!("p3 PR-B: wipe_all")
+}
