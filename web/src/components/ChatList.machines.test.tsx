@@ -549,3 +549,67 @@ describe("ChatList machines — B2: the online empty state (A37)", () => {
     expect(empty!.textContent).toBe("No chats on home-server.local yet");
   });
 });
+
+// ─── B5: the batch-5 (fidelity) contracts ──────────────────────────────────
+
+describe("ChatList machines — B5: the Machine sheet option (A35)", () => {
+  it("an offline machine option in the Machine sheet is disabled", async () => {
+    const el = await render({ machineStatus: STATUS_WB_DOWN });
+    await openMachineSheet(el);
+    const dlg = machineDialog()!;
+    expect(option(dlg, WB).hasAttribute("disabled"), "the offline machine is untappable").toBe(true);
+    expect(option(dlg, "all").hasAttribute("disabled"), "the All option is always enabled").toBe(false);
+    expect(option(dlg, "local").hasAttribute("disabled"), "the local option stays enabled").toBe(false);
+  });
+});
+
+describe("ChatList machines — B5: the picker rows (A34)", () => {
+  it("picker rows show the sub under the name", async () => {
+    const el = await render();
+    const fab = el.querySelector<HTMLElement>('button[aria-label="New chat"]')!;
+    await act(async () => {
+      fab.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    });
+    const dlg = document.body.querySelector<HTMLElement>(
+      '[role="dialog"][aria-label="New chat on…"]',
+    );
+    expect(dlg, "the picker opens").not.toBeNull();
+    for (const [machine, name, sub] of [
+      ["local", "This device", "local"],
+      [HS, "home-server.local", "remote"],
+    ] as const) {
+      const opt = dlg!.querySelector<HTMLElement>(
+        `[data-testid="newchat-option"][data-machine="${machine}"]`,
+      )!;
+      // Name and sub are the option's only text-bearing leaf spans.
+      const leaves = [...opt.querySelectorAll("span")].filter(
+        (s) => s.textContent?.trim() && !s.querySelector("span"),
+      );
+      const nameEl = leaves.find((s) => s.textContent?.trim() === name);
+      const subEl = leaves.find((s) => s.textContent?.trim() === sub);
+      expect(nameEl, `the ${machine} option shows its name`).not.toBeUndefined();
+      expect(subEl, `the ${machine} option shows its sub`).not.toBeUndefined();
+      expect(
+        nameEl!.compareDocumentPosition(subEl!) & Node.DOCUMENT_POSITION_FOLLOWING,
+        `the ${machine} sub follows the name in the row`,
+      ).toBeTruthy();
+      expect(
+        subEl!.parentElement === opt,
+        `the ${machine} sub is not a trailing sibling of the row — it sits in the name column`,
+      ).toBe(false);
+      expect(
+        nameEl!.parentElement === subEl!.parentElement,
+        `the ${machine} sub sits in the same column as the name, under it`,
+      ).toBe(true);
+    }
+  });
+});
+
+describe("ChatList machines — B5: the light online dot (A42)", () => {
+  it("the online machine dot carries the light-theme green", async () => {
+    const el = await render();
+    const dot = pill(el)!.querySelector<HTMLElement>('[data-testid="machine-pill-dot"]')!;
+    expect(dot.className, "the dark dot").toContain("bg-emerald-400");
+    expect(dot.className, "the light theme paints the dot #16a34a").toContain("light:bg-[#16a34a]");
+  });
+});
