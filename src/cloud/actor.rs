@@ -11,13 +11,13 @@
 //! pre-fetching the relay delta first and answering from the buffered
 //! batch (erratum E-D1).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cloud::{
-    DeviceId, SessionId,
+    DeviceId, LetterId, SessionId,
     card::DeviceCard,
     chain::{self, VerifiedChain},
     codec::{self, FromRelay, ToRelay},
@@ -26,6 +26,7 @@ use cloud::{
         self, FrameReceiver, FrameSender, Inner, Mux, MuxEvent, Op, RecvOutcome, Role, StreamMsg,
     },
     handshake::{self, Close, Data, Hs1, Hs2, Hs3, Initiator, PipeMsg, SessionKeys},
+    letter::{self, LetterBody, LetterIn, RecipientState},
 };
 use futures::{SinkExt as _, StreamExt as _};
 use perma_crypto::v1;
@@ -38,10 +39,10 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use url::Url;
 
 use super::config::CloudConfig;
-use super::enroll;
+use super::enroll::{self, EnrollAttempt};
 use super::link::{
-    CloudCmd, CloudError, CloudState, CloudStateKind, DeviceInfo, FlowError, InboundHook,
-    LogoutOutcome, LogoutReason, TrustError,
+    CloudCmd, CloudError, CloudState, CloudStateKind, DeviceInfo, EnrollRequestInfo, FlowError,
+    InboundHook, LogoutOutcome, LogoutReason, TrustError,
 };
 use super::login;
 use super::session::{Handshaking, Open, Phase, Session, StreamSide};
@@ -102,6 +103,10 @@ enum RunEnd {
     Unauthorized,
     /// Terminal (refuse all sessions, no reconnect).
     Trust(TrustError),
+    /// The relay's view of our mode changed (pending ⇄ active): redial
+    /// with a fresh `Hello`/`HelloPending` (G.2 step 4, G.3 step 4). No
+    /// backoff — the socket was healthy.
+    ReHello,
     /// Socket lost / transient: reconnect with backoff.
     /// `(reason, reset-backoff: the socket reached Welcome and stayed ≥60 s)`.
     Dropped(String, bool),
@@ -156,6 +161,19 @@ pub struct Actor {
     token_expired: bool,
     attempt: u32,
     outbox_tx: mpsc::Sender<ActorOut>,
+    /// A pending ⇄ active flip was observed (G.2/G.3): the next live-loop
+    /// iteration ends the socket so the relay re-Hello's with the new mode.
+    re_handshake: bool,
+    /// The approver's verified, unexpired `EnrollRequest` letters (G.4).
+    requests: BTreeMap<LetterId, EnrollRequestInfo>,
+    /// The pending device's in-flight attempt (G.3): `None` = not yet
+    /// frozen, or rejected (no retry, G.3 step 4).
+    enroll: Option<EnrollAttempt>,
+    /// An `EnrollReject` was received: no re-freeze/repost until a fresh
+    /// login (G.3 step 4, "no retry route").
+    rejected: bool,
+    /// The relay replay set for letters addressed to us (spec §7.5).
+    seen: letter::ReplaySet,
 }
 
 /// The live (socket-up) phase: everything here dies with the socket,
@@ -171,6 +189,13 @@ struct Live {
     /// The in-flight `Cmd::Genesis` reply (resolved on `ChainChanged` /
     /// relay `Error`).
     pending_genesis: Option<oneshot::Sender<Result<DeviceId, CloudError>>>,
+    /// The in-flight `ChainAppend` (approve): the request's letter id +
+    /// reply. Resolved on the sync that contains the `Add`.
+    pending_append: Option<(LetterId, oneshot::Sender<Result<DeviceId, CloudError>>)>,
+    /// The in-flight `ChainAppend` (revoke): the target + reply.
+    pending_revoke: Option<(DeviceId, oneshot::Sender<Result<(), CloudError>>)>,
+    /// One rebuild-and-resend is spent on the in-flight append (G.4 step 3).
+    append_retry: bool,
     /// The delta fetched after `Welcome{head_seq > ours}`, pending apply.
     chain_delta: Option<VerifiedChain>,
     sessions: HashMap<DeviceId, Session>,
@@ -255,7 +280,8 @@ fn publish_live(state: &watch::Sender<CloudState>, actor: &Actor, live: &Live) {
             state,
             CloudState::Pending {
                 empty_account: live.empty_account,
-                sas: None,
+                // `Some` once our EnrollRequest is posted (head frozen, §5.5).
+                sas: actor.enroll.as_ref().map(|a| a.sas()),
             },
         );
     } else if let Some(c) = &actor.chain_cache {
@@ -263,7 +289,7 @@ fn publish_live(state: &watch::Sender<CloudState>, actor: &Actor, live: &Live) {
             state,
             CloudState::Active {
                 devices: devices_of(c),
-                requests: vec![],
+                requests: actor.requests.values().cloned().collect(),
             },
         );
     }
@@ -302,6 +328,11 @@ impl Actor {
                 token_expired: false,
                 attempt: 0,
                 outbox_tx: out_tx,
+                re_handshake: false,
+                requests: BTreeMap::new(),
+                enroll: None,
+                rejected: false,
+                seen: letter::ReplaySet::new(),
             },
             out_rx,
         )
@@ -722,6 +753,7 @@ impl Actor {
             Some(c) if head_seq > c.head.seq => (false, c.head.seq.saturating_add(1)),
             _ => (true, 0),
         };
+        let was_pending = live.pending;
         let Some(entries) = fetch_all(ws, from, &mut Some(&mut live.pending_msgs)).await else {
             return Some(RunEnd::Dropped("socket closed during resync".into(), false));
         };
@@ -735,8 +767,28 @@ impl Actor {
                     live.reset_all();
                     return Some(RunEnd::Trust(TrustError::Revoked));
                 }
+                // Resolve the in-flight ops BEFORE the bookkeeping clears
+                // the approved request (the device id is captured first).
+                let append_done = live.pending_append.take();
+                let append_device = append_done
+                    .as_ref()
+                    .and_then(|(lid, _)| self.requests.get(lid).map(|r| r.device));
+                let append_done = append_done.map(|(_, out)| out);
+                let revoke_done = live.pending_revoke.take();
+                self.on_chain_applied(live, ws, was_pending).await;
                 if let Some(out) = live.pending_genesis.take() {
                     let _ = out.send(Ok(self.id.id));
+                }
+                if let Some(out) = append_done {
+                    live.append_retry = false;
+                    let _ = out.send(match append_device {
+                        Some(device) => Ok(device),
+                        None => Err(CloudError::Flow(FlowError::UnknownRequest)),
+                    });
+                }
+                if let Some((_, out)) = revoke_done {
+                    live.append_retry = false;
+                    let _ = out.send(Ok(()));
                 }
                 publish_live(state, self, live);
                 None
@@ -747,6 +799,165 @@ impl Actor {
                         .await;
                 }
                 Some(RunEnd::Trust(t))
+            }
+        }
+    }
+
+    /// Bookkeeping after a verified chain replace (pre-Hello / resync /
+    /// conflict retry): expire and resolve requests, keep the pending
+    /// attempt's frozen head honest (G.3 step 4: head moved ⇒ re-freeze
+    /// and repost), and flag the re-Hello when our mode flipped
+    /// (G.2 step 4, G.3 step 4).
+    async fn on_chain_applied(&mut self, live: &mut Live, ws: &mut Ws, was_pending: bool) {
+        let now = now_secs();
+        self.seen.prune(now);
+        let active_now: BTreeSet<DeviceId> = self
+            .chain_cache
+            .as_ref()
+            .map(|c| c.active.keys().copied().collect())
+            .unwrap_or_default();
+        // Expired, or already on the chain (approved): gone (G.4 step 5).
+        self.requests
+            .retain(|_, r| r.expires_at > now && !active_now.contains(&r.device));
+        let active = active_now.contains(&self.id.id);
+        if was_pending && active {
+            // Enrolled (or genisied): the relay must re-Hello us as active.
+            self.enroll = None;
+            self.re_handshake = true;
+            return;
+        }
+        // Letters-only mode (G.3): (re)freeze at the current head and
+        // fan out to every active device.
+        if live.pending && self.chain_cache.is_some() && !self.rejected {
+            let Some(c) = self.chain_cache.as_ref() else {
+                return;
+            };
+            let stale = self.enroll.as_ref().is_some_and(|a| a.frozen() != c.head);
+            if self.enroll.is_none() || stale {
+                let att = EnrollAttempt::freeze(c, &self.id.card);
+                self.enroll = Some(att.clone());
+                self.post_enroll_request(ws, &att).await;
+            }
+        }
+    }
+
+    /// G.3 step 2: one signed + sealed `EnrollRequest` per active device
+    /// (any one of them may approve).
+    async fn post_enroll_request(&mut self, ws: &mut Ws, att: &EnrollAttempt) {
+        let Some(chain) = self.chain_cache.as_ref() else {
+            return;
+        };
+        let card = att.card().to_vec();
+        let frozen = att.frozen();
+        let now = now_secs();
+        let mut rng = Os;
+        for (dev, card_c) in chain.active.iter() {
+            if *dev == self.id.id {
+                continue;
+            }
+            let Ok(pk) = card_c.public_key() else {
+                continue;
+            };
+            let mut id = [0u8; 16];
+            if getrandom::fill(&mut id).is_err() {
+                continue;
+            }
+            let body = LetterBody {
+                letter_id: id,
+                from: self.id.id,
+                to: *dev,
+                created_at: now,
+                kind: letter::LetterKind::EnrollRequest,
+                body: letter::LetterKindBody::EnrollRequest {
+                    card: card.clone(),
+                    head_n: frozen,
+                    has_mac: false,
+                    mac: None,
+                },
+            };
+            let Ok(signed) = letter::signed_letter(&body, &self.id.sk, &mut rng) else {
+                continue;
+            };
+            let aad = letter::letter_aad(id, self.id.id, *dev);
+            let Ok(sealed) = letter::seal_letter(&pk, &signed, &aad, &mut rng) else {
+                tracing::debug!("cannot seal the EnrollRequest");
+                continue;
+            };
+            if send_to_relay(
+                ws,
+                &ToRelay::Post {
+                    to: *dev,
+                    letter_id: id,
+                    sealed,
+                },
+            )
+            .await
+            .is_err()
+            {
+                return; // the socket is dead; the run loop observes it
+            }
+        }
+    }
+
+    /// One relayed letter (G.3 step 4 / G.4 step 1): `check_letter` in the
+    /// crate's exact order; any `Err` is a silent drop (debug log).
+    async fn on_letter(
+        &mut self,
+        live: &mut Live,
+        ws: &mut Ws,
+        from: DeviceId,
+        letter_id: LetterId,
+        sealed: Vec<u8>,
+        state: &watch::Sender<CloudState>,
+    ) {
+        let Some(chain) = self.chain_cache.as_ref().cloned() else {
+            return;
+        };
+        let pending = live.pending;
+        let now = now_secs();
+        let mut in_ = LetterIn {
+            sealed,
+            relay_from: from,
+            relay_letter_id: letter_id,
+            self_id: self.id.id,
+            self_sk: &self.id.sk,
+            self_state: if pending {
+                RecipientState::Pending
+            } else {
+                RecipientState::Active
+            },
+            now,
+            chain: &chain,
+            seen: &mut self.seen,
+        };
+        let accepted = match letter::check_letter(&mut in_) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::debug!(%e, "letter dropped");
+                return;
+            }
+        };
+        match accepted.dispatch {
+            letter::Dispatch::Sas | letter::Dispatch::Qr => {
+                // A new device asks to join (G.4 step 2).
+                if self.requests.len() >= constants::MAX_PENDING_LETTERS {
+                    return;
+                }
+                let Some(info) = enroll::request_info(&chain, &accepted, now) else {
+                    // The letter's head is not in our verified history.
+                    tracing::debug!("EnrollRequest head not in history; dropped");
+                    return;
+                };
+                self.requests.insert(info.letter_id, info);
+                let _ = send_to_relay(ws, &ToRelay::Ack { letter_id }).await;
+                publish_live(state, self, live);
+            }
+            letter::Dispatch::Reject => {
+                // An active device refused us (G.3 step 4): stay Pending,
+                // SAS cleared, no retry until a fresh login.
+                self.enroll = None;
+                self.rejected = true;
+                publish_live(state, self, live);
             }
         }
     }
@@ -1570,26 +1781,54 @@ impl Actor {
                 self.on_unreachable(live, to);
                 None
             }
-            FromRelay::Error { code } => match code {
-                constants::relay_error::UNAUTHORIZED => Some(RunEnd::Unauthorized),
-                // Another socket for this device: back to `Connecting`
-                // with backoff (§D.3).
-                constants::relay_error::CONFLICT => Some(RunEnd::Dropped(
-                    "CONFLICT: another socket for this device".into(),
-                    false,
-                )),
-                // Fails the in-flight op that caused it (§D.3).
-                _ => {
-                    if let Some(out) = live.pending_genesis.take() {
+            FromRelay::Error { code } => {
+                if code == constants::relay_error::UNAUTHORIZED {
+                    return Some(RunEnd::Unauthorized);
+                }
+                let in_flight = live.pending_append.is_some()
+                    || live.pending_genesis.is_some()
+                    || live.pending_revoke.is_some();
+                if code == constants::relay_error::CONFLICT && !in_flight {
+                    // No in-flight op: CONFLICT = another socket for this
+                    // device → back to `Connecting` with backoff (§D.3).
+                    return Some(RunEnd::Dropped(
+                        "CONFLICT: another socket for this device".into(),
+                        false,
+                    ));
+                }
+                // Fails the in-flight op that caused it (§D.3); a
+                // `CONFLICT` on an append gets ONE rebuild-and-resend (G.4).
+                let conflict = code == constants::relay_error::CONFLICT;
+                if let Some(out) = live.pending_genesis.take() {
+                    let _ = out.send(Err(CloudError::Flow(FlowError::ChainBusy)));
+                }
+                if let Some((letter_id, out)) = live.pending_append.take() {
+                    if conflict && !live.append_retry {
+                        live.append_retry = true;
+                        self.retry_append(live, ws, letter_id, out).await;
+                    } else {
                         let _ = out.send(Err(CloudError::Flow(FlowError::ChainBusy)));
                     }
-                    tracing::warn!(code, "relay error");
-                    None
                 }
-            },
-            // Letters are enrollment-only (P4/P5); P3 only routes them.
-            FromRelay::Letter { .. } => {
-                tracing::debug!("letter received (enrollment phase)");
+                if let Some((target, out)) = live.pending_revoke.take() {
+                    if conflict && !live.append_retry {
+                        live.append_retry = true;
+                        self.retry_revoke(live, ws, target, out).await;
+                    } else {
+                        let _ = out.send(Ok(()));
+                    }
+                }
+                tracing::warn!(code, "relay error");
+                None
+            }
+            // Letters are enrollment (G.3/G.4): check, then dispatch.
+            FromRelay::Letter {
+                from,
+                letter_id,
+                sealed,
+            } => {
+                self.on_letter(live, ws, from, letter_id, sealed, state)
+                    .await;
                 None
             }
             // Out of band while live (handled in the pre-Hello phase).
@@ -1665,11 +1904,44 @@ impl Actor {
                 None
             }
             CloudCmd::Logout { out } => {
-                // G.6: best-effort POST /logout → WIPE → SignedOut.
+                // G.6: self-revoke (best effort, only when others remain)
+                // → POST /logout → WIPE → SignedOut. Steps 2–3 always run.
+                let mut revoked = false;
+                let self_revocable = self
+                    .chain_cache
+                    .as_ref()
+                    .is_some_and(|c| c.active.contains_key(&self.id.id) && c.active.len() > 1);
+                if self_revocable
+                    && let Some(chain) = self.chain_cache.as_ref()
+                    && let Ok(entry) = {
+                        let mut rng = Os;
+                        enroll::revoke_entry(
+                            chain,
+                            self.id.id,
+                            self.id.card.clone(),
+                            &self.id.sk,
+                            &mut rng,
+                        )
+                    }
+                {
+                    revoked = send_to_relay(
+                        ws,
+                        &ToRelay::ChainAppend {
+                            entry: entry.encode(),
+                        },
+                    )
+                    .await
+                    .is_ok();
+                }
                 let base = self.cfg.relay.origin().clone();
                 let store = self.store.clone();
-                if let Ok(Some(t)) = store_op(move || store.load_token()).await {
-                    let _ = login::logout_post(&base, &t).await;
+                // A failed relay /logout means the session (and thus the
+                // device's listing) survives: report `revoked: false`.
+                match store_op(move || store.load_token()).await {
+                    Ok(Some(t)) => {
+                        revoked = revoked && login::logout_post(&base, &t).await.is_ok();
+                    }
+                    _ => revoked = false,
                 }
                 let store = self.store.clone();
                 let public = self.public.clone();
@@ -1677,34 +1949,367 @@ impl Actor {
                 self.pin = None;
                 self.raw.clear();
                 self.chain_cache = None;
+                self.requests.clear();
+                self.enroll = None;
                 live.reset_all();
-                let _ = out.send(Ok(LogoutOutcome { revoked: false }));
+                live.pending_append = None;
+                live.pending_revoke = None;
+                let _ = out.send(Ok(LogoutOutcome { revoked }));
                 Some(RunEnd::LoggedOut)
             }
             CloudCmd::TokenStored(_) => {
-                // A token is already in use on this socket; re-login is a
-                // flow-phase concern.
+                // A fresh login restarts enrollment (G.3 "no retry route").
+                self.rejected = false;
                 None
             }
-            // Flow-phase commands (approve/reject/revoke/profiles).
-            CloudCmd::Approve { out, .. } => {
-                let _ = out.send(Err(CloudError::Io(
-                    "enrollment flows land in a later phase".into(),
-                )));
+            CloudCmd::Approve { letter_id, out } => {
+                self.do_approve(live, ws, letter_id, out).await;
                 None
             }
-            CloudCmd::Reject { out, .. } | CloudCmd::Revoke { out, .. } => {
-                let _ = out.send(Err(CloudError::Io(
-                    "enrollment flows land in a later phase".into(),
-                )));
+            CloudCmd::Reject { letter_id, out } => {
+                self.do_reject(live, ws, letter_id, out, state).await;
                 None
             }
-            CloudCmd::Profiles { out, .. } => {
-                let _ = out.send(Vec::new());
+            CloudCmd::Revoke { target, out } => {
+                self.do_revoke(live, ws, target, out).await;
+                None
+            }
+            CloudCmd::Profiles { device, out } => {
+                self.do_profiles(live, ws, device, out).await;
                 None
             }
             CloudCmd::Stop => Some(RunEnd::Stopped),
         }
+    }
+
+    /// G.4 step 3: sign the `Add` for the request's card; the reply rides
+    /// the `ChainChanged` sync (one rebuild on a relay `CONFLICT`).
+    async fn do_approve(
+        &mut self,
+        live: &mut Live,
+        ws: &mut Ws,
+        letter_id: LetterId,
+        out: oneshot::Sender<Result<DeviceId, CloudError>>,
+    ) {
+        let Some(req) = self.requests.get(&letter_id) else {
+            let _ = out.send(Err(CloudError::Flow(FlowError::UnknownRequest)));
+            return;
+        };
+        let card = req.card.clone();
+        let Some(chain) = self.chain_cache.as_ref().cloned() else {
+            let _ = out.send(Err(CloudError::NotActive(CloudStateKind::Pending)));
+            return;
+        };
+        let mut rng = Os;
+        let entry =
+            match enroll::approve_entry(&chain, &card, self.id.card.clone(), &self.id.sk, &mut rng)
+            {
+                Ok(e) => e,
+                Err(e) => {
+                    let _ = out.send(Err(CloudError::Io(e.to_string())));
+                    return;
+                }
+            };
+        if send_to_relay(
+            ws,
+            &ToRelay::ChainAppend {
+                entry: entry.encode(),
+            },
+        )
+        .await
+        .is_err()
+        {
+            let _ = out.send(Err(CloudError::Io("send failed".into())));
+        } else {
+            live.pending_append = Some((letter_id, out));
+        }
+    }
+
+    /// G.4 step 4: seal an `EnrollReject` to the requester, `Ack` the
+    /// request, and drop it from state.
+    async fn do_reject(
+        &mut self,
+        live: &mut Live,
+        ws: &mut Ws,
+        letter_id: LetterId,
+        out: oneshot::Sender<Result<(), CloudError>>,
+        state: &watch::Sender<CloudState>,
+    ) {
+        let Some(req) = self.requests.get(&letter_id).cloned() else {
+            let _ = out.send(Err(CloudError::Flow(FlowError::UnknownRequest)));
+            return;
+        };
+        let to = req.device;
+        let mut rng = Os;
+        let mut id = [0u8; 16];
+        if getrandom::fill(&mut id).is_err() {
+            let _ = out.send(Err(CloudError::Io("rng failed".into())));
+            return;
+        }
+        let card = match DeviceCard::parse(&req.card) {
+            Ok(c) => c,
+            Err(_) => {
+                let _ = out.send(Err(CloudError::Io("requester card undecodable".into())));
+                return;
+            }
+        };
+        let Ok(pk) = card.public_key() else {
+            let _ = out.send(Err(CloudError::Io("requester key undecodable".into())));
+            return;
+        };
+        let body = enroll::reject_letter(id, now_secs(), self.id.id, to);
+        let Ok(signed) = letter::signed_letter(&body, &self.id.sk, &mut rng) else {
+            let _ = out.send(Err(CloudError::Io("sign failed".into())));
+            return;
+        };
+        let aad = letter::letter_aad(id, self.id.id, to);
+        let Ok(sealed) = letter::seal_letter(&pk, &signed, &aad, &mut rng) else {
+            let _ = out.send(Err(CloudError::Io("seal failed".into())));
+            return;
+        };
+        if send_to_relay(
+            ws,
+            &ToRelay::Post {
+                to,
+                letter_id: id,
+                sealed,
+            },
+        )
+        .await
+        .is_err()
+        {
+            let _ = out.send(Err(CloudError::Io("send failed".into())));
+            return;
+        }
+        let _ = send_to_relay(ws, &ToRelay::Ack { letter_id }).await;
+        self.requests.remove(&letter_id);
+        publish_live(state, self, live);
+        let _ = out.send(Ok(()));
+    }
+
+    /// G.5: sign the `Revoke` for `target`; self ⇒ `use_logout`, an
+    /// unknown id ⇒ `unknown_device`.
+    async fn do_revoke(
+        &mut self,
+        live: &mut Live,
+        ws: &mut Ws,
+        target: DeviceId,
+        out: oneshot::Sender<Result<(), CloudError>>,
+    ) {
+        if target == self.id.id {
+            let _ = out.send(Err(CloudError::Flow(FlowError::UseLogout)));
+            return;
+        }
+        let Some(chain) = self.chain_cache.as_ref().cloned() else {
+            let _ = out.send(Err(CloudError::NotActive(CloudStateKind::Pending)));
+            return;
+        };
+        if !chain.active.contains_key(&target) {
+            let _ = out.send(Err(CloudError::UnknownDevice));
+            return;
+        }
+        let mut rng = Os;
+        let entry =
+            match enroll::revoke_entry(&chain, target, self.id.card.clone(), &self.id.sk, &mut rng)
+            {
+                Ok(e) => e,
+                Err(e) => {
+                    let _ = out.send(Err(CloudError::Io(e.to_string())));
+                    return;
+                }
+            };
+        if send_to_relay(
+            ws,
+            &ToRelay::ChainAppend {
+                entry: entry.encode(),
+            },
+        )
+        .await
+        .is_err()
+        {
+            let _ = out.send(Err(CloudError::Io("send failed".into())));
+        } else {
+            live.pending_revoke = Some((target, out));
+        }
+    }
+
+    /// The `Profiles` op (§E.3): open a stream, read `Head` → `Chunk`s →
+    /// `End`, parse `{ "profiles": [{name, color}] }`.
+    async fn do_profiles(
+        &mut self,
+        live: &mut Live,
+        ws: &mut Ws,
+        device: DeviceId,
+        out: oneshot::Sender<Result<Vec<crate::cloud::session::ProfileInfo>, CloudError>>,
+    ) {
+        let known = self
+            .chain_cache
+            .as_ref()
+            .is_some_and(|c| c.active.contains_key(&device));
+        if !known {
+            let err = if live.pending {
+                CloudError::NotActive(CloudStateKind::Pending)
+            } else {
+                CloudError::UnknownDevice
+            };
+            let _ = out.send(Err(err));
+            return;
+        }
+        let (open_tx, open_rx) = oneshot::channel();
+        self.start_open(live, ws, device, Op::Profiles, open_tx)
+            .await;
+        let mut stream = match open_rx.await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                let _ = out.send(Err(e));
+                return;
+            }
+            Err(_) => {
+                let _ = out.send(Err(CloudError::Offline));
+                return;
+            }
+        };
+        // The peer answers `Head, Chunk*, End` (mux S4); a `Reset` is a
+        // refusal (a `Close{TRUST}` maps to the PROTOCOL reset code).
+        let mut body = Vec::new();
+        let result =
+            tokio::time::timeout(Duration::from_secs(constants::HANDSHAKE_TIMEOUT), async {
+                let mut status = 0u16;
+                loop {
+                    match stream.next().await {
+                        Some(StreamMsg::Head { status: s, .. }) => status = s,
+                        Some(StreamMsg::Chunk(c)) => body.extend(c),
+                        Some(StreamMsg::End) => break,
+                        Some(StreamMsg::Reset(code)) => return Err(CloudError::Reset(code)),
+                        Some(_) => {}
+                        None => return Err(CloudError::Offline),
+                    }
+                }
+                if status != 200 {
+                    return Err(CloudError::Io(format!("peer answered {status}")));
+                }
+                Ok(())
+            })
+            .await;
+        match result {
+            Ok(Ok(())) => {
+                let profiles: Vec<crate::cloud::session::ProfileInfo> =
+                    serde_json::from_slice(&body).unwrap_or_default();
+                let _ = stream.send(StreamMsg::End).await;
+                let _ = out.send(Ok(profiles));
+            }
+            Ok(Err(e)) => {
+                let _ = stream
+                    .send(StreamMsg::Reset(constants::reset::CANCELLED))
+                    .await;
+                let _ = out.send(Err(e));
+            }
+            Err(_) => {
+                let _ = stream
+                    .send(StreamMsg::Reset(constants::reset::CANCELLED))
+                    .await;
+                let _ = out.send(Err(CloudError::Offline));
+            }
+        }
+    }
+
+    /// G.4 step 3, the one retry: refetch (the `CONFLICT` says the head
+    /// moved, not how far), rebuild at the new head, resend.
+    async fn retry_append(
+        &mut self,
+        live: &mut Live,
+        ws: &mut Ws,
+        letter_id: LetterId,
+        out: oneshot::Sender<Result<DeviceId, CloudError>>,
+    ) {
+        let Some(card) = self.requests.get(&letter_id).map(|r| r.card.clone()) else {
+            let _ = out.send(Err(CloudError::Flow(FlowError::UnknownRequest)));
+            return;
+        };
+        if let Err(e) = self.refetch_full(live, ws).await {
+            let _ = out.send(Err(e));
+            return;
+        }
+        self.on_chain_applied(live, ws, live.pending).await;
+        let Some(chain) = self.chain_cache.as_ref().cloned() else {
+            let _ = out.send(Err(CloudError::Offline));
+            return;
+        };
+        let mut rng = Os;
+        let entry =
+            match enroll::approve_entry(&chain, &card, self.id.card.clone(), &self.id.sk, &mut rng)
+            {
+                Ok(e) => e,
+                Err(e) => {
+                    let _ = out.send(Err(CloudError::Io(e.to_string())));
+                    return;
+                }
+            };
+        if send_to_relay(
+            ws,
+            &ToRelay::ChainAppend {
+                entry: entry.encode(),
+            },
+        )
+        .await
+        .is_err()
+        {
+            let _ = out.send(Err(CloudError::Io("send failed".into())));
+        } else {
+            live.pending_append = Some((letter_id, out));
+        }
+    }
+
+    /// G.5's conflict retry: refetch, rebuild the `Revoke`, resend.
+    async fn retry_revoke(
+        &mut self,
+        live: &mut Live,
+        ws: &mut Ws,
+        target: DeviceId,
+        out: oneshot::Sender<Result<(), CloudError>>,
+    ) {
+        if let Err(e) = self.refetch_full(live, ws).await {
+            let _ = out.send(Err(e));
+            return;
+        }
+        self.on_chain_applied(live, ws, live.pending).await;
+        let Some(chain) = self.chain_cache.as_ref().cloned() else {
+            let _ = out.send(Err(CloudError::Offline));
+            return;
+        };
+        let mut rng = Os;
+        let entry =
+            match enroll::revoke_entry(&chain, target, self.id.card.clone(), &self.id.sk, &mut rng)
+            {
+                Ok(e) => e,
+                Err(e) => {
+                    let _ = out.send(Err(CloudError::Io(e.to_string())));
+                    return;
+                }
+            };
+        if send_to_relay(
+            ws,
+            &ToRelay::ChainAppend {
+                entry: entry.encode(),
+            },
+        )
+        .await
+        .is_err()
+        {
+            let _ = out.send(Err(CloudError::Io("send failed".into())));
+        } else {
+            live.pending_revoke = Some((target, out));
+        }
+    }
+
+    /// Refetch the full chain and re-verify against the pin.
+    async fn refetch_full(&mut self, live: &mut Live, ws: &mut Ws) -> Result<(), CloudError> {
+        let Some(entries) = fetch_all(ws, 0, &mut Some(&mut live.pending_msgs)).await else {
+            return Err(CloudError::Offline);
+        };
+        self.apply_entries(live, ws, entries, true)
+            .await
+            .map_err(CloudError::Trust)
     }
 
     /// Relay messages queued during a `ChainFetch` round-trip.
@@ -1753,7 +2358,12 @@ impl Actor {
         live.sessions.clear();
         live.pending_msgs.clear();
         live.pending_genesis = None;
+        live.pending_append = None;
+        live.pending_revoke = None;
+        live.append_retry = false;
         live.chain_delta = None;
+        self.re_handshake = false;
+        let was_pending = live.pending;
         if let Err(e) = pre_hello(self, &mut ws, live).await {
             return match e {
                 PreHelloErr::Trust(t) => RunEnd::Trust(t),
@@ -1764,6 +2374,8 @@ impl Actor {
         if let Some(c) = live.chain_delta.take() {
             self.chain_cache = Some(c);
         }
+        // Start (or resume) the pending attempt and flag the re-Hello.
+        self.on_chain_applied(live, &mut ws, was_pending).await;
         publish_live(state, self, live);
         run_live(self, live, &mut ws, cmd_rx, out_rx, state).await
     }
@@ -1781,6 +2393,11 @@ async fn run_live(
 ) -> RunEnd {
     let welcome_at = Instant::now();
     loop {
+        // Our mode flipped on the last sync: end the socket so the relay
+        // re-Hello's us with the new mode (G.2/G.3).
+        if actor.re_handshake {
+            return RunEnd::ReHello;
+        }
         let next_expiry = live
             .sessions
             .values()
@@ -1907,6 +2524,9 @@ pub async fn run(
         empty_account: actor.chain_cache.is_none(),
         pending_msgs: VecDeque::new(),
         pending_genesis: None,
+        pending_append: None,
+        pending_revoke: None,
+        append_retry: false,
         chain_delta: None,
         sessions: HashMap::new(),
     };
@@ -1929,12 +2549,26 @@ pub async fn run(
                 match cmd {
                     CloudCmd::TokenStored(_) => {
                         actor.token_expired = false;
+                        // A fresh login restarts enrollment (G.3 step 4).
+                        actor.rejected = false;
                         stage = Stage::Connecting;
                     }
                     CloudCmd::Open { out, .. } => {
                         let _ = out.send(Err(CloudError::NotActive(CloudStateKind::LoggedOut)));
                     }
                     CloudCmd::Genesis { out } => {
+                        let _ = out.send(Err(CloudError::NotActive(CloudStateKind::LoggedOut)));
+                    }
+                    CloudCmd::Approve { out, .. } => {
+                        let _ = out.send(Err(CloudError::NotActive(CloudStateKind::LoggedOut)));
+                    }
+                    CloudCmd::Reject { out, .. } => {
+                        let _ = out.send(Err(CloudError::NotActive(CloudStateKind::LoggedOut)));
+                    }
+                    CloudCmd::Revoke { out, .. } => {
+                        let _ = out.send(Err(CloudError::NotActive(CloudStateKind::LoggedOut)));
+                    }
+                    CloudCmd::Profiles { out, .. } => {
                         let _ = out.send(Err(CloudError::NotActive(CloudStateKind::LoggedOut)));
                     }
                     CloudCmd::Logout { out } => {
@@ -1947,7 +2581,6 @@ pub async fn run(
                         let _ = out.send(Ok(LogoutOutcome { revoked: false }));
                     }
                     CloudCmd::Stop => return,
-                    _ => {}
                 }
             }
             Stage::Trust(e) => {
@@ -1961,6 +2594,18 @@ pub async fn run(
                         let _ = out.send(Err(CloudError::Trust(e.clone())));
                     }
                     CloudCmd::Genesis { out } => {
+                        let _ = out.send(Err(CloudError::Trust(e.clone())));
+                    }
+                    CloudCmd::Approve { out, .. } => {
+                        let _ = out.send(Err(CloudError::Trust(e.clone())));
+                    }
+                    CloudCmd::Reject { out, .. } => {
+                        let _ = out.send(Err(CloudError::Trust(e.clone())));
+                    }
+                    CloudCmd::Revoke { out, .. } => {
+                        let _ = out.send(Err(CloudError::Trust(e.clone())));
+                    }
+                    CloudCmd::Profiles { out, .. } => {
                         let _ = out.send(Err(CloudError::Trust(e.clone())));
                     }
                     CloudCmd::Logout { out } => {
@@ -2001,6 +2646,10 @@ pub async fn run(
                         live.reset_all();
                         stage = Stage::Trust(e);
                     }
+                    RunEnd::ReHello => {
+                        // The socket was healthy; redial at once (no backoff).
+                        stage = Stage::Connecting;
+                    }
                     RunEnd::Stopped => return,
                     RunEnd::LoggedOut => stage = Stage::Idle(LogoutReason::SignedOut),
                     RunEnd::Dropped(err, reset) => {
@@ -2008,6 +2657,13 @@ pub async fn run(
                         if let Some(out) = live.pending_genesis.take() {
                             let _ = out.send(Err(CloudError::Offline));
                         }
+                        if let Some((_, out)) = live.pending_append.take() {
+                            let _ = out.send(Err(CloudError::Offline));
+                        }
+                        if let Some((_, out)) = live.pending_revoke.take() {
+                            let _ = out.send(Err(CloudError::Offline));
+                        }
+                        live.append_retry = false;
                         if reset {
                             // The socket reached Welcome and stayed ≥60 s.
                             actor.attempt = 0;
@@ -2030,6 +2686,26 @@ pub async fn run(
                                     )));
                                 }
                                 Some(CloudCmd::Genesis { out }) => {
+                                    let _ = out.send(Err(CloudError::NotActive(
+                                        CloudStateKind::Connecting,
+                                    )));
+                                }
+                                Some(CloudCmd::Approve { out, .. }) => {
+                                    let _ = out.send(Err(CloudError::NotActive(
+                                        CloudStateKind::Connecting,
+                                    )));
+                                }
+                                Some(CloudCmd::Reject { out, .. }) => {
+                                    let _ = out.send(Err(CloudError::NotActive(
+                                        CloudStateKind::Connecting,
+                                    )));
+                                }
+                                Some(CloudCmd::Revoke { out, .. }) => {
+                                    let _ = out.send(Err(CloudError::NotActive(
+                                        CloudStateKind::Connecting,
+                                    )));
+                                }
+                                Some(CloudCmd::Profiles { out, .. }) => {
                                     let _ = out.send(Err(CloudError::NotActive(
                                         CloudStateKind::Connecting,
                                     )));

@@ -301,7 +301,14 @@ async fn revoking_a_peer_triggers_chainchanged_and_drops_sessions() {
 
     let b = spawn_device(2, "Desktop", &fake, None);
     b.login(&fake).await;
-    let c = spawn_device(3, "Pixel 9", &fake, None);
+    // C must accept inbound sessions (design §A: no hook ⇒ `Close{PROTOCOL}`),
+    // and its hook must HOLD the stream — a dropped one would send
+    // `Reset(CANCELLED)` and fake the revoke assertion below.
+    let (held_tx, _held_rx) = tokio::sync::mpsc::unbounded_channel();
+    let hook: peakbot::cloud::InboundHook = std::sync::Arc::new(move |dev, op, stream| {
+        let _ = held_tx.send((dev, op, stream));
+    });
+    let c = spawn_device(3, "Pixel 9", &fake, Some(hook));
     c.login(&fake).await;
     // Approve both requests (B's then C's, in arrival order).
     for name in ["Desktop", "Pixel 9"] {

@@ -32,7 +32,7 @@ pub struct Session {
 
 /// A local profile as reported by the `Profiles` op (§E.3: local profiles
 /// only — `remote:` profiles never cross).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProfileInfo {
     pub name: String,
     pub color: String,

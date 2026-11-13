@@ -60,13 +60,16 @@ pub struct DeviceInfo {
     pub online: Option<bool>,
 }
 
-/// A verified, unexpired `EnrollRequest` letter (§G, G.4 step 2).
+/// A verified, unexpired `EnrollRequest` letter (§G, G.4 step 2). `card`
+/// is the raw CE card the `Add` entry signs (not re-derivable from the
+/// DeviceId — erratum E-F1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnrollRequestInfo {
     pub letter_id: LetterId,
     pub device: DeviceId,
     pub name: String,
     pub platform: String,
+    pub card: Vec<u8>,
     pub sas: SasWords,
     pub expires_at: u64,
 }
@@ -211,7 +214,7 @@ pub enum CloudCmd {
     },
     Profiles {
         device: DeviceId,
-        out: oneshot::Sender<Vec<crate::cloud::session::ProfileInfo>>,
+        out: oneshot::Sender<Result<Vec<crate::cloud::session::ProfileInfo>, CloudError>>,
     },
     /// Stop the actor (handle teardown).
     Stop,
@@ -311,28 +314,69 @@ impl CloudHandle {
             .map_err(|_| CloudError::Io("the cloud actor stopped".into()))?
     }
 
-    /// Approve an `EnrollRequest` (§G.4): `Add` at head+1.
-    pub async fn approve(&self, _letter_id: LetterId) -> Result<DeviceId, CloudError> {
-        todo!("p3 PR-B: CloudHandle::approve (flow phase)")
+    /// Approve an `EnrollRequest` (§G.4): `Add` at head+1; the reply rides
+    /// the `ChainChanged` sync (one rebuild on a relay conflict).
+    pub async fn approve(&self, letter_id: LetterId) -> Result<DeviceId, CloudError> {
+        let kind = self.state.borrow().kind();
+        if kind != CloudStateKind::Active {
+            return Err(CloudError::NotActive(kind));
+        }
+        let (out, rx) = oneshot::channel();
+        self.cmd
+            .send(CloudCmd::Approve { letter_id, out })
+            .await
+            .map_err(|_| CloudError::Io("the cloud actor stopped".into()))?;
+        rx.await
+            .map_err(|_| CloudError::Io("the cloud actor stopped".into()))?
     }
 
     /// Reject an `EnrollRequest` (§G.4 step 4): sealed `EnrollReject`.
-    pub async fn reject(&self, _letter_id: LetterId) -> Result<(), CloudError> {
-        todo!("p3 PR-B: CloudHandle::reject (flow phase)")
+    pub async fn reject(&self, letter_id: LetterId) -> Result<(), CloudError> {
+        let kind = self.state.borrow().kind();
+        if kind != CloudStateKind::Active {
+            return Err(CloudError::NotActive(kind));
+        }
+        let (out, rx) = oneshot::channel();
+        self.cmd
+            .send(CloudCmd::Reject { letter_id, out })
+            .await
+            .map_err(|_| CloudError::Io("the cloud actor stopped".into()))?;
+        rx.await
+            .map_err(|_| CloudError::Io("the cloud actor stopped".into()))?
     }
 
-    /// Revoke a peer (§G.5): `Revoke` entry; self ⇒ `use_logout`, the last
-    /// active device ⇒ `last_device`.
-    pub async fn revoke(&self, _target: DeviceId) -> Result<(), CloudError> {
-        todo!("p3 PR-B: CloudHandle::revoke (flow phase)")
+    /// Revoke a peer (§G.5): `Revoke` entry; self ⇒ `use_logout`, an
+    /// unknown id ⇒ `unknown_device`.
+    pub async fn revoke(&self, target: DeviceId) -> Result<(), CloudError> {
+        let kind = self.state.borrow().kind();
+        if kind != CloudStateKind::Active {
+            return Err(CloudError::NotActive(kind));
+        }
+        let (out, rx) = oneshot::channel();
+        self.cmd
+            .send(CloudCmd::Revoke { target, out })
+            .await
+            .map_err(|_| CloudError::Io("the cloud actor stopped".into()))?;
+        rx.await
+            .map_err(|_| CloudError::Io("the cloud actor stopped".into()))?
     }
 
     /// The `Profiles` op on a peer (§E.3: local profiles only).
     pub async fn profiles(
         &self,
-        _device: DeviceId,
+        device: DeviceId,
     ) -> Result<Vec<crate::cloud::session::ProfileInfo>, CloudError> {
-        todo!("p3 PR-B: CloudHandle::profiles (flow phase)")
+        let kind = self.state.borrow().kind();
+        if kind != CloudStateKind::Active {
+            return Err(CloudError::NotActive(kind));
+        }
+        let (out, rx) = oneshot::channel();
+        self.cmd
+            .send(CloudCmd::Profiles { device, out })
+            .await
+            .map_err(|_| CloudError::Io("the cloud actor stopped".into()))?;
+        rx.await
+            .map_err(|_| CloudError::Io("the cloud actor stopped".into()))?
     }
 }
 

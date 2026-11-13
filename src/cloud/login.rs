@@ -212,8 +212,10 @@ pub async fn redeem_token(
     Ok(SessionToken::new(token.to_string()))
 }
 
-/// `POST {base}/logout` with Bearer, best effort, 5 s (the relay endpoint
-/// is idempotent). A failure must NOT stop the local wipe (p3-design §G.6).
+/// `POST {base}/logout` with Bearer (the relay endpoint is idempotent).
+/// Best effort with a 5 s bound: the failure must NOT stop the local wipe
+/// (p3-design §G.6), but it IS reported — a dead relay session means the
+/// device stays listed, so the API answers `revoked: false`.
 pub async fn logout_post(base: &Url, token: &SessionToken) -> Result<(), CloudError> {
     let url = base
         .join("logout")
@@ -222,6 +224,15 @@ pub async fn logout_post(base: &Url, token: &SessionToken) -> Result<(), CloudEr
         .post(url)
         .header("Authorization", format!("Bearer {}", token.as_str()))
         .send();
-    let _ = tokio::time::timeout(Duration::from_secs(5), req).await;
+    let resp = tokio::time::timeout(Duration::from_secs(5), req)
+        .await
+        .map_err(|_| CloudError::Io("relay /logout timed out".into()))?
+        .map_err(|e| CloudError::Io(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(CloudError::Io(format!(
+            "relay /logout answered {}",
+            resp.status()
+        )));
+    }
     Ok(())
 }

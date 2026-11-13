@@ -8,9 +8,6 @@
 //! approver recomputes from `letter.head`. A letter whose head is not in
 //! our verified history is dropped (G.4 step 2).
 
-// Flow skeletons (todo!() bodies) land in a later phase; drop this then.
-#![allow(unused_variables, dead_code)]
-
 use cloud::{
     Head,
     card::DeviceCard,
@@ -51,7 +48,32 @@ pub fn request_info(
     accepted: &AcceptedLetter,
     now: u64,
 ) -> Option<EnrollRequestInfo> {
-    todo!("p3 PR-B: request_info (frozen-head check + SAS recompute)")
+    let cloud::letter::LetterKindBody::EnrollRequest { card, head_n, .. } = &accepted.body.body
+    else {
+        return None;
+    };
+    // The letter's head must be in our verified history (G.4 step 2).
+    if chain.hashes.get(head_n.seq as usize) != Some(&head_n.hash) {
+        return None;
+    }
+    let parsed = DeviceCard::parse(card).ok()?;
+    let expires_at = accepted
+        .body
+        .created_at
+        .saturating_add(cloud::constants::TTL_LETTER);
+    // An already-expired request is not worth showing (G.4 step 5).
+    if expires_at <= now {
+        return None;
+    }
+    Some(EnrollRequestInfo {
+        letter_id: accepted.body.letter_id,
+        device: parsed.device_id(),
+        name: parsed.name.clone(),
+        platform: parsed.platform.to_string(),
+        card: card.clone(),
+        sas: sas::words(card, head_n),
+        expires_at,
+    })
 }
 
 /// The `Add` entry at `head+1` for the letter's card (G.4 step 3).
@@ -62,12 +84,34 @@ pub fn approve_entry<R: CryptoRng>(
     sk: &v1::PrivateKey,
     rng: &mut R,
 ) -> cloud::Result<ChainEntry> {
-    todo!("p3 PR-B: approve_entry")
+    cloud::chain::build_entry(
+        chain.head.seq.saturating_add(1),
+        chain.head.hash,
+        cloud::chain::ChainOp::Add,
+        Some(card.to_vec()),
+        None,
+        signer.device_id(),
+        sk,
+        rng,
+    )
 }
 
-/// The `EnrollReject` letter body (G.4 step 4).
-pub fn reject_letter(now: u64, from: cloud::DeviceId, to: cloud::DeviceId) -> LetterBody {
-    todo!("p3 PR-B: reject_letter")
+/// The `EnrollReject` letter body (G.4 step 4): the fresh `letter_id` is
+/// minted by the caller (it is the dedupe + `Ack` key).
+pub fn reject_letter(
+    letter_id: cloud::LetterId,
+    now: u64,
+    from: cloud::DeviceId,
+    to: cloud::DeviceId,
+) -> LetterBody {
+    LetterBody {
+        letter_id,
+        from,
+        to,
+        created_at: now,
+        kind: cloud::letter::LetterKind::EnrollReject,
+        body: cloud::letter::LetterKindBody::EnrollReject,
+    }
 }
 
 /// The `Revoke` entry at `head+1` for `target` (G.5 step 1).
@@ -78,12 +122,21 @@ pub fn revoke_entry<R: CryptoRng>(
     sk: &v1::PrivateKey,
     rng: &mut R,
 ) -> cloud::Result<ChainEntry> {
-    todo!("p3 PR-B: revoke_entry")
+    cloud::chain::build_entry(
+        chain.head.seq.saturating_add(1),
+        chain.head.hash,
+        cloud::chain::ChainOp::Revoke,
+        None,
+        Some(target),
+        signer.device_id(),
+        sk,
+        rng,
+    )
 }
 
 /// The SAS words for a pending device's card at the frozen head (G.3 step 1).
 pub fn sas_for(card: &[u8], frozen: &Head) -> sas::SasWords {
-    todo!("p3 PR-B: sas_for")
+    sas::words(card, frozen)
 }
 
 /// Why an enrollment step was refused.
@@ -108,17 +161,37 @@ pub struct EnrollAttempt {
 impl EnrollAttempt {
     /// Freeze `chain.head` and compute the words for `card`.
     pub fn freeze(chain: &VerifiedChain, card: &DeviceCard) -> Self {
-        todo!("p3 PR-B: EnrollAttempt::freeze")
+        let frozen = chain.head;
+        let sas = sas::words(&card.encode(), &frozen);
+        Self {
+            frozen,
+            card: card.encode(),
+            sas,
+        }
     }
 
     /// The frozen head (the letter ships exactly this).
     pub fn frozen(&self) -> Head {
-        todo!("p3 PR-B: EnrollAttempt::frozen")
+        self.frozen
+    }
+
+    /// The CE card bytes the letter ships.
+    pub fn card(&self) -> &[u8] {
+        &self.card
+    }
+
+    /// The frozen SAS words (published as `Pending.sas`).
+    pub fn sas(&self) -> sas::SasWords {
+        self.sas
     }
 
     /// Reveal the words, but only while `current` is still the frozen
     /// head; a moved head is an error, not a silent re-derivation.
     pub fn reveal(&self, current: &Head) -> Result<sas::SasWords, EnrollError> {
-        todo!("p3 PR-B: EnrollAttempt::reveal")
+        if *current == self.frozen {
+            Ok(self.sas)
+        } else {
+            Err(EnrollError::HeadMoved)
+        }
     }
 }
