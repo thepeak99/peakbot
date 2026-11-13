@@ -1,0 +1,73 @@
+# peakbot-relay — Shifu Cloud Mode relay (design: /tmp/peakbot/design/relay-design.md).
+# Workspace member, NOT a default-member: plain `cargo build/test/clippy` stays on
+# the root crate; always address this crate with `-p peakbot-relay`.
+#
+# SKELETON (TDD): the lib and binary compile; every behaviour is `todo!()`.
+# Integration tests in tests/ are RED on purpose until the implementation lands.
+[package]
+name = "peakbot-relay"
+version = "0.1.0"
+edition = "2024"
+description = "Shifu Cloud Mode relay: OIDC login, device WebSocket auth, account chain + letter store, Pipe routing"
+
+# No explicit [lib]/[[bin]]: auto-discovery gives lib `peakbot_relay` (tests drive
+# it in-process) and binary `peakbot-relay` (design §7 task 1).
+
+[dependencies]
+# The protocol core: envelope codecs, card parsing, Hello verification, chain
+# verification. Reused, never copied (design §2).
+peakbot-cloud = { path = "../cloud" }
+tokio = { version = "1", features = ["full"] }
+# Plain HTTP behind the TLS proxy; `ws` for /ws (design §2, deliberately no
+# axum-server / server-side rustls).
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "ws", "json"] }
+# Hand-rolled OIDC on the workspace reqwest (design §5.3: no openidconnect).
+reqwest = { version = "0.13", features = ["rustls", "json", "form"], default-features = false }
+# One SQLite file, one connection, one lock; bundled C so no system lib (design §3.4).
+rusqlite = { version = "0.37", features = ["bundled"] }
+# JWS + registered claims; aws_lc_rs reuses the aws-lc-rs rustls already links.
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# relay.yaml (design §3.1): the workspace's serde_yaml 0.9.
+serde_yaml = "0.9"
+sha2 = "0.10"
+base64 = "0.22"
+url = "2"
+# Constant-time nonce comparison (design §5.3).
+subtle = "2"
+# OsRng for tokens, nonces, states, one-time codes.
+rand_core = { version = "0.9", features = ["std", "os_rng"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+
+[dev-dependencies]
+# Integration-test harness (design §9.1): the harness drives the relay
+# in-process, so it needs the same crates the lib uses, plus WS/IdP tooling.
+peakbot-cloud = { path = "../cloud" }
+tokio = { version = "1", features = ["full", "test-util"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "ws", "json", "form"] }
+reqwest = { version = "0.13", features = ["rustls", "json", "form", "query"], default-features = false }
+futures-util = "0.3"
+url = "2"
+serde_json = "1"
+base64 = "0.22"
+sha2 = { version = "0.10", features = ["oid"] }
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# DB inspection after shutdown (chain.rs revoke test).
+rusqlite = { version = "0.37", features = ["bundled"] }
+tokio-tungstenite = "0.28"
+tempfile = "3"
+# Device keys/cards/chain entries come from the same perma-crypto rev as cloud.
+perma-crypto = { git = "https://git.patchnotes.com/ai-bots/perma-crypto.git", rev = "bb917b548f75922a2a3c39f9797798546ba8bd26" }
+rand = "0.9"
+# FakeIdp key material: ES256 via p256, RS256 via rsa (pure-Rust backend;
+# design §9.1, R8 fallback: keys generated in-test).
+p256 = { version = "0.13", features = ["ecdsa", "ecdh"] }
+rsa = { version = "0.9" }
+# Raise the soft RLIMIT_NOFILE in the test harness (socket_cap_returns_503).
+libc = "0.2"
