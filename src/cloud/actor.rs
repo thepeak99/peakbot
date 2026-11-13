@@ -1991,7 +1991,11 @@ impl Actor {
         letter_id: LetterId,
         out: oneshot::Sender<Result<DeviceId, CloudError>>,
     ) {
-        let Some(req) = self.requests.get(&letter_id) else {
+        let Some(req) = self
+            .requests
+            .get(&letter_id)
+            .filter(|r| r.expires_at > now_secs())
+        else {
             let _ = out.send(Err(CloudError::Flow(FlowError::UnknownRequest)));
             return;
         };
@@ -2035,7 +2039,12 @@ impl Actor {
         out: oneshot::Sender<Result<(), CloudError>>,
         state: &watch::Sender<CloudState>,
     ) {
-        let Some(req) = self.requests.get(&letter_id).cloned() else {
+        let Some(req) = self
+            .requests
+            .get(&letter_id)
+            .filter(|r| r.expires_at > now_secs())
+            .cloned()
+        else {
             let _ = out.send(Err(CloudError::Flow(FlowError::UnknownRequest)));
             return;
         };
@@ -2108,6 +2117,8 @@ impl Actor {
             let _ = out.send(Err(CloudError::UnknownDevice));
             return;
         }
+        // (`last_device`, G.5 step 4, is unreachable here: self is Active and
+        // `target != self`, so ≥ 2 devices; see erratum E-F4.)
         let mut rng = Os;
         let entry =
             match enroll::revoke_entry(&chain, target, self.id.card.clone(), &self.id.sk, &mut rng)

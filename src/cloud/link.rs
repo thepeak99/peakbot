@@ -141,6 +141,43 @@ pub enum FlowError {
     LastDevice,
 }
 
+/// Directory slug per device (design F.5 / H.1): `slug(name)` =
+/// `[a-z0-9-]{1,32}`, de-duplicated by appending `-` + the first 4 hex of
+/// the DeviceId when two devices share one. Derived, never stored.
+pub fn device_slugs(devices: &[DeviceInfo]) -> Vec<String> {
+    fn base(name: &str) -> String {
+        let mut s = String::new();
+        for c in name.chars() {
+            if c.is_ascii_alphanumeric() {
+                s.push(c.to_ascii_lowercase());
+            } else if !s.ends_with('-') && !s.is_empty() {
+                s.push('-');
+            }
+        }
+        let s = s.trim_end_matches('-');
+        let s: String = s.chars().take(32).collect();
+        if s.is_empty() {
+            "device".to_string()
+        } else {
+            s
+        }
+    }
+    let bases: Vec<String> = devices.iter().map(|d| base(&d.name)).collect();
+    devices
+        .iter()
+        .zip(&bases)
+        .map(|(d, b)| {
+            if bases.iter().filter(|x| *x == b).count() > 1 {
+                let short: String = d.id.iter().take(2).map(|x| format!("{x:02x}")).collect();
+                let keep: String = b.chars().take(27).collect();
+                format!("{keep}-{short}")
+            } else {
+                b.clone()
+            }
+        })
+        .collect()
+}
+
 /// `POST /api/cloud/logout` → `{"revoked": bool}` (G.6 step 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LogoutOutcome {
@@ -231,7 +268,8 @@ impl CloudHandle {
     /// a browser. A second login cancels the first (G.1 step 5).
     pub async fn login(&self, open_browser: impl FnOnce(Url)) -> Result<(), CloudError> {
         let mut slot = self.login_task.lock().await;
-        if slot.is_some() && self.state.borrow().kind() != CloudStateKind::LoggedOut {
+        // Any state past `LoggedOut` means a token already exists (H.1).
+        if self.state.borrow().kind() != CloudStateKind::LoggedOut {
             return Err(CloudError::Flow(FlowError::AlreadyLoggedIn));
         }
         if let Some(t) = slot.take() {
@@ -258,6 +296,18 @@ impl CloudHandle {
         }));
         open_browser(auth_url);
         Ok(())
+    }
+
+    /// A login listener is running right now (G.1 step 5). The handle's
+    /// `login` cancels it (design G.1); the API instead refuses with
+    /// `already_logged_in` (H.1) so a double click cannot kill a flow the
+    /// user is completing in the browser (erratum E-F3).
+    pub async fn login_in_flight(&self) -> bool {
+        self.login_task
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|t| !t.is_finished())
     }
 
     /// Logout = `POST /logout` (best effort) + WIPE (seed, token, chain,

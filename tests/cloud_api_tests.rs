@@ -592,7 +592,7 @@ async fn revoke_unknown_device_is_404() {
     .await;
     let c = client();
 
-    let unknown = "77".repeat(16);
+    let unknown = "77".repeat(32);
     let resp = c
         .post(api(addr, &format!("/api/cloud/devices/{unknown}/revoke")))
         .send()
@@ -617,7 +617,7 @@ async fn revoke_bad_device_id_is_400() {
     .await;
     let c = client();
 
-    for bad in ["nothex".to_string(), "ZZ".repeat(16), "77".repeat(15)] {
+    for bad in ["nothex".to_string(), "ZZ".repeat(32), "77".repeat(31)] {
         let resp = c
             .post(api(addr, &format!("/api/cloud/devices/{bad}/revoke")))
             .send()
@@ -723,7 +723,7 @@ async fn events_sse_emits_full_state_on_change() {
         let url = post_login(&client(), addr).await;
         async move { rig::drive_login(&fake, url).await }
     });
-    let second = next_sse_data(&mut stream).await;
+    let second = next_sse_state_skipping(&mut stream, "connecting").await;
     assert_eq!(second["state"], "pending", "login event: {second}");
     assert_eq!(second["empty_account"], true);
 
@@ -732,9 +732,24 @@ async fn events_sse_emits_full_state_on_change() {
         .send()
         .await
         .unwrap();
-    let third = next_sse_data(&mut stream).await;
+    let third = next_sse_state_skipping(&mut stream, "connecting").await;
     assert_eq!(third["state"], "active", "genesis event: {third}");
     assert_eq!(third["devices"].as_array().expect("devices[]").len(), 1);
+}
+
+/// The next SSE state that is not the transient `skip` state: H.2 sends one
+/// full event per `watch` change, and the actor passes through
+/// `connecting` (login redial, post-genesis re-Hello) on the way.
+async fn next_sse_state_skipping(
+    stream: &mut (impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin),
+    skip: &str,
+) -> Value {
+    loop {
+        let v = next_sse_data(stream).await;
+        if v["state"] != skip {
+            return v;
+        }
+    }
 }
 
 #[tokio::test]
@@ -794,7 +809,7 @@ async fn settings_filter_blocks_mutating_routes() {
     let c = client();
 
     // The six mutating routes → 403 settings_disabled.
-    let revoke_path = format!("/api/cloud/devices/{}/revoke", "77".repeat(16));
+    let revoke_path = format!("/api/cloud/devices/{}/revoke", "77".repeat(32));
     let cases: Vec<(&str, &str)> = vec![
         ("/api/cloud/login", "{}"),
         ("/api/cloud/genesis", "{}"),
