@@ -1308,7 +1308,9 @@ describe("App desktop — option D: the desktop shell is always wide", () => {
     expect(rail, "the desktop drawer rail renders in the desktop shell at any width").not.toBeNull();
     expect(tid("panels-button"), "no phone panels button in the desktop shell").toBeNull();
     expect(panelsDialog(), "no phone sheet in the desktop shell").toBeNull();
-    expect(host.querySelector("header"), "no phone ChatHeader in the desktop shell").toBeNull();
+    // The desktop shell has no Chats screen, so no phone ChatHeader (back button);
+    // its <header> is the desktop TopBar.
+    expect(tid("chat-back"), "no phone ChatHeader in the desktop shell").toBeNull();
   });
 
   it("a NARROW desktop-shell viewport keeps the desktop composer face ('Type a message…')", async () => {
@@ -1316,7 +1318,9 @@ describe("App desktop — option D: the desktop shell is always wide", () => {
     hoisted.agent = makeAgent(withTabs());
     mount();
     await flush();
-    const ta = host.querySelector('[data-testid="composer"] textarea') as HTMLTextAreaElement;
+    // data-testid="composer" is the phone face's marker, so the desktop face has none.
+    expect(tid("composer"), "no phone composer face in the desktop shell").toBeNull();
+    const ta = host.querySelector("textarea") as HTMLTextAreaElement;
     expect(ta, "the composer textarea renders").not.toBeNull();
     expect(ta!.placeholder, "the desktop placeholder, not the phone's 'Message'").toBe("Type a message…");
   });

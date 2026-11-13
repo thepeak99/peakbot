@@ -41,6 +41,7 @@ import type { TabsState } from "./convoTabs";
 import { useTaskNotifications } from "./useTaskNotifications";
 import { useTabIndicator } from "./useTabIndicator";
 import { useFocusMode } from "./useFocusMode";
+import { isDesktop as isDesktopShell } from "./desktop";
 import { useMediaQuery } from "./useMediaQuery";
 import { useMobileChats } from "./useMobileChats";
 import { useScreenSlide } from "./useScreenSlide";
@@ -152,8 +153,11 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   // Called once here (not in TopBar) so App can filter with the same value
   // the button renders — two useState copies would desync (plan §6.1).
   const focusMode = useFocusMode();
-  // ≥1024px: the desktop drawer rail; below: the phone's Panels sheet.
-  const isDesktop = useMediaQuery("(min-width: 1024px)");
+  // The desktop drawer rail at ≥1024px or anywhere in the desktop app (its
+  // window is never narrower than that); below: the phone's Panels sheet.
+  // The hook is always called, so hook order stays stable.
+  const wideViewport = useMediaQuery("(min-width: 1024px)");
+  const isDesktop = isDesktopShell() || wideViewport;
 
   // Sub-agent roster: one entry per delegation call, in call order (Phase 2 +
   // per-call). Zero backend — derived from the transcript. A role delegated to

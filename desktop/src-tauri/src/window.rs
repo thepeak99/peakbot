@@ -16,6 +16,11 @@ use crate::commands::ActionTx;
 
 pub const MAIN_LABEL: &str = "main";
 
+/// Minimum window size: the width matches the web `lg` breakpoint (1024px), so the
+/// window can never fall into the phone layout.
+const MIN_WIDTH: f64 = 1024.0;
+const MIN_HEIGHT: f64 = 600.0;
+
 /// The init script that tags this window's origin as the desktop shell. Byte-for-byte
 /// the mobile init-script's `peakbotShell` definition with `"desktop"` in place of
 /// `"mobile"`. Injected on every load, including the remote
@@ -29,7 +34,7 @@ pub fn create_main(app: &AppHandle, nav: Arc<RwLock<Option<String>>>) -> tauri::
         tauri::WebviewWindowBuilder::new(app, MAIN_LABEL, WebviewUrl::App("index.html".into()))
             .title("PeakBot")
             .inner_size(1200.0, 800.0)
-            .min_inner_size(800.0, 500.0)
+            .min_inner_size(MIN_WIDTH, MIN_HEIGHT)
             // Tauri re-runs init scripts on every load in this window, so one
             // call covers the bundled page and the remote :7823 web UI alike.
             .initialization_script(SHELL_MARKER_SCRIPT)
