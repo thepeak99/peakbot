@@ -1351,6 +1351,7 @@ impl Actor {
         }
         if let Some(side) = o.streams.get_mut(&inner.stream) {
             if side.to_caller.try_send(inner.msg.clone()).is_err() {
+                eprintln!("DBG route_inner CANCELLED stream={} msg={:?}", inner.stream, inner.msg);
                 // Backpressure (§D.5): reset the stream, never block.
                 self.drop_stream(o, inner.stream);
                 self.send_reset(ws, o, peer, inner.stream, constants::reset::CANCELLED)
@@ -1369,6 +1370,7 @@ impl Actor {
                     self.drop_stream(o, id);
                 }
                 MuxEvent::AnswerReset(id, code) => {
+                    eprintln!("DBG AnswerReset id={id} code={code}");
                     self.send_reset(ws, o, peer, id, code).await;
                 }
             }
@@ -1506,6 +1508,7 @@ impl Actor {
     }
 
     async fn send_reset(&self, ws: &mut Ws, o: &mut Open, peer: DeviceId, id: u32, code: u16) {
+        eprintln!("DBG wire send_reset code={code} stream={id}\n{}", std::backtrace::Backtrace::force_capture());
         let reset = Inner {
             stream: id,
             msg: StreamMsg::Reset(code),

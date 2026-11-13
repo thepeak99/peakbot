@@ -22,7 +22,7 @@ use axum::http::{Method, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use bytes::Bytes;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use percent_encoding::percent_decode_str;
 use uuid::Uuid;
 
@@ -134,7 +134,7 @@ async fn upload_post(profile: &str, req: Request<Body>) -> Response {
         return not_found().await;
     };
     let content_type = req.headers().get(header::CONTENT_TYPE).cloned();
-    let body = reqwest::Body::wrap_stream(req.into_body().into_data_stream());
+    let body = req.into_body().into_data_stream().boxed();
     match client.post_upload(&convo, &name, content_type, body).await {
         Ok(upstream) => upstream_response(upstream),
         Err(e) => failure_response(e),
@@ -221,9 +221,9 @@ struct SizedStream<S> {
 
 impl<S> Stream for SizedStream<S>
 where
-    S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
+    S: Stream<Item = Result<Bytes, RemoteError>> + Unpin,
 {
-    type Item = Result<Bytes, reqwest::Error>;
+    type Item = Result<Bytes, RemoteError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.as_mut().get_mut();

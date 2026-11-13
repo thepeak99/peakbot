@@ -4,10 +4,12 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use peakbot::boot::{self, WebBoot, WebSession};
 use peakbot::cloud::{CloudState, InboundHook};
 use peakbot::config::{Config, ParseCtx, Source};
+use peakbot::paths::{self, Roots};
 use peakbot::skills::SkillRegistry;
 use peakbot::ui::WebUi;
 use peakbot::ui::web::settings::TokenSource;
@@ -55,6 +57,28 @@ pub fn yaml_small_uploads() -> String {
     )
 }
 
+/// A session re-reads the GLOBAL config from disk (`reload_config` →
+/// `paths::config_dir`), and `paths::init_roots` is a process-global
+/// OnceLock — so the fixture YAML is written ONCE under one temp root all
+/// cores in this process share (every fixture has the same profiles;
+/// per-core limits ride on `SessionDeps`, not on disk).
+static ROOT: OnceLock<tempfile::TempDir> = OnceLock::new();
+
+fn pin_global_config(yaml: &str) {
+    ROOT.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("config root");
+        let config = dir.path().join("config");
+        std::fs::create_dir_all(&config).expect("config dir");
+        std::fs::write(config.join("config.yaml"), yaml).expect("write config");
+        paths::init_roots(Roots {
+            config,
+            data: dir.path().join("data"),
+            cache: dir.path().join("cache"),
+        });
+        dir
+    });
+}
+
 pub struct Core {
     pub addr: SocketAddr,
     /// Keeps the WebUi (and its registry/deps) alive for the router.
@@ -67,6 +91,7 @@ pub struct Core {
 /// router on a random loopback port, and return the CloudServe inbound hook
 /// (host-only seam, §E) for wiring into the core's CloudLink.
 pub async fn boot_core(yaml: &str) -> (Core, Option<InboundHook>) {
+    pin_global_config(yaml);
     let config = Config::parse(
         Source {
             path: Path::new("/global/config.yaml"),

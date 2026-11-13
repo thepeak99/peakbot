@@ -19,6 +19,9 @@ use peakbot::ui::web::remote_types::{
 };
 use tokio_tungstenite::tungstenite::Message as TMsg;
 
+#[cfg(feature = "host")]
+use cloud_common::host::{YAML, boot_core};
+
 use cloud_common::devices::id_a;
 use cloud_common::fake_relay::FakeRelay;
 use cloud_common::rig::{self, Dev, TIMEOUT, spawn_device};
@@ -40,8 +43,8 @@ async fn login(dev: &Dev, fake: &FakeRelay) {
 }
 
 /// A (host) and B (controller), both Active on one fake relay.
-async fn enroll_pair(fake: &FakeRelay) -> (Dev, Dev) {
-    let a = spawn_device(1, "Laptop", fake, None);
+async fn enroll_pair(fake: &FakeRelay, host_inbound: Option<peakbot::cloud::InboundHook>) -> (Dev, Dev) {
+    let a = spawn_device(1, "Laptop", fake, host_inbound);
     let b = spawn_device(2, "Desktop", fake, None);
     login(&a, fake).await;
     a.handle.genesis().await.expect("genesis");
@@ -69,10 +72,12 @@ async fn enroll_pair(fake: &FakeRelay) -> (Dev, Dev) {
 /// `Client::Cloud{…}.dial()` → a `WsStream::Cloud` that the existing relay
 /// code consumes UNCHANGED: the same `TMsg::Text` attach frame in, the same
 /// `attached`/`ready` JSON frames out (the §F.2 `Frame` ↔ `Text` mapping).
+#[cfg(feature = "host")]
 #[tokio::test]
 async fn client_cloud_dial_yields_a_ws_stream_the_relay_consumes() {
     let fake = FakeRelay::spawn().await;
-    let (_a, b) = enroll_pair(&fake).await;
+    let (_core, hook) = boot_core(YAML).await;
+    let (_a, b) = enroll_pair(&fake, hook).await;
 
     let client = Client::Cloud {
         handle: b.handle.clone(),
@@ -115,10 +120,12 @@ async fn client_cloud_dial_yields_a_ws_stream_the_relay_consumes() {
 
 /// `Client::Cloud.get(Upload)` → `Upstream` whose `bytes_stream()` yields
 /// the uploaded bytes: Head first, then the Chunks, then end.
+#[cfg(feature = "host")]
 #[tokio::test]
 async fn upstream_cloud_body_streams_the_uploaded_bytes() {
     let fake = FakeRelay::spawn().await;
-    let (_a, b) = enroll_pair(&fake).await;
+    let (_core, hook) = boot_core(YAML).await;
+    let (_a, b) = enroll_pair(&fake, hook).await;
 
     let convo = attach_ready(&b).await;
 
@@ -290,7 +297,7 @@ fn an_at_sign_cannot_be_a_profile_name() {
 #[tokio::test]
 async fn directory_resolves_profile_at_device_via_the_verified_chain() {
     let fake = FakeRelay::spawn().await;
-    let (_a, b) = enroll_pair(&fake).await;
+    let (_a, b) = enroll_pair(&fake, None).await;
 
     let dir = Directory::new().with_cloud(Some(b.handle.clone()));
     let client = dir

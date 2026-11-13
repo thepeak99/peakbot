@@ -11,9 +11,11 @@
 //! reply never takes longer than 2 s.
 
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
-use super::DIRECTORY;
+use super::{Client, DIRECTORY};
 use crate::ui::web::KILL_RUNNING_MSG;
 use crate::ui::web::conversations::local_rows;
 use crate::ui::web::registry::{KillOutcome, SessionRegistry};
@@ -71,7 +73,12 @@ pub(crate) async fn merged_listing(registry: &SessionRegistry) -> Listing {
             .insert(r.target.clone(), r.name.clone());
     }
 
-    let fetches = servers.into_iter().map(|(origin, targets)| {
+    // One fetch per target (a distinct remote server, or a cloud device),
+    // all in a single `join_all` (F.6: no new cap).
+    let mut fetches: Vec<
+        Pin<Box<dyn Future<Output = (String, Vec<ConversationSummaryWire>, bool)> + Send>>,
+    > = Vec::new();
+    for (origin, targets) in servers {
         // Any profile's client reaches that server (the token is the
         // server's), so one of its names picks the client.
         let client_name = targets
@@ -79,7 +86,7 @@ pub(crate) async fn merged_listing(registry: &SessionRegistry) -> Listing {
             .next()
             .cloned()
             .expect("a server has ≥1 profile");
-        async move {
+        fetches.push(Box::pin(async move {
             // The bound covers the client build too (a first-use CA
             // bootstrap must not push the reply past LIST_TIMEOUT); a
             // failure at any step is a `None`, which reports offline.
@@ -103,14 +110,58 @@ pub(crate) async fn merged_listing(registry: &SessionRegistry) -> Listing {
                         row
                     })
                 })
-                .collect::<Vec<_>>();
+                .collect();
             (origin, rows, online)
+        }));
+    }
+
+    // F.6: cloud devices are more fan-out targets — one `list()` per
+    // Active device (self excluded), the same bound, rows re-tagged
+    // `profile@slug`; a dead device contributes no rows and an offline
+    // status, in the same shape remotes use for "down".
+    if let Some(handle) = DIRECTORY.cloud() {
+        let state = handle.state().borrow().clone();
+        if let crate::cloud::CloudState::Active { devices, .. } = state {
+            let self_id = handle.device_id();
+            for (device, slug) in devices.iter().zip(crate::cloud::link::device_slugs(&devices)) {
+                if Some(device.id) == self_id {
+                    continue; // self is never listed (F.5)
+                }
+                let handle = handle.clone();
+                let device = device.id;
+                fetches.push(Box::pin(async move {
+                    // `list()` ignores the profile field; the rows carry
+                    // their own local profiles, which get re-tagged.
+                    let client = Client::Cloud {
+                        handle,
+                        device,
+                        profile: String::new(),
+                    };
+                    let fetched =
+                        tokio::time::timeout(LIST_TIMEOUT, client.list())
+                            .await
+                            .ok()
+                            .and_then(Result::ok);
+                    let online = fetched.is_some();
+                    let rows = fetched
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|mut row| {
+                            row.profile.take().map(|p| {
+                                row.profile = Some(format!("{p}@{slug}"));
+                                row
+                            })
+                        })
+                        .collect();
+                    (slug, rows, online)
+                }));
+            }
         }
-    });
+    }
 
     let mut machines = Vec::new();
-    for (origin, rows, online) in futures::future::join_all(fetches).await {
-        machines.push(MachineStatusWire { id: origin, online });
+    for (id, rows, online) in futures::future::join_all(fetches).await {
+        machines.push(MachineStatusWire { id, online });
         items.extend(rows);
     }
     items.sort_by_key(|row| std::cmp::Reverse(parse_updated_at(&row.updated_at)));
