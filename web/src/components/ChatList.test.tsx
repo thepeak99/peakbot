@@ -208,7 +208,7 @@ describe("ChatList — L1: sections and rows", () => {
     expect(c2.textContent).toContain("Tune WS keepalive");
     // Batch 2 (A21, §9 Q2): the second line is `profile · time` (no tag in
     // single-machine mode); the old "N msgs · model" meta is dropped.
-    expect(secondLineOf(c2).textContent).toMatch(new RegExp(`^dev · ${REL_TIME}$`));
+    expect(secondLineOf(c2).textContent).toMatch(new RegExp(`^dev[\u00A0 ]·[\u00A0 ]${REL_TIME}$`));
     expect(c2.textContent).not.toContain("5 msgs");
     expect(c2.textContent).not.toContain("sonnet");
     const c2bar = c2.querySelector('[data-testid="chat-bar"]');
@@ -217,7 +217,7 @@ describe("ChatList — L1: sections and rows", () => {
 
     const c1 = row(el, "c1");
     expect(c1.textContent).toContain("Debug WS relay");
-    expect(secondLineOf(c1).textContent).toMatch(new RegExp(`^home · ${REL_TIME}$`));
+    expect(secondLineOf(c1).textContent).toMatch(new RegExp(`^home[\u00A0 ]·[\u00A0 ]${REL_TIME}$`));
     expect(c1.textContent).not.toContain("3 msgs");
     const c1bar = c1.querySelector('[data-testid="chat-bar"]');
     expect(c1bar!.getAttribute("style")).toContain("var(--profile-teal)");
