@@ -30,7 +30,30 @@ pub fn session_deps(
     shell_kind: Option<ShellKind>,
     profile_pin: Option<String>,
 ) -> Arc<SessionDeps> {
-    let uploads = UploadStore::new(UploadStore::default_root(), config.general.uploads);
+    session_deps_in(
+        config,
+        skills,
+        mcp_handles,
+        boot_notices,
+        shell_kind,
+        profile_pin,
+        UploadStore::default_root(),
+    )
+}
+
+/// [`session_deps`] with the upload root injected (PR-C e2e seam):
+/// `paths::init_roots` is a process-global OnceLock, so two cores in one
+/// process must not both derive their upload dir from it.
+pub fn session_deps_in(
+    config: Config,
+    skills: SkillRegistry,
+    mcp_handles: Vec<McpServerHandle>,
+    boot_notices: Vec<String>,
+    shell_kind: Option<ShellKind>,
+    profile_pin: Option<String>,
+    uploads_root: PathBuf,
+) -> Arc<SessionDeps> {
+    let uploads = UploadStore::new(uploads_root, config.general.uploads);
     // Boot-only: the turn-end channel is process-wide and built once
     // (notify PR-B §7.6) — `None` iff `general.notifications.enabled`
     // is false, so "disabled but still emitting" cannot exist. Derived

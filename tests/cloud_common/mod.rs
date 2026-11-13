@@ -23,4 +23,6 @@ pub mod devices;
 pub mod fake_relay;
 #[cfg(feature = "host")]
 pub mod host;
+#[cfg(feature = "host")]
+pub mod relay_harness;
 pub mod rig;
