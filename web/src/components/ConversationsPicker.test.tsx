@@ -365,8 +365,8 @@ describe("ConversationsPicker — desktop vs browser (issue #373)", () => {
 
 describe("ConversationsPicker — per-profile row colour dot (remote-profiles T2)", () => {
   const CATALOG: CatalogProfile[] = [
-    { name: "dev", origin: "global", overridesGlobal: false, agents: [], color: "teal" },
-    { name: "ops", origin: "global", overridesGlobal: false, agents: [], color: "pink" },
+    { name: "dev", origin: "global", overridesGlobal: false, machine: null, agents: [], color: "teal" },
+    { name: "ops", origin: "global", overridesGlobal: false, machine: null, agents: [], color: "pink" },
   ];
   const convoWith = (id: string, profile: string | null): ConversationSummary => ({
     ...convo(id),

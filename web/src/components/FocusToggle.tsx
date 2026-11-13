@@ -1,18 +1,54 @@
 // Focus-mode toggle (plan §6.2). Dumb button — the preference lives in
 // App's useFocusMode hook (two useState copies would desync), so this only
 // renders `enabled` and reports clicks. Same 6×6 icon-button shape as
-// ThemeToggle/NotifyToggle.
+// ThemeToggle/NotifyToggle. `phone` (mobile fidelity batch 1) renders the
+// mock's 34px bordered `.ibi` face with the corners glyph; the default
+// branch is the desktop button, untouched.
+
+import { IB, IBI, IBI_ON } from "./phoneUi";
 
 export function FocusToggle({
   enabled,
   onToggle,
+  phone = false,
 }: {
   enabled: boolean;
   onToggle: () => void;
+  phone?: boolean;
 }) {
   const title = enabled
     ? "Focus mode on — showing only your messages and final answers (click to show all steps)"
     : "Focus mode off — showing every step (click to focus)";
+
+  if (phone) {
+    // One glyph in both states (proto:378); the .ibi.on tint carries the on.
+    return (
+      <button
+        type="button"
+        onClick={onToggle}
+        title={title}
+        aria-label="Focus mode"
+        aria-pressed={enabled}
+        className={IB}
+      >
+        <span className={enabled ? IBI_ON : IBI}>
+          <svg
+            width="18"
+            height="18"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.9"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden
+          >
+            <path d="M4 9V5h4M16 5h4v4M20 15v4h-4M8 19H4v-4" />
+          </svg>
+        </span>
+      </button>
+    );
+  }
 
   return (
     <button

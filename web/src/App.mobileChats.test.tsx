@@ -1,8 +1,9 @@
 // App-level wiring for the mobile Chats home screen (design §4.3, A1–A9).
 //
 // The mobile shell (shell() === "mobile") swaps the TopBar for the
-// Conversation header, renders the Chats list as a layer, and drops the
-// ConversationsPicker + lg:hidden from the bottom bar. Browser and desktop
+// Conversation header, renders the Chats list as a layer, and (mobile
+// redesign) hosts the selection chip in the header subtitle, so the bottom
+// bar is gone unless the remote CwdPicker needs it. Browser and desktop
 // shells are untouched (A8/A9 are the regression locks).
 //
 // Harness: ./App.mobileNav.test.tsx conventions (mocked ./useAgent, raw DOM,
@@ -45,6 +46,7 @@ interface FakeAgent {
   activeAlias: string;
   conversations: ConversationSummary[];
   conversationsError: string | null;
+  machines: { id: string; online: boolean }[];
   commands: unknown[];
   dirListing: null;
   recentDirs: string[];
@@ -96,6 +98,7 @@ function makeAgent(
     activeAlias: "",
     conversations: [],
     conversationsError: null,
+    machines: [],
     commands: [],
     dirListing: null,
     recentDirs: [],
@@ -370,7 +373,7 @@ describe("App mobile Chats wiring (A1–A9)", () => {
     expect(pushSpy, "one more pushState").toHaveBeenCalledTimes(1);
   });
 
-  it("A4: the FAB starts a new chat in place", async () => {
+  it("A4: with one machine the FAB is still switchConvo(null, null) — no picker, no pill", async () => {
     hoisted.agent = makeAgent(stateFor("c1"));
     mount();
     await flush();
@@ -382,6 +385,12 @@ describe("App mobile Chats wiring (A1–A9)", () => {
     await flush();
 
     const agent = hoisted.agent as FakeAgent;
+    expect(host.querySelector('[data-testid="machine-pill"]'), "no machine UI with one machine").toBeNull();
+    expect(
+      document.body.querySelector('[role="dialog"][aria-label="New chat on…"]'),
+      "no picker with one machine",
+    ).toBeNull();
+    expect(agent.switchConvo).toHaveBeenCalledTimes(1);
     expect(agent.switchConvo).toHaveBeenCalledWith(null, null);
     expect(host.querySelector('[data-testid="chat-list"]'), "the list is gone").toBeNull();
   });
@@ -454,22 +463,28 @@ describe("App mobile Chats wiring (A1–A9)", () => {
     expect(host.querySelector('[data-testid="chat-title"]')!.textContent).toBe("New chat");
   });
 
-  it("A8: the bottom bar drops lg:hidden in the mobile shell, keeps it in a browser", async () => {
-    // Mobile shell.
+  it("A8: in the mobile shell with a local chat the bottom bar is absent; a browser keeps it (lg:hidden)", async () => {
+    // Mobile shell, local chat (no remote cwd to pick): nothing to show.
     setShell("mobile");
     hoisted.agent = makeAgent(stateFor("c1"));
     mount();
     await flush();
-    const mobileBar = host.querySelector('[data-testid="bottom-bar"]');
-    expect(mobileBar, "the bottom bar renders in the mobile shell").not.toBeNull();
-    expect(mobileBar!.classList.contains("lg:hidden"), "no lg:hidden in the mobile shell").toBe(false);
+    expect(
+      host.querySelector('[data-testid="bottom-bar"]'),
+      "the chip moved to the header: no empty bar in the mobile shell",
+    ).toBeNull();
+    expect(
+      host.querySelector('header [data-testid="chat-subtitle"]'),
+      "the header hosts the subtitle",
+    ).not.toBeNull();
     unmount();
 
-    // Browser.
+    // Browser: unchanged.
     setShell("browser");
     mount();
     await flush();
     const browserBar = host.querySelector('[data-testid="bottom-bar"]')!;
+    expect(browserBar, "the bar renders in a browser").not.toBeNull();
     expect(browserBar.classList.contains("lg:hidden"), "lg:hidden in a browser").toBe(true);
     expect(
       browserBar.querySelector('button[title="Load a saved conversation"]'),

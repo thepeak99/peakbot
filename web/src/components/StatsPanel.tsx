@@ -1,5 +1,6 @@
 import type { ContextUsage, SessionStats } from "../types";
 import { viewLabel } from "../adapt";
+import { PANEL_HEAD, PANEL_SUB, PANEL_TITLE } from "./phoneUi";
 
 function fmtTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
@@ -35,6 +36,7 @@ export function StatsPanel({
   peakbotVersion,
   scopeLabel,
   laneMessages,
+  phone = false,
 }: {
   stats: SessionStats;
   context: ContextUsage;
@@ -48,10 +50,47 @@ export function StatsPanel({
   /** Lane → transcript message count. Same map the Agents panel uses, so a
    * lane's `msgs` reads identically in both places. */
   laneMessages: Record<string, number>;
+  /** Phone face: Cost / Tokens / Context rows only (mock .sess). */
+  phone?: boolean;
 }) {
   const pct = context.windowSize
     ? (context.currentUsage / context.windowSize) * 100
     : 0;
+  if (phone) {
+    const SROW = "flex items-center justify-between px-0.5 py-[7px] text-sm text-zinc-400";
+    return (
+      <section>
+        <div className={PANEL_HEAD}>
+          <h3 className={PANEL_TITLE}>Session</h3>
+          <span className={PANEL_SUB}>{scopeLabel ? `scoped to ${scopeLabel}` : "this chat"}</span>
+        </div>
+        <div className="flex flex-col gap-1 p-0.5">
+          <div className={SROW}>
+            Cost
+            <b className="text-[15px] font-semibold text-zinc-100">${stats.costUsd.toFixed(2)}</b>
+          </div>
+          <div className={SROW}>
+            Tokens
+            <span className="font-mono text-[12.5px] font-medium text-zinc-500">
+              {fmtTokens(stats.inputTokens)} in · {fmtTokens(stats.outputTokens)} out
+            </span>
+          </div>
+          <div className="flex flex-col gap-2 px-0.5 py-[7px] text-sm text-zinc-400">
+            <span className="flex items-center justify-between">
+              Context
+              <em className="font-mono text-xs font-semibold not-italic text-zinc-300">{Math.round(pct)}%</em>
+            </span>
+            <div className="h-1.5 overflow-hidden rounded-[3px] bg-zinc-800">
+              <div
+                className="h-full rounded-[3px] bg-gradient-to-r from-emerald-600 to-sky-400"
+                style={{ width: `${Math.min(pct, 100)}%` }}
+              />
+            </div>
+          </div>
+        </div>
+      </section>
+    );
+  }
   const thresholdPct = context.compactionThreshold * 100;
   const barColor =
     pct >= 95 ? "bg-red-500" : pct >= thresholdPct ? "bg-amber-500" : "bg-emerald-500";

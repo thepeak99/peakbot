@@ -3,10 +3,10 @@
 // the component tree. Sending, Stop, the working spinner, and every side
 // panel are driven by live state.
 //
-// Side panels live in a single `TabbedDrawer` (vertical tab handles pinned to
-// the right edge; the body slides in). One responsive mechanism: on lg+ the
-// body is a 288px rail, below sm it spans 94vw. Replaces the old static aside
-// + separate mobile hamburger drawer.
+// Side panels: one `drawerTab` state, two surfaces — the desktop
+// `TabbedDrawer` rail (≥1024px) or the phone's `PanelsSheet` (<1024px),
+// picked by `useMediaQuery`. The Todo badge is per surface: the row count on
+// desktop, the open count on a phone.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Transcript, type TranscriptHandle } from "./components/Transcript";
@@ -25,6 +25,7 @@ import { ConvoTabBar } from "./components/ConvoTabBar";
 import { BottomBar } from "./components/BottomBar";
 import { ActivityRow } from "./components/ActivityRow";
 import { TabbedDrawer } from "./components/TabbedDrawer";
+import { PanelsSheet } from "./components/PanelsSheet";
 import { StatsPanel } from "./components/StatsPanel";
 import { TodoPanel } from "./components/TodoPanel";
 import { BgPanel } from "./components/BgPanel";
@@ -40,10 +41,13 @@ import type { TabsState } from "./convoTabs";
 import { useTaskNotifications } from "./useTaskNotifications";
 import { useTabIndicator } from "./useTabIndicator";
 import { useFocusMode } from "./useFocusMode";
+import { isDesktop as isDesktopShell } from "./desktop";
+import { useMediaQuery } from "./useMediaQuery";
 import { useMobileChats } from "./useMobileChats";
 import { useScreenSlide } from "./useScreenSlide";
 import { ChatHeader } from "./components/ChatHeader";
 import { ChatList } from "./components/ChatList";
+import { SelectionChip } from "./components/SelectionChip";
 import { focusView } from "./focus";
 import { epochKey, nextEpoch, type EpochState } from "./transcriptEpoch";
 import { filterTabs, resolveActiveTab, settingsGearEnabled } from "./tabs";
@@ -66,6 +70,7 @@ import {
   laneOf,
   messagesByLane,
   scopeStatsToView,
+  todoCounts,
   todoTree,
   todosFromMessages,
   viewLabel,
@@ -148,6 +153,11 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   // Called once here (not in TopBar) so App can filter with the same value
   // the button renders — two useState copies would desync (plan §6.1).
   const focusMode = useFocusMode();
+  // The desktop drawer rail at ≥1024px or anywhere in the desktop app (its
+  // window is never narrower than that); below: the phone's Panels sheet.
+  // The hook is always called, so hook order stays stable.
+  const wideViewport = useMediaQuery("(min-width: 1024px)");
+  const isDesktop = isDesktopShell() || wideViewport;
 
   // Sub-agent roster: one entry per delegation call, in call order (Phase 2 +
   // per-call). Zero backend — derived from the transcript. A role delegated to
@@ -230,37 +240,44 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
             peakbotVersion={welcome?.peakbotVersion}
             scopeLabel={scopeLabel}
             laneMessages={laneMessages}
+            phone={!isDesktop}
           />
         ) : null,
     },
     {
       id: "todo",
       label: "Todo",
-      content: <TodoPanel nodes={todos} />,
-      // Every rendered row counts — parents plus their nested sub-agent todos.
-      badge: todos.reduce((n, node) => n + 1 + node.children.length, 0),
+      content: <TodoPanel nodes={todos} phone={!isDesktop} />,
+      // Per surface: every rendered row on desktop, the OPEN count on a
+      // phone (the pill badge and the panels badge both read it).
+      badge: isDesktop
+        ? todos.reduce((n, node) => n + 1 + node.children.length, 0)
+        : todoCounts(todos).open,
     },
     {
       id: "files",
       label: "Files",
-      content: <FilesPanel files={files} />,
+      content: <FilesPanel files={files} phone={!isDesktop} />,
       badge: files.length,
     },
     {
       id: "tasks",
       label: "Tasks",
-      content: <BgPanel processes={bg} />,
+      content: <BgPanel processes={bg} phone={!isDesktop} />,
       badge: runningBg,
     },
     {
       id: "bash",
       label: "Bash",
       content: bash ? (
-        <BashPanel panel={bash} />
+        <BashPanel panel={bash} phone={!isDesktop} />
       ) : (
-        <p className="text-sm text-zinc-600">No bash command yet.</p>
+        <p className="text-sm text-zinc-600 max-lg:py-8 max-lg:text-center max-lg:text-zinc-500">
+          No bash command yet.
+        </p>
       ),
-      badge: bash?.status === "running" ? 1 : undefined,
+      // Desktop-only: the phone mock's Bash pill carries no badge (C17).
+      badge: isDesktop && bash?.status === "running" ? 1 : undefined,
     },
     {
       id: "agents",
@@ -269,10 +286,12 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
         <AgentsPanel
           boundAgent={boundAgent}
           active={view}
-          onSelect={setView}
+          // On a phone, Watch also closes the sheet to reveal the banner (X6).
+          onSelect={isDesktop ? setView : (v) => { setView(v); closePanels(); }}
           roster={roster}
           laneCalls={laneCalls}
           laneMessages={laneMessages}
+          phone={!isDesktop}
         />
       ),
       badge: roster.length > 0 ? roster.length : undefined,
@@ -284,6 +303,20 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   // field (older server) means "no rule yet" → every tab shows.
   const visibleTabs = filterTabs(tabs, state?.visible_tabs);
   const visibleTabIds = visibleTabs.map((t) => t.id);
+
+  // The phone's combined badge: running tasks + open todos, each counted only
+  // when its tab is visible (a count that opens a hidden tab is a lie). The
+  // button opens the FIRST visible tab; a count tap opens its own.
+  const shown = (id: string): boolean => visibleTabIds.includes(id);
+  const tasksN = shown("tasks") ? runningBg : 0;
+  const { open, total } = shown("todo") ? todoCounts(todos) : { open: 0, total: 0 };
+  const panels =
+    !isDesktop && visibleTabs.length > 0
+      ? { count: tasksN + open, onOpen: () => setDrawerTab(visibleTabIds[0]) }
+      : undefined;
+  // Stable for the Sheet's back layer (useBackDismiss re-pushes on a new
+  // identity).
+  const closePanels = useCallback(() => setDrawerTab(null), []);
 
   // The gear (and Ctrl+,) exist only when the server says Settings is
   // available (`settings_available`, false under a --profile pin) AND the
@@ -365,6 +398,8 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
     supportsVision: state?.supports_vision ?? true,
     settingsEnabled,
     stopPending: state?.stop_pending ?? false,
+    // One switch, decided once: the phone composer face (fidelity batch 1).
+    phone: !isDesktop,
     uploadLimits: state?.upload_limits ?? DEFAULT_UPLOAD_LIMITS,
   };
 
@@ -376,19 +411,26 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
       {chats ? (
         <ChatHeader
           title={convoTitle ?? "New chat"}
-          profile={selection?.profile ?? null}
-          profileColor={
-            selection
-              ? catalog.find((p) => p.name === selection.profile)?.color
-              : undefined
+          selector={
+            <SelectionChip
+              sheet
+              catalog={catalog}
+              selection={selection}
+              models={models}
+              activeAlias={stats?.modelAlias || activeAlias}
+              locked={selectionLocked}
+              pinned={state?.profile_pinned ?? false}
+              send={send}
+              onToast={showToast}
+              onReattach={reattach}
+            />
           }
-          model={stats?.modelAlias || activeAlias}
-          badge={chats.backBadge}
           onBack={chats.showChats}
           connected={connected}
           isRunning={isRunning}
           focusMode={focusMode.focus}
           onToggleFocus={focusMode.toggle}
+          panels={panels}
         />
       ) : (
         <TopBar
@@ -418,6 +460,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
         profilePinned={state?.profile_pinned ?? false}
         onToast={showToast}
         stopPending={state?.stop_pending ?? false}
+        panels={panels}
       />
       )}
       <UpdateBanner />
@@ -442,18 +485,18 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
               scrolling element's only child must be the virtualizer's sized
               container, or the row offsets stop matching the scroll offset. */}
           {scopeLabel && (
-            <div className="mr-12 px-4 pt-4 sm:px-6 md:px-8">
-              <div className="mx-auto flex max-w-5xl items-center justify-between rounded-md border border-sky-900/60 bg-sky-950/30 px-3 py-1.5 text-xs text-sky-300">
+            <div className="lg:mr-12 px-4 pt-4 max-lg:p-0 sm:px-6 md:px-8">
+              <div className="mx-auto flex max-w-5xl items-center justify-between rounded-md border border-sky-900/60 bg-sky-950/30 px-3 py-1.5 text-xs text-sky-300 max-lg:mx-0 max-lg:h-11 max-lg:max-w-none max-lg:gap-2 max-lg:rounded-none max-lg:border-0 max-lg:border-b max-lg:border-sky-400/35 max-lg:bg-sky-400/12 max-lg:px-4 max-lg:py-0 max-lg:text-[13.5px] max-lg:text-zinc-100 max-lg:light:bg-sky-700/8">
                 <span>
-                  👁 Watching <span className="font-medium">{scopeLabel}</span>
-                  <span className="ml-2 text-sky-500/70">
+                  👁 Watching <span className="font-medium max-lg:font-semibold max-lg:text-sky-400">{scopeLabel}</span>
+                  <span className="ml-2 text-sky-500/70 max-lg:hidden">
                     {visibleMessages.length} message
                     {visibleMessages.length === 1 ? "" : "s"}
                   </span>
                 </span>
                 <button
                   onClick={() => setView("global")}
-                  className="cursor-pointer rounded px-1.5 py-0.5 text-sky-400 hover:bg-sky-900/40"
+                  className="cursor-pointer rounded px-1.5 py-0.5 text-sky-400 hover:bg-sky-900/40 max-lg:h-8 max-lg:rounded-2xl max-lg:bg-sky-400/18 max-lg:px-3 max-lg:py-0 max-lg:text-[13px] max-lg:font-semibold"
                 >
                   Clear
                 </button>
@@ -467,6 +510,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
               messages={transcriptMessages}
               drawerOpen={drawerOpen}
               base={base}
+              phone={!isDesktop}
               ref={transcriptRef}
             />
           ) : (
@@ -476,7 +520,26 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
             />
           )}
 
-          {focusing && turnInFlight && <ActivityRow step={focused?.activity ?? null} />}
+          {isDesktop && focusing && turnInFlight && (
+            <ActivityRow line={{ kind: "step", step: focused?.activity ?? null }} />
+          )}
+          {!isDesktop && (isRunning || tasksN > 0 || open > 0) && (
+            <ActivityRow
+              line={
+                isRunning
+                  ? focusing && turnInFlight
+                    ? { kind: "step", step: focused?.activity ?? null }
+                    : { kind: "working" }
+                  : { kind: "idle" }
+              }
+              counts={{
+                tasks: tasksN,
+                todosDone: total - open,
+                todosTotal: total,
+                onOpen: setDrawerTab,
+              }}
+            />
+          )}
 
           {convoTabs ? (
             // Keep-alive: every tab's composer stays mounted, only the active
@@ -531,11 +594,26 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
       />
    
 
-      <TabbedDrawer
-        tabs={visibleTabs}
-        active={drawerTab}
-        onActiveChange={setDrawerTab}
-      />
+      {/* One open-panel state, two surfaces; the relocation effect above
+          covers both. */}
+      {isDesktop ? (
+        <TabbedDrawer
+          tabs={visibleTabs}
+          active={drawerTab}
+          onActiveChange={setDrawerTab}
+        />
+      ) : (
+        drawerTab !== null && (
+          <PanelsSheet
+            tabs={visibleTabs}
+            active={drawerTab}
+            onActiveChange={setDrawerTab}
+            onClose={closePanels}
+            running={isRunning}
+            onStop={() => send({ type: "stop" })}
+          />
+        )
+      )}
       </div>
 
       {chats && chatListSlide !== "gone" && (
@@ -551,6 +629,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
           onOpen={chats.open}
           onNew={chats.newChat}
           onOpenSettings={settingsEnabled ? settingsView.toggle : undefined}
+          machineStatus={agent.machines}
         />
       )}
 

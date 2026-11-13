@@ -187,9 +187,9 @@ describe("InboundMessage — select is part of the union, old frames are gone", 
 describe("isRemote — catalog origin lookup (exported for the CwdPicker gate)", () => {
   // The REAL wire shape (resolve.rs `Catalog::infos()`), one entry per origin.
   const catalog: CatalogProfile[] = [
-    { name: "dev", origin: "global", overridesGlobal: false, agents: [], color: "teal" },
-    { name: "repo-dev", origin: "repo", overridesGlobal: false, agents: [], color: "teal" },
-    { name: "bonsol-dev", origin: "remote", overridesGlobal: false, agents: [], color: "teal" },
+    { name: "dev", origin: "global", overridesGlobal: false, machine: null, agents: [], color: "teal" },
+    { name: "repo-dev", origin: "repo", overridesGlobal: false, machine: null, agents: [], color: "teal" },
+    { name: "bonsol-dev", origin: "remote", overridesGlobal: false, machine: null, agents: [], color: "teal" },
   ];
 
   it("is_true_only_for_a_remote_origin_entry", () => {

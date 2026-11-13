@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { FileEdit } from "../types";
+import { ACTION_PILL, PANEL_HEAD, PANEL_SUB, PANEL_TITLE, ROW } from "./phoneUi";
 
 // Files the agent touched this session (#126), derived from file tool calls in
 // the transcript (see filesFromMessages). Read-only list — reverting a change needs
@@ -15,7 +16,7 @@ const KIND_META: Record<
   read: { glyph: "👁", color: "text-zinc-500", label: "read" },
 };
 
-export function FilesPanel({ files }: { files: FileEdit[] }) {
+export function FilesPanel({ files, phone = false }: { files: FileEdit[]; phone?: boolean }) {
   const [copied, setCopied] = useState(false);
   // Only changed files are stage-worthy; a read leaves nothing to `git add`.
   const changed = files.filter((f) => f.kind !== "read").map((f) => f.path);
@@ -30,6 +31,45 @@ export function FilesPanel({ files }: { files: FileEdit[] }) {
       // Clipboard blocked (insecure context / permission) — silently ignore.
     }
   };
+
+  if (phone) {
+    // Mock .frow: flat left-to-right paths; the ± counts are parked (no data).
+    return (
+      <section>
+        <div className={PANEL_HEAD}>
+          <h3 className={PANEL_TITLE}>Files</h3>
+          <span className={PANEL_SUB}>{files.length} touched</span>
+        </div>
+        {files.length === 0 ? (
+          <p className="py-8 text-center text-sm text-zinc-500">No files touched yet.</p>
+        ) : (
+          <>
+            <ul>
+              {files.map((f) => (
+                <li key={f.path} className={ROW} title={KIND_META[f.kind].label}>
+                  <span className="min-w-0 flex-1 truncate text-[13.5px] text-zinc-300">{f.path}</span>
+                  {f.edits > 1 && (
+                    <span className="shrink-0 font-mono text-[12.5px] font-semibold text-zinc-500">
+                      ×{f.edits}
+                    </span>
+                  )}
+                </li>
+              ))}
+            </ul>
+            {changed.length > 0 && (
+              <button
+                type="button"
+                onClick={copyGitAdd}
+                className={`mt-3 ${ACTION_PILL} bg-sky-400/14 text-sky-400`}
+              >
+                {copied ? "Copied ✓" : `Copy ${changed.length} for git add`}
+              </button>
+            )}
+          </>
+        )}
+      </section>
+    );
+  }
 
   return (
     <section>

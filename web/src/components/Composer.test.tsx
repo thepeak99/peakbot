@@ -229,7 +229,9 @@ const typeInto = async (el: HTMLTextAreaElement, value: string): Promise<void> =
 
 const click = async (el: HTMLElement): Promise<void> => {
   await act(async () => {
-    el.click();
+    // Dispatch (not `el.click()`): jsdom's SVG elements have no .click(),
+    // and the attach-menu icon tests click an <svg> directly.
+    el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
   });
 };
 
@@ -1562,11 +1564,11 @@ describe("Composer — Stop label by stopPending (two-stage stop)", () => {
 
 // ─── Mobile: right-rail clearance + keep-focus buttons ───────────────────
 //
-// On phones the fixed right-hand TabbedDrawer rail (40px handles) overlaps
-// the composer. Contract (Tailwind classes ARE the layout contract — jsdom
-// has no layout engine):
-//   1. the Composer's outer container carries `pr-12` (rail clearance) so
-//      its controls never sit under the rail;
+// The fixed right-hand TabbedDrawer rail (40px handles) exists from lg up
+// only (phones get the Panels sheet). Contract (Tailwind classes ARE the
+// layout contract — jsdom has no layout engine):
+//   1. the Composer's outer container carries `lg:pr-12` (rail clearance
+//      from lg up) and NO bare `pr-12`, so phones use the full width;
 //   2. Stop, Queue and Pause call preventDefault() on `pointerdown`, so the
 //      textarea keeps focus (tapping them must not collapse the soft
 //      keyboard, which would shift the layout and cancel the tap).
@@ -1583,17 +1585,19 @@ const pointerDown = async (el: HTMLElement): Promise<boolean> => {
   return ev.defaultPrevented;
 };
 
-describe("Composer — rail clearance (mobile)", () => {
-  it("outer container has the pr-12 right clearance class (idle)", async () => {
+describe("Composer — rail clearance (desktop only)", () => {
+  it("outer container has lg:pr-12 and no bare pr-12 (idle)", async () => {
     const el = await mount(makeProps());
     const outer = el.firstElementChild as HTMLElement;
-    expect(outer.classList.contains("pr-12")).toBe(true);
+    expect(outer.classList.contains("lg:pr-12")).toBe(true);
+    expect(outer.classList.contains("pr-12"), "phones use the full width").toBe(false);
   });
 
-  it("outer container keeps pr-12 while a turn is running", async () => {
+  it("outer container keeps lg:pr-12 while a turn is running", async () => {
     const el = await mount(makeProps({ isRunning: true }));
     const outer = el.firstElementChild as HTMLElement;
-    expect(outer.classList.contains("pr-12")).toBe(true);
+    expect(outer.classList.contains("lg:pr-12")).toBe(true);
+    expect(outer.classList.contains("pr-12")).toBe(false);
   });
 });
 
@@ -1741,9 +1745,10 @@ describe("Composer — hidden prop: root attribute", () => {
     expect(composerRoot(el).hasAttribute("hidden")).toBe(false);
   });
 
-  it("keeps the existing root classes (pr-12 clearance) alongside hidden", async () => {
+  it("keeps the existing root classes (lg:pr-12 clearance) alongside hidden", async () => {
     const el = await mount({ ...makeProps(), hidden: true } as unknown as ComposerProps);
-    expect(composerRoot(el).classList.contains("pr-12")).toBe(true);
+    expect(composerRoot(el).classList.contains("lg:pr-12")).toBe(true);
+    expect(composerRoot(el).classList.contains("pr-12")).toBe(false);
   });
 });
 
@@ -1889,5 +1894,235 @@ describe("Composer — hidden prop: textarea auto-grow", () => {
     const el = await mount(makeProps());
     await typeInto(textareaOf(el), "grow me");
     expect(textareaOf(el).style.height).toBe("64px");
+  });
+});
+
+// ─── Batch 1: the phone contract (phone: true) ───────────────────────────
+//
+// The `phone` prop (default false; App derives it as `!isDesktop`) switches
+// the shared Composer to the mock's phone face (fix-plan §3, items 1.2,
+// 1.12–1.20). The desktop contract above is untouched: `phone` false or
+// absent renders today's DOM exactly (R1).
+//
+// RED until the prop lands: `Composer` has no `phone` prop, the root has no
+// `data-testid="composer"`, the placeholder is "Type a message…" and an
+// idle empty box always shows a disabled Send — the phone assertions below
+// fail on that missing behaviour, not on setup.
+
+function phoneMount(props: ComposerProps): Promise<HTMLDivElement> {
+  return mount({ ...props, phone: true } as unknown as ComposerProps);
+}
+
+const composerRootTestid = (el: HTMLElement): HTMLElement | null =>
+  el.querySelector('[data-testid="composer"]');
+
+const textareaPlaceholder = (el: HTMLElement): string =>
+  el.querySelector("textarea")?.getAttribute("placeholder") ?? "";
+
+describe("Composer — phone (phone: true)", () => {
+  it("idle and empty: no Send button; typing shows a 'Send' button (B28)", async () => {
+    const el = await phoneMount(makeProps({ isRunning: false }));
+    expect(
+      buttonWithText(el, "Send"),
+      "an idle, empty phone composer shows no dispatch button",
+    ).toBeNull();
+    expect(buttonWithText(el, "Queue")).toBeNull();
+
+    await typeInto(el.querySelector("textarea")!, "hello");
+    expect(
+      buttonWithText(el, "Send"),
+      "typing text brings the 'Send' button back",
+    ).not.toBeNull();
+  });
+
+  it("placeholder reads 'Message' idle, 'Queue a message…' running, 'Connecting…' offline, 'Message the orchestrator…' while watching (B25)", async () => {
+    expect(textareaPlaceholder(await phoneMount(makeProps()))).toBe("Message");
+    expect(
+      textareaPlaceholder(await phoneMount(makeProps({ isRunning: true }))),
+    ).toBe("Queue a message…");
+    expect(
+      textareaPlaceholder(await phoneMount(makeProps({ connected: false }))),
+    ).toBe("Connecting…");
+    expect(
+      textareaPlaceholder(await phoneMount(makeProps({ watchingRole: "researcher" }))),
+    ).toBe("Message the orchestrator…");
+  });
+
+  it("running and empty: Pause/Stop by aria-label, no Send; running with text: a 'Queue' button (B26–B28)", async () => {
+    const props = makeProps({ isRunning: true, subAgent: subAgent("running") });
+    let el = await phoneMount(props);
+    expect(controlByName(el, "Pause"), "Pause is present while working").not.toBeNull();
+    expect(controlByName(el, "Stop"), "Stop is present while working").not.toBeNull();
+    expect(buttonWithText(el, "Send"), "no Send while running").toBeNull();
+    expect(buttonWithText(el, "Queue"), "no Queue while empty").toBeNull();
+
+    el = await phoneMount(props);
+    await typeInto(el.querySelector("textarea")!, "queue me");
+    expect(
+      buttonWithText(el, "Queue"),
+      "running with text shows the 'Queue' button",
+    ).not.toBeNull();
+    expect(controlByName(el, "Stop")).toBeNull();
+  });
+
+  it("the root carries the bottom safe-area inset (B29)", async () => {
+    const el = await phoneMount(makeProps());
+    const composer = composerRootTestid(el);
+    expect(
+      composer,
+      'the composer root carries data-testid="composer"',
+    ).not.toBeNull();
+    // The class IS the contract here (jsdom has no env() to resolve): the
+    // phone bottom padding is env(safe-area-inset-bottom) + 18px.
+    expect(
+      composer!.className,
+      "the composer region pads out the bottom safe area",
+    ).toContain("safe-area-inset-bottom");
+  });
+
+  it("the watch note renders outside the pill and its Clear calls onClearWatch (B30)", async () => {
+    const onClearWatch = vi.fn();
+    const el = await phoneMount(makeProps({ watchingRole: "researcher", onClearWatch }));
+    const note = el.querySelector('[data-testid="composer-watch-note"]');
+    expect(note, "the watching note renders on the phone").not.toBeNull();
+    expect(note!.textContent).toContain("your message goes to the orchestrator");
+    // Above the pill: the first child of the relative wrapper, not inside
+    // the input box.
+    const box = el.querySelector(".rounded-xl");
+    expect(box, "the composer pill renders").not.toBeNull();
+    expect(
+      note!.parentElement?.contains(box) && note === note!.parentElement!.firstElementChild,
+      "the note is the first child of the wrapper, above the pill",
+    ).toBe(true);
+    expect(box!.contains(note), "the note is NOT inside the pill").toBe(false);
+
+    const clear = Array.from(note!.querySelectorAll("button")).find(
+      (b) => (b.textContent ?? "").trim() === "Clear",
+    );
+    expect(clear, "the note carries a 'Clear' button").not.toBeNull();
+    await click(clear!);
+    expect(onClearWatch).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── Batch 1: desktop lock (R1) ──────────────────────────────────────────
+
+describe("Composer — desktop lock (R1): phone absent keeps the old contract", () => {
+  it("without phone the placeholder stays 'Type a message…' and an empty idle box still shows a disabled 'Send'", async () => {
+    const el = await mount(makeProps());
+    expect(textareaPlaceholder(el)).toBe("Type a message…");
+    const send = buttonWithText(el, "Send");
+    expect(send, "the idle desktop box keeps its 'Send' button").not.toBeNull();
+    expect(send!.disabled, "with no content it is disabled, as today").toBe(true);
+    expect(
+      el.querySelector('[data-testid="composer"]'),
+      "no phone-only root testid on the desktop render",
+    ).toBeNull();
+  });
+});
+
+// ─── Fix 1 (device polish): icons on the phone attach menu ───────────────
+//
+// The phone's "+" menu showed text only. The mock (prototype.html:191-197,
+// 416-420) gives every row an icon before its label (📷 / 🖼️ / 📎 in a 24px
+// `.ai` box). The shipped menu's existing contract — trimmed textContent is
+// EXACTLY the label — means the icon must carry no text, so it is an
+// aria-hidden inline <svg>. The menu is SHARED with desktop (it is gated by the
+// Android UA, not by `phone`), so `phone: false` must keep today's output.
+//
+// RED until the icons land: the rows contain no <svg> yet.
+
+const ATTACH_LABELS = ["Take a photo", "Choose from gallery", "Pick a file"] as const;
+
+async function openPhoneAttachMenu(phone: boolean): Promise<HTMLElement> {
+  mockUA(ANDROID_UA);
+  const el = await mount({ ...makeProps(), phone } as unknown as ComposerProps);
+  await click(attachButtonOf(el)!);
+  expect(menuOf(el), "the attach menu opens on Android").not.toBeNull();
+  return el;
+}
+
+describe("Composer — phone attach menu icons (phone: true)", () => {
+  it("each of the 3 menuitems has an aria-hidden svg icon BEFORE its label text", async () => {
+    const el = await openPhoneAttachMenu(true);
+    const items = menuItemsOf(el);
+    expect(items, "still exactly three items").toHaveLength(3);
+
+    items.forEach((item, i) => {
+      const svg = item.querySelector("svg");
+      expect(svg, `"${ATTACH_LABELS[i]}" has an svg icon`).not.toBeNull();
+      expect(svg!.getAttribute("aria-hidden"), "the icon is decorative").toBe("true");
+      expect(
+        (svg!.textContent ?? "").trim(),
+        "the icon carries no text, so the label stays exact",
+      ).toBe("");
+      expect(
+        item.firstChild === svg || item.firstChild!.contains(svg!),
+        `the icon is the first thing in "${ATTACH_LABELS[i]}", before the label`,
+      ).toBe(true);
+      expect(
+        svg!.querySelector("path, circle, rect, line, polyline, polygon"),
+        "the svg actually draws something",
+      ).not.toBeNull();
+    });
+  });
+
+  it("the three icons are distinct (camera / image / paperclip, not one glyph repeated)", async () => {
+    const el = await openPhoneAttachMenu(true);
+    const drawn = menuItemsOf(el).map((b) => b.querySelector("svg")?.innerHTML ?? "");
+    expect(drawn.every((d) => d.length > 0), "every row has a drawn icon").toBe(true);
+    expect(new Set(drawn).size, "three different drawings").toBe(3);
+  });
+
+  it("labels stay exactly 'Take a photo', 'Choose from gallery', 'Pick a file' in order", async () => {
+    const el = await openPhoneAttachMenu(true);
+    expect(menuItemsOf(el).map((b) => (b.textContent ?? "").trim())).toEqual([...ATTACH_LABELS]);
+    expect(menuItemsOf(el).map((b) => b.getAttribute("data-testid"))).toEqual([
+      "attach-menu-camera",
+      "attach-menu-gallery",
+      "attach-menu-file",
+    ]);
+    expect(menuItemsOf(el).every((b) => b.getAttribute("role") === "menuitem")).toBe(true);
+  });
+
+  it.each([
+    [0, "camera", "Take a photo"],
+    [1, "gallery", "Choose from gallery"],
+    [2, "plain", "Pick a file"],
+  ] as const)("clicking the icon of row %i (%s: %s) still fires only that item's input and closes the menu", async (idx, which, label) => {
+    mockUA(ANDROID_UA);
+    const el = await mount({ ...makeProps(), phone: true } as unknown as ComposerProps);
+    const [plain, camera, gallery] = fileInputs(el);
+    expect(fileInputs(el), "plain, camera and gallery inputs").toHaveLength(3);
+    const clicks = {
+      plain: vi.spyOn(plain, "click"),
+      camera: vi.spyOn(camera, "click"),
+      gallery: vi.spyOn(gallery, "click"),
+    };
+    await click(attachButtonOf(el)!);
+
+    const svg = menuItemsOf(el)[idx].querySelector("svg");
+    expect(svg, `the "${label}" icon exists to click`).not.toBeNull();
+    await click(svg as unknown as HTMLElement); // bubbles to the button's onClick
+
+    for (const k of ["plain", "camera", "gallery"] as const) {
+      expect(clicks[k], `${k} input click count`).toHaveBeenCalledTimes(k === which ? 1 : 0);
+    }
+    expect(menuOf(el), "the menu closes after picking").toBeNull();
+  });
+});
+
+describe("Composer — desktop lock: the shared attach menu is unchanged without phone", () => {
+  it("phone absent/false (Android UA): rows are text-only — no svg, no icon wrapper — with today's classes", async () => {
+    const el = await openPhoneAttachMenu(false);
+    const items = menuItemsOf(el);
+    expect(items.map((b) => (b.textContent ?? "").trim())).toEqual([...ATTACH_LABELS]);
+    for (const item of items) {
+      expect(item.querySelector("svg"), "no icon on the non-phone menu").toBeNull();
+      expect(item.children.length, "the row is just its label text").toBe(0);
+      expect(item.classList.contains("block"), "today's block row").toBe(true);
+      expect(item.classList.contains("px-4")).toBe(true);
+      expect(item.classList.contains("py-3")).toBe(true);
+    }
   });
 });

@@ -5,7 +5,9 @@
 //
 // The contract under test:
 //
-//   <ActivityRow step={WireChatMessage | null} />
+//   <ActivityRow line={ActivityLine} counts?={StatusCounts} />
+//   ActivityLine = {kind:"step", step: WireChatMessage | null}
+//                | {kind:"working"} | {kind:"idle"}     (mobile redesign §2.5)
 //
 //   - wrapper: role="status" + aria-live="polite"
 //   - label = first non-empty, trimmed line of step.content;
@@ -21,10 +23,10 @@
 // No timers: the animated dots are CSS-only per §6.4, so nothing here is
 // time-dependent.
 
-import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { ActivityRow } from "./ActivityRow";
+import { ActivityRow, type ActivityLine, type StatusCounts } from "./ActivityRow";
 import type { WireChatMessage } from "../state";
 
 // React 19's flushSync reads IS_REACT_ACT_ENVIRONMENT; set once so the
@@ -51,11 +53,15 @@ let container: HTMLDivElement | null = null;
 let root: Root | null = null;
 
 async function mount(stepValue: WireChatMessage | null): Promise<HTMLDivElement> {
+  return mountLine({ kind: "step", step: stepValue });
+}
+
+async function mountLine(line: ActivityLine, counts?: StatusCounts): Promise<HTMLDivElement> {
   container = document.createElement("div");
   document.body.appendChild(container);
   await act(async () => {
     root = createRoot(container!);
-    root.render(<ActivityRow step={stepValue} />);
+    root.render(<ActivityRow line={line} counts={counts} />);
   });
   return container;
 }
@@ -143,5 +149,209 @@ describe("ActivityRow — case 24", () => {
     const status = el.querySelector('[role="status"]');
     expect(status).not.toBeNull();
     expect(status!.getAttribute("aria-live")).toBe("polite");
+  });
+});
+
+// ─── AR1–AR7: the compact phone line (mobile redesign design §2.5/§2.7) ───
+//
+//   counts absent  ⇒ today's boxed desktop row (`data-variant="box"`), no counts.
+//   counts present ⇒ the compact one-row line (`data-variant="line"`): an
+//     optional "working…" label (only while a turn runs), then tappable
+//     "⏳ N tasks" / "☑ x/y todos" segments, each shown only when its count
+//     is > 0 (todos: total > 0). One row: `flex-nowrap whitespace-nowrap`.
+
+function counts(over: Partial<StatusCounts> = {}): StatusCounts {
+  return { tasks: 0, todosDone: 0, todosTotal: 0, onOpen: () => {}, ...over };
+}
+
+const q = (el: HTMLElement, id: string): HTMLElement | null =>
+  el.querySelector<HTMLElement>(`[data-testid="${id}"]`);
+
+describe("ActivityRow — AR1: the line variant", () => {
+  it("counts present ⇒ data-variant=line on a polite status root", async () => {
+    const el = await mountLine({ kind: "working" }, counts());
+    const root_ = q(el, "activity-row")!;
+    expect(root_, "the row root").not.toBeNull();
+    expect(root_.getAttribute("data-variant")).toBe("line");
+    expect(root_.getAttribute("role")).toBe("status");
+    expect(root_.getAttribute("aria-live")).toBe("polite");
+  });
+
+  it("counts absent ⇒ data-variant=box (the desktop row)", async () => {
+    const el = await mount(step({ role: "toolcall", tool_name: "bash", content: "ls" }));
+    expect(q(el, "activity-row")!.getAttribute("data-variant")).toBe("box");
+  });
+});
+
+describe("ActivityRow — AR2: 'working…' only while running", () => {
+  it("a working line shows 'working…'", async () => {
+    const el = await mountLine({ kind: "working" }, counts({ tasks: 2 }));
+    expect(q(el, "activity-label")!.textContent).toContain("working…");
+  });
+
+  it("an idle line shows no 'working…' label at all", async () => {
+    const el = await mountLine({ kind: "idle" }, counts({ tasks: 2 }));
+    expect(el.textContent).not.toContain("working…");
+    expect(q(el, "activity-label")).toBeNull();
+  });
+
+  it("a step line keeps the step label and appends the counts (focus mode, D)", async () => {
+    const s = step({ role: "toolcall", tool_name: "bash", content: "ls -la" });
+    const el = await mountLine({ kind: "step", step: s }, counts({ tasks: 1 }));
+    expect(q(el, "activity-label")!.textContent).toBe("ls -la");
+    expect(q(el, "activity-tasks"), "the counts ride the same row").not.toBeNull();
+  });
+
+  it("a step line with no step reads 'Thinking' in the line variant", async () => {
+    const el = await mountLine({ kind: "step", step: null }, counts({ tasks: 1 }));
+    expect(q(el, "activity-label")!.textContent).toContain("Thinking");
+  });
+});
+
+describe("ActivityRow — AR3: counts alone when idle", () => {
+  it("idle with tasks and todos shows both segments with their text", async () => {
+    const el = await mountLine({ kind: "idle" }, counts({ tasks: 3, todosDone: 1, todosTotal: 4 }));
+    expect(q(el, "activity-tasks")!.textContent).toBe("⏳ 3 tasks");
+    expect(q(el, "activity-todos")!.textContent).toBe("☑ 1/4 todos");
+  });
+
+  it("singularises one task", async () => {
+    const el = await mountLine({ kind: "idle" }, counts({ tasks: 1 }));
+    expect(q(el, "activity-tasks")!.textContent).toBe("⏳ 1 task");
+  });
+});
+
+describe("ActivityRow — AR4: hidden-segment rules", () => {
+  it("tasks 0 hides the tasks segment", async () => {
+    const el = await mountLine({ kind: "idle" }, counts({ tasks: 0, todosDone: 0, todosTotal: 2 }));
+    expect(q(el, "activity-tasks")).toBeNull();
+    expect(q(el, "activity-todos")).not.toBeNull();
+  });
+
+  it("todosTotal 0 hides the todos segment (even with todosDone 0)", async () => {
+    const el = await mountLine({ kind: "idle" }, counts({ tasks: 2, todosTotal: 0 }));
+    expect(q(el, "activity-todos")).toBeNull();
+    expect(q(el, "activity-tasks")).not.toBeNull();
+  });
+
+  it("all zero while working shows only the label", async () => {
+    const el = await mountLine({ kind: "working" }, counts());
+    expect(q(el, "activity-label")).not.toBeNull();
+    expect(q(el, "activity-tasks")).toBeNull();
+    expect(q(el, "activity-todos")).toBeNull();
+  });
+
+  it("a completed-everything todo list still shows x/y", async () => {
+    const el = await mountLine({ kind: "idle" }, counts({ todosDone: 3, todosTotal: 3 }));
+    expect(q(el, "activity-todos")!.textContent).toBe("☑ 3/3 todos");
+  });
+});
+
+describe("ActivityRow — AR5: tapping a count opens its panel", () => {
+  it("tasks → onOpen('tasks'), todos → onOpen('todo'), with their aria-labels", async () => {
+    const onOpen = vi.fn();
+    const el = await mountLine({ kind: "idle" }, counts({ tasks: 2, todosDone: 0, todosTotal: 2, onOpen }));
+    const tasks = q(el, "activity-tasks")!;
+    const todos = q(el, "activity-todos")!;
+    expect(tasks.tagName).toBe("BUTTON");
+    expect(tasks.getAttribute("aria-label")).toBe("Open Tasks panel");
+    expect(todos.tagName).toBe("BUTTON");
+    expect(todos.getAttribute("aria-label")).toBe("Open Todo panel");
+
+    await act(async () => {
+      tasks.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    });
+    expect(onOpen).toHaveBeenLastCalledWith("tasks");
+    await act(async () => {
+      todos.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    });
+    expect(onOpen).toHaveBeenLastCalledWith("todo");
+    expect(onOpen).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("ActivityRow — AR8: the '·' separators (batch 1, B18)", () => {
+  // DOM order of the row's meaningful children: segment testids plus the
+  // '·' separators. Decorative children (the pulse dot, glyphs) carry no
+  // testid and no '·' text, so they drop out of the sequence.
+  const seqOf = (el: HTMLDivElement): string[] =>
+    [...q(el, "activity-row")!.children]
+      .map((c) => {
+        const id = (c as HTMLElement).getAttribute("data-testid");
+        if (id) return id;
+        return (c as HTMLElement).textContent?.trim() === "·" ? "·" : null;
+      })
+      .filter((x): x is string => x !== null);
+
+  it("a '·' separator (aria-hidden) sits between the label and each count, and between the counts", async () => {
+    const el = await mountLine(
+      { kind: "working" },
+      counts({ tasks: 2, todosDone: 1, todosTotal: 3 }),
+    );
+    expect(q(el, "activity-label"), "the working label renders").not.toBeNull();
+    const seps = Array.from(
+      q(el, "activity-row")!.querySelectorAll("span[aria-hidden]"),
+    ).filter((s) => (s.textContent ?? "").trim() === "·");
+    expect(seps.length, "one separator between each pair of segments").toBe(2);
+    seps.forEach((s) =>
+      expect(s.getAttribute("aria-hidden"), "the separators are aria-hidden").toBe("true"),
+    );
+    expect(seqOf(el), "the row reads label, ·, tasks, ·, todos").toEqual([
+      "activity-label",
+      "·",
+      "activity-tasks",
+      "·",
+      "activity-todos",
+    ]);
+  });
+
+  it("idle: a lone count stands alone, two counts keep exactly one '·' between them", async () => {
+    const lone = await mountLine({ kind: "idle" }, counts({ tasks: 2 }));
+    expect(seqOf(lone), "no separator around a lone count").toEqual(["activity-tasks"]);
+
+    const pair = await mountLine(
+      { kind: "idle" },
+      counts({ tasks: 2, todosDone: 1, todosTotal: 3 }),
+    );
+    expect(seqOf(pair), "the counts read tasks, ·, todos").toEqual([
+      "activity-tasks",
+      "·",
+      "activity-todos",
+    ]);
+  });
+});
+
+describe("ActivityRow — AR6/AR7: one compact row", () => {
+  it("the line root is a single non-wrapping row (flex-nowrap + whitespace-nowrap)", async () => {
+    const el = await mountLine({ kind: "working" }, counts({ tasks: 12, todosDone: 10, todosTotal: 11 }));
+    const cls = q(el, "activity-row")!.className;
+    expect(cls).toContain("flex-nowrap");
+    expect(cls).toContain("whitespace-nowrap");
+    expect(cls, "no boxed-strip border in the line variant").not.toMatch(/(^|\s)border(\s|$)/);
+  });
+
+  it("the line is small and muted (text-xs or smaller, no full-width box)", async () => {
+    const el = await mountLine({ kind: "idle" }, counts({ tasks: 1 }));
+    // The size class may sit on the root or a child; the design only fixes 11–12px.
+    expect(el.innerHTML).toMatch(/text-(\[1[12]px\]|xs)/);
+    expect(q(el, "activity-row")!.className).not.toContain("rounded-md");
+  });
+});
+
+describe("ActivityRow — C12: the box variant is unchanged with no counts", () => {
+  it("keeps the boxed strip, the dots and no count segments", async () => {
+    const el = await mount(step({ role: "toolcall", tool_name: "bash", content: "ls" }));
+    const status = el.querySelector('[role="status"]') as HTMLElement;
+    expect(status.className).toContain("border");
+    expect(status.className).toContain("rounded-md");
+    expect(q(el, "activity-tasks")).toBeNull();
+    expect(q(el, "activity-todos")).toBeNull();
+  });
+
+  it("the wrapper reserves the rail only from lg (lg:mr-12, no bare mr-12)", async () => {
+    const el = await mount(step({ role: "toolcall", tool_name: "bash", content: "ls" }));
+    const wrapper = el.firstElementChild as HTMLElement;
+    expect(wrapper.classList.contains("lg:mr-12")).toBe(true);
+    expect(wrapper.classList.contains("mr-12")).toBe(false);
   });
 });

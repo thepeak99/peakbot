@@ -1012,6 +1012,7 @@ fn local_catalog() -> Vec<ProfileInfo> {
             overrides_global: false,
             agents: vec![agent_info("team")],
             color: TabColor::derived(P),
+            machine: None,
         },
         ProfileInfo {
             name: "alt".into(),
@@ -1019,6 +1020,7 @@ fn local_catalog() -> Vec<ProfileInfo> {
             overrides_global: false,
             agents: vec![agent_info("a1"), agent_info("a2")],
             color: TabColor::derived("alt"),
+            machine: None,
         },
         ProfileInfo {
             name: L.to_string(),
@@ -1026,6 +1028,7 @@ fn local_catalog() -> Vec<ProfileInfo> {
             overrides_global: false,
             agents: vec![agent_info("placeholder")],
             color: TabColor::derived(L),
+            machine: Some("https://remote.example:7823".into()),
         },
     ]
 }

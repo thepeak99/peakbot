@@ -1,8 +1,8 @@
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { type ExtraProps } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkBreaks from "remark-breaks";
 import rehypeHighlight from "rehype-highlight";
-import { memo, useState, type ComponentProps } from "react";
+import { memo, useRef, useState, type ComponentProps } from "react";
 import type { AttachmentView, ChatMessage, MessageRole } from "../types";
 import {
   GROUP_STYLE,
@@ -13,6 +13,8 @@ import {
   middleTruncate,
 } from "../fileTypes";
 import { Lightbox } from "./Lightbox";
+import { MTAG } from "./phoneUi";
+import { firstLine } from "../transcriptRows";
 
 // Per-role visual treatment. Mirrors the TUI's role glyphs/colours so the
 // web transcript reads the same way (src/ui/app_state.rs MessageRole +
@@ -182,13 +184,150 @@ function CachedImage({ src, alt }: ComponentProps<"img"> & { node?: unknown }) {
 // a fresh reference every render and defeat memoization.
 const MARKDOWN_COMPONENTS = { img: CachedImage } as const;
 
+// ─── Phone (< lg) faces: mock `.u` / `.a` / `.tool` / `.code` (fix-plan 3.3–3.6) ───
+// Kept apart from the desktop card so `phone` false renders exactly the old DOM.
+
+const PHONE_MARKDOWN_COMPONENTS = { img: CachedImage, pre: CodeBlock } as const;
+
+const COPY_ICON = (
+  <svg aria-hidden width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <rect x="9" y="9" width="11" height="11" rx="2" />
+    <path d="M5 15V6a2 2 0 0 1 2-2h9" />
+  </svg>
+);
+const CHECK_ICON = (
+  <svg aria-hidden width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M5 12l5 5 9-10" />
+  </svg>
+);
+
+// Fence wrapper: language header + Copy button around the highlighted <pre>.
+// Styled by the `.md-phone .code-*` rules in index.css.
+function CodeBlock({ node, children, ...rest }: ComponentProps<"pre"> & ExtraProps) {
+  const ref = useRef<HTMLPreElement>(null);
+  const [copied, setCopied] = useState(false);
+  const codeClass = node?.children[0]?.type === "element" ? node.children[0].properties.className : undefined;
+  const lang =
+    (Array.isArray(codeClass) ? codeClass.map(String).find((c) => c.startsWith("language-")) : undefined)?.slice(9) ?? "code";
+  const copy = () => {
+    // Swallow clipboard errors (insecure context / denied), like FilesPanel.
+    navigator.clipboard
+      ?.writeText(ref.current?.textContent ?? "")
+      ?.then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      })
+      .catch(() => {});
+  };
+  return (
+    <div className="code-block">
+      <div className="code-hdr">
+        <span>{lang}</span>
+        <button type="button" aria-label="Copy code" onClick={copy}>
+          {copied ? CHECK_ICON : COPY_ICON}
+        </button>
+      </div>
+      <pre ref={ref} {...rest}>
+        {children}
+      </pre>
+    </div>
+  );
+}
+
+// Collapsible tool row (`.tool` + `.toolext`). Opening changes the row's
+// height; the transcript's per-row ResizeObserver (measureElement) re-measures.
+function ToolRow({ message }: { message: ChatMessage }) {
+  const [open, setOpen] = useState(false);
+  const call = message.role === "toolCall";
+  return (
+    <div>
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={() => setOpen((o) => !o)}
+        className="flex h-11 w-full cursor-pointer items-center gap-2 rounded-xl border border-zinc-800 bg-zinc-900 px-3 text-left text-[13px] text-zinc-400"
+      >
+        <span aria-hidden className="text-[15px]">
+          {call ? "🔧" : "↳"}
+        </span>
+        <span className="shrink-0 font-mono text-[12.5px] text-zinc-300">
+          {message.toolName ?? (call ? "tool" : "result")}
+        </span>
+        <span className="min-w-0 flex-1 truncate">{firstLine(message.content)}</span>
+        <svg
+          aria-hidden
+          width="14"
+          height="14"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          className={`shrink-0 text-zinc-500 transition-transform ${open ? "rotate-90" : ""}`}
+        >
+          <path d="M9 6l6 6-6 6" />
+        </svg>
+      </button>
+      {open && (
+        <div
+          data-testid="tool-ext"
+          className="mt-1.5 whitespace-pre-wrap break-words rounded-[10px] border border-zinc-800 bg-zinc-950 px-3 py-2.5 font-mono text-[11.5px] leading-[1.5] text-zinc-300"
+        >
+          {message.content}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PhoneMessage({ message }: { message: ChatMessage }) {
+  const { role } = message;
+  if (role === "user") {
+    return (
+      <div className="flex flex-col items-end gap-1.5">
+        {message.attachments && <Attachments attachments={message.attachments} />}
+        <div className="max-w-[88%] whitespace-pre-wrap break-words rounded-[18px_18px_6px_18px] bg-zinc-800 px-3.5 py-2.5 text-[15px] leading-[1.4] text-zinc-100">
+          {message.content}
+        </div>
+      </div>
+    );
+  }
+  if (role === "toolCall" || role === "toolResult") return <ToolRow message={message} />;
+  const prose = role === "agent" ? "text-[15px] leading-[1.5] text-zinc-100" : "text-[13.5px] text-zinc-400";
+  return (
+    <div>
+      {(message.subAgentRole || message.fromBackground || role === "summary") && (
+        <div className="mb-1 flex gap-1">
+          {role === "summary" && <span className={MTAG}>summary</span>}
+          {message.subAgentRole && <span className={MTAG}>🧩 {message.subAgentRole}</span>}
+          {message.fromBackground && <span className={MTAG}>🛰 bg</span>}
+        </div>
+      )}
+      {message.thinking && message.thinking.length > 0 && (
+        <ThinkingBlocks blocks={message.thinking} />
+      )}
+      <div className={`markdown-body md-phone max-w-[96%] break-words ${prose}`}>
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm, remarkBreaks]}
+          rehypePlugins={[rehypeHighlight]}
+          components={PHONE_MARKDOWN_COMPONENTS}
+        >
+          {message.content}
+        </ReactMarkdown>
+      </div>
+    </div>
+  );
+}
+
 // Unexported renderer. Wrapped by `memo` below so that, with the value comparator
 // (`sameMessage`), re-renders are skipped when the adapted message hasn't
 // actually changed. Identity comparison alone wouldn't help: every websocket
 // frame is a fresh `JSON.parse`, and `adaptMessage` allocates a new object per
 // call at the render site, so the prop reference never survives a re-render —
 // we need the structural comparison.
-function MessageView({ message }: { message: ChatMessage }) {
+function MessageView({ message, phone = false }: { message: ChatMessage; phone?: boolean }) {
+  if (phone) return <PhoneMessage message={message} />;
   const meta = ROLE_META[message.role];
   return (
     <div className={`rounded-lg border px-3.5 py-2.5 ${meta.bubble}`}>
@@ -344,4 +483,7 @@ function ThinkingBlocks({ blocks }: { blocks: string[] }) {
   );
 }
 
-export const Message = memo(MessageView, (a, b) => sameMessage(a.message, b.message));
+export const Message = memo(
+  MessageView,
+  (a, b) => a.phone === b.phone && sameMessage(a.message, b.message),
+);

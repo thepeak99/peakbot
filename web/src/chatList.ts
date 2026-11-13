@@ -1,4 +1,5 @@
-import type { ConversationSummary } from "./state";
+import type { ConversationSummary, WireMachineStatus } from "./state";
+import type { CatalogProfile, MachineId } from "./types";
 
 export type Range = readonly [start: number, end: number];
 
@@ -58,19 +59,6 @@ export function relativeTime(updatedAt: string, now: Date): string {
   const d = new Date(t);
   if (d.getFullYear() === now.getFullYear()) return `${d.getDate()} ${MONTHS[d.getMonth()]}`;
   return `${d.getDate()} ${MONTHS[d.getMonth()]} ${d.getFullYear()}`;
-}
-
-// Join the count/model/relative segments with " · ", dropping any that are
-// empty (0 messages, no model, unparseable timestamp) rather than printing
-// them blank.
-export function metaLine(chat: ConversationSummary, now: Date): string {
-  const parts: string[] = [];
-  const n = chat.message_count;
-  if (n > 0) parts.push(`${n} ${n === 1 ? "msg" : "msgs"}`);
-  if (chat.model) parts.push(chat.model);
-  const rel = relativeTime(chat.updated_at, now);
-  if (rel) parts.push(rel);
-  return parts.join(" · ");
 }
 
 export function filterChats(
@@ -198,13 +186,106 @@ export function foldActivity(
   return { running, unread };
 }
 
-// The back-nav badge is true only when some chat OTHER than the one we're
-// leaving still looks active; the bound chat is exempt so leaving it doesn't
-// flag itself.
-export function backBadge(
+// ─── Machine derivation + filter (mobile-redesign design §2.4) ────────────
+//
+// A "machine" is this device (id `null`) or one remote origin. Pure: derived
+// from the catalog (profile → machine) and the last conversations_list's
+// optional machine statuses. No React, no DOM.
+
+export const LOCAL_MACHINE_NAME = "This device";
+
+export interface Machine {
+  readonly id: MachineId;
+  readonly name: string;
+  readonly online: boolean;
+  readonly profiles: readonly [string, ...string[]];
+}
+
+export type MachineFilter = { kind: "all" } | { kind: "one"; id: MachineId };
+
+export const ALL_MACHINES: MachineFilter = { kind: "all" };
+
+/** The machine a conversation/profile lives on: the catalog entry's machine;
+ * a null or unknown profile is local (legacy rows; remote rows are always
+ * retagged with a live local name). */
+export function machineOf(
+  catalog: readonly CatalogProfile[],
+  profile: string | null,
+): MachineId {
+  if (profile === null) return null;
+  return catalog.find((p) => p.name === profile)?.machine ?? null;
+}
+
+/** null → "This device"; else the origin's hostname, display-only (ids and
+ * filters keep the full origin, so two servers on one host differ only in
+ * port and show the same name). The id is server-normalised, so no try/catch. */
+export function machineName(id: MachineId): string {
+  if (id === null) return LOCAL_MACHINE_NAME;
+  return new URL(id).hostname;
+}
+
+/** One entry per distinct catalog machine: local first (only if any local
+ * profile exists), then remotes in first-catalog-appearance order. Local is
+ * always online; a remote follows its status, or is online when it has no
+ * status (unknown ≠ offline). A status for an origin the catalog doesn't
+ * carry is ignored. */
+export function deriveMachines(
+  catalog: readonly CatalogProfile[],
+  statuses: readonly WireMachineStatus[],
+): Machine[] {
+  const localProfiles: string[] = [];
+  const remoteOrder: string[] = [];
+  const remoteProfiles = new Map<string, string[]>();
+  for (const p of catalog) {
+    if (p.machine === null) {
+      localProfiles.push(p.name);
+    } else {
+      const existing = remoteProfiles.get(p.machine);
+      if (existing) {
+        existing.push(p.name);
+      } else {
+        remoteProfiles.set(p.machine, [p.name]);
+        remoteOrder.push(p.machine);
+      }
+    }
+  }
+  const statusById = new Map(statuses.map((s) => [s.id, s.online]));
+  const out: Machine[] = [];
+  if (localProfiles.length > 0) {
+    out.push({
+      id: null,
+      name: LOCAL_MACHINE_NAME,
+      online: true,
+      profiles: localProfiles as [string, ...string[]],
+    });
+  }
+  for (const id of remoteOrder) {
+    out.push({
+      id,
+      name: machineName(id),
+      online: statusById.get(id) ?? true,
+      profiles: remoteProfiles.get(id) as [string, ...string[]],
+    });
+  }
+  return out;
+}
+
+/** The effective filter: All when fewer than 2 machines exist, or when a
+ * "one" names a machine not in `machines` (stale storage). Storage is not
+ * rewritten. */
+export function resolveFilter(f: MachineFilter, machines: readonly Machine[]): MachineFilter {
+  if (f.kind === "all") return ALL_MACHINES;
+  if (machines.length < 2) return ALL_MACHINES;
+  if (!machines.some((m) => m.id === f.id)) return ALL_MACHINES;
+  return f;
+}
+
+/** Rows on the filtered machine (All = unchanged list, in input order). */
+export function filterByMachine(
   list: readonly ConversationSummary[],
-  unread: ReadonlySet<string>,
-  bound: string | null,
-): boolean {
-  return list.some((c) => c.id !== bound && (c.running === true || unread.has(c.id)));
+  catalog: readonly CatalogProfile[],
+  f: MachineFilter,
+): ConversationSummary[] {
+  if (f.kind === "all") return [...list];
+  return list.filter((row) => machineOf(catalog, row.profile ?? null) === f.id);
 }

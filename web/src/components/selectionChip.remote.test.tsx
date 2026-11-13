@@ -51,7 +51,7 @@ const CATALOG: CatalogProfile[] = [
   {
     name: "dev",
     origin: "global",
-    overridesGlobal: false,
+    overridesGlobal: false, machine: null,
     agents: [
       { name: "team", model: "sonnet", subagents: [] },
       { name: "review", model: "sonnet", subagents: [] },
@@ -63,7 +63,7 @@ const CATALOG: CatalogProfile[] = [
   {
     name: "bonsol-dev",
     origin: "remote",
-    overridesGlobal: false,
+    overridesGlobal: false, machine: null,
     agents: [],
     color: "teal",
   },
@@ -223,7 +223,7 @@ describe("selection chip — a remote profile with known agents (relay-filled)",
       {
         name: "home-dev",
         origin: "remote",
-        overridesGlobal: false,
+        overridesGlobal: false, machine: null,
         agents: [{ name: "ops", model: "sonnet", subagents: [] }],
         color: "pink",
       },
@@ -281,7 +281,7 @@ describe("selection chip — browsing never connects other profiles", () => {
       {
         name: "home-dev",
         origin: "remote",
-        overridesGlobal: false,
+        overridesGlobal: false, machine: null,
         agents: [{ name: "ops", model: "sonnet", subagents: [] }],
         color: "pink",
       },

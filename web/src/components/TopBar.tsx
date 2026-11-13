@@ -11,6 +11,7 @@ import { ConversationsPicker } from "./ConversationsPicker";
 import { SelectionChip } from "./SelectionChip";
 import { NotifyToggle } from "./NotifyToggle";
 import { FocusToggle } from "./FocusToggle";
+import { PanelsButton, type PanelsButtonProps } from "./PanelsSheet";
 import { ThemeToggle } from "./ThemeToggle";
 import type { TaskNotifications } from "../useTaskNotifications";
 import { edition } from "../desktop";
@@ -45,6 +46,7 @@ export function TopBar({
   profilePinned = false,
   onToast,
   stopPending = false,
+  panels,
 }: {
   isRunning: boolean;
   connected: boolean;
@@ -88,6 +90,9 @@ export function TopBar({
   /** Two-stage stop: a graceful stop is pending. While set, the working…
    * chip shows the escalation sentence INSTEAD of the statusMessage. */
   stopPending?: boolean;
+  /** Phone browser (<1024px): the Panels button. App passes it only when
+   * there is a visible tab to open. */
+  panels?: PanelsButtonProps;
 }) {
   return (
 
@@ -190,6 +195,7 @@ export function TopBar({
       )}
 
       <div className="ml-auto flex items-center gap-4 font-mono text-[11px] tabular-nums text-zinc-500">
+        {panels && <PanelsButton {...panels} />}
         <FocusToggle enabled={focusMode} onToggle={onToggleFocus} />
         <ThemeToggle />
         <NotifyToggle notify={notify} />

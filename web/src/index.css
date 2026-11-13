@@ -21,6 +21,22 @@ html.light {
   --color-zinc-50: oklch(14.1% 0.005 285.823); /* was 950 */
 }
 
+/* Phone-only light remap (64rem = 1024px, so desktop light keeps its tokens):
+   the mock's light palette — pure-white bg, sky-700 links, emerald accents.
+   Settings restores the originals so it stays visually untouched. */
+@media (width < 64rem) {
+  html.light {
+    --color-zinc-950: #ffffff;
+    --color-sky-400: #0369a1;
+    --color-emerald-400: #047857;
+  }
+  html.light [data-testid="settings-view"] {
+    --color-zinc-950: oklch(98.5% 0 0);
+    --color-sky-400: oklch(74.6% 0.16 232.661);
+    --color-emerald-400: oklch(76.5% 0.177 163.223);
+  }
+}
+
 /* Per-profile accent palette (remote-profiles T2). The server resolves each
    profile's colour (RP8); these vars only paint it. Dark is the default:
    bright -400 tones read on the zinc-950/900 tab bar; light uses -600 tones
@@ -44,6 +60,27 @@ html.light {
   --profile-blue: #2563eb;
   --profile-purple: #7c3aed;
   --profile-pink: #db2777;
+}
+
+/* `light:` — the html.light theme (portaled sheets included). */
+@custom-variant light (&:where(.light, .light *));
+
+/* Bottom-sheet entrance (mobile redesign): the sheet slides up from below
+   the viewport on mount. `@theme` makes `animate-sheet-in` a utility; the
+   components gate it with `motion-safe:`. */
+@theme {
+  --animate-sheet-in: sheet-in 0.25s ease-out;
+  /* 26px sheet/pill radius — the mock's only r26 (sheet top, composer pill). */
+  --radius-sheet: 26px;
+
+  @keyframes sheet-in {
+    from {
+      transform: translateY(100%);
+    }
+    to {
+      transform: translateY(0);
+    }
+  }
 }
 
 /* Window background: the SPA dark background token —
@@ -174,6 +211,68 @@ html.light .markdown-body a {
 .markdown-body td {
   border: 1px solid rgb(63 63 70);
   padding: 0.3rem 0.5rem;
+}
+
+/* Phone markdown (mock `code` / `.code`, proto:151, 165-171). Scoped to
+   `.md-phone`, which only the phone Message emits, so desktop is untouched.
+   The light inline-chip tint comes from the `html.light .markdown-body` rule. */
+.md-phone :not(pre) > code {
+  font-size: 12.5px;
+  background: rgb(255 255 255 / 0.09);
+  padding: 1px 5px;
+  border-radius: 5px;
+  color: inherit;
+}
+.md-phone .code-block {
+  margin: 0.5rem 0;
+  background: #0d1117;
+  border: 1px solid #27272a;
+  border-radius: 12px;
+  overflow: hidden;
+}
+html.light .md-phone .code-block {
+  border-color: #d4d4d8;
+}
+.md-phone .code-hdr {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 12px;
+  font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #8b949e;
+  border-bottom: 1px solid #21262d;
+}
+.md-phone .code-hdr button {
+  display: inline-flex;
+  cursor: pointer;
+  color: inherit;
+}
+.md-phone .code-block pre {
+  margin: 0;
+  background: transparent;
+  border-radius: 0;
+  padding: 10px 12px;
+  color: #e6edf3;
+  line-height: 1.55;
+}
+.md-phone pre code {
+  font-size: 12px;
+}
+/* Diff lines tint edge to edge: cancel the <pre>'s 12px side padding. */
+.md-phone .hljs-deletion,
+.md-phone .hljs-addition {
+  display: inline-block;
+  min-width: calc(100% + 24px);
+  margin: 0 -12px;
+  padding: 0 12px;
+}
+.md-phone .hljs-deletion {
+  color: #ffa198;
+  background: rgb(248 81 73 / 0.16);
+}
+.md-phone .hljs-addition {
+  color: #7ee787;
+  background: rgb(46 160 67 / 0.2);
 }
 
 /* Desktop conversation tab bar (issue #373). Uses the zinc theme vars, so the

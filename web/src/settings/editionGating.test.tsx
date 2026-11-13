@@ -478,14 +478,14 @@ const REMOTE_CATALOG: CatalogProfile[] = [
   {
     name: "dev",
     origin: "global",
-    overridesGlobal: false,
+    overridesGlobal: false, machine: null,
     agents: [{ name: "team", model: "sonnet", subagents: [] }],
     color: "teal",
   },
   {
     name: "bonsol-dev",
     origin: "remote",
-    overridesGlobal: false,
+    overridesGlobal: false, machine: null,
     agents: [],
     color: "teal",
   },
@@ -500,7 +500,7 @@ function localCatalog(origin: "global" | "repo"): CatalogProfile[] {
     {
       name: origin === "repo" ? "repo-dev" : "dev",
       origin,
-      overridesGlobal: false,
+      overridesGlobal: false, machine: null,
       agents: [{ name: "team", model: "sonnet", subagents: [] }],
       color: "teal",
     },

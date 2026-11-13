@@ -29,8 +29,8 @@ beforeAll(() => {
 // ─── fixture ────────────────────────────────────────────────────────────
 
 const CATALOG: CatalogProfile[] = [
-  { name: "dev", origin: "global", overridesGlobal: false, agents: [], color: "teal" },
-  { name: "home-dev", origin: "remote", overridesGlobal: false, agents: [], color: "pink" },
+  { name: "dev", origin: "global", overridesGlobal: false, machine: null, agents: [], color: "teal" },
+  { name: "home-dev", origin: "remote", overridesGlobal: false, machine: null, agents: [], color: "pink" },
 ];
 
 const row = (
