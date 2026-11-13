@@ -26,8 +26,7 @@ use futures::Stream;
 use percent_encoding::percent_decode_str;
 use uuid::Uuid;
 
-use super::{Client, DIRECTORY, RemoteError, Upstream};
-use crate::image_cache::valid_image_id;
+use super::{Client, DIRECTORY, GetTarget, RemoteError, Upstream};
 
 /// One entry for the whole `/r/` prefix — axum 0.8's router cannot mix a
 /// wildcard route with sibling routes, so the three allowlisted shapes are
@@ -78,9 +77,16 @@ async fn under_r(req: Request<Body>) -> Response {
     };
     let segs: Vec<&str> = segments.iter().map(String::as_str).collect();
     match segs.as_slice() {
-        [profile, "images", id] if method == Method::GET => image_get(profile, id).await,
-        [profile, "api", "uploads", convo, id] if method == Method::GET => {
-            upload_get(profile, convo, id).await
+        // The GET tail is parsed ONCE into a typed target at the boundary
+        // (p3-design §F.4): an unparseable tail is a local 404 and the
+        // upstream is never contacted.
+        [profile, tail @ ..]
+            if method == Method::GET && !tail.is_empty() =>
+        {
+            match GetTarget::parse(&tail.join("/")) {
+                Some(target) => get_target(profile, target).await,
+                None => not_found().await,
+            }
         }
         [profile, "api", "uploads"] if method == Method::POST => upload_post(profile, req).await,
         _ => not_found().await,
@@ -100,32 +106,14 @@ async fn resolve(name: &str) -> Option<Arc<Client>> {
     DIRECTORY.client(name).await.ok()
 }
 
-/// `GET /r/{L}/images/{id}` → upstream `GET /images/{id}`. The id is
-/// `image_cache`'s grammar (64 lower-hex + known ext) — checked before any
-/// network.
-async fn image_get(profile: &str, id: &str) -> Response {
-    if !valid_image_id(id) {
-        return not_found().await;
-    }
+/// `GET /r/{L}/<typed target>` → upstream `GET <target.path()>`
+/// (p3-design §F.4). The id/UUID grammar was already checked at the
+/// boundary by `GetTarget::parse` — before any network.
+async fn get_target(profile: &str, target: GetTarget) -> Response {
     let Some(client) = resolve(profile).await else {
         return not_found().await;
     };
-    get_upstream(&client, &format!("images/{id}")).await
-}
-
-/// `GET /r/{L}/api/uploads/{convo}/{id}` → upstream of the same shape; both
-/// segments must be UUIDs.
-async fn upload_get(profile: &str, convo: &str, id: &str) -> Response {
-    let Ok(convo) = Uuid::parse_str(convo) else {
-        return not_found().await;
-    };
-    let Ok(id) = Uuid::parse_str(id) else {
-        return not_found().await;
-    };
-    let Some(client) = resolve(profile).await else {
-        return not_found().await;
-    };
-    get_upstream(&client, &format!("api/uploads/{convo}/{id}")).await
+    get_upstream(&client, &target).await
 }
 
 /// `POST /r/{L}/api/uploads?convo=&name=` → upstream with the query REBUILT
@@ -155,8 +143,8 @@ async fn upload_post(profile: &str, req: Request<Body>) -> Response {
     }
 }
 
-async fn get_upstream(client: &Arc<Client>, path: &str) -> Response {
-    match client.get(path).await {
+async fn get_upstream(client: &Arc<Client>, target: &GetTarget) -> Response {
+    match client.get(target.clone()).await {
         Ok(upstream) => upstream_response(upstream),
         Err(e) => failure_response(e),
     }
@@ -171,7 +159,18 @@ fn upstream_response(upstream: Upstream) -> Response {
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok());
-    let stream = upstream.body.bytes_stream();
+    // The allowlist values outlive the body move (p3-design §F.3).
+    let allowlisted: [(header::HeaderName, Option<reqwest::header::HeaderValue>); 4] = [
+        (header::CONTENT_TYPE, upstream.headers.get(header::CONTENT_TYPE).cloned()),
+        (header::CONTENT_LENGTH, upstream.headers.get(header::CONTENT_LENGTH).cloned()),
+        (header::CACHE_CONTROL, upstream.headers.get(header::CACHE_CONTROL).cloned()),
+        (
+            header::CONTENT_DISPOSITION,
+            upstream.headers.get(header::CONTENT_DISPOSITION).cloned(),
+        ),
+    ];
+    let status = upstream.status;
+    let stream = upstream.bytes_stream();
     let body = match length {
         // An exact size hint lets the browser get length framing.
         Some(len) => Body::from_stream(SizedStream {
@@ -181,15 +180,10 @@ fn upstream_response(upstream: Upstream) -> Response {
         None => Body::from_stream(stream),
     };
     let mut response = Response::new(body);
-    *response.status_mut() = upstream.status;
-    for name in [
-        header::CONTENT_TYPE,
-        header::CONTENT_LENGTH,
-        header::CACHE_CONTROL,
-        header::CONTENT_DISPOSITION,
-    ] {
-        if let Some(value) = upstream.headers.get(name.as_str()) {
-            response.headers_mut().insert(name, value.clone());
+    *response.status_mut() = status;
+    for (name, value) in allowlisted {
+        if let Some(value) = value {
+            response.headers_mut().insert(name, value);
         }
     }
     response

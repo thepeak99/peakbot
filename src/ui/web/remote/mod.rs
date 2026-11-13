@@ -10,9 +10,14 @@ use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::{Arc, LazyLock, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
+use bytes::Bytes;
+use futures::stream::BoxStream;
+use futures::{Sink, Stream};
 use reqwest::StatusCode;
 use reqwest::header::{COOKIE, HeaderValue};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -26,12 +31,14 @@ use serde::Deserialize;
 use tokio::net::TcpStream;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::Error as WsError;
+use tokio_tungstenite::tungstenite::Message as TMsg;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use url::{Host, Url};
 use uuid::Uuid;
 
 use crate::config::remote::{CaFingerprint, Endpoint, RemoteProfile, Trust};
 use crate::config::resolve::{CatalogEntry, Config, LoadError, ParseCtx, ProfileInfo, RepoMode};
+use crate::image_cache::valid_image_id;
 use crate::ui::wire::ConversationSummaryWire;
 
 pub(super) mod listing;
@@ -71,7 +78,45 @@ mod t11_tests;
 #[cfg(test)]
 mod t10_tests;
 
-pub type WsStream = tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>;
+/// The WS stream a `Client` dials — an enum so the cloud-tunnel variant can
+/// land above the transport without forking the callers (p3-design §F.2).
+#[derive(Debug)]
+pub enum WsStream {
+    Direct(tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>),
+}
+
+impl Stream for WsStream {
+    type Item = Result<TMsg, WsError>;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.get_mut() {
+            Self::Direct(inner) => Pin::new(inner).poll_next(cx),
+        }
+    }
+}
+
+impl Sink<TMsg> for WsStream {
+    type Error = WsError;
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        match self.get_mut() {
+            Self::Direct(inner) => Pin::new(inner).poll_ready(cx),
+        }
+    }
+    fn start_send(self: Pin<&mut Self>, item: TMsg) -> Result<(), Self::Error> {
+        match self.get_mut() {
+            Self::Direct(inner) => Pin::new(inner).start_send(item),
+        }
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        match self.get_mut() {
+            Self::Direct(inner) => Pin::new(inner).poll_flush(cx),
+        }
+    }
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        match self.get_mut() {
+            Self::Direct(inner) => Pin::new(inner).poll_close(cx),
+        }
+    }
+}
 
 /// The bounds of §5.12, injectable so tests run in seconds.
 #[derive(Clone, Copy, Debug)]
@@ -103,11 +148,24 @@ pub struct RemoteRef {
 
 /// The remote's answer to a proxied request (T8): its status, its response
 /// headers (the proxy copies an allowlist of them) and its body, left for
-/// streaming.
+/// streaming. The body is an enum (p3-design §F.3); the proxy only ever
+/// calls `bytes_stream()`, so it never learns which transport it holds.
 pub struct Upstream {
     pub status: StatusCode,
     pub headers: reqwest::header::HeaderMap,
-    pub body: reqwest::Response,
+    body: UpstreamBody,
+}
+
+enum UpstreamBody {
+    Direct(reqwest::Response),
+}
+
+impl Upstream {
+    pub fn bytes_stream(self) -> BoxStream<'static, Result<Bytes, reqwest::Error>> {
+        match self.body {
+            UpstreamBody::Direct(resp) => Box::pin(resp.bytes_stream()),
+        }
+    }
 }
 
 /// The typed `GET` target at the `/r/{profile}/…` boundary (p3-design
@@ -127,13 +185,26 @@ pub enum GetTarget {
 impl GetTarget {
     /// Parse the tail after `/r/{profile}/` (segments already
     /// percent-decoded by the boundary) into a target. `None` → local 404.
-    pub fn parse(_path_after_r: &str) -> Option<GetTarget> {
-        todo!("P3 PR-A A6: the typed proxy boundary")
+    /// The per-shape grammar checks are the traversal defence: a `..`
+    /// segment can never match either shape.
+    pub fn parse(path_after_r: &str) -> Option<GetTarget> {
+        let segs: Vec<&str> = path_after_r.split('/').collect();
+        match segs.as_slice() {
+            ["images", id] if valid_image_id(id) => Some(Self::Image(id.to_string())),
+            ["api", "uploads", convo, id] => Some(Self::Upload {
+                convo: Uuid::parse_str(convo).ok()?,
+                id: Uuid::parse_str(id).ok()?,
+            }),
+            _ => None,
+        }
     }
 
     /// Render the target back to the upstream path (e.g. `/images/{id}`).
     pub(crate) fn path(&self) -> String {
-        todo!("P3 PR-A A6: the typed proxy boundary")
+        match self {
+            Self::Image(id) => format!("/images/{id}"),
+            Self::Upload { convo, id } => format!("/api/uploads/{convo}/{id}"),
+        }
     }
 }
 
@@ -462,7 +533,7 @@ async fn bootstrap_pinned(
 
 /// One remote profile's connection policy, built once (CA bootstrap
 /// included) and reused for every dial and HTTP call.
-pub struct Client {
+pub struct DirectClient {
     peer: Peer,
     origin: Url,
     /// `peakbot_token=<remote token>`, marked sensitive.
@@ -474,16 +545,16 @@ pub struct Client {
 }
 
 // Hand-written so the cookie (the token) can never reach a Debug print.
-impl fmt::Debug for Client {
+impl fmt::Debug for DirectClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Client")
+        f.debug_struct("DirectClient")
             .field("profile", &self.peer.profile)
             .field("host", &self.peer.host_port)
             .finish_non_exhaustive()
     }
 }
 
-impl Client {
+impl DirectClient {
     pub async fn new(profile: &RemoteProfile, opts: ClientOpts) -> Result<Self, RemoteError> {
         let origin = match &profile.endpoint {
             Endpoint::Tls { origin, .. } | Endpoint::LoopbackPlain { origin } => origin,
@@ -563,7 +634,7 @@ impl Client {
         request.headers_mut().insert(COOKIE, self.cookie.clone());
         // tungstenite's defaults (64 MiB message / 16 MiB frame) are the §7 bounds.
         match tokio_tungstenite::client_async(request, stream).await {
-            Ok((ws, _response)) => Ok(ws),
+            Ok((ws, _response)) => Ok(WsStream::Direct(ws)),
             Err(WsError::Http(response)) if response.status() == StatusCode::UNAUTHORIZED => {
                 Err(peer.auth())
             }
@@ -621,7 +692,7 @@ impl Client {
         Ok(Upstream {
             status: resp.status(),
             headers: resp.headers().clone(),
-            body: resp,
+            body: UpstreamBody::Direct(resp),
         })
     }
 
@@ -657,7 +728,7 @@ impl Client {
         Ok(Upstream {
             status: resp.status(),
             headers: resp.headers().clone(),
-            body: resp,
+            body: UpstreamBody::Direct(resp),
         })
     }
 
@@ -683,6 +754,68 @@ impl Client {
                 .text()
                 .await
                 .map_err(|e| self.peer.classify_reqwest(&e)),
+        }
+    }
+}
+
+/// The remote-profile controller — an enum over transports (p3-design
+/// §F.1): `Direct` is today's client, unchanged; the `Cloud` variant lands
+/// in PR-C. Nothing above the transport learns which one it holds.
+pub enum Client {
+    Direct(DirectClient),
+}
+
+impl Client {
+    pub async fn new(profile: &RemoteProfile, opts: ClientOpts) -> Result<Self, RemoteError> {
+        Ok(Self::Direct(DirectClient::new(profile, opts).await?))
+    }
+
+    fn direct(&self) -> &DirectClient {
+        match self {
+            Self::Direct(d) => d,
+        }
+    }
+
+    /// The connection policy the timeout/auth errors carry (§F.1 `peer()`).
+    pub fn peer(&self) -> &Peer {
+        &self.direct().peer
+    }
+
+    pub async fn dial(&self) -> Result<WsStream, RemoteError> {
+        self.direct().dial().await
+    }
+
+    pub async fn list(&self) -> Result<Vec<ConversationSummaryWire>, RemoteError> {
+        self.direct().list().await
+    }
+
+    pub async fn kill(&self, id: &Uuid) -> Result<Option<String>, RemoteError> {
+        self.direct().kill(id).await
+    }
+
+    /// The typed `GET` at the `/r/` boundary (p3-design §F.4): `Direct`
+    /// renders `path()` to a URL; `Cloud` (PR-C) maps to `Op::Get(…)`.
+    pub async fn get(&self, target: GetTarget) -> Result<Upstream, RemoteError> {
+        self.direct().get(&target.path()).await
+    }
+
+    pub async fn post_upload(
+        &self,
+        convo: &Uuid,
+        name: &str,
+        content_type: Option<HeaderValue>,
+        body: reqwest::Body,
+    ) -> Result<Upstream, RemoteError> {
+        self.direct()
+            .post_upload(convo, name, content_type, body)
+            .await
+    }
+}
+
+impl fmt::Debug for Client {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Direct(d) => d.fmt(f),
         }
     }
 }

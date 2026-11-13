@@ -209,7 +209,7 @@ pub async fn run<L, E>(
     let frames = match handshake {
         Ok(Ok(frames)) => frames,
         Ok(Err(message)) => return refuse(out_tx, writer_task, message).await,
-        Err(_) => return refuse(out_tx, writer_task, client.peer.timeout().to_string()).await,
+        Err(_) => return refuse(out_tx, writer_task, client.peer().timeout().to_string()).await,
     };
     for frame in frames {
         let _ = out_tx.send(frame);
