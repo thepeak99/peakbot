@@ -23,7 +23,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { App } from "./App";
-import type { AppState, ConversationSummary, WireChatMessage, WireMachineStatus } from "./state";
+import type { AppState, ConversationSummary, WireChatMessage, WireMachineStatus, WireWelcome } from "./state";
 
 // ─── mocks ───────────────────────────────────────────────────────────────
 
@@ -154,6 +154,22 @@ const WIRE_CATALOG_REMOTE = [
     machine: HS,
   },
 ];
+
+const WELCOME: WireWelcome = {
+  provider_name: "anthropic",
+  model: "claude",
+  max_tokens: 100000,
+  builtin_tools_count: 10,
+  mcp_tools_count: 1,
+  skills_count: 2,
+  searxng_enabled: false,
+  cost_tracking_enabled: true,
+  compaction_enabled: true,
+  compaction_threshold: 0.8,
+  compaction_keep_recent: 3,
+  conversation_persistence_enabled: true,
+  cwd: "/home/exe",
+};
 
 function stateFor(id: string | null, over: Partial<AppState> = {}): AppState {
   return {
@@ -1019,5 +1035,184 @@ describe("App mobile sheet — BK6: the active tab disappears under an open shee
     expect(panelsDialog(), "the sheet closes").toBeNull();
     expect(tid("panels-button"), "no button either").toBeNull();
     expect(backSpy, "its marker is consumed once").toHaveBeenCalledTimes(1);
+  });
+});
+
+// ═══ B31 — the watch banner (batch 3, fidelity plan 3.9) ═════════════════
+
+describe("App mobile sheet — B31: the watch banner", () => {
+  const subMsg: WireChatMessage = {
+    role: "agent",
+    content: "found the bug",
+    timestamp: T,
+    source: { kind: "sub_agent", role: "researcher" },
+  };
+
+  /** The banner's own "Clear" — the composer carries a second watch note
+   *  with its own Clear, which must not satisfy these assertions. */
+  const bannerClear = (): HTMLButtonElement | undefined =>
+    [...host.querySelectorAll("button")].find(
+      (b) =>
+        b.textContent?.trim() === "Clear" &&
+        !b.closest('[data-testid="composer"]') &&
+        !b.closest("footer, .border-t") &&
+        (b.closest("div")?.textContent ?? "").includes("Watching"),
+    );
+
+  /** Mount a chat with one researcher turn; assert the global view has no banner. */
+  async function setup(): Promise<void> {
+    hoisted.agent = makeAgent(
+      stateFor("c1", {
+        chat: {
+          messages: [
+            { role: "user", content: "dig in", timestamp: T },
+            subMsg,
+          ],
+          auto_scroll: true,
+          scroll_offset: 0,
+        },
+      } as Partial<AppState>),
+    );
+    mount();
+    await flush();
+    expect(bannerClear(), "no banner in the global view").toBeUndefined();
+  }
+
+  /** Panels → Agents → watch the researcher's lane. */
+  async function watchResearcher(): Promise<void> {
+    click(must("panels-button"));
+    await flush();
+    click(document.body.querySelector('[data-testid="panels-pill"][data-tab="agents"]')!);
+    await flush();
+    click(document.body.querySelector('button[title^="Watch every turn researcher"]')!);
+    await flush();
+  }
+
+  it("shows 'Watching ‹who›' and Clear returns to the global view", async () => {
+    await setup();
+    await watchResearcher();
+
+    const clear = bannerClear();
+    expect(clear, "the banner (outside the composer) renders with its Clear").toBeDefined();
+    expect(clear!.closest("div")!.textContent).toContain("Watching researcher");
+
+    click(clear!);
+    await flush();
+    expect(bannerClear(), "back to the global view, banner gone").toBeUndefined();
+  });
+
+  it("the 'N messages' count is hidden on the phone (max-lg:hidden) but still rendered", async () => {
+    await setup();
+    await watchResearcher();
+    const count = [...bannerClear()!.closest("div")!.querySelectorAll("span")].find((s) =>
+      /^\d+ messages?$/.test(s.textContent?.trim() ?? ""),
+    );
+    expect(count, "the count span exists").toBeDefined();
+    expect(count!.textContent!.trim()).toBe("1 message");
+    expect(count!.classList.contains("max-lg:hidden"), "hidden below lg only").toBe(true);
+  });
+
+  it("desktop lock: at ≥1024px the banner still reads 'Watching ‹who›' with its message count, and Clear works", async () => {
+    desktopWidth = true;
+    setShell("browser");
+    hoisted.agent = makeAgent(
+      stateFor("c1", {
+        chat: {
+          messages: [{ role: "user", content: "dig in", timestamp: T }, subMsg],
+          auto_scroll: true,
+          scroll_offset: 0,
+        },
+      } as Partial<AppState>),
+    );
+    mount();
+    await flush();
+    const handle = [...host.querySelectorAll<HTMLElement>('aside [role="tab"]')].find((t) =>
+      (t.textContent ?? "").includes("Agents"),
+    )!;
+    click(handle);
+    await flush();
+    click(host.querySelector('button[title^="Watch every turn researcher"]')!);
+    await flush();
+
+    const clear = bannerClear();
+    expect(clear, "the banner renders with its Clear").toBeDefined();
+    const banner = clear!.closest("div")!;
+    expect(banner.textContent).toContain("Watching researcher");
+    expect(banner.textContent, "the count stays on desktop").toContain("1 message");
+    click(clear!);
+    await flush();
+    expect(bannerClear()).toBeUndefined();
+  });
+});
+
+// ═══ X2 — Transcript gets `phone={!isDesktop}` (batch 3, 3.1) ═════════════
+
+describe("App mobile sheet — X2: the transcript rows follow the breakpoint", () => {
+  const withRows = (): FakeAgent =>
+    makeAgent(
+      stateFor("c1", {
+        chat: {
+          messages: [
+            { role: "user", content: "hi", timestamp: T },
+            { role: "agent", content: "yo", timestamp: T },
+          ],
+          auto_scroll: true,
+          scroll_offset: 0,
+        },
+      } as Partial<AppState>),
+    );
+
+  async function withViewport(run: () => Promise<void>): Promise<void> {
+    const desc = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "offsetHeight");
+    Object.defineProperty(HTMLElement.prototype, "offsetHeight", { configurable: true, get: () => 400 });
+    try {
+      await run();
+    } finally {
+      if (desc) Object.defineProperty(HTMLElement.prototype, "offsetHeight", desc);
+    }
+  }
+
+  it("on a phone the rows carry no 'You' / 'Shifu' labels", async () => {
+    await withViewport(async () => {
+      hoisted.agent = withRows();
+      mount();
+      await flush();
+      const rows = [...host.querySelectorAll("[data-index]")].map((r) => r.textContent ?? "");
+      expect(rows.length, "rows render").toBe(2);
+      expect(rows.join("|")).toContain("hi");
+      expect(rows.join("|")).toContain("yo");
+      expect(rows.join("|"), "no role labels on the phone").not.toMatch(/You|Shifu/);
+    });
+  });
+
+  it("at ≥1024px the rows keep today's labelled cards", async () => {
+    await withViewport(async () => {
+      desktopWidth = true;
+      setShell("browser");
+      hoisted.agent = withRows();
+      mount();
+      await flush();
+      const rows = [...host.querySelectorAll("[data-index]")].map((r) => r.textContent ?? "");
+      expect(rows.join("|")).toContain("You");
+      expect(rows.join("|")).toContain("Shifu");
+    });
+  });
+});
+
+// ═══ B32 — the fresh-chat empty state (batch 3, fidelity plan 3.10) ══════
+
+describe("App mobile sheet — B32: the fresh-chat empty state", () => {
+  it("shows the welcome card and the 'Nothing here yet' hint", async () => {
+    hoisted.agent = makeAgent(stateFor("c1", { welcome: WELCOME }));
+    mount();
+    await flush();
+    expect(host.textContent, "the welcome card is kept").toContain("Welcome to Shifu");
+    const hint = [...host.querySelectorAll("p")].find((p) =>
+      p.textContent?.includes("Nothing here yet"),
+    );
+    expect(hint, "the 'Nothing here yet' hint").toBeDefined();
+    // lg:hidden is the contract: the hint is phone-only, the desktop render
+    // is unchanged.
+    expect(hint!.classList.contains("lg:hidden"), "the hint is phone-only").toBe(true);
   });
 });
