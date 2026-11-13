@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::ws::{Message, WebSocket};
+use axum::extract::ws::Message;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use tokio::task::JoinHandle;
@@ -165,15 +165,17 @@ enum End {
 
 /// Run one relayed browser socket to completion (§5.2). `convo`/`agent` are
 /// the browser's attach fields. `registry` only answers the local list.
-pub async fn run(
-    mut local: SplitStream<WebSocket>,
+pub async fn run<L, E>(
+    mut local: L,
     out_tx: OutboundTx,
     mut writer_task: JoinHandle<()>,
     registry: SessionRegistry,
     view: LocalView,
     convo: Option<String>,
     agent: Option<String>,
-) {
+) where
+    L: futures::Stream<Item = Result<Message, E>> + Unpin,
+{
     let dialed = match DIRECTORY.client(&view.name).await {
         Ok(client) => client.dial().await.map(|ws| (client, ws)),
         Err(e) => Err(e),
@@ -207,7 +209,7 @@ pub async fn run(
     let frames = match handshake {
         Ok(Ok(frames)) => frames,
         Ok(Err(message)) => return refuse(out_tx, writer_task, message).await,
-        Err(_) => return refuse(out_tx, writer_task, client.peer.timeout().to_string()).await,
+        Err(_) => return refuse(out_tx, writer_task, client.peer().timeout().to_string()).await,
     };
     for frame in frames {
         let _ = out_tx.send(frame);
