@@ -58,6 +58,8 @@ sha2 = { version = "0.10", features = ["oid"] }
 jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# DB inspection after shutdown (chain.rs revoke test).
+rusqlite = { version = "0.37", features = ["bundled"] }
 tokio-tungstenite = "0.28"
 tempfile = "3"
 # Device keys/cards/chain entries come from the same perma-crypto rev as cloud.

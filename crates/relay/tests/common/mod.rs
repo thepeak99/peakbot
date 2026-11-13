@@ -130,6 +130,8 @@ struct IdpInner {
     rs: Option<rsa::RsaPrivateKey>,
     /// Discovery `issuer` override (discovery_issuer_mismatch_rejected).
     discovery_issuer: Option<String>,
+    /// The most recent minted ID token (logs_are_redacted needle).
+    last_id_token: Option<String>,
     mint: Mint,
     /// code -> (flow nonce, relay S256 challenge).
     codes: HashMap<String, (String, String)>,
@@ -170,6 +172,7 @@ impl FakeIdp {
             discovery_issuer: None,
             mint: Mint::default(),
             codes: HashMap::new(),
+            last_id_token: None,
         }));
         let app = axum::Router::new()
             .route("/.well-known/openid-configuration", get(discovery))
@@ -208,6 +211,11 @@ impl FakeIdp {
 
     pub fn set_discovery_issuer(&self, issuer: Option<String>) {
         self.state.lock().unwrap().discovery_issuer = issuer;
+    }
+
+    /// The last minted ID token (for redaction needles).
+    pub fn last_id_token(&self) -> Option<String> {
+        self.state.lock().unwrap().last_id_token.clone()
     }
 }
 
@@ -308,6 +316,7 @@ async fn token_endpoint(
         ));
     }
     let id_token = mint_id_token(&st, &nonce);
+    st.last_id_token = Some(id_token.clone());
     Ok(axum::Json(serde_json::json!({
         "token_type": "Bearer",
         "id_token": id_token,
@@ -451,6 +460,13 @@ impl TestRelay {
 
     pub fn db_path(&self) -> &Path {
         &self.cfg.db
+    }
+
+    /// Stop the relay (and release the DB lock) without restarting.
+    pub async fn shutdown_all(&mut self) {
+        if let Some(relay) = self.relay.take() {
+            relay.shutdown().await;
+        }
     }
 
     /// `restart()` = shutdown + serve on the same DB (design §9.1).
@@ -842,6 +858,52 @@ pub async fn connect_active(t: &TestRelay, token: &str, d: &mut FakeDevice, head
     d.connect(&t.ws_url(), token).await;
     d.hello(t.origin()).await;
     expect_welcome(&d.recv().await, head, false).await;
+}
+
+/// `Post` from `d` to `to`; returns the letter id (no success reply exists,
+/// design §4.6).
+pub async fn post_to(d: &mut FakeDevice, to: DeviceId, sealed: Vec<u8>) -> LetterId {
+    let id = letter_id();
+    d.send(ToRelay::Post { to, letter_id: id, sealed }).await;
+    id
+}
+
+/// `ChainFetch` and the expected single `Chain` reply.
+pub async fn fetch_chain(d: &mut FakeDevice, from_seq: u64) -> Vec<Vec<u8>> {
+    d.send(ToRelay::ChainFetch { from_seq }).await;
+    match d.recv().await {
+        FromRelay::Chain { entries } => entries,
+        other => panic!("expected Chain, got {other:?}"),
+    }
+}
+
+/// Add `count` active devices after `seq` (prev = `prev`); returns the devices
+/// and the new head hash. All sockets stay open.
+pub async fn add_devices(
+    t: &TestRelay,
+    token: &str,
+    seq: u64,
+    prev: [u8; 32],
+    active: &mut FakeDevice,
+    count: u64,
+) -> (Vec<FakeDevice>, [u8; 32]) {
+    let mut out = Vec::new();
+    let mut cur = prev;
+    for i in 0..count {
+        let s = seq + i;
+        let mut d = FakeDevice::new(5000 + s);
+        d.connect(&t.ws_url(), token).await;
+        d.hello_pending(t.origin()).await;
+        expect_welcome(&d.recv().await, Some(s - 1), true).await;
+        let e = entry(s, cur, ChainOp::Add, Some(d.card.clone()), None, active);
+        let raw = e.encode();
+        active.send(ToRelay::ChainAppend { entry: raw.clone() }).await;
+        expect_chain_changed(&active.recv().await, s).await;
+        expect_chain_changed(&d.recv().await, s).await;
+        cur = cloud::chain::entry_hash(&raw);
+        out.push(d);
+    }
+    (out, cur)
 }
 
 // ------------------------------------------------------------- assertions
