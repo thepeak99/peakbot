@@ -13,15 +13,14 @@
 //! it at the PR-A seam explicitly and are independent of A1's internals.)
 
 use super::ws_handler;
-use crate::config::resolve::{Config, ParseCtx, Source};
 use crate::config::CONFIG_ENV_LOCK;
+use crate::config::resolve::{Config, ParseCtx, Source};
 use crate::session::{SessionDeps, test_support};
 use crate::storage::{ConversationStorage, InMemoryStorage};
 use crate::ui::web::WsState;
 use crate::ui::web::registry::SessionRegistry;
-use axum::extract::State;
-use axum::routing::get;
 use axum::Router;
+use axum::routing::get;
 use futures::SinkExt;
 use serde_json::{Value, json};
 use std::ffi::OsString;

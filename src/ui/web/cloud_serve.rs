@@ -19,9 +19,16 @@ use super::WsState;
 #[derive(Debug)]
 pub(super) enum PeerOp {
     List,
-    Kill { id: Uuid },
-    GetImage { id: String },
-    GetUpload { convo: Uuid, id: Uuid },
+    Kill {
+        id: Uuid,
+    },
+    GetImage {
+        id: String,
+    },
+    GetUpload {
+        convo: Uuid,
+        id: Uuid,
+    },
     Upload {
         convo: Uuid,
         name: String,
@@ -53,7 +60,7 @@ mod tests {
     use crate::ui::web::registry::SessionRegistry;
     use axum::extract::ws::Message;
     use futures::channel::mpsc;
-    use futures::{Sink, StreamExt};
+    use futures::{Sink, SinkExt, StreamExt};
     use serde_json::Value;
     use std::convert::Infallible;
     use std::ffi::OsString;
@@ -178,7 +185,7 @@ profiles:
             )
             .expect("fixture config must parse"),
         );
-        let uploads_dir = limits.is_some().then(tempfile::tempdir).flatten();
+        let uploads_dir = limits.and_then(|_| tempfile::tempdir().ok());
         let uploads = match (limits, uploads_dir.as_ref()) {
             (Some(l), Some(dir)) => UploadStore::new(dir.path().to_path_buf(), l),
             _ => deps.uploads.clone(),
@@ -207,23 +214,30 @@ profiles:
 
     impl Sink<Message> for OutSink {
         type Error = Infallible;
-        fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            self.tx.poll_ready(cx).map_err(infallible)
+        fn poll_ready(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            self.tx
+                .poll_ready(cx)
+                .map_err(|_| unreachable!("outbound channel closed mid-test"))
         }
-        fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+        fn start_send(mut self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
             self.tx.start_send(item);
             Ok(())
         }
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
             Poll::Ready(Ok(()))
         }
-        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
             Poll::Ready(Ok(()))
         }
-    }
-
-    fn infallible(e: Infallible) -> Infallible {
-        match e {}
     }
 
     fn text(s: &str) -> Message {
@@ -333,8 +347,7 @@ profiles:
         to_host.send(text(r#"{"type":"shutdown"}"#)).await.unwrap();
         let err = wait_for(&mut from_host, "error").await;
         assert_eq!(
-            err["message"],
-            "shutdown is not allowed over Cloud Mode",
+            err["message"], "shutdown is not allowed over Cloud Mode",
             "locked refusal text (p3-design §E.1)"
         );
 
@@ -370,10 +383,12 @@ profiles:
 
     async fn refused_cloud_chain(relayed: bool) {
         let env = state_for(WITH_REMOTE_YAML);
-        let (mut to_host, mut from_host, _task) =
-            serve(env.state, Principal::CloudPeer(dev()));
+        let (mut to_host, mut from_host, _task) = serve(env.state, Principal::CloudPeer(dev()));
 
-        to_host.send(attach_frame("home-dev", relayed)).await.unwrap();
+        to_host
+            .send(attach_frame("home-dev", relayed))
+            .await
+            .unwrap();
         let err = wait_for(&mut from_host, "error").await;
         assert_eq!(
             err["message"],
@@ -396,7 +411,9 @@ profiles:
     // ── A2: serve_op — the non-Attach ops in process ────────────────────
 
     async fn body(resp: Response) -> Bytes {
-        axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap()
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
     }
 
     /// list → 200 `items[]`; kill → 200; unknown image → 404 (no oracle);
@@ -466,4 +483,3 @@ profiles:
         );
     }
 }
-

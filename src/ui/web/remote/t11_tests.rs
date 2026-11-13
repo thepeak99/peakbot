@@ -19,7 +19,7 @@ const L: &str = "home-dev";
 const CONVO: &str = "11111111-1111-4111-8111-111111111111";
 const FILE: &str = "22222222-2222-4222-8222-222222222222";
 /// 64 lower-hex + `.png` — a valid image-cache id.
-const IMG: &str = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1.png";
+const IMG: &str = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1.png";
 
 // ═══════════════════════════════════════════════════════════════════════
 // `GetTarget::parse` — the table (segments already percent-decoded)
@@ -33,12 +33,13 @@ fn get_target_parse_image_id() {
 
 #[test]
 fn get_target_parse_upload() {
-    let t = GetTarget::parse(&format!("api/uploads/{CONVO}/{FILE}")).expect("api/uploads/{c}/{id} parses");
+    let t = GetTarget::parse(&format!("api/uploads/{CONVO}/{FILE}"))
+        .expect("api/uploads/{c}/{id} parses");
     assert_eq!(
         t,
         GetTarget::Upload {
-            convo: Uuid::from_str(CONVO).unwrap(),
-            id: Uuid::from_str(FILE).unwrap(),
+            convo: Uuid::parse_str(CONVO).unwrap(),
+            id: Uuid::parse_str(FILE).unwrap(),
         }
     );
 }
@@ -46,14 +47,14 @@ fn get_target_parse_upload() {
 #[test]
 fn get_target_parse_refuses_other_paths() {
     for tail in [
-        "",                                   // bare prefix
-        "api/settings",                       // the spec's example
-        "api/conversations",                  // no conversations GET target
-        "images",                             // missing id
-        "images/a/b",                         // extra segment
-        "api/uploads",                        // the POST shape is not a GET target
+        "",                                                 // bare prefix
+        "api/settings",                                     // the spec's example
+        "api/conversations",                                // no conversations GET target
+        "images",                                           // missing id
+        "images/a/b",                                       // extra segment
+        "api/uploads",                                      // the POST shape is not a GET target
         "api/uploads/11111111-1111-4111-8111-111111111111", // missing id
-        "images/{IMG}/x",                     // trailing segment
+        "images/{IMG}/x",                                   // trailing segment
     ] {
         assert_eq!(GetTarget::parse(tail), None, "tail {tail:?} must not parse");
     }
@@ -71,9 +72,9 @@ fn get_target_parse_refuses_malformed_image_ids() {
     let hex = "a1".repeat(32);
     for id in [
         "abc.png".to_string(),
-        hex.clone(),                 // no extension
-        format!("{hex}.svg"),        // unknown extension
-        format!("{}.PNG", hex),      // upper-case extension
+        hex.clone(),                   // no extension
+        format!("{hex}.svg"),          // unknown extension
+        format!("{}.PNG", hex),        // upper-case extension
         format!("{}.png", &hex[..63]), // 63 chars
     ] {
         assert_eq!(
@@ -97,11 +98,14 @@ fn get_target_parse_refuses_malformed_upload_uuids() {
 
 #[test]
 fn get_target_path_renders_the_upstream_path() {
-    assert_eq!(GetTarget::Image(IMG.to_string()).path(), format!("/images/{IMG}"));
+    assert_eq!(
+        GetTarget::Image(IMG.to_string()).path(),
+        format!("/images/{IMG}")
+    );
     assert_eq!(
         GetTarget::Upload {
-            convo: Uuid::from_str(CONVO).unwrap(),
-            id: Uuid::from_str(FILE).unwrap(),
+            convo: Uuid::parse_str(CONVO).unwrap(),
+            id: Uuid::parse_str(FILE).unwrap(),
         }
         .path(),
         format!("/api/uploads/{CONVO}/{FILE}")
@@ -141,12 +145,17 @@ fn untouched(r: &FakeRemote, what: &str) {
 async fn proxy_image_path_reaches_the_upstream_as_a_target() {
     let (a, env) = one().await;
     let png = vec![0x89, b'P', b'N', b'G'];
-    a.can("GET", &format!("/images/{IMG}"), Canned::new(200, png.clone()).header("content-type", "image/png"));
+    a.can(
+        "GET",
+        &format!("/images/{IMG}"),
+        Canned::new(200, png.clone()).header("content-type", "image/png"),
+    );
 
     let resp = get(&env, &format!("/r/{L}/images/{IMG}")).await;
+    let status = resp.status();
     let body = resp.bytes().await.expect("body");
-    assert_eq!(resp.status(), 200);
-    assert_eq!(body, png, "the upstream body comes through");
+    assert_eq!(status, 200);
+    assert_eq!(&body[..], &png[..], "the upstream body comes through");
     assert_eq!(
         a.hits_for("GET", &format!("/images/{IMG}")).len(),
         1,
@@ -164,11 +173,13 @@ async fn proxy_upload_path_reaches_the_upstream_as_a_target() {
     );
 
     let resp = get(&env, &format!("/r/{L}/api/uploads/{CONVO}/{FILE}")).await;
+    let status = resp.status();
     let body = resp.bytes().await.expect("body");
-    assert_eq!(resp.status(), 200);
-    assert_eq!(body, b"hello", "the upstream body comes through");
+    assert_eq!(status, 200);
+    assert_eq!(&body[..], b"hello", "the upstream body comes through");
     assert_eq!(
-        a.hits_for("GET", &format!("/api/uploads/{CONVO}/{FILE}")).len(),
+        a.hits_for("GET", &format!("/api/uploads/{CONVO}/{FILE}"))
+            .len(),
         1,
         "the typed target rendered to the exact upstream path"
     );
