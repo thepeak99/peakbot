@@ -37,7 +37,7 @@ url = "2"
 # Constant-time nonce comparison (design §5.3).
 subtle = "2"
 # OsRng for tokens, nonces, states, one-time codes.
-rand_core = { version = "0.9", features = ["std"] }
+rand_core = { version = "0.9", features = ["std", "os_rng"] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
