@@ -4,9 +4,8 @@
 //! SKELETON: signatures are the locked interface; bodies are `todo!()`.
 
 /// The IdP boundary (design §5.3).
-pub struct Oidc {
-    _priv: (),
-}
+#[non_exhaustive]
+pub struct Oidc;
 
 impl Oidc {
     /// Discover the issuer (fresh, no cache) and build the authorize URL with
@@ -24,9 +23,8 @@ impl Oidc {
 
 /// One in-flight `/login` flow (design §3.3). Stored in `Logins` under the
 /// relay→IdP `state`; removed at the callback (single use).
-pub struct Flow {
-    _priv: (),
-}
+#[non_exhaustive]
+pub struct Flow;
 
 /// Verified identity: the account key is `(issuer, sub)` — never email/name.
 #[derive(Debug, Clone, PartialEq, Eq)]

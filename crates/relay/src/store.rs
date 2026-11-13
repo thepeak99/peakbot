@@ -12,9 +12,8 @@ use std::path::Path;
 pub type AccountId = i64;
 
 /// The single source of truth (design §3.3). Lives behind ONE `std::sync::Mutex`.
-pub struct Store {
-    _priv: (),
-}
+#[non_exhaustive]
+pub struct Store;
 
 /// The process-wide handle to the store: one connection, one lock (design §3.4).
 #[derive(Clone)]
@@ -22,7 +21,10 @@ pub struct Db(std::sync::Arc<std::sync::Mutex<Store>>);
 
 impl Db {
     /// Run `f` under the single store lock, off the async runtime.
-    pub async fn run<T: Send + 'static>(&self, f: impl FnOnce(&mut Store) -> T + Send + 'static) -> T {
+    pub async fn run<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut Store) -> T + Send + 'static,
+    ) -> T {
         todo!("P2 task 3: spawn_blocking over the one Mutex<Store>")
     }
 }

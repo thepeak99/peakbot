@@ -20,25 +20,23 @@
 //! then `tokio::time::pause()` if a paused clock is needed).
 
 use std::collections::HashMap;
-use std::io::Write as _;
-use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use base64::Engine as _;
-use base64::engine::general_purpose::{URL_SAFE_NO_PAD as B64U, STANDARD as B64S};
 use axum::routing::{get, post};
+use base64::Engine as _;
+use base64::engine::general_purpose::{STANDARD as B64S, URL_SAFE_NO_PAD as B64U};
 use cloud::chain::{ChainEntry, ChainOp};
 use cloud::codec::{FromRelay, ToRelay};
 use cloud::{DeviceId, LetterId};
+use futures_util::{SinkExt as _, StreamExt as _};
 use perma_crypto::v1;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use futures_util::{SinkExt as _, StreamExt as _};
+use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-use tokio_tungstenite::tungstenite::Message;
 
 /// Default device redirect URI for the login dance (explicit port, §5.1).
 pub const DEFAULT_REDIRECT: &str = "http://127.0.0.1:9/cb";
@@ -49,7 +47,10 @@ pub const SENTINEL: &[u8] = b"PBSENTINEL";
 
 /// Unix seconds, for the `now` arguments.
 pub fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 pub fn b64u(bytes: &[u8]) -> String {
@@ -153,7 +154,9 @@ impl FakeIdp {
         let es_alt = p256::ecdsa::SigningKey::from_slice(&rand_bytes(32)).expect("p256 key");
         let rs = if rs256 {
             // rsa 0.9 uses rand_core 0.6; its re-exported OsRng satisfies it.
-            Some(rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).expect("rsa-2048 keygen"))
+            Some(
+                rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).expect("rsa-2048 keygen"),
+            )
         } else {
             None
         };
@@ -224,7 +227,10 @@ async fn discovery(
 ) -> axum::Json<serde_json::Value> {
     let st = st.lock().unwrap();
     // The issuer is the server URL; the override tests the byte-for-byte check.
-    let issuer = st.discovery_issuer.clone().unwrap_or_else(|| st.url.clone());
+    let issuer = st
+        .discovery_issuer
+        .clone()
+        .unwrap_or_else(|| st.url.clone());
     axum::Json(serde_json::json!({
         "issuer": issuer,
         "authorization_endpoint": format!("{issuer}/authorize"),
@@ -279,8 +285,14 @@ async fn token_endpoint(
     axum::extract::State(st): axum::extract::State<Arc<Mutex<IdpInner>>>,
     headers: axum::http::HeaderMap,
     form: Result<axum::extract::Form<TokenForm>, axum::extract::rejection::FormRejection>,
-) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
-    let form = form.map_err(|e| (axum::http::StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error": "invalid_request", "detail": format!("{e}")}))))?;
+) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, axum::Json<serde_json::Value>)>
+{
+    let form = form.map_err(|e| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "invalid_request", "detail": format!("{e}")})),
+        )
+    })?;
     let mut st = st.lock().unwrap();
 
     // client_secret_basic (RFC 6749 §2.3.1), enforced.
@@ -288,7 +300,10 @@ async fn token_endpoint(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let want = format!("Basic {}", B64S.encode(format!("{}:{}", st.client_id, st.client_secret)));
+    let want = format!(
+        "Basic {}",
+        B64S.encode(format!("{}:{}", st.client_id, st.client_secret))
+    );
     if auth != want {
         return Err((
             axum::http::StatusCode::UNAUTHORIZED,
@@ -328,7 +343,10 @@ fn mint_id_token(st: &IdpInner, nonce: &str) -> String {
     let m = &st.mint;
     let t = now();
     let mut claims = serde_json::Map::new();
-    claims.insert("iss".into(), serde_json::json!(m.iss.clone().unwrap_or_else(|| st.url.clone())));
+    claims.insert(
+        "iss".into(),
+        serde_json::json!(m.iss.clone().unwrap_or_else(|| st.url.clone())),
+    );
     let aud = match &m.aud {
         Some(Aud::Str(s)) => serde_json::json!(s),
         Some(Aud::Vec(v)) => serde_json::json!(v),
@@ -338,7 +356,10 @@ fn mint_id_token(st: &IdpInner, nonce: &str) -> String {
     if let Some(azp) = m.azp.clone().flatten() {
         claims.insert("azp".into(), serde_json::json!(azp));
     }
-    claims.insert("exp".into(), serde_json::json!(t as i64 + 3600 + m.exp_offset));
+    claims.insert(
+        "exp".into(),
+        serde_json::json!(t as i64 + 3600 + m.exp_offset),
+    );
     claims.insert("iat".into(), serde_json::json!(t as i64 + m.iat_offset));
     let nonce_claim: Option<String> = match &m.nonce {
         Some(inner) => inner.clone(),
@@ -347,7 +368,10 @@ fn mint_id_token(st: &IdpInner, nonce: &str) -> String {
     if let Some(n) = nonce_claim {
         claims.insert("nonce".into(), serde_json::json!(n));
     }
-    claims.insert("sub".into(), serde_json::json!(m.sub.clone().unwrap_or_else(|| "user-1".into())));
+    claims.insert(
+        "sub".into(),
+        serde_json::json!(m.sub.clone().unwrap_or_else(|| "user-1".into())),
+    );
 
     let alg = m.alg.unwrap_or(IdpAlg::Es256);
     let alg_str = match alg {
@@ -356,13 +380,10 @@ fn mint_id_token(st: &IdpInner, nonce: &str) -> String {
         IdpAlg::None => "none",
         IdpAlg::Hs256 => "HS256",
     };
-    let kid = m
-        .kid
-        .clone()
-        .unwrap_or_else(|| match alg {
-            IdpAlg::Rs256 => "idp-rs256".to_string(),
-            _ => "idp-es256".to_string(),
-        });
+    let kid = m.kid.clone().unwrap_or_else(|| match alg {
+        IdpAlg::Rs256 => "idp-rs256".to_string(),
+        _ => "idp-es256".to_string(),
+    });
     let header = serde_json::json!({ "alg": alg_str, "typ": "JWT", "kid": kid });
     let h = B64U.encode(serde_json::to_string(&header).unwrap().as_bytes());
     let p = B64U.encode(serde_json::to_string(&claims).unwrap().as_bytes());
@@ -433,12 +454,22 @@ impl TestRelay {
                 client_secret: peakbot_relay::config::ClientSecret::new(idp.client_secret.clone()),
             }],
         };
-        let relay = Some(peakbot_relay::serve(cfg.clone(), listener).await.expect("serve"));
+        let relay = Some(
+            peakbot_relay::serve(cfg.clone(), listener)
+                .await
+                .expect("serve"),
+        );
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap();
-        Self { idp, relay, tmp, cfg, http }
+        Self {
+            idp,
+            relay,
+            tmp,
+            cfg,
+            http,
+        }
     }
 
     pub fn handle(&self) -> &peakbot_relay::RelayHandle {
@@ -478,7 +509,11 @@ impl TestRelay {
         let addr = listener.local_addr().unwrap();
         let mut cfg = self.cfg.clone();
         cfg.bind = addr;
-        self.relay = Some(peakbot_relay::serve(cfg, listener).await.expect("serve after restart"));
+        self.relay = Some(
+            peakbot_relay::serve(cfg, listener)
+                .await
+                .expect("serve after restart"),
+        );
     }
 
     pub async fn sweep_at(&self, now: u64) {
@@ -488,6 +523,7 @@ impl TestRelay {
     // ------------------------------------------------- the no-browser login
 
     /// `GET /login` (redirects off); on 302, parse the IdP URL into the flow.
+    #[allow(clippy::result_large_err)]
     pub async fn begin_login(&self, redirect_uri: &str) -> Result<LoginFlow, reqwest::Response> {
         let (verifier, challenge) = pkce();
         let resp = self
@@ -531,7 +567,10 @@ impl TestRelay {
         let resp = self
             .http
             .get(format!("{}/oidc/callback", self.url()))
-            .query(&[("code", code.as_str()), ("state", flow.relay_state.as_str())])
+            .query(&[
+                ("code", code.as_str()),
+                ("state", flow.relay_state.as_str()),
+            ])
             .send()
             .await
             .unwrap();
@@ -586,7 +625,13 @@ impl TestRelay {
             .await
             .expect("GET /login → 302");
         let cb = self
-            .finish_login(&flow, &Mint { sub: Some(sub.to_string()), ..Default::default() })
+            .finish_login(
+                &flow,
+                &Mint {
+                    sub: Some(sub.to_string()),
+                    ..Default::default()
+                },
+            )
             .await;
         assert!(
             cb.response.status() == axum::http::StatusCode::FOUND && cb.code.is_some(),
@@ -629,19 +674,23 @@ impl Callback {
             .headers()
             .get(axum::http::header::LOCATION)
             .and_then(|v| v.to_str().ok())
+            && let Ok(u) = url::Url::parse(loc)
         {
-            if let Ok(u) = url::Url::parse(loc) {
-                for (k, v) in u.query_pairs() {
-                    match k.as_ref() {
-                        "code" => code = Some(v.to_string()),
-                        "error" => error = Some(v.to_string()),
-                        "state" => device_state = Some(v.to_string()),
-                        _ => {}
-                    }
+            for (k, v) in u.query_pairs() {
+                match k.as_ref() {
+                    "code" => code = Some(v.to_string()),
+                    "error" => error = Some(v.to_string()),
+                    "state" => device_state = Some(v.to_string()),
+                    _ => {}
                 }
             }
         }
-        Self { response, code, error, device_state }
+        Self {
+            response,
+            code,
+            error,
+            device_state,
+        }
     }
 }
 
@@ -653,7 +702,11 @@ pub struct FakeDevice {
     pub card: Vec<u8>,
     pub sk: v1::PrivateKey,
     pub pk: v1::PublicKey,
-    ws: Option<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>,
+    ws: Option<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    >,
     nonce: [u8; 32],
     stalled: bool,
 }
@@ -707,26 +760,42 @@ impl FakeDevice {
     pub async fn hello(&mut self, origin: impl AsRef<str>) {
         let tbs = cloud::codec::hello_tbs(origin.as_ref(), self.nonce, self.id, 0);
         let sig = cloud::codec::sign_hello(&self.sk, &tbs, &mut rand::rng()).expect("sig");
-        self.send(ToRelay::Hello { device: self.id, sig }).await;
+        self.send(ToRelay::Hello {
+            device: self.id,
+            sig,
+        })
+        .await;
     }
 
     /// `Hello` signed for a *different* origin (hello_signed_for_other_origin).
     pub async fn hello_with_origin(&mut self, origin: impl AsRef<str>) {
         let tbs = cloud::codec::hello_tbs(origin.as_ref(), self.nonce, self.id, 0);
         let sig = cloud::codec::sign_hello(&self.sk, &tbs, &mut rand::rng()).expect("sig");
-        self.send(ToRelay::Hello { device: self.id, sig }).await;
+        self.send(ToRelay::Hello {
+            device: self.id,
+            sig,
+        })
+        .await;
     }
 
     /// A `Hello` whose signature is garbage (hello_bad_sig).
     pub async fn hello_bad_sig(&mut self) {
-        self.send(ToRelay::Hello { device: self.id, sig: rand_bytes(64) }).await;
+        self.send(ToRelay::Hello {
+            device: self.id,
+            sig: rand_bytes(64),
+        })
+        .await;
     }
 
     /// `HelloPending` with this device's card.
     pub async fn hello_pending(&mut self, origin: impl AsRef<str>) {
         let tbs = cloud::codec::hello_tbs(origin.as_ref(), self.nonce, self.id, 1);
         let sig = cloud::codec::sign_hello(&self.sk, &tbs, &mut rand::rng()).expect("sig");
-        self.send(ToRelay::HelloPending { card: self.card.clone(), sig }).await;
+        self.send(ToRelay::HelloPending {
+            card: self.card.clone(),
+            sig,
+        })
+        .await;
     }
 
     pub async fn send(&mut self, msg: ToRelay) {
@@ -783,7 +852,11 @@ impl FakeDevice {
         self.stalled = true;
     }
 
-    async fn next_raw_stream(ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>) -> Message {
+    async fn next_raw_stream(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> Message {
         match ws.next().await {
             Some(Ok(msg)) => msg,
             other => panic!("socket closed: {other:?}"),
@@ -791,7 +864,9 @@ impl FakeDevice {
     }
 
     async fn first_frame(
-        ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
     ) -> FromRelay {
         let msg = Self::next_raw_stream(ws).await;
         match msg {
@@ -812,8 +887,17 @@ pub fn entry(
     target: Option<DeviceId>,
     signer: &FakeDevice,
 ) -> ChainEntry {
-    cloud::chain::build_entry(seq, prev, op, card, target, signer.id, signer.sk(), &mut rand::rng())
-        .expect("build_entry")
+    cloud::chain::build_entry(
+        seq,
+        prev,
+        op,
+        card,
+        target,
+        signer.id,
+        signer.sk(),
+        &mut rand::rng(),
+    )
+    .expect("build_entry")
 }
 
 impl FakeDevice {
@@ -846,8 +930,17 @@ pub async fn enroll_add(
     new.connect(&t.ws_url(), token).await;
     new.hello_pending(t.origin()).await;
     expect_welcome(&new.recv().await, Some(seq - 1), true).await;
-    let e = entry(seq, prev, ChainOp::Add, Some(new.card.clone()), None, active);
-    active.send(ToRelay::ChainAppend { entry: e.encode() }).await;
+    let e = entry(
+        seq,
+        prev,
+        ChainOp::Add,
+        Some(new.card.clone()),
+        None,
+        active,
+    );
+    active
+        .send(ToRelay::ChainAppend { entry: e.encode() })
+        .await;
     expect_chain_changed(&active.recv().await, seq).await;
     expect_chain_changed(&new.recv().await, seq).await;
 }
@@ -864,7 +957,12 @@ pub async fn connect_active(t: &TestRelay, token: &str, d: &mut FakeDevice, head
 /// design §4.6).
 pub async fn post_to(d: &mut FakeDevice, to: DeviceId, sealed: Vec<u8>) -> LetterId {
     let id = letter_id();
-    d.send(ToRelay::Post { to, letter_id: id, sealed }).await;
+    d.send(ToRelay::Post {
+        to,
+        letter_id: id,
+        sealed,
+    })
+    .await;
     id
 }
 
@@ -897,7 +995,9 @@ pub async fn add_devices(
         expect_welcome(&d.recv().await, Some(s - 1), true).await;
         let e = entry(s, cur, ChainOp::Add, Some(d.card.clone()), None, active);
         let raw = e.encode();
-        active.send(ToRelay::ChainAppend { entry: raw.clone() }).await;
+        active
+            .send(ToRelay::ChainAppend { entry: raw.clone() })
+            .await;
         expect_chain_changed(&active.recv().await, s).await;
         expect_chain_changed(&d.recv().await, s).await;
         cur = cloud::chain::entry_hash(&raw);
@@ -910,7 +1010,10 @@ pub async fn add_devices(
 
 pub async fn expect_welcome(m: &FromRelay, head: Option<u64>, pending: bool) -> Option<u64> {
     match m {
-        FromRelay::Welcome { head_seq, pending: p } => {
+        FromRelay::Welcome {
+            head_seq,
+            pending: p,
+        } => {
             assert_eq!(*head_seq, head, "welcome head_seq");
             assert_eq!(*p, pending, "welcome pending flag");
             *head_seq
@@ -952,7 +1055,11 @@ pub fn expect_pipe(m: &FromRelay, from: DeviceId, bytes: &[u8]) {
 
 pub fn expect_letter(m: &FromRelay, from: DeviceId, letter_id: LetterId, sealed: &[u8]) {
     match m {
-        FromRelay::Letter { from: f, letter_id: id, sealed: s } => {
+        FromRelay::Letter {
+            from: f,
+            letter_id: id,
+            sealed: s,
+        } => {
             assert_eq!(*f, from, "letter from");
             assert_eq!(*id, letter_id, "letter id");
             assert_eq!(s, sealed, "letter sealed");

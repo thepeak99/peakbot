@@ -9,14 +9,12 @@ use crate::store::Role;
 
 /// One live socket (design §3.3). Closing goes through `close`, never `tx`,
 /// so a full queue can still be closed (§6.2).
-pub struct Conn {
-    _priv: (),
-}
+#[non_exhaustive]
+pub struct Conn;
 
 /// The router (design §6.2). The lock is never held across `.await`.
-pub struct Hub {
-    _priv: (),
-}
+#[non_exhaustive]
+pub struct Hub;
 
 impl Hub {
     /// New.
@@ -62,10 +60,15 @@ impl Hub {
     }
 }
 
-/// RAII socket permit (design §6.5): drops decrement the per-account counter.
-pub struct SocketPermit {
-    _priv: (),
+impl Default for Hub {
+    fn default() -> Self {
+        Self::new()
+    }
 }
+
+/// RAII socket permit (design §6.5): drops decrement the per-account counter.
+#[non_exhaustive]
+pub struct SocketPermit;
 
 /// Outcome of `Hub::send` (design §6.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

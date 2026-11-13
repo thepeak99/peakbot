@@ -1,3 +1,5 @@
+#![allow(dead_code)] // shared harness: each test binary uses a slice of it
+
 //! Log redaction (design §9.2 `logs.rs`, §4.9): TRACE logs must never contain
 //! tokens, codes, verifiers, states, nonces, ID tokens, client secrets, the
 //! subject, Pipe/letter payload markers, or card/sig bytes. Own test binary
@@ -20,7 +22,13 @@ async fn logs_are_redacted() {
     let sub = "log-sub-user-42";
     let flow = t.begin_login(DEFAULT_REDIRECT).await.expect("login 302");
     let cb = t
-        .finish_login(&flow, &Mint { sub: Some(sub.into()), ..Default::default() })
+        .finish_login(
+            &flow,
+            &Mint {
+                sub: Some(sub.into()),
+                ..Default::default()
+            },
+        )
         .await;
     let code = cb.code.expect("one-time code");
     let resp = t.get_token(&flow, &code).await;
@@ -36,7 +44,11 @@ async fn logs_are_redacted() {
     let pipe_marker = "PBLOGPIPE-abcdef0123456789abcdef0123456789";
     let graw = cloud::chain::entry_hash(&g[0]);
     enroll_add(&t, &token, 1, graw, &mut a, &mut b).await;
-    a.send(ToRelay::Pipe { to: b.id, bytes: pipe_marker.as_bytes().to_vec() }).await;
+    a.send(ToRelay::Pipe {
+        to: b.id,
+        bytes: pipe_marker.as_bytes().to_vec(),
+    })
+    .await;
     match b.recv().await {
         cloud::codec::FromRelay::Pipe { .. } => {}
         other => panic!("expected Pipe, got {other:?}"),
@@ -65,13 +77,19 @@ async fn logs_are_redacted() {
         sub,
         pipe_marker,
         letter_marker,
-        &hex(&a.card),           // card bytes, hex
-        &b64u(&a.card),           // card bytes, b64
+        &hex(&a.card),  // card bytes, hex
+        &b64u(&a.card), // card bytes, b64
         &hex(&b.card),
         &b64u(&b.card),
     ] {
-        assert!(!buf.contains(needle), "log buffer must not contain {needle:?}");
+        assert!(
+            !buf.contains(needle),
+            "log buffer must not contain {needle:?}"
+        );
     }
     // Positive control: the buffer is non-empty (the relay did log at TRACE).
-    assert!(buf.contains("account"), "log buffer has account-related output");
+    assert!(
+        buf.contains("account"),
+        "log buffer has account-related output"
+    );
 }

@@ -1,8 +1,9 @@
+#![allow(dead_code)] // shared harness: each test binary uses a slice of it
+
 //! Enrollment letters: delivery, caps, expiry, acks, rate limits
 //! (design §9.2 `mailbox.rs`). RED on purpose.
 
 mod common;
-
 
 use cloud::codec::ToRelay;
 use cloud::constants::relay_error;
@@ -161,7 +162,15 @@ async fn active_to_active_post_not_permitted() {
     enroll_genesis(&t, &token, &mut a).await;
     let mut b = FakeDevice::new(2);
     let g = fetch_chain(&mut a, 0).await;
-    enroll_add(&t, &token, 1, cloud::chain::entry_hash(&g[0]), &mut a, &mut b).await;
+    enroll_add(
+        &t,
+        &token,
+        1,
+        cloud::chain::entry_hash(&g[0]),
+        &mut a,
+        &mut b,
+    )
+    .await;
     post_to(&mut a, b.id, vec![1]).await;
     expect_error(&a.recv().await, relay_error::NOT_PERMITTED).await;
 }
@@ -223,9 +232,19 @@ async fn duplicate_letter_id_not_permitted() {
     let token = t.login("m11").await;
     let (mut a, mut p) = active_and_pending(&t, &token).await;
     let lid = letter_id();
-    a.send(ToRelay::Post { to: p.id, letter_id: lid, sealed: vec![1] }).await;
+    a.send(ToRelay::Post {
+        to: p.id,
+        letter_id: lid,
+        sealed: vec![1],
+    })
+    .await;
     expect_letter(&p.recv().await, a.id, lid, &[1]);
-    a.send(ToRelay::Post { to: p.id, letter_id: lid, sealed: vec![2] }).await;
+    a.send(ToRelay::Post {
+        to: p.id,
+        letter_id: lid,
+        sealed: vec![2],
+    })
+    .await;
     expect_error(&a.recv().await, relay_error::NOT_PERMITTED).await;
 }
 

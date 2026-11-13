@@ -1,3 +1,5 @@
+#![allow(dead_code)] // shared harness: each test binary uses a slice of it
+
 //! `reset-account` (design §9.2 `reset.rs`, §4.8). RED on purpose.
 
 mod common;
@@ -39,7 +41,15 @@ async fn reset_account_clears_chain_pending_letters_sessions() {
     enroll_genesis(&t, &token, &mut a).await;
     let mut b = FakeDevice::new(2);
     let g = fetch_chain(&mut a, 0).await;
-    enroll_add(&t, &token, 1, cloud::chain::entry_hash(&g[0]), &mut a, &mut b).await;
+    enroll_add(
+        &t,
+        &token,
+        1,
+        cloud::chain::entry_hash(&g[0]),
+        &mut a,
+        &mut b,
+    )
+    .await;
     let mut p = FakeDevice::new(3);
     p.connect(&t.ws_url(), &token).await;
     p.hello_pending(&t.origin()).await;
@@ -57,17 +67,23 @@ async fn reset_account_clears_chain_pending_letters_sessions() {
 
     // The relay must be stopped for a reset.
     t.shutdown_all().await;
-    let report = peakbot_relay::reset_account(t.db_path(), &t.idp.url, sub)
-        .expect("reset ok");
+    let report = peakbot_relay::reset_account(t.db_path(), &t.idp.url, sub).expect("reset ok");
     assert!(report.chain_entries >= 2, "chain deleted, got {report:?}");
-    assert!(report.pending_devices >= 1, "pending deleted, got {report:?}");
+    assert!(
+        report.pending_devices >= 1,
+        "pending deleted, got {report:?}"
+    );
     assert!(report.letters >= 1, "letters deleted, got {report:?}");
     assert!(report.sessions >= 1, "sessions deleted, got {report:?}");
 
     // Old token is dead.
     t.restart().await;
     let r = t.ws_status(Some(&token)).await;
-    assert_eq!(r.status(), axum::http::StatusCode::UNAUTHORIZED, "old token → 401");
+    assert_eq!(
+        r.status(),
+        axum::http::StatusCode::UNAUTHORIZED,
+        "old token → 401"
+    );
 
     // Re-login: the chain is empty and EnrollGenesis is allowed again.
     let token2 = t.login(sub).await;
@@ -75,12 +91,23 @@ async fn reset_account_clears_chain_pending_letters_sessions() {
     a2.connect(&t.ws_url(), &token2).await;
     a2.hello_pending(&t.origin()).await;
     expect_welcome(&a2.recv().await, None, true).await; // empty chain
-    let e = entry(0, [0; 32], ChainOp::Genesis, Some(a2.card.clone()), None, &a2);
+    let e = entry(
+        0,
+        [0; 32],
+        ChainOp::Genesis,
+        Some(a2.card.clone()),
+        None,
+        &a2,
+    );
     a2.send(ToRelay::EnrollGenesis { entry: e.encode() }).await;
     expect_chain_changed(&a2.recv().await, 0).await;
 
     // The other account is untouched.
     let mut c2 = FakeDevice::new(10);
     connect_active(&t, &token_y, &mut c2, Some(0)).await;
-    assert_eq!(fetch_chain(&mut c2, 0).await.len(), 1, "other account intact");
+    assert_eq!(
+        fetch_chain(&mut c2, 0).await.len(),
+        1,
+        "other account intact"
+    );
 }

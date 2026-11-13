@@ -1,3 +1,5 @@
+#![allow(dead_code)] // shared harness: each test binary uses a slice of it
+
 //! Device chain: genesis, append, CAS, revoke, fetch batching, restart
 //! (design §9.2 `chain.rs`). RED on purpose.
 
@@ -18,7 +20,15 @@ async fn genesis_on_empty_account_promotes_pending() {
     // The pending socket is now Active: it can ChainAppend (Active only).
     let mut b = FakeDevice::new(2);
     let g = fetch_chain(&mut a, 0).await;
-    enroll_add(&t, &token, 1, cloud::chain::entry_hash(&g[0]), &mut a, &mut b).await;
+    enroll_add(
+        &t,
+        &token,
+        1,
+        cloud::chain::entry_hash(&g[0]),
+        &mut a,
+        &mut b,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -46,7 +56,14 @@ async fn genesis_card_must_match_hello_pending() {
     expect_welcome(&p.recv().await, None, true).await;
     // Genesis entry carries a DIFFERENT card (not this socket's).
     let other = FakeDevice::new(9);
-    let e = entry(0, [0; 32], ChainOp::Genesis, Some(other.card.clone()), None, &p);
+    let e = entry(
+        0,
+        [0; 32],
+        ChainOp::Genesis,
+        Some(other.card.clone()),
+        None,
+        &p,
+    );
     p.send(ToRelay::EnrollGenesis { entry: e.encode() }).await;
     expect_error(&p.recv().await, relay_error::NOT_PERMITTED).await;
 }
@@ -89,7 +106,14 @@ async fn add_only_for_pending() {
     expect_chain_changed(&a.recv().await, 1).await;
     expect_chain_changed(&s.recv().await, 1).await;
     // Active now: s can ChainAppend.
-    let e2 = entry(2, cloud::chain::entry_hash(&e.encode()), ChainOp::Add, Some(stranger.card.clone()), None, &s);
+    let e2 = entry(
+        2,
+        cloud::chain::entry_hash(&e.encode()),
+        ChainOp::Add,
+        Some(stranger.card.clone()),
+        None,
+        &s,
+    );
     // (stranger still has no row: NOT_PERMITTED, but the socket role is proven
     // to be Active because ChainAppend is permitted from Active at all.)
     s.send(ToRelay::ChainAppend { entry: e2.encode() }).await;
@@ -108,7 +132,14 @@ async fn add_pending_of_other_account_not_permitted() {
     p.hello_pending(&t.origin()).await;
     expect_welcome(&p.recv().await, None, true).await;
     let g = fetch_chain(&mut a, 0).await;
-    let e = entry(1, cloud::chain::entry_hash(&g[0]), ChainOp::Add, Some(p.card.clone()), None, &a);
+    let e = entry(
+        1,
+        cloud::chain::entry_hash(&g[0]),
+        ChainOp::Add,
+        Some(p.card.clone()),
+        None,
+        &a,
+    );
     a.send(ToRelay::ChainAppend { entry: e.encode() }).await;
     expect_error(&a.recv().await, relay_error::NOT_PERMITTED).await;
 }
@@ -127,7 +158,14 @@ async fn add_after_pending_expired_not_permitted() {
     t.sweep_at(now() + cloud::constants::TTL_LETTER + 1).await;
     p.expect_close(1008).await;
     let g = fetch_chain(&mut a, 0).await;
-    let e = entry(1, cloud::chain::entry_hash(&g[0]), ChainOp::Add, Some(p.card.clone()), None, &a);
+    let e = entry(
+        1,
+        cloud::chain::entry_hash(&g[0]),
+        ChainOp::Add,
+        Some(p.card.clone()),
+        None,
+        &a,
+    );
     a.send(ToRelay::ChainAppend { entry: e.encode() }).await;
     expect_error(&a.recv().await, relay_error::NOT_PERMITTED).await;
 }
@@ -190,14 +228,18 @@ async fn concurrent_append_exactly_one_wins() {
     let p1 = FakeDevice::new(3);
     let p2 = FakeDevice::new(4);
     let g2 = fetch_chain(&mut a, 0).await;
-    let head1 = cloud::chain::entry_hash(&g2.last().unwrap());
+    let head1 = cloud::chain::entry_hash(g2.last().unwrap());
     let e1 = entry(2, head1, ChainOp::Add, Some(p1.card.clone()), None, &a);
     let e2 = entry(2, head1, ChainOp::Add, Some(p2.card.clone()), None, &b);
     let raw1 = e1.encode();
     let raw2 = e2.encode();
     tokio::join!(
-        a.send(ToRelay::ChainAppend { entry: raw1.clone() }),
-        b.send(ToRelay::ChainAppend { entry: raw2.clone() }),
+        a.send(ToRelay::ChainAppend {
+            entry: raw1.clone()
+        }),
+        b.send(ToRelay::ChainAppend {
+            entry: raw2.clone()
+        }),
     );
     let r1 = a.recv().await;
     let r2 = b.recv().await;
@@ -224,7 +266,15 @@ async fn revoke_closes_socket_deletes_letters_broadcasts() {
     enroll_genesis(&t, &token, &mut a).await;
     let mut b = FakeDevice::new(2);
     let g = fetch_chain(&mut a, 0).await;
-    enroll_add(&t, &token, 1, cloud::chain::entry_hash(&g[0]), &mut a, &mut b).await;
+    enroll_add(
+        &t,
+        &token,
+        1,
+        cloud::chain::entry_hash(&g[0]),
+        &mut a,
+        &mut b,
+    )
+    .await;
     let mut p = FakeDevice::new(3);
     p.connect(&t.ws_url(), &token).await;
     p.hello_pending(&t.origin()).await;
@@ -265,7 +315,6 @@ async fn revoke_closes_socket_deletes_letters_broadcasts() {
     assert_eq!(n, 0, "letters with active_id = B deleted on revoke");
 }
 
-
 #[tokio::test]
 async fn chain_fetch_batches_and_caught_up() {
     let t = TestRelay::spawn().await;
@@ -288,8 +337,15 @@ async fn chain_fetch_batches_and_caught_up() {
     let mut c = FakeDevice::new(50);
     enroll_genesis(&t, &token2, &mut c).await;
     let g2 = fetch_chain(&mut c, 0).await;
-    let (_devs2, _head2) =
-        add_devices(&t, &token2, 1, cloud::chain::entry_hash(&g2[0]), &mut c, 255).await;
+    let (_devs2, _head2) = add_devices(
+        &t,
+        &token2,
+        1,
+        cloud::chain::entry_hash(&g2[0]),
+        &mut c,
+        255,
+    )
+    .await;
     let batch = fetch_chain(&mut c, 0).await;
     assert_eq!(batch.len(), 256);
     let caught = fetch_chain(&mut c, 256).await;
@@ -304,7 +360,15 @@ async fn chain_survives_restart() {
     enroll_genesis(&t, &token, &mut a).await;
     let mut b = FakeDevice::new(2);
     let g = fetch_chain(&mut a, 0).await;
-    enroll_add(&t, &token, 1, cloud::chain::entry_hash(&g[0]), &mut a, &mut b).await;
+    enroll_add(
+        &t,
+        &token,
+        1,
+        cloud::chain::entry_hash(&g[0]),
+        &mut a,
+        &mut b,
+    )
+    .await;
 
     t.restart().await;
     let mut a2 = FakeDevice::new(1);

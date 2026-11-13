@@ -1,3 +1,5 @@
+#![allow(dead_code)] // shared harness: each test binary uses a slice of it
+
 //! At-rest privacy (design §9.2 `privacy.rs`): nothing from Pipe ever reaches
 //! the SQLite files; stored letter `sealed` does (positive control).
 //! RED on purpose.
@@ -29,24 +31,48 @@ async fn db_contains_no_pipe_plaintext() {
     enroll_genesis(&t, &token, &mut a).await;
     let mut b = FakeDevice::new(2);
     let g = fetch_chain(&mut a, 0).await;
-    enroll_add(&t, &token, 1, cloud::chain::entry_hash(&g[0]), &mut a, &mut b).await;
+    enroll_add(
+        &t,
+        &token,
+        1,
+        cloud::chain::entry_hash(&g[0]),
+        &mut a,
+        &mut b,
+    )
+    .await;
     let mut c = FakeDevice::new(3);
     let g2 = fetch_chain(&mut a, 0).await;
-    enroll_add(&t, &token, 2, cloud::chain::entry_hash(&g2[1]), &mut a, &mut c).await;
+    enroll_add(
+        &t,
+        &token,
+        2,
+        cloud::chain::entry_hash(&g2[1]),
+        &mut a,
+        &mut c,
+    )
+    .await;
 
     let delivered = marker();
     let unreachable = marker();
     let stored = marker();
 
     // 1) A → B pipe carrying `delivered` (delivered live).
-    a.send(ToRelay::Pipe { to: b.id, bytes: delivered.clone().into_bytes() }).await;
+    a.send(ToRelay::Pipe {
+        to: b.id,
+        bytes: delivered.clone().into_bytes(),
+    })
+    .await;
     match b.recv().await {
         FromRelay::Pipe { bytes, .. } => assert_eq!(String::from_utf8_lossy(&bytes), delivered),
         other => panic!("expected Pipe, got {other:?}"),
     }
     // 2) A → C pipe carrying `unreachable`: C goes offline first.
     c.close_code().await;
-    a.send(ToRelay::Pipe { to: c.id, bytes: unreachable.clone().into_bytes() }).await;
+    a.send(ToRelay::Pipe {
+        to: c.id,
+        bytes: unreachable.clone().into_bytes(),
+    })
+    .await;
     expect_unreachable(&a.recv().await, c.id).await;
     // 3) A letter to a pending device, `stored` inside the sealed ciphertext
     //    (positive control: the sealed letter IS stored).
@@ -73,11 +99,19 @@ async fn db_contains_no_pipe_plaintext() {
 
     // Shut down, then the pipe plaintext must be absent from every DB file.
     t.shutdown_all().await;
-    db_files.extend(["relay.db", "relay.db-wal", "relay.db-shm"].iter().map(|f| dir.join(f)));
+    db_files.extend(
+        ["relay.db", "relay.db-wal", "relay.db-shm"]
+            .iter()
+            .map(|f| dir.join(f)),
+    );
     for needle in [delivered.as_str(), unreachable.as_str()] {
         let n = needle.as_bytes();
         for f in &db_files {
-            assert!(!file_contains(f, n), "pipe plaintext {needle} found in {}", f.display());
+            assert!(
+                !file_contains(f, n),
+                "pipe plaintext {needle} found in {}",
+                f.display()
+            );
         }
     }
 }

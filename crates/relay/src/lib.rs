@@ -15,8 +15,8 @@
 
 pub mod config;
 pub mod conn;
-pub mod hub;
 pub mod http;
+pub mod hub;
 pub mod limits;
 pub mod oidc;
 pub mod store;
@@ -35,11 +35,11 @@ pub async fn serve(
 }
 
 /// Handle to a running relay (design §5.4).
+#[non_exhaustive]
 pub struct RelayHandle {
     /// The bound address of the listener.
     pub addr: SocketAddr,
     // private: store, hub, logins, shutdown
-    _priv: (),
 }
 
 impl RelayHandle {
@@ -58,7 +58,11 @@ impl RelayHandle {
 
 /// `peakbot-relay reset-account <issuer> <subject>` (design §4.8, §5.4).
 /// The relay must be stopped: `Locked` when the exclusive DB lock is held.
-pub fn reset_account(db: &Path, issuer: &str, subject: &str) -> Result<store::ResetReport, store::ResetError> {
+pub fn reset_account(
+    db: &Path,
+    issuer: &str,
+    subject: &str,
+) -> Result<store::ResetReport, store::ResetError> {
     let _ = (db, issuer, subject);
     todo!("P2 task 4: thin wrapper over store::reset_account")
 }

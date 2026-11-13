@@ -1,3 +1,5 @@
+#![allow(dead_code)] // shared harness: each test binary uses a slice of it
+
 //! WebSocket authentication, Hello verification, frame caps and socket caps
 //! (design §9.2 `ws_auth.rs`, plus the global `socket_cap_returns_503`).
 //! RED on purpose: the relay is a `todo!()` skeleton.
@@ -15,7 +17,11 @@ use common::*;
 async fn ws_no_token_401() {
     let t = TestRelay::spawn().await;
     let r = t.ws_status(None).await;
-    assert_eq!(r.status(), axum::http::StatusCode::UNAUTHORIZED, "no token → 401");
+    assert_eq!(
+        r.status(),
+        axum::http::StatusCode::UNAUTHORIZED,
+        "no token → 401"
+    );
 }
 
 #[tokio::test]
@@ -23,7 +29,11 @@ async fn ws_bad_token_401() {
     let t = TestRelay::spawn().await;
     let bad = b64u(&rand_bytes(32));
     let r = t.ws_status(Some(&bad)).await;
-    assert_eq!(r.status(), axum::http::StatusCode::UNAUTHORIZED, "bad token → 401");
+    assert_eq!(
+        r.status(),
+        axum::http::StatusCode::UNAUTHORIZED,
+        "bad token → 401"
+    );
 }
 
 #[tokio::test]
@@ -34,11 +44,23 @@ async fn pre_hello_socket_can_only_chain_fetch() {
     d.connect(&t.ws_url(), &token).await; // Authed, pre-Hello
 
     // Everything except ChainFetch is NOT_PERMITTED, and the socket stays open.
-    d.send(ToRelay::Pipe { to: d.id, bytes: vec![1] }).await;
+    d.send(ToRelay::Pipe {
+        to: d.id,
+        bytes: vec![1],
+    })
+    .await;
     expect_error(&d.recv().await, relay_error::NOT_PERMITTED).await;
-    d.send(ToRelay::Post { to: d.id, letter_id: letter_id(), sealed: vec![1] }).await;
+    d.send(ToRelay::Post {
+        to: d.id,
+        letter_id: letter_id(),
+        sealed: vec![1],
+    })
+    .await;
     expect_error(&d.recv().await, relay_error::NOT_PERMITTED).await;
-    d.send(ToRelay::Ack { letter_id: letter_id() }).await;
+    d.send(ToRelay::Ack {
+        letter_id: letter_id(),
+    })
+    .await;
     expect_error(&d.recv().await, relay_error::NOT_PERMITTED).await;
     d.send(ToRelay::ChainAppend { entry: vec![0] }).await;
     expect_error(&d.recv().await, relay_error::NOT_PERMITTED).await;
@@ -184,7 +206,11 @@ async fn socket_cap_429_and_permit_released() {
     }
     // At the cap: 429 before the upgrade (design §6.5).
     let r = t.ws_status(Some(&token)).await;
-    assert_eq!(r.status(), axum::http::StatusCode::TOO_MANY_REQUESTS, "cap → 429");
+    assert_eq!(
+        r.status(),
+        axum::http::StatusCode::TOO_MANY_REQUESTS,
+        "cap → 429"
+    );
     // Release one permit: the next upgrade is allowed again (RAII drop).
     open.pop().expect("a socket to close");
     for _ in 0..200 {
@@ -233,7 +259,8 @@ async fn text_frame_closed_1002() {
     let token = t.login("w11").await;
     let mut d = FakeDevice::new(1);
     d.connect(&t.ws_url(), &token).await;
-    d.send_raw(Message::Text("not a pbc1 envelope".into())).await;
+    d.send_raw(Message::Text("not a pbc1 envelope".into()))
+        .await;
     d.expect_close(1002).await;
 }
 
@@ -268,8 +295,7 @@ async fn socket_cap_returns_503() {
     let t = TestRelay::spawn().await;
     let per_acct = peakbot_relay::limits::MAX_SOCKETS_PER_ACCOUNT;
     let accounts = peakbot_relay::limits::MAX_SOCKETS / per_acct;
-    let mut open: Vec<FakeDevice> =
-        Vec::with_capacity(peakbot_relay::limits::MAX_SOCKETS);
+    let mut open: Vec<FakeDevice> = Vec::with_capacity(peakbot_relay::limits::MAX_SOCKETS);
     for a in 0..accounts as u64 {
         let token = t.login(&format!("global-cap-{a}")).await;
         for i in 0..per_acct as u64 {
