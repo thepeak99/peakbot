@@ -1,17 +1,13 @@
 //! Cloud Mode (p3-design): one process-wide [`CloudHandle`] actor owns the
 //! relay socket, the verified chain, and every E2E peer session.
 //!
-//! PR-B is RED: the public seams below are locked (p3-design §B, §C, §D.6,
-//! §H) and the bodies are `todo!()` — the tests in `tests/cloud_*` are
-//! written against them. Protocol logic lives only in `peakbot-cloud`;
-//! this module is IO, state and glue.
+//! The public seams are locked (p3-design §B, §C, §D.6, §H); protocol
+//! logic lives only in `peakbot-cloud` — this module is IO, state and
+//! glue.
 //!
 //! Edition gating (p3-design §A): only [`keyring`] is host-only. The Local
 //! edition builds the actor with `inbound = None` (controller-only).
-
-// RED skeleton (todo!() bodies): drop with the green phase.
-#![allow(unused_variables, dead_code)]
-
+mod actor;
 pub mod config;
 pub mod enroll;
 pub mod link;

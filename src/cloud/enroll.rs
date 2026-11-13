@@ -8,6 +8,9 @@
 //! approver recomputes from `letter.head`. A letter whose head is not in
 //! our verified history is dropped (G.4 step 2).
 
+// Flow skeletons (todo!() bodies) land in a later phase; drop this then.
+#![allow(unused_variables, dead_code)]
+
 use cloud::{
     Head,
     card::DeviceCard,
@@ -27,7 +30,17 @@ pub fn genesis_entry<R: CryptoRng>(
     sk: &v1::PrivateKey,
     rng: &mut R,
 ) -> cloud::Result<ChainEntry> {
-    todo!("p3 PR-B: genesis_entry")
+    let entry = cloud::chain::build_entry(
+        0,
+        [0; 32],
+        cloud::chain::ChainOp::Genesis,
+        Some(card.encode()),
+        None,
+        card.device_id(),
+        sk,
+        rng,
+    )?;
+    Ok(entry)
 }
 
 /// Turn an accepted `EnrollRequest` letter into approver state (G.4 step 2):

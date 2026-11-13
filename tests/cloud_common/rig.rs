@@ -58,9 +58,21 @@ pub fn spawn_device(n: u8, name: &str, fake: &FakeRelay, inbound: Option<Inbound
     Dev { handle, store, dir }
 }
 
+/// A client that does NOT follow the relay's 302 (the tests assert on it).
+fn no_redirect_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("client")
+}
+
 /// GET the auth URL (302 → fake IdP), mint the code, hit the loopback `/cb`.
 pub async fn drive_login(fake: &FakeRelay, auth_url: Url) {
-    let resp = reqwest::get(auth_url.clone()).await.expect("GET auth url");
+    let resp = no_redirect_client()
+        .get(auth_url.clone())
+        .send()
+        .await
+        .expect("GET auth url");
     assert_eq!(resp.status(), 302, "the auth url starts a 302 flow");
     let loc = resp
         .headers()

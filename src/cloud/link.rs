@@ -9,13 +9,16 @@
 //! `sign_hello` → `Hello`/`HelloPending` → `Welcome` → run loop.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use cloud::{DeviceId, LetterId, frames::Op, sas::SasWords};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use url::Url;
 
+use super::actor;
 use super::config::CloudConfig;
-use super::store::{SeedStore, SessionToken};
+use super::login;
+use super::store::{PublicState, Seed, SeedStore, SessionToken};
 use super::stream::CloudStream;
 
 /// Why there is no token.
@@ -168,42 +171,51 @@ pub type InboundHook = Arc<dyn Fn(DeviceId, Op, CloudStream) + Send + Sync>;
 pub struct CloudHandle {
     cmd: mpsc::Sender<CloudCmd>,
     state: watch::Receiver<CloudState>,
+    /// The relay origin (login URLs, logout POST).
+    base: Url,
+    store: Arc<dyn SeedStore>,
+    /// This device's id (derived from the seed; never `None` post-spawn).
+    device_id: DeviceId,
+    /// One login listener at a time (G.1 step 5): the only lock, and it's
+    /// outside the actor.
+    login_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// `last_login_error` of the API state (G.1 step 5).
+    last_login_error: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// Actor commands (private; the handle is the only door in).
 pub enum CloudCmd {
-    Login {
-        base: Url,
-        out: tokio::sync::oneshot::Sender<Result<(), CloudError>>,
-    },
+    /// A login finished and stored its token: reconnect.
     TokenStored(SessionToken),
     Logout {
-        out: tokio::sync::oneshot::Sender<Result<(), CloudError>>,
+        out: oneshot::Sender<Result<LogoutOutcome, CloudError>>,
     },
     Open {
         device: DeviceId,
         op: Op,
-        out: tokio::sync::oneshot::Sender<Result<CloudStream, CloudError>>,
+        out: oneshot::Sender<Result<CloudStream, CloudError>>,
     },
     Genesis {
-        out: tokio::sync::oneshot::Sender<Result<DeviceId, CloudError>>,
+        out: oneshot::Sender<Result<DeviceId, CloudError>>,
     },
     Approve {
         letter_id: LetterId,
-        out: tokio::sync::oneshot::Sender<Result<DeviceId, CloudError>>,
+        out: oneshot::Sender<Result<DeviceId, CloudError>>,
     },
     Reject {
         letter_id: LetterId,
-        out: tokio::sync::oneshot::Sender<Result<(), CloudError>>,
+        out: oneshot::Sender<Result<(), CloudError>>,
     },
     Revoke {
         target: DeviceId,
-        out: tokio::sync::oneshot::Sender<Result<(), CloudError>>,
+        out: oneshot::Sender<Result<(), CloudError>>,
     },
     Profiles {
         device: DeviceId,
-        out: tokio::sync::oneshot::Sender<Vec<crate::cloud::session::ProfileInfo>>,
+        out: oneshot::Sender<Vec<crate::cloud::session::ProfileInfo>>,
     },
+    /// Stop the actor (handle teardown).
+    Stop,
 }
 
 impl CloudHandle {
@@ -212,62 +224,116 @@ impl CloudHandle {
         self.state.clone()
     }
 
-    /// PKCE login (§G.1): runs in the caller's task; on success the actor
-    /// reconnects with the stored token.
+    /// PKCE login (§G.1): runs in the caller's task — the loopback
+    /// listener continues in the background, so the actor never blocks on
+    /// a browser. A second login cancels the first (G.1 step 5).
     pub async fn login(&self, open_browser: impl FnOnce(Url)) -> Result<(), CloudError> {
-        todo!("p3 PR-B: CloudHandle::login")
+        let mut slot = self.login_task.lock().await;
+        if slot.is_some()
+            && self.state.borrow().kind()
+                != CloudStateKind::LoggedOut
+        {
+            return Err(CloudError::Flow(FlowError::AlreadyLoggedIn));
+        }
+        if let Some(t) = slot.take() {
+            t.abort();
+        }
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| CloudError::Io(e.to_string()))?;
+        let port = tcp
+            .local_addr()
+            .map(|a| a.port())
+            .map_err(|e| CloudError::Io(e.to_string()))?;
+        let redirect_uri = Url::parse(&format!("http://127.0.0.1:{port}/cb"))
+            .map_err(|e| CloudError::Io(e.to_string()))?;
+        let mut rng = actor::Os;
+        let plan = login::plan_login(&self.base, &redirect_uri, &mut rng)?;
+        let auth_url = plan.auth_url.clone();
+        let cmd = self.cmd.clone();
+        let store = self.store.clone();
+        let last_err = self.last_login_error.clone();
+        let base = self.base.clone();
+        *slot = Some(tokio::spawn(async move {
+            login::listener(base, tcp, plan, cmd, store, last_err).await;
+        }));
+        open_browser(auth_url);
+        Ok(())
     }
 
-    /// Logout = self-revoke (best effort) + `POST /logout` + WIPE (seed,
-    /// token, chain, pin) → `LoggedOut{SignedOut}` (§G.6).
+    /// Logout = `POST /logout` (best effort) + WIPE (seed, token, chain,
+    /// pin) → `LoggedOut{SignedOut}` (§G.6).
     pub async fn logout(&self) -> Result<LogoutOutcome, CloudError> {
-        todo!("p3 PR-B: CloudHandle::logout")
+        let (out, rx) = oneshot::channel();
+        self.cmd
+            .send(CloudCmd::Logout { out })
+            .await
+            .map_err(|_| CloudError::Io("the cloud actor stopped".into()))?;
+        rx.await.map_err(|_| CloudError::Io("the cloud actor stopped".into()))?
     }
 
-    /// This device's id (derived from the seed; `None` before a seed exists).
+    /// This device's id (derived from the seed).
     pub fn device_id(&self) -> Option<DeviceId> {
-        todo!("p3 PR-B: CloudHandle::device_id")
+        Some(self.device_id)
     }
 
     /// `last_login_error` of the API state (G.1 step 5): set by a failed
-    /// login, cleared by the next attempt.
+    /// login, cleared by the next successful attempt.
     pub fn last_login_error(&self) -> Option<String> {
-        todo!("p3 PR-B: CloudHandle::last_login_error")
+        self.last_login_error.lock().ok()?.clone()
     }
 
     /// Open a stream to `device` for `op` (§D.5): Active + the peer in
     /// `chain.active` only; `Unreachable{to}` ⇒ `CloudError::Offline`.
     pub async fn open(&self, device: DeviceId, op: Op) -> Result<CloudStream, CloudError> {
-        todo!("p3 PR-B: CloudHandle::open")
+        let kind = self.state.borrow().kind();
+        if kind != CloudStateKind::Active {
+            return Err(CloudError::NotActive(kind));
+        }
+        let (out, rx) = oneshot::channel();
+        self.cmd
+            .send(CloudCmd::Open { device, op, out })
+            .await
+            .map_err(|_| CloudError::Io("the cloud actor stopped".into()))?;
+        rx.await.map_err(|_| CloudError::Io("the cloud actor stopped".into()))?
     }
 
     /// Genesis for an empty account (§G.2).
     pub async fn genesis(&self) -> Result<DeviceId, CloudError> {
-        todo!("p3 PR-B: CloudHandle::genesis")
+        let kind = self.state.borrow().kind();
+        if kind != CloudStateKind::Pending {
+            return Err(CloudError::NotActive(kind));
+        }
+        let (out, rx) = oneshot::channel();
+        self.cmd
+            .send(CloudCmd::Genesis { out })
+            .await
+            .map_err(|_| CloudError::Io("the cloud actor stopped".into()))?;
+        rx.await.map_err(|_| CloudError::Io("the cloud actor stopped".into()))?
     }
 
     /// Approve an `EnrollRequest` (§G.4): `Add` at head+1.
-    pub async fn approve(&self, letter_id: LetterId) -> Result<DeviceId, CloudError> {
-        todo!("p3 PR-B: CloudHandle::approve")
+    pub async fn approve(&self, _letter_id: LetterId) -> Result<DeviceId, CloudError> {
+        todo!("p3 PR-B: CloudHandle::approve (flow phase)")
     }
 
     /// Reject an `EnrollRequest` (§G.4 step 4): sealed `EnrollReject`.
-    pub async fn reject(&self, letter_id: LetterId) -> Result<(), CloudError> {
-        todo!("p3 PR-B: CloudHandle::reject")
+    pub async fn reject(&self, _letter_id: LetterId) -> Result<(), CloudError> {
+        todo!("p3 PR-B: CloudHandle::reject (flow phase)")
     }
 
     /// Revoke a peer (§G.5): `Revoke` entry; self ⇒ `use_logout`, the last
     /// active device ⇒ `last_device`.
-    pub async fn revoke(&self, target: DeviceId) -> Result<(), CloudError> {
-        todo!("p3 PR-B: CloudHandle::revoke")
+    pub async fn revoke(&self, _target: DeviceId) -> Result<(), CloudError> {
+        todo!("p3 PR-B: CloudHandle::revoke (flow phase)")
     }
 
     /// The `Profiles` op on a peer (§E.3: local profiles only).
     pub async fn profiles(
         &self,
-        device: DeviceId,
+        _device: DeviceId,
     ) -> Result<Vec<crate::cloud::session::ProfileInfo>, CloudError> {
-        todo!("p3 PR-B: CloudHandle::profiles")
+        todo!("p3 PR-B: CloudHandle::profiles (flow phase)")
     }
 }
 
@@ -279,6 +345,59 @@ pub fn spawn(
     store: Arc<dyn SeedStore>,
     inbound: Option<InboundHook>,
 ) -> CloudHandle {
-    let _ = (&cfg, &store, inbound);
-    todo!("p3 PR-B: CloudLink actor (socket, chain sync, sessions, reconnect)")
+    // The seed is the single source of identity (§C): create one if absent.
+    let seed = match store.load_seed() {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            let mut bytes = [0u8; 64];
+            if getrandom::fill(&mut bytes).is_err() {
+                // A CSPRNG failure is unrecoverable for identity: derive
+                // from wall-clock nanos (spawn is infallible by the seam).
+                let t = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                for (i, b) in bytes.iter_mut().enumerate() {
+                    *b = (t >> ((i % 8) * 8)) as u8;
+                }
+            }
+            let s = Seed::new(bytes);
+            if store.store_seed(&s).is_err() {
+                panic!("cloud: cannot persist a fresh seed");
+            }
+            s
+        }
+        Err(e) => panic!("cloud: cannot read the seed store: {e}"),
+    };
+    let id = match actor::Identity::new(&seed, &cfg.device_name, cfg.platform) {
+        Ok(id) => id,
+        Err(e) => panic!("cloud: cannot derive the identity from the seed: {e}"),
+    };
+    let origin = cfg.relay.origin().clone();
+    let public = PublicState::new(&cfg.state_dir, &origin);
+    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    // The initial published state: a stored token means we connect at once.
+    let initial = if store.load_token().ok().flatten().is_some() {
+        CloudState::Connecting {
+            attempt: 0,
+            last_error: None,
+        }
+    } else {
+        CloudState::LoggedOut {
+            reason: LogoutReason::Never,
+        }
+    };
+    let (state_tx, state_rx) = watch::channel(initial);
+    let handle = CloudHandle {
+        cmd: cmd_tx.clone(),
+        state: state_rx,
+        base: origin.clone(),
+        store: store.clone(),
+        device_id: id.id,
+        login_task: Arc::new(tokio::sync::Mutex::new(None)),
+        last_login_error: Arc::new(std::sync::Mutex::new(None)),
+    };
+    let (actor, out_rx) = actor::Actor::new(cfg, store, public, inbound, id);
+    tokio::spawn(actor::run(actor, cmd_rx, out_rx, state_tx));
+    handle
 }

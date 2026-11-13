@@ -96,12 +96,22 @@ fn spawn_device(
     };
     (spawn(cfg, store.clone(), inbound), store)
 }
+/// A client that does NOT follow the relay's 302 (the tests assert on it).
+fn no_redirect_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("client")
+}
+
 
 /// Drive the PKCE login to completion without a browser: GET the auth URL
 /// (302 → fake IdP), mint a code via `issue_code`, and hit the loopback
 /// redirect. The `auth_url` is captured for assertions.
 async fn drive_login(fake: &FakeRelay, auth_url: Url) {
-    let resp = reqwest::get(auth_url.clone())
+    let resp = no_redirect_client()
+        .get(auth_url.clone())
+        .send()
         .await
         .expect("GET the auth url");
     assert_eq!(resp.status(), 302, "the auth url starts a 302 flow");

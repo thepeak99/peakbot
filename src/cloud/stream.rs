@@ -1,8 +1,9 @@
 //! `CloudStream` — the bidirectional per-stream handle the actor hands to
 //! callers (p3-design §D.6): `Stream<Item = StreamMsg>` + `Sink<StreamMsg>`.
-//! Dropping it sends `Reset(CANCELLED)` unless `End` was already
-//! exchanged. `AttachStream` (the spike) wraps it as `Frame(String)` ↔
-//! `TMsg::Text` for the controller.
+//! Dropping it makes the actor send `Reset(CANCELLED)` (observed through
+//! the outbound channel closing) unless `End` was already exchanged.
+//! `AttachStream` (the spike) wraps it as `Frame(String)` ↔ `TMsg::Text`
+//! for the controller.
 
 use std::pin::Pin;
 use std::task::Context;
@@ -13,8 +14,9 @@ use tokio::sync::mpsc;
 
 use super::link::CloudError;
 
-/// One open stream to a peer. The actor owns the other side of the pair
-/// (routed through the peer's `Mux`); this type is the thin channel end.
+/// One open stream to a peer. The actor owns the other end of both
+/// channel pairs (routed through the peer's `Mux`); this type is the thin
+/// channel end the caller holds.
 impl std::fmt::Debug for CloudStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("CloudStream")
@@ -24,22 +26,11 @@ impl std::fmt::Debug for CloudStream {
 pub struct CloudStream {
     tx: mpsc::Sender<StreamMsg>,
     rx: mpsc::Receiver<StreamMsg>,
-    /// Set when the actor already sent `End` for this stream: dropping
-    /// then must NOT also send `Reset(CANCELLED)`.
-    ended: bool,
 }
 
 impl CloudStream {
     pub fn new(tx: mpsc::Sender<StreamMsg>, rx: mpsc::Receiver<StreamMsg>) -> Self {
-        Self {
-            tx,
-            rx,
-            ended: false,
-        }
-    }
-
-    pub(crate) fn mark_ended(&mut self) {
-        self.ended = true;
+        Self { tx, rx }
     }
 }
 

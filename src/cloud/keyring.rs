@@ -129,6 +129,12 @@ impl SeedStore for FileSeedStore {
         self.write(&file)
     }
 
+    fn clear_token(&self) -> io::Result<()> {
+        let mut file = self.read()?.unwrap_or_default();
+        file.token = None;
+        self.write(&file)
+    }
+
     fn wipe(&self) -> io::Result<()> {
         match std::fs::remove_file(self.path()) {
             Ok(()) => Ok(()),
@@ -184,6 +190,14 @@ impl SeedStore for KeyringSeedStore {
         self.entry("cloud-token")?
             .set_password(token.as_str())
             .map_err(keyring_io)
+    }
+
+    fn clear_token(&self) -> io::Result<()> {
+        match self.entry("cloud-token")?.delete_credential() {
+            Ok(()) => Ok(()),
+            Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(keyring_io(e)),
+        }
     }
 
     fn wipe(&self) -> io::Result<()> {

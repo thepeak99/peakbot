@@ -111,6 +111,9 @@ perma-crypto = { git = "https://git.patchnotes.com/ai-bots/perma-crypto.git", re
 # RNG trait for the login/enroll seams (`&mut impl CryptoRng`); the same
 # 0.9 family perma-crypto depends on.
 rand_core = "=0.9.5"
+# CSPRNG for the actor (login state, seeds, backoff jitter): rand 0.9 is
+# a dev-dependency, so the actor fills bytes through getrandom directly.
+getrandom = "0.3"
 # Zeroizing secret wrappers for cloud identity (p3-design §C).
 zeroize = "1"
 serde = { version = "1", features = ["derive", "rc"] }

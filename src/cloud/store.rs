@@ -60,6 +60,8 @@ pub trait SeedStore: Send + Sync + 'static {
     fn store_seed(&self, seed: &Seed) -> io::Result<()>;
     fn load_token(&self) -> io::Result<Option<SessionToken>>;
     fn store_token(&self, token: &SessionToken) -> io::Result<()>;
+    /// Delete the token ONLY (a 401 on `/ws`, §C: seed + pin survive).
+    fn clear_token(&self) -> io::Result<()>;
     fn wipe(&self) -> io::Result<()>;
 }
 
@@ -115,6 +117,11 @@ impl SeedStore for MemSeedStore {
         Ok(())
     }
 
+    fn clear_token(&self) -> io::Result<()> {
+        *self.token.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        Ok(())
+    }
+
     fn wipe(&self) -> io::Result<()> {
         *self.seed.lock().unwrap_or_else(|p| p.into_inner()) = None;
         *self.token.lock().unwrap_or_else(|p| p.into_inner()) = None;
@@ -128,6 +135,7 @@ impl SeedStore for MemSeedStore {
 /// pin on load, so a corrupt file means a refetch, never trust).
 /// Lives at `<state_dir>/<origin-slug>/{genesis,chain}`; both files 0600,
 /// written atomically (tmp + rename).
+#[derive(Clone)]
 pub struct PublicState {
     dir: std::path::PathBuf,
 }

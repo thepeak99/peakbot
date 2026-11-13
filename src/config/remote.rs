@@ -80,6 +80,12 @@ pub enum Endpoint {
 }
 
 impl Endpoint {
+    /// The relay/remote origin, whichever trust mode it carries.
+    pub fn origin(&self) -> &Url {
+        match self {
+            Endpoint::Tls { origin, .. } | Endpoint::LoopbackPlain { origin } => origin,
+        }
+    }
     /// The origin without its trailing slash, for messages (RP4).
     pub fn origin_without_slash(&self) -> String {
         let origin = match self {
