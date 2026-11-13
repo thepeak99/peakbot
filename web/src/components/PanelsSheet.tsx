@@ -91,21 +91,25 @@ export function PanelsSheet({
         running ? (
           <div
             data-testid="panels-working"
-            className="flex h-11 items-center gap-1 rounded-full border border-zinc-700 bg-zinc-900/90 px-1.5 pl-4 shadow-xl backdrop-blur"
+            className="pointer-events-auto flex h-[46px] items-center gap-1 rounded-[23px] border border-zinc-700 bg-zinc-900/90 pl-4 pr-[5px] shadow-[0_8px_24px_rgba(0,0,0,0.5)] backdrop-blur-xl"
           >
-            <span className="flex items-center gap-2 text-sm font-medium text-amber-400">
-              <span className="h-2 w-2 animate-spin rounded-full border-2 border-amber-400 border-t-transparent" />
+            <span className="flex items-center gap-2 text-[14px] font-medium text-amber-500">
+              <span
+                aria-hidden
+                className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-amber-500 shadow-[0_0_0_4px_rgba(245,158,11,0.2)]"
+              />
               working…
             </span>
-            <span aria-hidden className="mx-1.5 h-5 w-px bg-zinc-700" />
+            <span aria-hidden className="mx-1.5 h-[22px] w-px bg-zinc-700" />
             <button
               type="button"
               data-testid="panels-stop"
               aria-label="Stop"
               onClick={onStop}
-              className="flex h-9 cursor-pointer items-center rounded-full bg-red-500/15 px-3.5 text-sm font-semibold text-red-300"
+              className="flex h-[38px] cursor-pointer items-center gap-2 rounded-[19px] bg-red-600/18 pl-[13px] pr-4 text-[14px] font-semibold text-red-300"
             >
-              ■ Stop
+              <span aria-hidden className="h-3.5 w-3.5 rounded-[3px] bg-red-600" />
+              Stop
             </button>
           </div>
         ) : null

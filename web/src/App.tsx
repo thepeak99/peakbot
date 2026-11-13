@@ -257,7 +257,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
     {
       id: "files",
       label: "Files",
-      content: <FilesPanel files={files} />,
+      content: <FilesPanel files={files} phone={!isDesktop} />,
       badge: files.length,
     },
     {
@@ -270,11 +270,14 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
       id: "bash",
       label: "Bash",
       content: bash ? (
-        <BashPanel panel={bash} />
+        <BashPanel panel={bash} phone={!isDesktop} />
       ) : (
-        <p className="text-sm text-zinc-600">No bash command yet.</p>
+        <p className="text-sm text-zinc-600 max-lg:py-8 max-lg:text-center max-lg:text-zinc-500">
+          No bash command yet.
+        </p>
       ),
-      badge: bash?.status === "running" ? 1 : undefined,
+      // Desktop-only: the phone mock's Bash pill carries no badge (C17).
+      badge: isDesktop && bash?.status === "running" ? 1 : undefined,
     },
     {
       id: "agents",
@@ -283,10 +286,12 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
         <AgentsPanel
           boundAgent={boundAgent}
           active={view}
-          onSelect={setView}
+          // On a phone, Watch also closes the sheet to reveal the banner (X6).
+          onSelect={isDesktop ? setView : (v) => { setView(v); closePanels(); }}
           roster={roster}
           laneCalls={laneCalls}
           laneMessages={laneMessages}
+          phone={!isDesktop}
         />
       ),
       badge: roster.length > 0 ? roster.length : undefined,

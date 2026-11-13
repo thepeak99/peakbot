@@ -137,7 +137,12 @@ export function Sheet({ title, onClose, detents = false, above, children }: Shee
         onPointerUp={settle}
         onPointerCancel={settle}
       >
-        {above && <div className="absolute inset-x-0 bottom-full mb-3.5 flex justify-center px-4">{above}</div>}
+        {/* Mock `min(h+14, H−120)`: % resolves against the dialog height, and the cap keeps the pill clear of the header at the large detent. */}
+        {above && (
+          <div className="pointer-events-none absolute inset-x-0 bottom-[min(calc(100%+14px),calc(100dvh-120px))] flex justify-center px-4">
+            {above}
+          </div>
+        )}
         <div
           className={`${detents ? "h-full" : "max-h-[92dvh]"} flex flex-col overflow-hidden rounded-t-sheet border-t border-zinc-700 bg-zinc-900 pb-[env(safe-area-inset-bottom)] shadow-[0_-12px_40px_rgba(0,0,0,0.5)] motion-safe:animate-sheet-in`}
         >
