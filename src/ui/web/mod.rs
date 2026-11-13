@@ -100,6 +100,9 @@ pub mod system;
 // Remote-profile E2E: `remote:` profiles parse in every edition.
 #[cfg(test)]
 mod t4_tests;
+// P3 PR-A: PIN tests for Principal::Token (E.5) — green now, must stay green.
+#[cfg(test)]
+mod t11_tests;
 pub mod tls;
 pub mod uploads;
 
