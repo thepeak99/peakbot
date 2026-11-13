@@ -229,7 +229,9 @@ const typeInto = async (el: HTMLTextAreaElement, value: string): Promise<void> =
 
 const click = async (el: HTMLElement): Promise<void> => {
   await act(async () => {
-    el.click();
+    // Dispatch (not `el.click()`): jsdom's SVG elements have no .click(),
+    // and the attach-menu icon tests click an <svg> directly.
+    el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
   });
 };
 

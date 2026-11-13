@@ -186,17 +186,6 @@ export function foldActivity(
   return { running, unread };
 }
 
-// The back-nav badge is true only when some chat OTHER than the one we're
-// leaving still looks active; the bound chat is exempt so leaving it doesn't
-// flag itself.
-export function backBadge(
-  list: readonly ConversationSummary[],
-  unread: ReadonlySet<string>,
-  bound: string | null,
-): boolean {
-  return list.some((c) => c.id !== bound && (c.running === true || unread.has(c.id)));
-}
-
 // ─── Machine derivation + filter (mobile-redesign design §2.4) ────────────
 //
 // A "machine" is this device (id `null`) or one remote origin. Pure: derived

@@ -47,7 +47,6 @@ import { useScreenSlide } from "./useScreenSlide";
 import { ChatHeader } from "./components/ChatHeader";
 import { ChatList } from "./components/ChatList";
 import { SelectionChip } from "./components/SelectionChip";
-import { machineName, machineOf } from "./chatList";
 import { focusView } from "./focus";
 import { epochKey, nextEpoch, type EpochState } from "./transcriptEpoch";
 import { filterTabs, resolveActiveTab, settingsGearEnabled } from "./tabs";
@@ -147,9 +146,6 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   const catalog = state ? adaptCatalog(state) : [];
   const selection = state ? adaptSelection(state) : null;
   const boundAgent = boundAgentOf(catalog, selection);
-  // The header's machine prefix: remote chats only (this device = no prefix).
-  const chatMachineId = machineOf(catalog, selection?.profile ?? null);
-  const chatMachine = chatMachineId === null ? null : machineName(chatMachineId);
   // `/r/<L>` prefix for uploads and attachment URLs; derived, never stored.
   const base = apiBase(selection?.profile ?? null, catalog);
   const [view, setView] = useState<ViewFilter>("global");
@@ -411,7 +407,6 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
       {chats ? (
         <ChatHeader
           title={convoTitle ?? "New chat"}
-          machine={chatMachine}
           selector={
             <SelectionChip
               sheet
@@ -426,7 +421,6 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
               onReattach={reattach}
             />
           }
-          badge={chats.backBadge}
           onBack={chats.showChats}
           connected={connected}
           isRunning={isRunning}

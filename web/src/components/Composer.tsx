@@ -37,6 +37,7 @@
 // to `readClipboardImage()` (WebKit Bug 218519). On Android 📎 opens a menu
 // (camera / gallery / file); elsewhere it opens the OS dialog.
 
+import type { JSX } from "react";
 import { useCallback, useEffect, useRef, useState, useLayoutEffect } from "react";
 import { isAndroid } from "../platform";
 import { isDesktop, readClipboardImage } from "../desktop";
@@ -59,6 +60,49 @@ const PHONE_MAX_H = 118;
 // pointer event and the compat mousedown (Android Chrome focuses on the latter).
 const preventFocusSteal = (e: { preventDefault: () => void }) => e.preventDefault();
 const keepTextareaFocus = { onPointerDown: preventFocusSteal, onMouseDown: preventFocusSteal };
+
+// The attach menu's rows in order: label, the input it fires, and the
+// phone's stroke icon (mock .amenu: camera / image / paperclip in a 24px
+// box). Desktop (no `phone`) renders the rows text-only, as before.
+const ATTACH_ITEMS: {
+  testid: string;
+  label: string;
+  ref: "file" | "camera" | "gallery";
+  icon: JSX.Element;
+}[] = [
+  {
+    testid: "attach-menu-camera",
+    label: "Take a photo",
+    ref: "camera",
+    icon: (
+      <>
+        <path d="M20 8h-2.35A4.5 4.5 0 0 0 13.2 5.6H10.8A4.5 4.5 0 0 0 6.35 8H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-9a2 2 0 0 0-2-2Z" />
+        <circle cx="12" cy="14" r="3.5" />
+      </>
+    ),
+  },
+  {
+    testid: "attach-menu-gallery",
+    label: "Choose from gallery",
+    ref: "gallery",
+    icon: (
+      <>
+        <rect x="3" y="4" width="18" height="16" rx="2" />
+        <circle cx="9" cy="10" r="1.6" />
+        <path d="M3 17l4.5-4.5L12 17l3-3 6 6" />
+      </>
+    ),
+  },
+  {
+    testid: "attach-menu-file",
+    label: "Pick a file",
+    ref: "file",
+    // The existing desktop Attach path — same paperclip, new menu.
+    icon: (
+      <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+    ),
+  },
+];
 
 // Inert default so the Composer works standalone (no upload plumbing).
 const NO_ATTACHMENTS: Attachments = {
@@ -159,6 +203,8 @@ export function Composer({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cameraInputRef = useRef<HTMLInputElement>(null);
   const galleryInputRef = useRef<HTMLInputElement>(null);
+  // The three attach inputs in menu order, so the menu can drive a pick by row.
+  const attachInputRefs = { file: fileInputRef, camera: cameraInputRef, gallery: galleryInputRef };
   const attachButtonRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -429,38 +475,49 @@ export function Composer({
               role="menu"
               aria-label="Attach"
               data-testid="attach-menu"
-              className="absolute bottom-full left-0 z-20 mb-2 w-56 rounded-lg border border-zinc-800 bg-zinc-900 py-1 shadow-xl"
+              // Phone: the mock's .amenu (s1 surface, bd2 border, r16, soft
+              // shadow, 6px padding). Non-phone keeps the shared look.
+              className={
+                phone
+                  ? "absolute bottom-full left-0 z-20 mb-2 w-56 rounded-2xl border border-zinc-700 bg-zinc-900 p-1.5 shadow-[0_12px_32px_rgba(0,0,0,0.45)]"
+                  : "absolute bottom-full left-0 z-20 mb-2 w-56 rounded-lg border border-zinc-800 bg-zinc-900 py-1 shadow-xl"
+              }
             >
-              <button
-                type="button"
-                role="menuitem"
-                data-testid="attach-menu-camera"
-                {...keepTextareaFocus}
-                onClick={() => pick(cameraInputRef)}
-                className="block w-full px-4 py-3 text-left text-sm text-zinc-200 hover:bg-zinc-800"
-              >
-                Take a photo
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                data-testid="attach-menu-gallery"
-                {...keepTextareaFocus}
-                onClick={() => pick(galleryInputRef)}
-                className="block w-full px-4 py-3 text-left text-sm text-zinc-200 hover:bg-zinc-800"
-              >
-                Choose from gallery
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                data-testid="attach-menu-file"
-                {...keepTextareaFocus}
-                onClick={() => pick(fileInputRef)}
-                className="block w-full px-4 py-3 text-left text-sm text-zinc-200 hover:bg-zinc-800"
-              >
-                Pick a file
-              </button>
+              {ATTACH_ITEMS.map(({ testid, label, ref, icon }) => (
+                <button
+                  key={testid}
+                  type="button"
+                  role="menuitem"
+                  data-testid={testid}
+                  {...keepTextareaFocus}
+                  onClick={() => pick(attachInputRefs[ref])}
+                  className={
+                    phone
+                      ? "flex h-11 w-[212px] items-center gap-2.5 rounded-[11px] px-3 text-left text-[14.5px] text-zinc-200 active:bg-zinc-800"
+                      : "block w-full px-4 py-3 text-left text-sm text-zinc-200 hover:bg-zinc-800"
+                  }
+                >
+                  {phone && (
+                    // .ai — a 24px centred icon box in front of the label.
+                    <span className="grid w-6 place-items-center">
+                      <svg
+                        aria-hidden
+                        width="20"
+                        height="20"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="1.8"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      >
+                        {icon}
+                      </svg>
+                    </span>
+                  )}
+                  {label}
+                </button>
+              ))}
             </div>
           )}
 

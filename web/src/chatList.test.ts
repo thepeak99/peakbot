@@ -17,7 +17,6 @@ import {
   ALL_MACHINES,
   LOCAL_MACHINE_NAME,
   NO_ACTIVITY,
-  backBadge,
   deriveMachines,
   filterByMachine,
   filterChats,
@@ -278,25 +277,6 @@ describe("foldActivity", () => {
   });
 });
 
-describe("backBadge", () => {
-  const A = row("a");
-  const B = row("b");
-
-  it("no badge when only the bound chat is active", () => {
-    expect(backBadge([row("a", { running: true }), B], new Set(), "a")).toBe(false);
-    expect(backBadge([A, B], new Set(["a"]), "a")).toBe(false);
-    expect(backBadge([A], new Set(["Z"]), "a")).toBe(false);
-  });
-
-  it("badge when an unbound chat is running or unread", () => {
-    expect(backBadge([A, row("b", { running: true })], new Set(), "a")).toBe(true);
-    expect(backBadge([A, B], new Set(["b"]), "a")).toBe(true);
-  });
-
-  it("no badge with an empty list", () => {
-    expect(backBadge([], new Set(), null)).toBe(false);
-  });
-});
 
 describe("NO_ACTIVITY", () => {
   it("is an empty running/unread activity", () => {

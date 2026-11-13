@@ -84,7 +84,6 @@ type Api = {
   screen: "chats" | "conversation";
   loaded: boolean;
   unread: ReadonlySet<string>;
-  backBadge: boolean;
   open(convo: string, profile: string | null): void;
   newChat(profile: string | null): void;
   showChats(): void;
@@ -519,8 +518,6 @@ describe("useMobileChats — polling and activity (P1–P6)", () => {
     expect(A().loaded).toBe(true);
     // c2 is running but was not running before → no unread edge yet.
     expect([...A().unread]).toEqual([]);
-    // c2 is running and unbound → the back button shows a badge.
-    expect(A().backBadge).toBe(true);
 
     // c2's turn finishes while we view c1 → unread.
     agent.conversations = [convoRow("c1"), convoRow("c2", { running: false })];

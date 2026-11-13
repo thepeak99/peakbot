@@ -1,18 +1,14 @@
 // Header of the mobile Conversation screen (design §4.2): "‹ Chats" back
-// button (dot badge when another chat is running / unread), centred title +
-// a subtitle that IS the selection chip (`selector`, behind a machine prefix
-// on remote chats), Panels button, Focus toggle and connection state.
+// button, centred title + a subtitle that IS the selection chip (`selector`),
+// Panels button, Focus toggle and connection state.
 import type { JSX, ReactNode } from "react";
 import { FocusToggle } from "./FocusToggle";
 import { PanelsButton, type PanelsButtonProps } from "./PanelsSheet";
 
 interface ChatHeaderProps {
   title: string;
-  /** Remote machine display name; null = this device (no prefix). */
-  machine: string | null;
   /** `<SelectionChip sheet …/>`; renders nothing before the first state. */
   selector: ReactNode;
-  badge: boolean;
   onBack(): void;
   connected: boolean;
   isRunning: boolean;
@@ -25,9 +21,7 @@ interface ChatHeaderProps {
 export function ChatHeader(props: ChatHeaderProps): JSX.Element {
   const {
     title,
-    machine,
     selector,
-    badge,
     onBack,
     connected,
     isRunning,
@@ -60,14 +54,6 @@ export function ChatHeader(props: ChatHeaderProps): JSX.Element {
           <path d="M15 5l-7 7 7 7" />
         </svg>
         Chats
-        {badge && (
-          // Kept feature (user decision 1): the running/unread dot, restyled
-          // as the mock's .udot 8px with a 2px bg ring on the chevron.
-          <span
-            data-testid="chat-back-badge"
-            className="absolute left-[17px] top-[9px] h-2 w-2 rounded-full bg-sky-400 shadow-[0_0_0_2px_var(--color-zinc-950)]"
-          />
-        )}
       </button>
 
       <div className="flex min-w-0 flex-1 flex-col items-center justify-center gap-[3px]">
@@ -81,11 +67,6 @@ export function ChatHeader(props: ChatHeaderProps): JSX.Element {
           data-testid="chat-subtitle"
           className="flex w-full min-w-0 items-center justify-center gap-1.5 text-xs text-zinc-500"
         >
-          {machine && (
-            <span data-testid="chat-machine" className="shrink-0">
-              {machine} ·
-            </span>
-          )}
           {selector}
         </div>
       </div>

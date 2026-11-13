@@ -5,7 +5,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { isMobile } from "./desktop";
 import { useBackDismiss } from "./useBackDismiss";
-import { backBadge, foldActivity, NO_ACTIVITY, type Activity } from "./chatList";
+import { foldActivity, NO_ACTIVITY, type Activity } from "./chatList";
 import { saveLastChat } from "./mobileStorage";
 import { profileFromUrl, type ConversationSummary } from "./state";
 import type { AgentConnection } from "./useAgent";
@@ -17,7 +17,6 @@ export interface MobileChatsApi {
   /** A `conversations_list` has arrived since mount. */
   loaded: boolean;
   unread: ReadonlySet<string>;
-  backBadge: boolean;
   open(convo: string, profile: string | null): void;
   /** null = the server-default machine; a profile name = that machine's. */
   newChat(profile: string | null): void;
@@ -116,7 +115,6 @@ export function useMobileChats(
     screen,
     loaded,
     unread,
-    backBadge: backBadge(agent.conversations, unread, agent.convo),
     open,
     newChat,
     showChats,
