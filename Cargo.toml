@@ -159,6 +159,9 @@ tokio-util = { version = "0.7", features = ["io"] }
 # The `query` extractor URL-decodes auto (Linear `%3A`-encodes the auth code).
 # `ws` feature is for the default PeakBot WebSocket transport (src/ui/web/).
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "ws"] }
+# Cloud Mode CloudServe: `ServiceExt::oneshot` runs a tunnelled op through the
+# same in-process router the HTTP routes use (already in the tree via axum).
+tower = { version = "0.5", default-features = false, features = ["util"] }
 # `peakbot --tls`: serve HTTPS with a self-signed CA PeakBot owns end to
 # end. `axum-server` handles the rustls acceptor (incl. WS upgrades + graceful
 # shutdown); `rcgen` mints the CA + leaf. Both route through the aws-lc-rs

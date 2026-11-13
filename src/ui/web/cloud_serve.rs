@@ -2,18 +2,23 @@
 //! reach the SAME in-process routers the HTTP routes use — one place for
 //! validation, the 404-no-oracle behaviour and the upload limits.
 //!
-//! PR-A (A2) is skeleton only: the types and the `serve_op` signature. The
-//! body runs each op through `tower::ServiceExt::oneshot` on the existing
-//! routers (no socket, no token layer). The file is folded into
-//! `src/cloud/serve.rs` when the crate lands (PR-B/C).
+//! `serve_op` runs each op through `tower::ServiceExt::oneshot` on the
+//! existing routers (no socket, no token layer: the tunnel's pairing is the
+//! credential). The file is folded into `src/cloud/serve.rs` when the crate
+//! lands (PR-B/C).
 
 #![allow(dead_code)] // the CloudServe caller lands in PR-C
 
-use axum::response::Response;
+use axum::Router;
+use axum::body::Body;
+use axum::http::{Method, Request, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
 use bytes::Bytes;
+use tower::ServiceExt;
 use uuid::Uuid;
 
-use super::WsState;
+use super::{WsState, conversations, images, uploads};
 
 /// The non-Attach ops (mirrors `cloud::Op` minus `Attach`/`Profiles`, §E.2).
 #[derive(Debug)]
@@ -40,8 +45,58 @@ pub(super) enum PeerOp {
 /// Answer one request/response op in process (A2): the same router (and so
 /// the same validation, size limits and no-existence-oracle 404s) as the
 /// HTTP routes, via `tower::ServiceExt::oneshot`.
-pub(super) async fn serve_op(_state: &WsState, _op: PeerOp) -> Response {
-    todo!("P3 PR-A A2: run the op through the in-process router")
+pub(super) async fn serve_op(state: &WsState, op: PeerOp) -> Response {
+    let router = Router::new()
+        .route("/images/{id}", get(images::image_handler))
+        .merge(uploads::router(state.uploads.clone()))
+        .merge(conversations::router(state.clone()));
+    let Some(req) = build_request(op) else {
+        // Only a malformed constant/encoded part fails — unreachable in
+        // practice, but the seam must not panic the socket task.
+        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "bad op").into_response();
+    };
+    match router.oneshot(req).await {
+        Ok(resp) => resp,
+        Err(never) => match never {},
+    }
+}
+
+fn build_request(op: PeerOp) -> Option<Request<Body>> {
+    let (method, uri, body) = match op {
+        PeerOp::List => (Method::GET, "/api/conversations".to_string(), None),
+        PeerOp::Kill { id } => (
+            Method::POST,
+            format!("/api/conversations/{id}/kill"),
+            None,
+        ),
+        PeerOp::GetImage { id } => (Method::GET, format!("/images/{}", enc(&id)), None),
+        PeerOp::GetUpload { convo, id } => (
+            Method::GET,
+            format!("/api/uploads/{convo}/{id}"),
+            None,
+        ),
+        PeerOp::Upload {
+            convo,
+            name,
+            content_type,
+            body,
+        } => (
+            Method::POST,
+            format!("/api/uploads?convo={convo}&name={}", enc(&name)),
+            Some((content_type, body)),
+        ),
+    };
+    let builder = Request::builder().method(method).uri(uri);
+    let built = match body {
+        Some((ct, bytes)) => builder.header(header::CONTENT_TYPE, ct).body(Body::from(bytes)),
+        None => builder.body(Body::empty()),
+    };
+    built.ok()
+}
+
+/// The op parts are constants or percent-encoded; encode for the query/URI.
+fn enc(s: &str) -> String {
+    percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
 #[cfg(test)]
