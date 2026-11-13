@@ -114,6 +114,13 @@ const URL_LOOPBACK_MESSAGE: &str =
     "remote profiles connect over HTTPS — http is allowed only for 127.0.0.1 / localhost";
 const TOKEN_MESSAGE: &str = "the remote's web token (as printed by its `?token=…` link)";
 const CA_MISSING_MESSAGE: &str = "pin the server's CA (`ca: sha256:…` from its pairing link) or use `ca: system` for a publicly trusted certificate";
+/// p3-design §B: the CA-missing message with the noun parameterised —
+/// remote profiles read "server's", `general.cloud` reads "relay's".
+pub(crate) fn ca_missing(noun: &str) -> String {
+    format!(
+        "pin the {noun} CA (`ca: sha256:…` from its pairing link) or use `ca: system` for a publicly trusted certificate"
+    )
+}
 const CA_HTTP_MESSAGE: &str = "`ca` applies to https only";
 const CA_SHAPE_MESSAGE: &str = "expected `system` or `sha256:<64 hex chars>`";
 
@@ -192,6 +199,20 @@ pub fn parse_remote(
         }),
         _ => Err(errors),
     }
+}
+
+/// The url+ca half of `parse_remote` (p3-design §B): the shared
+/// `scheme://host[:port]` + trust-decision validation for remote-profile
+/// endpoints AND `general.cloud.relay`. Collects one error per violation,
+/// keyed `relay` / `ca`. The skeleton defers to the same rules
+/// `parse_origin` / `parse_ca` implement; the green phase folds
+/// `parse_remote` onto this (DRY — the rule is necessarily the same).
+pub(crate) fn parse_endpoint(
+    url: &str,
+    ca: Option<&str>,
+) -> Result<Endpoint, Vec<RemoteFieldError>> {
+    let _ = (url, ca);
+    todo!("p3 PR-B: extract the url+ca half of parse_remote")
 }
 
 /// `scheme://host[:port]` only (row 4); http is loopback-only (row 3).

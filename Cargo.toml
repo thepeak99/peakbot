@@ -18,6 +18,12 @@ mock = []
 # file + doc tools, MCP, the installer, the TUI and the CLI. Without it the
 # crate is the Local edition PeakBot runs in-process on a phone.
 default = ["host"]
+# Cloud Mode (p3-design §A/§C): the OS keyring is the green-phase home of
+# the seed/token. Its `sync-secret-service` backend needs the system
+# `libdbus-1-dev` at build time, which the RED sandbox lacks — so the
+# `keyring` CRATE is added in the green phase. The skeleton keeps
+# `KeyringSeedStore` a stub (todo!() bodies, no keyring import) and the
+# `FileSeedStore` 0600 fallback, so both editions compile now.
 host = [
     "dep:portable-pty",
     "dep:rmcp",
@@ -94,6 +100,17 @@ rmcp = { version = "1.6", optional = true, features = [
     "auth",
 ] }
 tokio = { version = "1", features = ["full"] }
+# pbc1 protocol core (Cloud Mode PR-B; p3-design §A): chain, handshake,
+# frames, relay codecs. Non-optional — BOTH editions need it.
+peakbot-cloud = { path = "crates/cloud" }
+# The crypto source the enroll seams name in their signatures (same rev as
+# `crates/cloud` — it must stay bit-identical).
+perma-crypto = { git = "https://git.patchnotes.com/ai-bots/perma-crypto.git", rev = "bb917b548f75922a2a3c39f9797798546ba8bd26" }
+# RNG trait for the login/enroll seams (`&mut impl CryptoRng`); the same
+# 0.9 family perma-crypto depends on.
+rand_core = "=0.9.5"
+# Zeroizing secret wrappers for cloud identity (p3-design §C).
+zeroize = "1"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 thiserror = "2"
@@ -235,6 +252,10 @@ webpki-roots = "1"
 rustls-platform-verifier = "0.6"
 
 [dev-dependencies]
+# Deterministic RNGs for the fake relay / test devices (spec §15.1 style:
+# seeded ChaCha20Rng). Same 0.9 family perma-crypto depends on.
+rand = "0.9"
+rand_chacha = "0.9"
 tempfile = "3.27"
 insta = { version = "1.40", features = ["yaml", "serde", "filters", "json"] }
 # `default-features = false`: with defaults on, this self edge would switch

@@ -505,6 +505,8 @@ pub fn boot_only_diff(boot: &Config, fresh: &Config) -> Vec<&'static str> {
         ("general.conversation", b.conversation != f.conversation),
         // PR-B: the turn-end channel is built once at boot.
         ("general.notifications", b.notifications != f.notifications),
+        // PR-B (p3-design §B): one process-wide CloudLink, built at boot.
+        ("general.cloud", b.cloud != f.cloud),
     ]
     .into_iter()
     .filter_map(|(key, changed)| changed.then_some(key))

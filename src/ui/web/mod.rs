@@ -91,6 +91,9 @@ mod conversations;
 // controller-only (edition table, §A). PR-A: types + signatures only.
 #[cfg(feature = "host")]
 mod cloud_serve;
+// /api/cloud/* (p3-design §H): both editions, merged inside the token
+// layer by WebUi::router (B7/B8).
+pub mod cloud_api;
 mod images;
 mod notify;
 pub mod registry;
