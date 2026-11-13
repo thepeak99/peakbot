@@ -413,12 +413,14 @@ async fn ws(
         Err(rejection) => return rejection.into_response(),
     };
     let cap = 1 + cloud::constants::MAX_ENVELOPE_PIPE;
-    let (db, hub, origin) = (st.db.clone(), st.hub.clone(), st.origin.clone());
-    let shutdown = st.shutdown.clone();
+    let env = crate::conn::ConnEnv {
+        db: st.db.clone(),
+        hub: st.hub.clone(),
+        origin: st.origin.clone(),
+        shutdown: st.shutdown.clone(),
+    };
     upgrade
         .max_message_size(cap)
         .max_frame_size(cap)
-        .on_upgrade(move |socket| {
-            crate::conn::run_conn(socket, permit, account, hash, db, hub, origin, shutdown)
-        })
+        .on_upgrade(move |socket| crate::conn::run_conn(socket, permit, account, hash, env))
 }

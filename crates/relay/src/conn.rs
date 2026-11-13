@@ -22,6 +22,15 @@ use crate::store::{Db, HelloOk, HelloReq, Reject, Role};
 /// Monotonic socket id: a replaced socket never evicts its successor (§6.2).
 static CONN_ID: AtomicU64 = AtomicU64::new(1);
 
+/// What a socket needs from the relay: store, router, origin, shutdown signal.
+#[derive(Clone)]
+pub struct ConnEnv {
+    pub db: Db,
+    pub hub: Hub,
+    pub origin: String,
+    pub shutdown: watch::Receiver<bool>,
+}
+
 /// Run the per-socket state machine until the socket closes. The permit lives
 /// as long as the socket, so a closed socket frees its slot (RAII, §6.5).
 pub async fn run_conn(
@@ -29,11 +38,14 @@ pub async fn run_conn(
     permit: SocketPermit,
     account: i64,
     session: [u8; 32],
-    db: Db,
-    hub: Hub,
-    origin: String,
-    shutdown: watch::Receiver<bool>,
+    env: ConnEnv,
 ) {
+    let ConnEnv {
+        db,
+        hub,
+        origin,
+        shutdown,
+    } = env;
     let Ok(nonce) = crate::random_32() else {
         return;
     };

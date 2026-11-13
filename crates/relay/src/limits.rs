@@ -1,7 +1,7 @@
 //! Relay-only knobs (design §5.6). Protocol constants live in `cloud::constants`
 //! and are reused, never copied.
 //!
-//! SKELETON: values are locked by the design; only the use-sites are `todo!()`.
+//! Values are locked by the design.
 
 /// 14 days **idle**, sliding on each `/ws` upgrade (design §5.6, §6.1).
 pub const SESSION_TTL: u64 = 1_209_600;

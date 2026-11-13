@@ -1,6 +1,6 @@
 //! `peakbot-relay` CLI (design §2, §7 task 11): `serve` and `reset-account`.
 //!
-//! SKELETON: argument parsing is in place; behaviour is `todo!()`.
+//! Argument parsing and the `serve` / `reset-account` commands.
 //! Exit codes for `reset-account`: 0 ok, 1 no such account / DB error,
 //! 2 relay is running (design §4.8).
 
