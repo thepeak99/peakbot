@@ -912,3 +912,153 @@ async fn profiles_route_not_active_is_409() {
     assert_eq!(err_code(&body), "not_active", "{body}");
     let _ = Op::Profiles; // the happy path (profiles list) needs PR-C's CloudServe
 }
+
+// ── P4 E-F7: `rejected` in the Pending DTO + POST /api/cloud/enroll/retry ──
+
+async fn app_for(dev: &cloud_common::rig::Dev, settings_enabled: bool) -> SocketAddr {
+    spawn_app(
+        CloudApiState {
+            handle: Some(dev.handle.clone()),
+            settings_enabled,
+        },
+        None,
+    )
+    .await
+}
+
+async fn get_state(c: &reqwest::Client, addr: SocketAddr) -> Value {
+    let resp = c.get(api(addr, "/api/cloud/state")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    resp.json().await.unwrap()
+}
+
+/// Reject B's request through A's handle and wait until B shows it.
+async fn reject_b(a: &cloud_common::rig::Dev, b: &cloud_common::rig::Dev) {
+    let s = rig::wait_state(
+        a.handle.state(),
+        |s| matches!(s, CloudState::Active { requests, .. } if !requests.is_empty()),
+    )
+    .await;
+    let CloudState::Active { requests, .. } = s else {
+        panic!("A must hold the request");
+    };
+    a.handle
+        .reject(requests[0].letter_id)
+        .await
+        .expect("reject");
+    let _ = rig::wait_state(b.handle.state(), |s| {
+        matches!(s, CloudState::Pending { sas: None, .. })
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn state_json_for_pending_includes_rejected_false() {
+    let fake = FakeRelay::spawn().await;
+    let (_a, b) = rig::a_active_b_pending(&fake).await;
+    let addr = app_for(&b, true).await;
+
+    let body = get_state(&client(), addr).await;
+    assert_eq!(body["state"], "pending", "{body}");
+    assert_eq!(body["rejected"], false, "rejected is always sent: {body}");
+    assert_eq!(body["sas"].as_array().map(Vec::len), Some(6), "{body}");
+}
+
+#[tokio::test]
+async fn state_json_for_rejected_pending_has_rejected_true_and_null_sas() {
+    let fake = FakeRelay::spawn().await;
+    let (a, b) = rig::a_active_b_pending(&fake).await;
+    reject_b(&a, &b).await;
+    let addr = app_for(&b, true).await;
+
+    let body = get_state(&client(), addr).await;
+    assert_eq!(body["state"], "pending", "{body}");
+    assert_eq!(body["rejected"], true, "{body}");
+    assert!(body["sas"].is_null(), "rejected ⇒ sas is null: {body}");
+}
+
+#[tokio::test]
+async fn retry_route_after_rejection_returns_empty_object_and_redials() {
+    let fake = FakeRelay::spawn().await;
+    let (a, b) = rig::a_active_b_pending(&fake).await;
+    reject_b(&a, &b).await;
+    let addr = app_for(&b, true).await;
+    let c = client();
+
+    let resp = c
+        .post(api(addr, "/api/cloud/enroll/retry"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v, Value::Object(Default::default()), "retry answers {{}}");
+
+    let _ = rig::wait_state(b.handle.state(), |s| {
+        matches!(
+            s,
+            CloudState::Pending {
+                sas: Some(_),
+                rejected: false,
+                ..
+            }
+        )
+    })
+    .await;
+    let body = get_state(&c, addr).await;
+    assert_eq!(body["rejected"], false, "{body}");
+    assert_eq!(body["sas"].as_array().map(Vec::len), Some(6), "{body}");
+}
+
+#[tokio::test]
+async fn retry_route_409_not_rejected_when_not_rejected() {
+    let fake = FakeRelay::spawn().await;
+    let (_a, b) = rig::a_active_b_pending(&fake).await;
+    let addr = app_for(&b, true).await;
+
+    let resp = client()
+        .post(api(addr, "/api/cloud/enroll/retry"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(err_code(&v), "not_rejected", "{v}");
+}
+
+#[tokio::test]
+async fn retry_route_403_when_settings_disabled() {
+    let fake = FakeRelay::spawn().await;
+    let (_a, b) = rig::a_active_b_pending(&fake).await;
+    let addr = app_for(&b, false).await;
+
+    let resp = client()
+        .post(api(addr, "/api/cloud/enroll/retry"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(err_code(&v), "settings_disabled", "{v}");
+}
+
+#[tokio::test]
+async fn retry_route_without_token_gets_401() {
+    let fake = FakeRelay::spawn().await;
+    let dev = spawn_device(1, "Laptop", &fake, None);
+    let addr = spawn_app(
+        CloudApiState {
+            handle: Some(dev.handle.clone()),
+            settings_enabled: true,
+        },
+        Some(WEB_TOKEN),
+    )
+    .await;
+
+    let resp = client()
+        .post(api(addr, "/api/cloud/enroll/retry"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}

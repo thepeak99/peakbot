@@ -20,7 +20,9 @@ mod cloud_common;
 use cloud::frames::{Op, StreamMsg};
 use futures::StreamExt;
 use peakbot::cloud::enroll::{EnrollAttempt, EnrollError};
-use peakbot::cloud::{CloudState, LogoutOutcome, LogoutReason, SeedStore, TrustError};
+use peakbot::cloud::{
+    CloudError, CloudState, FlowError, LogoutOutcome, LogoutReason, SeedStore, TrustError,
+};
 use url::Url;
 
 use cloud_common::devices::{self, card_a, card_c, id_c};
@@ -153,6 +155,7 @@ async fn new_device_pending_and_request_reaches_approver() {
         CloudState::Pending {
             empty_account: false,
             sas: Some(_),
+            rejected: false,
         } => {}
         other => panic!("B must be Pending with a posted request, got {other:?}"),
     }
@@ -273,8 +276,15 @@ async fn reject_sends_enrollreject_and_new_device_stays_pending() {
     })
     .await;
     assert!(
-        matches!(&sb, CloudState::Pending { sas: None, .. }),
-        "B must stay Pending with the SAS cleared, got {sb:?}"
+        matches!(
+            &sb,
+            CloudState::Pending {
+                sas: None,
+                rejected: true,
+                ..
+            }
+        ),
+        "B must stay Pending with the SAS cleared and `rejected: true` published (P4 E-F7), got {sb:?}"
     );
     // A's request list is empty again.
     let sa = state_where(
@@ -469,5 +479,123 @@ async fn offline_logout_still_wipes_and_reports_not_revoked() {
             }
         ),
         "B is SignedOut even offline, got {sb:?}"
+    );
+}
+
+fn words_of(s: &CloudState) -> Vec<String> {
+    match s {
+        CloudState::Pending { sas: Some(w), .. } => {
+            w.words().iter().map(|x| x.to_string()).collect()
+        }
+        other => panic!("expected Pending with a SAS, got {other:?}"),
+    }
+}
+
+/// P4 E-F7: reject → `retry_enroll` redials with a fresh EnrollRequest:
+/// `rejected` flips back to false, a NEW SAS appears, the approver sees a
+/// new request, and approving it makes B Active.
+#[tokio::test]
+async fn rejected_device_retries_and_gets_fresh_sas() {
+    let fake = FakeRelay::spawn().await;
+    let (a, b) = rig::a_active_b_pending(&fake).await;
+    let old_words = words_of(&b.state());
+
+    let s = state_where(
+        a.handle.state(),
+        |s| matches!(s, CloudState::Active { requests, .. } if !requests.is_empty()),
+    )
+    .await;
+    let CloudState::Active { requests, .. } = s else {
+        panic!("A must hold the request");
+    };
+    let old_letter = requests[0].letter_id;
+    a.handle.reject(old_letter).await.expect("reject");
+    let _ = state_where(b.handle.state(), |s| {
+        matches!(s, CloudState::Pending { rejected: true, .. })
+    })
+    .await;
+
+    b.handle
+        .retry_enroll()
+        .await
+        .expect("retry_enroll after a rejection is accepted");
+
+    let sb = state_where(b.handle.state(), |s| {
+        matches!(
+            s,
+            CloudState::Pending {
+                sas: Some(_),
+                rejected: false,
+                ..
+            }
+        )
+    })
+    .await;
+    assert!(
+        matches!(
+            &sb,
+            CloudState::Pending {
+                sas: Some(_),
+                rejected: false,
+                ..
+            }
+        ),
+        "after retry B is Pending{{rejected:false}} with a posted request, got {sb:?}"
+    );
+    assert_ne!(
+        words_of(&sb),
+        old_words,
+        "a retry makes a NEW request, hence a new SAS"
+    );
+
+    // The approver sees the NEW letter and approving it activates B.
+    let sa = state_where(
+        a.handle.state(),
+        |s| matches!(s, CloudState::Active { requests, .. } if requests.iter().any(|r| r.letter_id != old_letter)),
+    )
+    .await;
+    let CloudState::Active { requests, .. } = sa else {
+        panic!("A must stay Active");
+    };
+    let fresh = requests
+        .iter()
+        .find(|r| r.letter_id != old_letter)
+        .unwrap_or_else(|| panic!("A must hold a NEW request after the retry, got {requests:?}"));
+    let CloudState::Pending {
+        sas: Some(new_sas), ..
+    } = &sb
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        fresh.sas, *new_sas,
+        "approver and retried device compute the same words"
+    );
+    a.handle.approve(fresh.letter_id).await.expect("approve");
+    let sb = b.active().await;
+    assert!(
+        matches!(&sb, CloudState::Active { devices, .. } if devices.len() == 2),
+        "B becomes Active after approval of the retried request, got {sb:?}"
+    );
+}
+
+/// P4 E-F7: retrying while NOT rejected is refused with `NotRejected` and
+/// changes nothing.
+#[tokio::test]
+async fn retry_when_not_rejected_is_not_rejected() {
+    let fake = FakeRelay::spawn().await;
+    let (_a, b) = rig::a_active_b_pending(&fake).await;
+    let before = words_of(&b.state());
+
+    let e = b
+        .handle
+        .retry_enroll()
+        .await
+        .expect_err("not rejected → refused");
+    assert_eq!(e, CloudError::Flow(FlowError::NotRejected));
+    assert_eq!(
+        words_of(&b.state()),
+        before,
+        "a refused retry must not redial (SAS unchanged)"
     );
 }

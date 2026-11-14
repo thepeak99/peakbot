@@ -92,6 +92,9 @@ pub enum CloudState {
     Pending {
         empty_account: bool,
         sas: Option<SasWords>,
+        /// An active device refused our EnrollRequest; no auto-retry until
+        /// `retry_enroll` or a fresh login (P4 E-F7).
+        rejected: bool,
     },
     Active {
         devices: Vec<DeviceInfo>,
@@ -134,6 +137,8 @@ pub enum CloudError {
 pub enum FlowError {
     AlreadyLoggedIn,
     NotPendingEmpty,
+    /// `retry_enroll` while not rejected (P4 E-F7).
+    NotRejected,
     GenesisTaken,
     UnknownRequest,
     ChainBusy,
@@ -385,6 +390,12 @@ impl CloudHandle {
             .map_err(|_| CloudError::Io("the cloud actor stopped".into()))?;
         rx.await
             .map_err(|_| CloudError::Io("the cloud actor stopped".into()))?
+    }
+
+    /// Redial after a rejection with a fresh `EnrollRequest` (P4 E-F7).
+    /// SKELETON: not implemented yet (tests are RED).
+    pub async fn retry_enroll(&self) -> Result<(), CloudError> {
+        Err(CloudError::Io("retry_enroll: not implemented".into()))
     }
 
     /// Reject an `EnrollRequest` (§G.4 step 4): sealed `EnrollReject`.

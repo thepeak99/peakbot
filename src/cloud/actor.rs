@@ -282,6 +282,8 @@ fn publish_live(state: &watch::Sender<CloudState>, actor: &Actor, live: &Live) {
                 empty_account: live.empty_account,
                 // `Some` once our EnrollRequest is posted (head frozen, §5.5).
                 sas: actor.enroll.as_ref().map(|a| a.sas()),
+                // SKELETON (P4 E-F7): should be `actor.rejected`.
+                rejected: false,
             },
         );
     } else if let Some(c) = &actor.chain_cache {
