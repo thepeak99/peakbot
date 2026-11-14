@@ -60,11 +60,21 @@ afterEach(() => {
   uninstallFakeEventSource();
 });
 
+/** Flush microtasks (and React) so the (now async) fetch mock settles. */
+async function flush(): Promise<void> {
+  for (let i = 0; i < 4; i++) {
+    await act(async () => {
+      await Promise.resolve();
+    });
+  }
+}
+
 /** Drive the store to `body`, then render the pane. */
 async function withState(body: StateBody): Promise<HTMLDivElement> {
-  mockFetch((url) => (url.endsWith("/api/cloud/state") ? json(200, body) : json(200, {})));
+  mockFetch((url) => (url.endsWith("/api/cloud/state") ? Promise.resolve(json(200, body)) : Promise.resolve(json(200, {}))));
   store.reset();
   store.subscribe(() => {});
+  await flush();
   FakeEventSource.last()?.emit("state", body);
   container = await render(<CloudPane />);
   return container;
@@ -78,9 +88,10 @@ const buttonByText = (el: Element, label: string): HTMLButtonElement | undefined
 
 describe("no snapshot", () => {
   it("shows the loading line before the first SSE state", async () => {
-    mockFetch((url) => (url.endsWith("/api/cloud/state") ? json(200, disabled()) : json(200, {})));
+    mockFetch((url) => (url.endsWith("/api/cloud/state") ? Promise.resolve(json(200, disabled())) : Promise.resolve(json(200, {}))));
     store.reset();
     store.subscribe(() => {});
+    await flush();
     container = await render(<CloudPane />);
     expect(text(container!)).toContain(COPY.loading);
   });
@@ -111,12 +122,13 @@ describe("state → view (one row per §A.1)", () => {
 
   it("Sign in → POST /api/cloud/login, then window.open(auth_url)", async () => {
     mockFetch((url) => {
-      if (url.endsWith("/api/cloud/state")) return json(200, loggedOut("never"));
-      if (url.endsWith("/api/cloud/login")) return json(200, { auth_url: "https://idp/cb?x=1" });
-      return json(200, {});
+      if (url.endsWith("/api/cloud/state")) return Promise.resolve(json(200, loggedOut("never")));
+      if (url.endsWith("/api/cloud/login")) return Promise.resolve(json(200, { auth_url: "https://idp/cb?x=1" }));
+      return Promise.resolve(json(200, {}));
     });
     store.reset();
     store.subscribe(() => {});
+    await flush();
     FakeEventSource.last()?.emit("state", loggedOut("never"));
     container = await render(<CloudPane />);
     const btn = buttonByText(container!, COPY.btn.signIn);
@@ -161,12 +173,13 @@ describe("state → view (one row per §A.1)", () => {
 
   it("pending rejected → the rejection text + a 'Try again' that POSTs /enroll/retry", async () => {
     mockFetch((url) => {
-      if (url.endsWith("/api/cloud/state")) return json(200, pendingRejected());
-      if (url.endsWith("/api/cloud/enroll/retry")) return json(200, {});
-      return json(200, {});
+      if (url.endsWith("/api/cloud/state")) return Promise.resolve(json(200, pendingRejected()));
+      if (url.endsWith("/api/cloud/enroll/retry")) return Promise.resolve(json(200, {}));
+      return Promise.resolve(json(200, {}));
     });
     store.reset();
     store.subscribe(() => {});
+    await flush();
     FakeEventSource.last()?.emit("state", pendingRejected());
     container = await render(<CloudPane />);
     expect(text(container!)).toContain(COPY.rejected.title);
@@ -220,9 +233,10 @@ describe("state → view (one row per §A.1)", () => {
 
 describe("last_login_error", () => {
   it("is shown outside active", async () => {
-    mockFetch((url) => (url.endsWith("/api/cloud/state") ? json(200, { state: "logged_out", reason: "expired", last_login_error: "bad token" }) : json(200, {})));
+    mockFetch((url) => (url.endsWith("/api/cloud/state") ? Promise.resolve(json(200, { state: "logged_out", reason: "expired", last_login_error: "bad token" })) : Promise.resolve(json(200, {}))));
     store.reset();
     store.subscribe(() => {});
+    await flush();
     FakeEventSource.last()?.emit("state", { state: "logged_out", reason: "expired", last_login_error: "bad token" });
     container = await render(<CloudPane />);
     expect(text(container!)).toContain(COPY.lastLoginError("bad token"));
@@ -237,12 +251,13 @@ describe("last_login_error", () => {
 describe("error mapping (design §D.5)", () => {
   it("a 409 last_device revoke shows the mapped message, not the raw code", async () => {
     mockFetch((url) => {
-      if (url.endsWith("/api/cloud/state")) return json(200, active([selfDevice(), device({ name: "Desk", slug: "desk" })]));
-      if (url.endsWith("/revoke")) return json(409, { error: "last_device", message: "you can't revoke the last device" });
-      return json(200, {});
+      if (url.endsWith("/api/cloud/state")) return Promise.resolve(json(200, active([selfDevice(), device({ name: "Desk", slug: "desk" })])));
+      if (url.endsWith("/revoke")) return Promise.resolve(json(409, { error: "last_device", message: "you can't revoke the last device" }));
+      return Promise.resolve(json(200, {}));
     });
     store.reset();
     store.subscribe(() => {});
+    await flush();
     FakeEventSource.last()?.emit("state", active([selfDevice(), device({ name: "Desk", slug: "desk" })]));
     container = await render(<CloudPane />);
     const revoke = buttonByText(container!, COPY.btn.revoke);
@@ -257,12 +272,13 @@ describe("error mapping (design §D.5)", () => {
 
   it("an unknown code shows the server `message`", async () => {
     mockFetch((url) => {
-      if (url.endsWith("/api/cloud/state")) return json(200, active([selfDevice(), device({ name: "Desk", slug: "desk" })]));
-      if (url.endsWith("/revoke")) return json(418, { error: "mystery", message: "teapot" });
-      return json(200, {});
+      if (url.endsWith("/api/cloud/state")) return Promise.resolve(json(200, active([selfDevice(), device({ name: "Desk", slug: "desk" })])));
+      if (url.endsWith("/revoke")) return Promise.resolve(json(418, { error: "mystery", message: "teapot" }));
+      return Promise.resolve(json(200, {}));
     });
     store.reset();
     store.subscribe(() => {});
+    await flush();
     FakeEventSource.last()?.emit("state", active([selfDevice(), device({ name: "Desk", slug: "desk" })]));
     container = await render(<CloudPane />);
     const revoke = buttonByText(container!, COPY.btn.revoke);
@@ -293,12 +309,13 @@ describe("Sign out availability", () => {
 describe("confirms (G.4)", () => {
   it("first device: opening sends nothing; Cancel is focused; confirm → exactly one POST /genesis", async () => {
     mockFetch((url) => {
-      if (url.endsWith("/api/cloud/state")) return json(200, pendingEmpty());
-      if (url.endsWith("/api/cloud/genesis")) return json(200, { device_id: "aa" });
-      return json(200, {});
+      if (url.endsWith("/api/cloud/state")) return Promise.resolve(json(200, pendingEmpty()));
+      if (url.endsWith("/api/cloud/genesis")) return Promise.resolve(json(200, { device_id: "aa" }));
+      return Promise.resolve(json(200, {}));
     });
     store.reset();
     store.subscribe(() => {});
+    await flush();
     FakeEventSource.last()?.emit("state", pendingEmpty());
     container = await render(<CloudPane />);
     buttonByText(container!, COPY.btn.makeFirst)?.click();
@@ -316,12 +333,13 @@ describe("confirms (G.4)", () => {
   it("revoke: confirm → exactly one POST /devices/{id}/revoke", async () => {
     const id = "dd".repeat(32);
     mockFetch((url) => {
-      if (url.endsWith("/api/cloud/state")) return json(200, active([selfDevice(), device({ id, name: "Desk", slug: "desk" })]));
-      if (url.endsWith("/revoke")) return json(200, {});
-      return json(200, {});
+      if (url.endsWith("/api/cloud/state")) return Promise.resolve(json(200, active([selfDevice(), device({ id, name: "Desk", slug: "desk" })])));
+      if (url.endsWith("/revoke")) return Promise.resolve(json(200, {}));
+      return Promise.resolve(json(200, {}));
     });
     store.reset();
     store.subscribe(() => {});
+    await flush();
     FakeEventSource.last()?.emit("state", active([selfDevice(), device({ id, name: "Desk", slug: "desk" })]));
     container = await render(<CloudPane />);
     buttonByText(container!, COPY.btn.revoke)?.click();
@@ -335,12 +353,13 @@ describe("confirms (G.4)", () => {
 
   it("sign out: confirm → exactly one POST /api/cloud/logout", async () => {
     mockFetch((url) => {
-      if (url.endsWith("/api/cloud/state")) return json(200, active([selfDevice()]));
-      if (url.endsWith("/api/cloud/logout")) return json(200, { revoked: true });
-      return json(200, {});
+      if (url.endsWith("/api/cloud/state")) return Promise.resolve(json(200, active([selfDevice()])));
+      if (url.endsWith("/api/cloud/logout")) return Promise.resolve(json(200, { revoked: true }));
+      return Promise.resolve(json(200, {}));
     });
     store.reset();
     store.subscribe(() => {});
+    await flush();
     FakeEventSource.last()?.emit("state", active([selfDevice()]));
     container = await render(<CloudPane />);
     buttonByText(container!, COPY.btn.signOut)?.click();
@@ -353,9 +372,10 @@ describe("confirms (G.4)", () => {
   });
 
   it("a confirm Cancel closes with no fetch", async () => {
-    mockFetch((url) => (url.endsWith("/api/cloud/state") ? json(200, pendingEmpty()) : json(200, {})));
+    mockFetch((url) => (url.endsWith("/api/cloud/state") ? Promise.resolve(json(200, pendingEmpty())) : Promise.resolve(json(200, {}))));
     store.reset();
     store.subscribe(() => {});
+    await flush();
     FakeEventSource.last()?.emit("state", pendingEmpty());
     container = await render(<CloudPane />);
     buttonByText(container!, COPY.btn.makeFirst)?.click();

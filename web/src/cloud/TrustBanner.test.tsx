@@ -52,10 +52,20 @@ afterEach(() => {
   uninstallFakeEventSource();
 });
 
+/** Flush microtasks (and React) so the (now async) fetch mock settles. */
+async function flush(): Promise<void> {
+  for (let i = 0; i < 4; i++) {
+    await act(async () => {
+      await Promise.resolve();
+    });
+  }
+}
+
 async function withState(body: StateBody): Promise<HTMLDivElement> {
-  mockFetch((url) => (url.endsWith("/api/cloud/state") ? json(200, body) : json(200, {})));
+  mockFetch((url) => (url.endsWith("/api/cloud/state") ? Promise.resolve(json(200, body)) : Promise.resolve(json(200, {}))));
   store.reset();
   store.subscribe(() => {});
+  await flush();
   FakeEventSource.last()?.emit("state", body);
   container = await render(<TrustBanner />);
   return container;

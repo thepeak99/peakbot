@@ -33,25 +33,36 @@ beforeEach(() => {
   vi.restoreAllMocks();
 });
 
+/** Flush microtasks so the (now async) fetch mock settles. */
+async function flush(): Promise<void> {
+  for (let i = 0; i < 4; i++) {
+    await Promise.resolve();
+  }
+}
+
 describe("availability", () => {
-  it("a 404 on GET /state → available=false and NO EventSource is opened", () => {
+  it("a 404 on GET /state → available=false and NO EventSource is opened", async () => {
     mockFetch((url) =>
-      url.endsWith("/api/cloud/state") ? json(404, { error: "cloud_disabled", message: "" }) : json(200, {}),
+      url.endsWith("/api/cloud/state")
+        ? Promise.resolve(json(404, { error: "cloud_disabled", message: "" }))
+        : Promise.resolve(json(200, {})),
     );
     store.reset();
     store.subscribe(() => {});
+    await flush();
     expect(store.getSnapshot().available).toBe(false);
     expect(FakeEventSource.instances).toHaveLength(0);
   });
 
-  it("a 200 on GET /state → available=true and exactly ONE EventSource for N subscribers", () => {
+  it("a 200 on GET /state → available=true and exactly ONE EventSource for N subscribers", async () => {
     mockFetch((url) =>
-      url.endsWith("/api/cloud/state") ? json(200, disabled()) : json(200, {}),
+      url.endsWith("/api/cloud/state") ? Promise.resolve(json(200, disabled())) : Promise.resolve(json(200, {})),
     );
     store.reset();
     const un1 = store.subscribe(() => {});
     const un2 = store.subscribe(() => {});
     const un3 = store.subscribe(() => {});
+    await flush();
     expect(store.getSnapshot().available).toBe(true);
     expect(FakeEventSource.instances).toHaveLength(1);
     expect(FakeEventSource.last()?.url).toBe("/api/cloud/events");
@@ -60,11 +71,12 @@ describe("availability", () => {
     un3();
   });
 
-  it("the single EventSource is closed when the LAST subscriber leaves", () => {
-    mockFetch((url) => (url.endsWith("/api/cloud/state") ? json(200, disabled()) : json(200, {})));
+  it("the single EventSource is closed when the LAST subscriber leaves", async () => {
+    mockFetch((url) => (url.endsWith("/api/cloud/state") ? Promise.resolve(json(200, disabled())) : Promise.resolve(json(200, {}))));
     store.reset();
     const un1 = store.subscribe(() => {});
     const un2 = store.subscribe(() => {});
+    await flush();
     const es = FakeEventSource.last();
     expect(es).toBeDefined();
     un1();
@@ -75,19 +87,21 @@ describe("availability", () => {
 });
 
 describe("the snapshot is the single source of truth", () => {
-  it("emit replaces the snapshot", () => {
-    mockFetch((url) => (url.endsWith("/api/cloud/state") ? json(200, disabled()) : json(200, {})));
+  it("emit replaces the snapshot", async () => {
+    mockFetch((url) => (url.endsWith("/api/cloud/state") ? Promise.resolve(json(200, disabled())) : Promise.resolve(json(200, {}))));
     store.reset();
     store.subscribe(() => {});
+    await flush();
     const es = FakeEventSource.last()!;
     es.emit("state", pendingWithSas());
     expect(store.getSnapshot().snapshot?.state).toBe("pending");
   });
 
-  it("a stream error KEEPS the last snapshot and sets stale=true", () => {
-    mockFetch((url) => (url.endsWith("/api/cloud/state") ? json(200, disabled()) : json(200, {})));
+  it("a stream error KEEPS the last snapshot and sets stale=true", async () => {
+    mockFetch((url) => (url.endsWith("/api/cloud/state") ? Promise.resolve(json(200, disabled())) : Promise.resolve(json(200, {}))));
     store.reset();
     store.subscribe(() => {});
+    await flush();
     const es = FakeEventSource.last()!;
     es.emit("state", active());
     es.fail();
@@ -96,10 +110,11 @@ describe("the snapshot is the single source of truth", () => {
     expect(s.snapshot?.state, "the last snapshot survives the drop").toBe("active");
   });
 
-  it("reconnect: open() + a new emit → stale=false and the snapshot is replaced", () => {
-    mockFetch((url) => (url.endsWith("/api/cloud/state") ? json(200, disabled()) : json(200, {})));
+  it("reconnect: open() + a new emit → stale=false and the snapshot is replaced", async () => {
+    mockFetch((url) => (url.endsWith("/api/cloud/state") ? Promise.resolve(json(200, disabled())) : Promise.resolve(json(200, {}))));
     store.reset();
     store.subscribe(() => {});
+    await flush();
     const es = FakeEventSource.last()!;
     es.emit("state", active());
     es.fail();
@@ -111,10 +126,11 @@ describe("the snapshot is the single source of truth", () => {
     expect(s.snapshot?.state).toBe("pending");
   });
 
-  it("malformed SSE data is ignored and the previous snapshot is kept", () => {
-    mockFetch((url) => (url.endsWith("/api/cloud/state") ? json(200, disabled()) : json(200, {})));
+  it("malformed SSE data is ignored and the previous snapshot is kept", async () => {
+    mockFetch((url) => (url.endsWith("/api/cloud/state") ? Promise.resolve(json(200, disabled())) : Promise.resolve(json(200, {}))));
     store.reset();
     store.subscribe(() => {});
+    await flush();
     const es = FakeEventSource.last()!;
     es.emit("state", active());
     es.emit("state", "not-json{{{");
@@ -125,13 +141,14 @@ describe("the snapshot is the single source of truth", () => {
 describe("act — the single, re-entrancy-guarded POST", () => {
   it("act never mutates the snapshot", async () => {
     mockFetch((url, init) => {
-      if (url.endsWith("/api/cloud/state")) return json(200, disabled());
-      if (url.endsWith("/api/cloud/enroll/retry")) return json(200, {});
+      if (url.endsWith("/api/cloud/state")) return Promise.resolve(json(200, disabled()));
+      if (url.endsWith("/api/cloud/enroll/retry")) return Promise.resolve(json(200, {}));
       void init;
-      return json(200, {});
+      return Promise.resolve(json(200, {}));
     });
     store.reset();
     store.subscribe(() => {});
+    await flush();
     FakeEventSource.last()!.emit("state", disabled());
     const before = store.getSnapshot().snapshot;
     await store.act("/api/cloud/enroll/retry");
@@ -144,12 +161,13 @@ describe("act — the single, re-entrancy-guarded POST", () => {
       release = resolve;
     });
     mockFetch((url) => {
-      if (url.endsWith("/api/cloud/state")) return json(200, disabled());
+      if (url.endsWith("/api/cloud/state")) return Promise.resolve(json(200, disabled()));
       if (url.endsWith("/api/cloud/enroll/retry")) return gate;
-      return json(200, {});
+      return Promise.resolve(json(200, {}));
     });
     store.reset();
     store.subscribe(() => {});
+    await flush();
     const first = store.act("/api/cloud/enroll/retry");
     const second = store.act("/api/cloud/enroll/retry");
     release!(json(200, {}));
@@ -162,12 +180,14 @@ describe("act — the single, re-entrancy-guarded POST", () => {
 
   it("a non-2xx stores the server `message` in `error` (snapshot untouched)", async () => {
     mockFetch((url) => {
-      if (url.endsWith("/api/cloud/state")) return json(200, disabled());
-      if (url.endsWith("/api/cloud/devices/x/revoke")) return json(409, { error: "last_device", message: "You can't revoke the last device; sign out instead." });
-      return json(200, {});
+      if (url.endsWith("/api/cloud/state")) return Promise.resolve(json(200, disabled()));
+      if (url.endsWith("/api/cloud/devices/x/revoke"))
+        return Promise.resolve(json(409, { error: "last_device", message: "You can't revoke the last device; sign out instead." }));
+      return Promise.resolve(json(200, {}));
     });
     store.reset();
     store.subscribe(() => {});
+    await flush();
     await expect(store.act("/api/cloud/devices/x/revoke")).rejects.toBeDefined();
     expect(store.getSnapshot().error).toContain("last device");
   });

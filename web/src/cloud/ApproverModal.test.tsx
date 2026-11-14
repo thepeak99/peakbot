@@ -52,10 +52,20 @@ afterEach(() => {
   uninstallFakeEventSource();
 });
 
+/** Flush microtasks (and React) so the (now async) fetch mock settles. */
+async function flush(): Promise<void> {
+  for (let i = 0; i < 4; i++) {
+    await act(async () => {
+      await Promise.resolve();
+    });
+  }
+}
+
 async function withRequests(reqs: TestEnrollRequest[]): Promise<HTMLDivElement> {
-  mockFetch((url) => (url.endsWith("/api/cloud/state") ? json(200, active([selfDevice()], reqs)) : json(200, {})));
+  mockFetch((url) => (url.endsWith("/api/cloud/state") ? Promise.resolve(json(200, active([selfDevice()], reqs))) : Promise.resolve(json(200, {}))));
   store.reset();
   store.subscribe(() => {});
+  await flush();
   FakeEventSource.last()?.emit("state", active([selfDevice()], reqs));
   container = await render(<ApproverModal />);
   return container;
@@ -134,12 +144,13 @@ describe("double click sends exactly once", () => {
     let release: ((r: Response) => void) | undefined;
     const gate = new Promise<Response>((resolve) => { release = resolve; });
     mockFetch((url) => {
-      if (url.endsWith("/api/cloud/state")) return json(200, active([selfDevice()], [request({ name: "Phone" })]));
+      if (url.endsWith("/api/cloud/state")) return Promise.resolve(json(200, active([selfDevice()], [request({ name: "Phone" })])));
       if (url.endsWith("/enroll/approve")) return gate;
-      return json(200, {});
+      return Promise.resolve(json(200, {}));
     });
     store.reset();
     store.subscribe(() => {});
+    await flush();
     FakeEventSource.last()?.emit("state", active([selfDevice()], [request({ name: "Phone" })]));
     container = await render(<ApproverModal />);
     const approve = buttonByText(COPY.btn.approve);
@@ -160,12 +171,13 @@ describe("double click sends exactly once", () => {
     let release: ((r: Response) => void) | undefined;
     const gate = new Promise<Response>((resolve) => { release = resolve; });
     mockFetch((url) => {
-      if (url.endsWith("/api/cloud/state")) return json(200, active([selfDevice()], [request({ name: "Phone" })]));
+      if (url.endsWith("/api/cloud/state")) return Promise.resolve(json(200, active([selfDevice()], [request({ name: "Phone" })])));
       if (url.endsWith("/enroll/approve")) return gate;
-      return json(200, {});
+      return Promise.resolve(json(200, {}));
     });
     store.reset();
     store.subscribe(() => {});
+    await flush();
     FakeEventSource.last()?.emit("state", active([selfDevice()], [request({ name: "Phone" })]));
     container = await render(<ApproverModal />);
     const approve = buttonByText(COPY.btn.approve);
@@ -209,9 +221,10 @@ describe("focus trap", () => {
 
 describe("lifecycle", () => {
   it("unmounts when the request disappears from the next snapshot", async () => {
-    mockFetch((url) => (url.endsWith("/api/cloud/state") ? json(200, active([selfDevice()], [request({ name: "Phone" })])) : json(200, {})));
+    mockFetch((url) => (url.endsWith("/api/cloud/state") ? Promise.resolve(json(200, active([selfDevice()], [request({ name: "Phone" })]))) : Promise.resolve(json(200, {}))));
     store.reset();
     store.subscribe(() => {});
+    await flush();
     FakeEventSource.last()?.emit("state", active([selfDevice()], [request({ name: "Phone" })]));
     container = await render(<ApproverModal />);
     expect(dialog()).not.toBeNull();
