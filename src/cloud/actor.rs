@@ -282,8 +282,7 @@ fn publish_live(state: &watch::Sender<CloudState>, actor: &Actor, live: &Live) {
                 empty_account: live.empty_account,
                 // `Some` once our EnrollRequest is posted (head frozen, §5.5).
                 sas: actor.enroll.as_ref().map(|a| a.sas()),
-                // SKELETON (P4 E-F7): should be `actor.rejected`.
-                rejected: false,
+                rejected: actor.rejected,
             },
         );
     } else if let Some(c) = &actor.chain_cache {
@@ -1972,6 +1971,17 @@ impl Actor {
                 self.do_reject(live, ws, letter_id, out, state).await;
                 None
             }
+            CloudCmd::RetryEnroll { out } => {
+                if live.pending && self.rejected {
+                    // Redial: a fresh HelloPending re-freezes and reposts.
+                    self.rejected = false;
+                    let _ = out.send(Ok(()));
+                    Some(RunEnd::ReHello)
+                } else {
+                    let _ = out.send(Err(CloudError::Flow(FlowError::NotRejected)));
+                    None
+                }
+            }
             CloudCmd::Revoke { target, out } => {
                 self.do_revoke(live, ws, target, out).await;
                 None
@@ -2583,6 +2593,9 @@ pub async fn run(
                     CloudCmd::Reject { out, .. } => {
                         let _ = out.send(Err(CloudError::NotActive(CloudStateKind::LoggedOut)));
                     }
+                    CloudCmd::RetryEnroll { out, .. } => {
+                        let _ = out.send(Err(CloudError::NotActive(CloudStateKind::LoggedOut)));
+                    }
                     CloudCmd::Revoke { out, .. } => {
                         let _ = out.send(Err(CloudError::NotActive(CloudStateKind::LoggedOut)));
                     }
@@ -2618,6 +2631,9 @@ pub async fn run(
                         let _ = out.send(Err(CloudError::Trust(e.clone())));
                     }
                     CloudCmd::Reject { out, .. } => {
+                        let _ = out.send(Err(CloudError::Trust(e.clone())));
+                    }
+                    CloudCmd::RetryEnroll { out, .. } => {
                         let _ = out.send(Err(CloudError::Trust(e.clone())));
                     }
                     CloudCmd::Revoke { out, .. } => {
@@ -2714,6 +2730,11 @@ pub async fn run(
                                     )));
                                 }
                                 Some(CloudCmd::Reject { out, .. }) => {
+                                    let _ = out.send(Err(CloudError::NotActive(
+                                        CloudStateKind::Connecting,
+                                    )));
+                                }
+                                Some(CloudCmd::RetryEnroll { out, .. }) => {
                                     let _ = out.send(Err(CloudError::NotActive(
                                         CloudStateKind::Connecting,
                                     )));

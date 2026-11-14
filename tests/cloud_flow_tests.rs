@@ -492,10 +492,11 @@ fn words_of(s: &CloudState) -> Vec<String> {
 }
 
 /// P4 E-F7: reject → `retry_enroll` redials with a fresh EnrollRequest:
-/// `rejected` flips back to false, a NEW SAS appears, the approver sees a
-/// new request, and approving it makes B Active.
+/// `rejected` flips back to false, the approver sees a NEW request letter,
+/// and approving it makes B Active. The SAS words stay the same (same
+/// keypair, same chain head).
 #[tokio::test]
-async fn rejected_device_retries_and_gets_fresh_sas() {
+async fn rejected_device_retry_sends_fresh_enroll_request() {
     let fake = FakeRelay::spawn().await;
     let (a, b) = rig::a_active_b_pending(&fake).await;
     let old_words = words_of(&b.state());
@@ -542,10 +543,11 @@ async fn rejected_device_retries_and_gets_fresh_sas() {
         ),
         "after retry B is Pending{{rejected:false}} with a posted request, got {sb:?}"
     );
-    assert_ne!(
+    // words are a function of (card, head), so a retry with the same head shows the same words
+    assert_eq!(
         words_of(&sb),
         old_words,
-        "a retry makes a NEW request, hence a new SAS"
+        "same keypair and unchanged head give identical SAS words"
     );
 
     // The approver sees the NEW letter and approving it activates B.
@@ -561,6 +563,7 @@ async fn rejected_device_retries_and_gets_fresh_sas() {
         .iter()
         .find(|r| r.letter_id != old_letter)
         .unwrap_or_else(|| panic!("A must hold a NEW request after the retry, got {requests:?}"));
+    assert_ne!(fresh.letter_id, old_letter, "retry sends a new letter");
     let CloudState::Pending {
         sas: Some(new_sas), ..
     } = &sb

@@ -246,6 +246,10 @@ pub enum CloudCmd {
         letter_id: LetterId,
         out: oneshot::Sender<Result<DeviceId, CloudError>>,
     },
+    /// Redial after a rejection with a fresh `EnrollRequest` (P4 E-F7).
+    RetryEnroll {
+        out: oneshot::Sender<Result<(), CloudError>>,
+    },
     Reject {
         letter_id: LetterId,
         out: oneshot::Sender<Result<(), CloudError>>,
@@ -393,9 +397,14 @@ impl CloudHandle {
     }
 
     /// Redial after a rejection with a fresh `EnrollRequest` (P4 E-F7).
-    /// SKELETON: not implemented yet (tests are RED).
     pub async fn retry_enroll(&self) -> Result<(), CloudError> {
-        Err(CloudError::Io("retry_enroll: not implemented".into()))
+        let (out, rx) = oneshot::channel();
+        self.cmd
+            .send(CloudCmd::RetryEnroll { out })
+            .await
+            .map_err(|_| CloudError::Io("the cloud actor stopped".into()))?;
+        rx.await
+            .map_err(|_| CloudError::Io("the cloud actor stopped".into()))?
     }
 
     /// Reject an `EnrollRequest` (§G.4 step 4): sealed `EnrollReject`.

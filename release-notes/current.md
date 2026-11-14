@@ -23,6 +23,10 @@ This file is the working draft for the next release. When a version is tagged, t
 - **PeakBot Mobile: the phone now matches the approved design.** A fidelity pass aligned every phone screen to the approved mock: the chat header, composer and working line; the Chats list ("This device" for this machine, remotes by host only); message rendering — user bubbles, plain agent prose, collapsible tool rows, and code blocks with Copy and diff tints; the panels sheet chrome and the phone faces of the Todo, Tasks, Session, Files, Bash and Agents panels; the Profile/Agent/Model selection sheet; the restyled machine sheets; and a phone-only light palette. Desktop at 1024px and up is pixel-identical to before.
 - **PeakBot Desktop: always the wide layout.** The desktop app keeps the wide layout at any window size, and its minimum window size is now 1024×600.
 
+### Cloud Mode
+
+- Cloud: a rejected enrollment now shows as rejected, with a Try again action that sends a fresh enrollment request.
+
 ### Fixes
 
 - **Web tokens with special characters work.** Tokens containing characters like `+`, `&`, `%`, `;` or spaces were rejected by the desktop app and broke links and cookies; the server now accepts correctly encoded tokens, and the links it prints are encoded.
