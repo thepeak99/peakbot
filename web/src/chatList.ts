@@ -1,5 +1,6 @@
 import type { ConversationSummary, WireMachineStatus } from "./state";
 import type { CatalogProfile, MachineId } from "./types";
+import type { Device } from "./cloud/types";
 
 export type Range = readonly [start: number, end: number];
 
@@ -216,12 +217,18 @@ export function machineOf(
   return catalog.find((p) => p.name === profile)?.machine ?? null;
 }
 
-/** null → "This device"; else the origin's hostname, display-only (ids and
- * filters keep the full origin, so two servers on one host differ only in
- * port and show the same name). The id is server-normalised, so no try/catch. */
-export function machineName(id: MachineId): string {
+/** null → "This device"; a classic remote origin → its hostname (display-only,
+ * ids and filters keep the full origin). A bare cloud `slug` (no `://`) is
+ * looked up in `cloudDevices` and falls back to the slug — it must NEVER hit
+ * `new URL` on a bare name (that throws). Total: never throws. */
+export function machineName(id: MachineId, cloudDevices: readonly Device[] = []): string {
   if (id === null) return LOCAL_MACHINE_NAME;
-  return new URL(id).hostname;
+  if (!id.includes("://")) return cloudDevices.find((d) => d.slug === id)?.name ?? id;
+  try {
+    return new URL(id).hostname;
+  } catch {
+    return id;
+  }
 }
 
 /** One entry per distinct catalog machine: local first (only if any local
@@ -232,6 +239,7 @@ export function machineName(id: MachineId): string {
 export function deriveMachines(
   catalog: readonly CatalogProfile[],
   statuses: readonly WireMachineStatus[],
+  cloudDevices: readonly Device[] = [],
 ): Machine[] {
   const localProfiles: string[] = [];
   const remoteOrder: string[] = [];
@@ -262,7 +270,7 @@ export function deriveMachines(
   for (const id of remoteOrder) {
     out.push({
       id,
-      name: machineName(id),
+      name: machineName(id, cloudDevices),
       online: statusById.get(id) ?? true,
       profiles: remoteProfiles.get(id) as [string, ...string[]],
     });

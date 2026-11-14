@@ -63,6 +63,7 @@ pub fn router(state: CloudApiState) -> Router {
         .route("/api/cloud/genesis", post(genesis))
         .route("/api/cloud/enroll/approve", post(approve))
         .route("/api/cloud/enroll/reject", post(reject))
+        .route("/api/cloud/enroll/retry", post(retry))
         .route("/api/cloud/devices/{id}/revoke", post(revoke))
         .route("/api/cloud/logout", post(logout))
         .route_layer(from_fn_with_state(state.clone(), settings_gate));
@@ -129,6 +130,7 @@ impl From<CloudError> for ApiError {
             CloudError::Flow(f) => match f {
                 FlowError::AlreadyLoggedIn => (StatusCode::CONFLICT, "already_logged_in"),
                 FlowError::NotPendingEmpty => (StatusCode::CONFLICT, "not_pending_empty"),
+                FlowError::NotRejected => (StatusCode::CONFLICT, "not_rejected"),
                 FlowError::GenesisTaken => (StatusCode::CONFLICT, "genesis_taken"),
                 FlowError::UnknownRequest => (StatusCode::NOT_FOUND, "unknown_request"),
                 FlowError::ChainBusy => (StatusCode::CONFLICT, "chain_busy"),
@@ -183,6 +185,7 @@ pub enum CloudStateDto {
     Pending {
         empty_account: bool,
         sas: Option<Vec<String>>,
+        rejected: bool,
     },
     Active {
         devices: Vec<DeviceDto>,
@@ -306,8 +309,13 @@ impl CloudStateDto {
                 attempt: *attempt,
                 last_error: last_error.clone(),
             },
-            CloudState::Pending { empty_account, sas } => Self::Pending {
+            CloudState::Pending {
+                empty_account,
+                sas,
+                rejected,
+            } => Self::Pending {
                 empty_account: *empty_account,
+                rejected: *rejected,
                 sas: sas
                     .as_ref()
                     .map(|s| s.words().iter().map(|w| w.to_string()).collect()),
@@ -429,6 +437,12 @@ async fn approve(State(s): State<CloudApiState>, body: Bytes) -> ApiResult {
 async fn reject(State(s): State<CloudApiState>, body: Bytes) -> ApiResult {
     let h = handle(&s)?;
     h.reject(letter_id_from(&body)?).await?;
+    Ok(Json(json!({})))
+}
+
+async fn retry(State(s): State<CloudApiState>) -> ApiResult {
+    let h = handle(&s)?;
+    h.retry_enroll().await?;
     Ok(Json(json!({})))
 }
 

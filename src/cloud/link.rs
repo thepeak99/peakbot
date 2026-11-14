@@ -92,6 +92,9 @@ pub enum CloudState {
     Pending {
         empty_account: bool,
         sas: Option<SasWords>,
+        /// An active device refused our EnrollRequest; no auto-retry until
+        /// `retry_enroll` or a fresh login (P4 E-F7).
+        rejected: bool,
     },
     Active {
         devices: Vec<DeviceInfo>,
@@ -134,6 +137,8 @@ pub enum CloudError {
 pub enum FlowError {
     AlreadyLoggedIn,
     NotPendingEmpty,
+    /// `retry_enroll` while not rejected (P4 E-F7).
+    NotRejected,
     GenesisTaken,
     UnknownRequest,
     ChainBusy,
@@ -240,6 +245,10 @@ pub enum CloudCmd {
     Approve {
         letter_id: LetterId,
         out: oneshot::Sender<Result<DeviceId, CloudError>>,
+    },
+    /// Redial after a rejection with a fresh `EnrollRequest` (P4 E-F7).
+    RetryEnroll {
+        out: oneshot::Sender<Result<(), CloudError>>,
     },
     Reject {
         letter_id: LetterId,
@@ -381,6 +390,17 @@ impl CloudHandle {
         let (out, rx) = oneshot::channel();
         self.cmd
             .send(CloudCmd::Approve { letter_id, out })
+            .await
+            .map_err(|_| CloudError::Io("the cloud actor stopped".into()))?;
+        rx.await
+            .map_err(|_| CloudError::Io("the cloud actor stopped".into()))?
+    }
+
+    /// Redial after a rejection with a fresh `EnrollRequest` (P4 E-F7).
+    pub async fn retry_enroll(&self) -> Result<(), CloudError> {
+        let (out, rx) = oneshot::channel();
+        self.cmd
+            .send(CloudCmd::RetryEnroll { out })
             .await
             .map_err(|_| CloudError::Io("the cloud actor stopped".into()))?;
         rx.await
