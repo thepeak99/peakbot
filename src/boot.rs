@@ -30,7 +30,30 @@ pub fn session_deps(
     shell_kind: Option<ShellKind>,
     profile_pin: Option<String>,
 ) -> Arc<SessionDeps> {
-    let uploads = UploadStore::new(UploadStore::default_root(), config.general.uploads);
+    session_deps_in(
+        config,
+        skills,
+        mcp_handles,
+        boot_notices,
+        shell_kind,
+        profile_pin,
+        UploadStore::default_root(),
+    )
+}
+
+/// [`session_deps`] with the upload root injected (PR-C e2e seam):
+/// `paths::init_roots` is a process-global OnceLock, so two cores in one
+/// process must not both derive their upload dir from it.
+pub fn session_deps_in(
+    config: Config,
+    skills: SkillRegistry,
+    mcp_handles: Vec<McpServerHandle>,
+    boot_notices: Vec<String>,
+    shell_kind: Option<ShellKind>,
+    profile_pin: Option<String>,
+    uploads_root: PathBuf,
+) -> Arc<SessionDeps> {
+    let uploads = UploadStore::new(uploads_root, config.general.uploads);
     // Boot-only: the turn-end channel is process-wide and built once
     // (notify PR-B §7.6) — `None` iff `general.notifications.enabled`
     // is false, so "disabled but still emitting" cannot exist. Derived
@@ -145,6 +168,64 @@ pub fn web_boot(web: WebBoot, session: WebSession) -> anyhow::Result<WebUi> {
         web.tls_names,
         settings,
     ))
+}
+
+/// The device's name on its card (green phase: the hostname, §B). The
+/// toolchain's `std::env::hostname` is unavailable, so: env vars, then
+/// `/etc/hostname`, then a fixed fallback.
+pub fn device_name() -> String {
+    for var in ["HOSTNAME", "COMPUTERNAME"] {
+        if let Ok(v) = std::env::var(var)
+            && !v.trim().is_empty()
+        {
+            return v.trim().to_string();
+        }
+    }
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "peakbot".to_string())
+}
+
+/// Boot wiring (p3-design §B, PR-C): `general.cloud` present ⇒ spawn the
+/// process-wide CloudLink (and publish it via `cloud::set_boot_handle` so
+/// the remote `Directory` can resolve `profile@device`); absent ⇒ `None`
+/// (the web API answers `cloud_disabled`). `state_dir` and `store` are
+/// injected: `paths::init_roots` is process-global, so per-core state is
+/// never derived from roots in tests. `inbound` = `WebUi::cloud_inbound()`
+/// (host) or `None` (Local edition).
+pub fn boot_cloud(
+    config: &Config,
+    state_dir: PathBuf,
+    device_name: &str,
+    store: Arc<dyn crate::cloud::SeedStore>,
+    inbound: Option<crate::cloud::InboundHook>,
+) -> Option<crate::cloud::CloudHandle> {
+    let Some(def) = &config.general.cloud else {
+        return None;
+    };
+    // The resolve layer already validated this block; a re-parse failure is
+    // a logic bug — stay Disabled rather than boot a broken link.
+    let Ok(Some(mut cloud)) = crate::cloud::config::parse_cloud(Some(def)) else {
+        tracing::error!("general.cloud failed to re-parse; Cloud Mode stays off");
+        return None;
+    };
+    cloud.state_dir = state_dir;
+    cloud.device_name = device_name.to_string();
+    // Card platform byte (spec §4.1): the host edition is a computer, the
+    // Local edition is the phone.
+    #[cfg(feature = "host")]
+    {
+        cloud.platform = 1;
+    }
+    #[cfg(not(feature = "host"))]
+    {
+        cloud.platform = 4;
+    }
+    let handle = crate::cloud::spawn(cloud, store, inbound);
+    crate::cloud::set_boot_handle(handle.clone());
+    Some(handle)
 }
 
 #[cfg(test)]

@@ -94,6 +94,13 @@ mod cloud_serve;
 // /api/cloud/* (p3-design §H): both editions, merged inside the token
 // layer by WebUi::router (B7/B8).
 pub mod cloud_api;
+/// PR-C: the controller's transport types, public for the e2e harness and
+/// the Local embed (the `remote` module itself stays private).
+pub mod remote_types {
+    pub use super::remote::{
+        Client, Directory, GetTarget, RemoteError, RemoteName, Upstream, WsStream, from_cloud,
+    };
+}
 mod images;
 mod notify;
 pub mod registry;
@@ -180,6 +187,10 @@ struct WsState {
     /// The upload store, cloned from `SessionDeps` at boot. Serves the
     /// `/api/uploads` routes merged into the main router.
     uploads: crate::attachments::UploadStore,
+    /// Per-core `profile@device` + remote-profile resolution (PR-C, §F.5):
+    /// one per `WebUi`, so two cores in one process (the e2e) each resolve
+    /// against their own cloud handle.
+    directory: std::sync::Arc<remote::Directory>,
 }
 
 /// A Cloud Mode paired device's identity. PR-A placeholder for the
@@ -279,6 +290,7 @@ impl WebUi {
                 active_alias: active_alias.into(),
                 session_ttl: Duration::from_secs(web.session_ttl_secs),
                 uploads,
+                directory: std::sync::Arc::new(remote::Directory::new()),
             },
             token: token.map(Into::into),
             tls,
@@ -289,10 +301,33 @@ impl WebUi {
         }
     }
 
-    /// Attach the process-wide Cloud Mode handle (boot wiring, B8).
+    /// Attach the Cloud Mode handle (boot wiring, B8). The core's
+    /// `Directory` is rebuilt over it so `profile@device` resolves.
     pub fn with_cloud(mut self, cloud: Option<crate::cloud::CloudHandle>) -> Self {
+        self.ws_state.directory =
+            std::sync::Arc::new(remote::Directory::new().with_cloud(cloud.clone()));
         self.cloud = cloud;
         self
+    }
+
+    /// Per-core remote `Directory` (PR-C test/embed seam): the remote
+    /// attach, list, kill and `/r/` proxy routes resolve through it, so
+    /// two cores in ONE process keep separate cloud handles (the default
+    /// is the process-global `DIRECTORY`).
+    pub fn with_directory(mut self, directory: std::sync::Arc<remote::Directory>) -> Self {
+        self.ws_state.directory = directory;
+        self
+    }
+
+    /// The CloudServe inbound hook (p3-design §E): boot wiring passes it to
+    /// `cloud::spawn`. Host only — the Local edition has no CloudServe
+    /// (a phone answers every inbound with `Close{PROTOCOL}`, B8).
+    #[cfg(feature = "host")]
+    pub fn cloud_inbound(&self) -> Option<crate::cloud::InboundHook> {
+        let state = self.ws_state.clone();
+        Some(std::sync::Arc::new(move |peer, op, stream| {
+            cloud_serve::CloudServe::accept(state.clone(), peer, op, stream)
+        }))
     }
 
     /// H.3: the cloud mutations are gated by the same predicate as the
@@ -465,7 +500,7 @@ impl WebUi {
         // The `/r/` proxy (remote-profiles §6.2): the three allowlisted
         // routes plus a catch-all 404 for everything else under `/r/`.
         // Before the token layer, so token-gated like `/api/uploads`.
-        app = app.merge(remote::proxy::router());
+        app = app.merge(remote::proxy::router(self.ws_state.directory.clone()));
 
         // Gate every route behind the shared secret when one is configured.
         // Open by default (loopback); `main` guarantees a token exists before
@@ -937,6 +972,42 @@ async fn serve_socket<Si, St, E>(
         .clone()
         .expect("ws_handler is mounted only with deps; the needs_setup guard replaces it");
 
+    // §F.5: a `profile@device` name resolves against the verified chain
+    // (this core's Directory) — never the config's remote profiles, and
+    // never a local session.
+    if let Some(p) = profile.as_deref() {
+        let name = remote::RemoteName::parse(p);
+        if let remote::RemoteName::Cloud {
+            profile: target, ..
+        } = &name
+        {
+            match state.directory.resolve(&name).await {
+                Ok(client) => {
+                    let view = remote::relay::LocalView {
+                        name: p.to_string(),
+                        target_profile: target.clone(),
+                        target_agent: None,
+                        catalog: Vec::new(),
+                    };
+                    remote::relay::run(
+                        ws_stream,
+                        out_tx,
+                        writer_task,
+                        registry,
+                        std::sync::Arc::new(client),
+                        state.directory.clone(),
+                        view,
+                        convo,
+                        agent,
+                    )
+                    .await;
+                }
+                Err(e) => refuse(out_tx, writer_task, e.to_string()).await,
+            }
+            return;
+        }
+    }
+
     // §5.11 (freshness): the remote decision — is L a remote profile *right
     // now*, its target P and agent pin, and the relay's catalogue — comes
     // from ONE fresh global-config parse, never the boot catalogue: a
@@ -996,13 +1067,33 @@ async fn serve_socket<Si, St, E>(
             refuse(out_tx, writer_task, pinned_message(pin)).await;
             return;
         }
+        // Resolve through this core's Directory (PR-C): the per-core
+        // override for the e2e, the process-global one in production.
+        let client = match state.directory.client(&remote.name).await {
+            Ok(c) => c,
+            Err(e) => {
+                refuse(out_tx, writer_task, e.to_string()).await;
+                return;
+            }
+        };
         let view = remote::relay::LocalView {
             name: remote.name.clone(),
             target_profile: remote.target.profile.clone(),
             target_agent: remote.target.agent.clone(),
             catalog: fresh_catalog,
         };
-        remote::relay::run(ws_stream, out_tx, writer_task, registry, view, convo, agent).await;
+        remote::relay::run(
+            ws_stream,
+            out_tx,
+            writer_task,
+            registry,
+            client,
+            state.directory.clone(),
+            view,
+            convo,
+            agent,
+        )
+        .await;
         return;
     }
 
@@ -1061,6 +1152,7 @@ async fn serve_socket<Si, St, E>(
     let action_sender = registered.session.action_sender.clone();
     let sm_for_reader = registered.session.state_manager.clone();
     let registry_for_reader = registry.clone();
+    let directory_for_reader = state.directory.clone();
     let reader_tx = out_tx.clone();
 
     // Process a non-attach handshake frame before the reader loop starts.
@@ -1071,6 +1163,7 @@ async fn serve_socket<Si, St, E>(
             &reader_tx,
             &sm_for_reader,
             &registry_for_reader,
+            &directory_for_reader,
         );
     }
 
@@ -1093,6 +1186,7 @@ async fn serve_socket<Si, St, E>(
                 &reader_tx,
                 &sm_for_reader,
                 &registry_for_reader,
+                &directory_for_reader,
             ) {
                 break;
             }
@@ -1244,6 +1338,7 @@ fn dispatch_inbound(
     out_tx: &OutboundTx,
     state_manager: &StateManager,
     registry: &SessionRegistry,
+    directory: &std::sync::Arc<remote::Directory>,
 ) -> bool {
     match serde_json::from_str::<InboundMessage>(line) {
         Ok(InboundMessage::SendMessage { text, attachments }) => action_sender
@@ -1292,8 +1387,9 @@ fn dispatch_inbound(
         Ok(InboundMessage::RequestConversations) => {
             let registry = registry.clone();
             let out_tx = out_tx.clone();
+            let directory = directory.clone();
             tokio::spawn(async move {
-                let listing = remote::listing::merged_listing(&registry).await;
+                let listing = remote::listing::merged_listing(&directory, &registry).await;
                 let _ = out_tx.send(listing.into_frame(None));
             });
             true
@@ -1307,9 +1403,11 @@ fn dispatch_inbound(
         Ok(InboundMessage::KillSession { convo, profile }) => {
             let registry = registry.clone();
             let out_tx = out_tx.clone();
+            let directory = directory.clone();
             tokio::spawn(async move {
                 if let Some((listing, error)) =
-                    remote::listing::answer_kill(&registry, &convo, profile.as_deref()).await
+                    remote::listing::answer_kill(&directory, &registry, &convo, profile.as_deref())
+                        .await
                 {
                     let _ = out_tx.send(listing.into_frame(error));
                 }
@@ -1423,7 +1521,14 @@ mod tests {
     #[test]
     fn inbound_pause_maps_to_pause_sub_agent_action() {
         let (tx, mut rx, out_tx, sm, registry) = dispatch_fixture();
-        let kept = dispatch_inbound(r#"{"type":"pause"}"#, &tx, &out_tx, &sm, &registry);
+        let kept = dispatch_inbound(
+            r#"{"type":"pause"}"#,
+            &tx,
+            &out_tx,
+            &sm,
+            &registry,
+            &std::sync::Arc::new(remote::Directory::new()),
+        );
         assert!(kept, "pause frame must keep the socket loop alive");
         assert!(
             matches!(rx.try_recv().unwrap(), UiAction::PauseSubAgent),
@@ -1434,7 +1539,14 @@ mod tests {
     #[test]
     fn inbound_resume_maps_to_resume_sub_agent_action() {
         let (tx, mut rx, out_tx, sm, registry) = dispatch_fixture();
-        let kept = dispatch_inbound(r#"{"type":"resume"}"#, &tx, &out_tx, &sm, &registry);
+        let kept = dispatch_inbound(
+            r#"{"type":"resume"}"#,
+            &tx,
+            &out_tx,
+            &sm,
+            &registry,
+            &std::sync::Arc::new(remote::Directory::new()),
+        );
         assert!(kept, "resume frame must keep the socket loop alive");
         assert!(
             matches!(rx.try_recv().unwrap(), UiAction::ResumeSubAgent),
@@ -1477,7 +1589,14 @@ mod tests {
         // landed between SendMessage and SwitchModel; Stop must not have
         // drifted.
         let (tx, mut rx, out_tx, sm, registry) = dispatch_fixture();
-        let kept = dispatch_inbound(r#"{"type":"stop"}"#, &tx, &out_tx, &sm, &registry);
+        let kept = dispatch_inbound(
+            r#"{"type":"stop"}"#,
+            &tx,
+            &out_tx,
+            &sm,
+            &registry,
+            &std::sync::Arc::new(remote::Directory::new()),
+        );
         assert!(kept);
         assert!(matches!(rx.try_recv().unwrap(), UiAction::RequestStop));
     }
@@ -1497,6 +1616,7 @@ mod tests {
             &out_tx,
             &sm,
             &registry,
+            &std::sync::Arc::new(remote::Directory::new()),
         );
         assert!(kept, "select frame must keep the socket loop alive");
         let action = rx.try_recv().expect("an action must be emitted");
@@ -1525,6 +1645,7 @@ mod tests {
             &out_tx,
             &sm,
             &registry,
+            &std::sync::Arc::new(remote::Directory::new()),
         );
         assert!(kept, "select frame must keep the socket loop alive");
         match rx.try_recv().expect("an action must be emitted") {
@@ -1602,6 +1723,7 @@ mod tests {
             &out_tx,
             &sm,
             &registry,
+            &std::sync::Arc::new(remote::Directory::new()),
         );
         assert!(kept, "kill_session must keep the socket loop alive");
 
@@ -1650,6 +1772,7 @@ mod tests {
             &out_tx,
             &sm,
             &registry,
+            &std::sync::Arc::new(remote::Directory::new()),
         );
         assert!(kept, "kill_session must keep the socket loop alive");
 

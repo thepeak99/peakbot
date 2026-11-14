@@ -51,6 +51,19 @@ name = "integration"
 path = "tests/integration.rs"
 required-features = ["host"]
 
+# P3 PR-C: CloudServe is host-only (§E), so are its inbound-hook tests and
+# the host e2e. `cloud_controller_tests`/`cloud_boot_tests` run on both
+# editions (no required-features); `cloud_local` gates itself with cfg.
+[[test]]
+name = "cloud_serve_tests"
+path = "tests/cloud_serve_tests.rs"
+required-features = ["host"]
+
+[[test]]
+name = "cloud_e2e"
+path = "tests/cloud_e2e.rs"
+required-features = ["host"]
+
 [[test]]
 name = "repl_tests"
 path = "tests/repl_tests.rs"
@@ -304,6 +317,25 @@ x509-parser = "0.18"
 # Remote-profiles T4 E2E: `connect_async` (default `connect` feature) drives
 # `/ws` in `src/ui/web/t4_tests.rs`; the lib dep above is handshake-only.
 tokio-tungstenite = "0.29"
+# P3 PR-C e2e: the REAL relay in-process (`peakbot_relay::serve`) plus the
+# relay harness's `FakeIdp`/`TestRelay`, included by `#[path]` from
+# `tests/cloud_common/relay_harness.rs` (self-contained single file — no
+# feature flag, no copy). Dev-only edge: the prod dep never appears.
+peakbot-relay = { path = "crates/relay" }
+# The `#[path]`-included relay harness (crates/relay/tests/common/mod.rs)
+# mints IdP keys: ES256 (p256/ecdsa/signature) and RS256 (rsa) — the same
+# crates the relay's own dev-deps use, already in the lockfile.
+ecdsa = "0.16"
+signature = "2"
+p256 = { version = "0.13", features = ["ecdsa"] }
+rsa = "0.9"
+futures-util = "0.3"
+# `rsa::pkcs1v15::SigningKey::<Sha256>` needs the digest OID (relay dev-deps do the same).
+sha2 = { version = "0.10", features = ["oid"] }
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
+# `axum::extract::Form` (the harness's FakeIdp `/token` endpoint); unifies
+# with the lib's axum features.
+axum = { version = "0.8", default-features = false, features = ["form"] }
 
 # No debuginfo for test builds: cold codegen of the large lib test binary
 # OOMs at debuginfo=2 (host and CI). Mirrors CI's CARGO_PROFILE_TEST_DEBUG=0.

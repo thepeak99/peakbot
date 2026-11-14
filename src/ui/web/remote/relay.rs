@@ -14,7 +14,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message as TMsg;
 
-use super::{DIRECTORY, WsStream};
+use super::{Client, Directory, WsStream};
 use crate::config::resolve::ProfileInfo;
 use crate::ui::app_state::AppState;
 use crate::ui::outbound::{Disconnected, OutboundTx};
@@ -165,23 +165,24 @@ enum End {
 
 /// Run one relayed browser socket to completion (§5.2). `convo`/`agent` are
 /// the browser's attach fields. `registry` only answers the local list.
+/// `client` is the resolved transport (direct or cloud, §F.1); `directory`
+/// answers the list/kill verbs with this core's cloud handle.
+#[allow(clippy::too_many_arguments)] // each arg is a distinct leg of the pump
 pub async fn run<L, E>(
     mut local: L,
     out_tx: OutboundTx,
     mut writer_task: JoinHandle<()>,
     registry: SessionRegistry,
+    client: Arc<Client>,
+    directory: Arc<Directory>,
     view: LocalView,
     convo: Option<String>,
     agent: Option<String>,
 ) where
     L: futures::Stream<Item = Result<Message, E>> + Unpin,
 {
-    let dialed = match DIRECTORY.client(&view.name).await {
-        Ok(client) => client.dial().await.map(|ws| (client, ws)),
-        Err(e) => Err(e),
-    };
-    let (client, ws) = match dialed {
-        Ok(pair) => pair,
+    let ws = match client.dial().await {
+        Ok(ws) => ws,
         Err(e) => return refuse(out_tx, writer_task, e.to_string()).await,
     };
     let (mut remote_tx, mut remote_rx) = ws.split();
@@ -222,7 +223,10 @@ pub async fn run<L, E>(
         tokio::select! {
             frame = local.next() => match frame {
                 Some(Ok(Message::Text(t))) => {
-                    if let Some(end) = inbound(t.as_str(), &view, &out_tx, &mut remote_tx, &registry).await {
+                    if let Some(end) =
+                        inbound(t.as_str(), &view, &out_tx, &mut remote_tx, &registry, &directory)
+                            .await
+                    {
                         break end;
                     }
                 }
@@ -309,6 +313,7 @@ async fn inbound(
     out_tx: &OutboundTx,
     remote: &mut SplitSink<WsStream, TMsg>,
     registry: &SessionRegistry,
+    directory: &Arc<Directory>,
 ) -> Option<End> {
     if text.trim().is_empty() {
         return None;
@@ -337,8 +342,9 @@ async fn inbound(
         InboundDisposition::InterceptLocal(LocalVerb::RequestConversations) => {
             let registry = registry.clone();
             let out_tx = out_tx.clone();
+            let directory = directory.clone();
             tokio::spawn(async move {
-                let listing = super::listing::merged_listing(&registry).await;
+                let listing = super::listing::merged_listing(&directory, &registry).await;
                 let _ = out_tx.send(listing.into_frame(None));
             });
             return None;
@@ -348,9 +354,11 @@ async fn inbound(
         InboundDisposition::InterceptLocal(LocalVerb::KillSession { convo, profile }) => {
             let registry = registry.clone();
             let out_tx = out_tx.clone();
+            let directory = directory.clone();
             tokio::spawn(async move {
                 if let Some((listing, error)) =
-                    super::listing::answer_kill(&registry, &convo, profile.as_deref()).await
+                    super::listing::answer_kill(&directory, &registry, &convo, profile.as_deref())
+                        .await
                 {
                     let _ = out_tx.send(listing.into_frame(error));
                 }

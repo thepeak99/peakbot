@@ -16,7 +16,6 @@ pub mod session;
 pub mod store;
 pub mod stream;
 
-#[cfg(feature = "host")]
 pub mod keyring;
 
 pub use config::{CloudConfig, CloudDef};
@@ -25,3 +24,19 @@ pub use link::{
     InboundHook, LogoutOutcome, LogoutReason, TrustError, spawn,
 };
 pub use store::{Seed, SeedStore, SessionToken};
+
+// ── PR-C boot wiring: the process-wide handle the remote `Directory`
+// reads to resolve `profile@device` names (§F.5). Set once at boot
+// (like `paths::init_roots`): later calls are ignored, never mid-run.
+
+static BOOT_HANDLE: std::sync::OnceLock<CloudHandle> = std::sync::OnceLock::new();
+
+/// Boot wiring: publish the spawned handle (second call ignored).
+pub fn set_boot_handle(h: CloudHandle) {
+    let _ = BOOT_HANDLE.set(h);
+}
+
+/// The boot-published handle, if `general.cloud` was configured.
+pub fn boot_handle() -> Option<CloudHandle> {
+    BOOT_HANDLE.get().cloned()
+}

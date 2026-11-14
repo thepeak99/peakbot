@@ -5,8 +5,8 @@ mod common;
 
 use cloud::Error;
 use cloud::frames::{
-    self, FrameReceiver, FrameSender, Inner, Mux, MuxEvent, Op, RecvOutcome, Role, StreamMsg,
-    ctr_allowed, decode_inner, encode_inner,
+    self, FrameReceiver, FrameSender, GetTarget, Inner, Mux, MuxEvent, Op, RecvOutcome, Role,
+    StreamMsg, ctr_allowed, decode_inner, encode_inner,
 };
 use cloud::handshake::Data;
 
@@ -419,6 +419,79 @@ fn mux_end_both_sides_closes_stream() {
     // The peer's End arrives: both directions ended → Closed.
     let events = i.feed(&end).expect("peer end");
     assert!(events.contains(&MuxEvent::Closed(1)));
+}
+
+#[test]
+fn request_end_then_response_head_chunks_end_ok() {
+    // S4 half-close: I sends Open, Chunk*, End; R then sends Head, Chunk*,
+    // End. R's Head arrives AFTER I's End and must be accepted; the stream
+    // closes only when the second End arrives.
+    let mut i = Mux::new(Role::Initiator);
+    let open = Inner {
+        stream: 1,
+        msg: StreamMsg::Open(Op::Get(GetTarget::Image { id: "x".into() })),
+    };
+    assert!(i.feed(&open).is_ok());
+    let chunk = Inner {
+        stream: 1,
+        msg: StreamMsg::Chunk(vec![1]),
+    };
+    assert!(i.feed(&chunk).is_ok());
+    let end = Inner {
+        stream: 1,
+        msg: StreamMsg::End,
+    };
+    let events = i.feed(&end).expect("I's End: half-close only");
+    assert!(
+        !events.contains(&MuxEvent::Closed(1)),
+        "one End must not close the stream"
+    );
+    let head = Inner {
+        stream: 1,
+        msg: StreamMsg::Head {
+            status: 200,
+            content_type: "application/octet-stream".into(),
+            length: Some(1),
+        },
+    };
+    assert!(
+        i.feed(&head).is_ok(),
+        "R's Head after I's End must be accepted (half-close)"
+    );
+    assert!(i.feed(&chunk).is_ok(), "R's response chunk");
+    let events = i.feed(&end).expect("R's End");
+    assert!(
+        events.contains(&MuxEvent::Closed(1)),
+        "both directions ended → Closed"
+    );
+}
+
+#[test]
+fn chunk_after_own_end_aborts() {
+    // S4: I's sequence is Open, Chunk*, End. With no Head received, a
+    // Chunk after the single End can only be I's (R chunks follow Head) →
+    // out of sequence → Protocol abort.
+    let mut i = Mux::new(Role::Initiator);
+    let open = Inner {
+        stream: 1,
+        msg: StreamMsg::Open(Op::List),
+    };
+    assert!(i.feed(&open).is_ok());
+    let chunk = Inner {
+        stream: 1,
+        msg: StreamMsg::Chunk(vec![1]),
+    };
+    assert!(i.feed(&chunk).is_ok());
+    let end = Inner {
+        stream: 1,
+        msg: StreamMsg::End,
+    };
+    assert!(i.feed(&end).is_ok());
+    assert_eq!(
+        i.feed(&chunk),
+        Err(Error::Protocol),
+        "a frame after this side's own End is still an error"
+    );
 }
 
 #[test]

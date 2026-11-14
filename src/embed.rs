@@ -36,7 +36,13 @@ impl LocalCore {
         })?;
         let boot_cwd = std::env::current_dir().unwrap_or_default();
         let session = load_session(&config_dir, &boot_cwd)?;
-        let ui = web_boot(
+        // PR-C §B: the phone is controller-only — CloudLink yes (with its
+        // own identity), CloudServe never (`inbound = None`, B8).
+        let cloud_config = match &session {
+            WebSession::Ready(deps) => Some(deps.config.clone()),
+            WebSession::NeedsSetup { .. } => None,
+        };
+        let mut ui = web_boot(
             WebBoot {
                 // The port is the embedder's, chosen per serve; this is only
                 // the loopback fact the settings surface reports.
@@ -51,6 +57,17 @@ impl LocalCore {
             },
             session,
         )?;
+        if let Some(config) = cloud_config
+            && let Some(handle) = crate::boot::boot_cloud(
+                &config,
+                cloud_state_dir()?,
+                &crate::boot::device_name(),
+                cloud_store(&config)?,
+                None,
+            )
+        {
+            ui = ui.with_cloud(Some(handle));
+        }
         Ok(LocalCore {
             router: ui.router(),
             reaper: ui.spawn_reaper(),
@@ -78,6 +95,26 @@ impl Drop for LocalCore {
             reaper.abort();
         }
     }
+}
+
+/// `<data dir>/cloud` — the public chain/pin state (p3-design §C).
+fn cloud_state_dir() -> anyhow::Result<std::path::PathBuf> {
+    let dir = crate::paths::app_data_dir()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no data dir"))?;
+    Ok(dir.join("cloud"))
+}
+
+/// The phone's store: the 0600 file (no OS keyring in the Local edition).
+fn cloud_store(config: &Config) -> anyhow::Result<std::sync::Arc<dyn crate::cloud::SeedStore>> {
+    if config.general.cloud.is_some() {
+        return Ok(std::sync::Arc::new(
+            crate::cloud::keyring::FileSeedStore::new(cloud_state_dir()?),
+        ));
+    }
+    // boot_cloud returns None before the store is touched; never used.
+    Ok(std::sync::Arc::new(
+        crate::cloud::keyring::FileSeedStore::new(std::env::temp_dir()),
+    ))
 }
 
 /// Migrate, then load the global config. Any failure but IO means "set up

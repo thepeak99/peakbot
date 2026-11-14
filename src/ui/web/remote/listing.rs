@@ -11,9 +11,12 @@
 //! reply never takes longer than 2 s.
 
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
-use super::DIRECTORY;
+use super::{Client, Directory, RemoteName};
 use crate::ui::web::KILL_RUNNING_MSG;
 use crate::ui::web::conversations::local_rows;
 use crate::ui::web::registry::{KillOutcome, SessionRegistry};
@@ -44,17 +47,24 @@ impl Listing {
     }
 }
 
+/// One summary fetch: (display name, rows, offline) in a join_all.
+pub(crate) type FetchFuture =
+    Pin<Box<dyn Future<Output = (String, Vec<ConversationSummaryWire>, bool)> + Send>>;
+
 /// Local rows + every reachable remote's rows, merged by `updated_at`
 /// desc, plus one status per distinct origin in BTreeMap order (the SPA
 /// re-orders by catalog). `online` is true iff the list answered within
 /// LIST_TIMEOUT — a dial error, a 401, any list failure or the timeout
 /// all mean offline.
-pub(crate) async fn merged_listing(registry: &SessionRegistry) -> Listing {
+pub(crate) async fn merged_listing(
+    directory: &Arc<Directory>,
+    registry: &SessionRegistry,
+) -> Listing {
     let mut items = local_rows(registry);
 
     // §5.11: a fresh global-config parse on every request; a broken file
     // means no remote rows and no known machines.
-    let Ok(refs) = DIRECTORY.remotes() else {
+    let Ok(refs) = directory.remotes() else {
         return Listing {
             items,
             machines: Vec::new(),
@@ -71,7 +81,10 @@ pub(crate) async fn merged_listing(registry: &SessionRegistry) -> Listing {
             .insert(r.target.clone(), r.name.clone());
     }
 
-    let fetches = servers.into_iter().map(|(origin, targets)| {
+    // One fetch per target (a distinct remote server, or a cloud device),
+    // all in a single `join_all` (F.6: no new cap).
+    let mut fetches: Vec<FetchFuture> = Vec::new();
+    for (origin, targets) in servers {
         // Any profile's client reaches that server (the token is the
         // server's), so one of its names picks the client.
         let client_name = targets
@@ -79,38 +92,87 @@ pub(crate) async fn merged_listing(registry: &SessionRegistry) -> Listing {
             .next()
             .cloned()
             .expect("a server has ≥1 profile");
-        async move {
-            // The bound covers the client build too (a first-use CA
-            // bootstrap must not push the reply past LIST_TIMEOUT); a
-            // failure at any step is a `None`, which reports offline.
-            let fetched: Option<Vec<ConversationSummaryWire>> =
-                tokio::time::timeout(LIST_TIMEOUT, async {
-                    let Ok(client) = DIRECTORY.client(&client_name).await else {
-                        return None;
-                    };
-                    client.list().await.ok()
-                })
-                .await
-                .ok()
-                .flatten();
-            let online = fetched.is_some();
-            let rows = fetched
-                .into_iter()
-                .flatten()
-                .filter_map(|mut row| {
-                    targets.get(row.profile.as_deref()?).map(|local_name| {
-                        row.profile = Some(local_name.clone());
-                        row
+        fetches.push(Box::pin({
+            let directory = directory.clone();
+            async move {
+                // The bound covers the client build too (a first-use CA
+                // bootstrap must not push the reply past LIST_TIMEOUT); a
+                // failure at any step is a `None`, which reports offline.
+                let fetched: Option<Vec<ConversationSummaryWire>> =
+                    tokio::time::timeout(LIST_TIMEOUT, async {
+                        let Ok(client) = directory.client(&client_name).await else {
+                            return None;
+                        };
+                        client.list().await.ok()
                     })
-                })
-                .collect::<Vec<_>>();
-            (origin, rows, online)
+                    .await
+                    .ok()
+                    .flatten();
+                let online = fetched.is_some();
+                let rows = fetched
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|mut row| {
+                        targets.get(row.profile.as_deref()?).map(|local_name| {
+                            row.profile = Some(local_name.clone());
+                            row
+                        })
+                    })
+                    .collect();
+                (origin, rows, online)
+            }
+        }));
+    }
+
+    // F.6: cloud devices are more fan-out targets — one `list()` per
+    // Active device (self excluded), the same bound, rows re-tagged
+    // `profile@slug`; a dead device contributes no rows and an offline
+    // status, in the same shape remotes use for "down".
+    if let Some(handle) = directory.cloud() {
+        let state = handle.state().borrow().clone();
+        if let crate::cloud::CloudState::Active { devices, .. } = state {
+            let self_id = handle.device_id();
+            for (device, slug) in devices
+                .iter()
+                .zip(crate::cloud::link::device_slugs(&devices))
+            {
+                if Some(device.id) == self_id {
+                    continue; // self is never listed (F.5)
+                }
+                let handle = handle.clone();
+                let device = device.id;
+                fetches.push(Box::pin(async move {
+                    // `list()` ignores the profile field; the rows carry
+                    // their own local profiles, which get re-tagged.
+                    let client = Client::Cloud {
+                        handle,
+                        device,
+                        profile: String::new(),
+                    };
+                    let fetched = tokio::time::timeout(LIST_TIMEOUT, client.list())
+                        .await
+                        .ok()
+                        .and_then(Result::ok);
+                    let online = fetched.is_some();
+                    let rows = fetched
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|mut row| {
+                            row.profile.take().map(|p| {
+                                row.profile = Some(format!("{p}@{slug}"));
+                                row
+                            })
+                        })
+                        .collect();
+                    (slug, rows, online)
+                }));
+            }
         }
-    });
+    }
 
     let mut machines = Vec::new();
-    for (origin, rows, online) in futures::future::join_all(fetches).await {
-        machines.push(MachineStatusWire { id: origin, online });
+    for (id, rows, online) in futures::future::join_all(fetches).await {
+        machines.push(MachineStatusWire { id, online });
         items.extend(rows);
     }
     items.sort_by_key(|row| std::cmp::Reverse(parse_updated_at(&row.updated_at)));
@@ -124,6 +186,7 @@ pub(crate) async fn merged_listing(registry: &SessionRegistry) -> Listing {
 /// an unknown name) is today's local kill. `None` = a bad UUID: no frame,
 /// exactly like today's local kill.
 pub(crate) async fn answer_kill(
+    directory: &Arc<Directory>,
     registry: &SessionRegistry,
     convo: &str,
     profile: Option<&str>,
@@ -132,29 +195,44 @@ pub(crate) async fn answer_kill(
         return None;
     };
 
-    let Some(remote_name) = profile.and_then(|p| {
-        DIRECTORY
-            .remotes()
-            .ok()
-            .into_iter()
-            .flatten()
-            .find(|r| r.name == p)
-            .map(|r| r.name)
-    }) else {
-        // The local path, unchanged: KILL_RUNNING_MSG on a refused kill.
-        let refused = registry.kill(id) == KillOutcome::Running;
-        let listing = merged_listing(registry).await;
-        return Some((listing, refused.then(|| KILL_RUNNING_MSG.to_string())));
-    };
-
-    let error = match DIRECTORY.client(&remote_name).await {
-        Ok(client) => match client.kill(&id).await {
-            Ok(refusal) => refusal,
+    // §F.5: a `profile@device` kill goes through the cloud tunnel.
+    let cloud_name = profile.and_then(|p| match RemoteName::parse(p) {
+        RemoteName::Cloud { .. } => Some(RemoteName::parse(p)),
+        RemoteName::Profile(_) => None,
+    });
+    let (error, listing) = if let Some(name) = cloud_name {
+        let error = match directory.resolve(&name).await {
+            Ok(client) => match client.kill(&id).await {
+                Ok(refusal) => refusal,
+                Err(e) => Some(e.to_string()),
+            },
             Err(e) => Some(e.to_string()),
-        },
-        Err(e) => Some(e.to_string()),
+        };
+        (error, merged_listing(directory, registry).await)
+    } else {
+        let Some(remote_name) = profile.and_then(|p| {
+            directory
+                .remotes()
+                .ok()
+                .into_iter()
+                .flatten()
+                .find(|r| r.name == p)
+                .map(|r| r.name)
+        }) else {
+            // The local path, unchanged: KILL_RUNNING_MSG on a refused kill.
+            let refused = registry.kill(id) == KillOutcome::Running;
+            let listing = merged_listing(directory, registry).await;
+            return Some((listing, refused.then(|| KILL_RUNNING_MSG.to_string())));
+        };
+        let error = match directory.client(&remote_name).await {
+            Ok(client) => match client.kill(&id).await {
+                Ok(refusal) => refusal,
+                Err(e) => Some(e.to_string()),
+            },
+            Err(e) => Some(e.to_string()),
+        };
+        (error, merged_listing(directory, registry).await)
     };
-    let listing = merged_listing(registry).await;
     Some((listing, error))
 }
 

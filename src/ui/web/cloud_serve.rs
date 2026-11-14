@@ -7,18 +7,223 @@
 //! credential). The file is folded into `src/cloud/serve.rs` when the crate
 //! lands (PR-B/C).
 
-#![allow(dead_code)] // the CloudServe caller lands in PR-C
+use std::convert::Infallible;
+use std::pin::Pin;
 
 use axum::Router;
 use axum::body::Body;
+use axum::extract::ws::Message;
 use axum::http::{Method, Request, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use bytes::Bytes;
+use cloud::constants::{MAX_CHUNK, reset};
+use cloud::frames::{GetTarget, Op, StreamMsg};
+use futures::{Sink, SinkExt, Stream, StreamExt};
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use super::{WsState, conversations, images, uploads};
+use super::{DeviceId, Principal, WsState, conversations, images, serve_socket, uploads};
+use crate::cloud::stream::CloudStream;
+
+/// Cloud Mode inbound ops (p3-design §E.1/§E.2): the `InboundHook` target.
+/// Holds no state of its own — it only translates a peer's `Op` onto the
+/// same code paths a browser/token client hits (one task per stream).
+pub(crate) struct CloudServe;
+
+impl CloudServe {
+    /// One task per peer stream (§E.2 table): `Attach` → `serve_socket`
+    /// with `Principal::CloudPeer` (relayed forced, Shutdown dropped);
+    /// `Profiles` → the LOCAL profile list only (§E.3); `List`/`Kill`/
+    /// `Get`/`Upload` → `serve_op`. Upload bytes are counted and the
+    /// stream `Reset(TOO_LARGE)`s past `general.uploads.max_file_mb`
+    /// (§E.4), before the router.
+    pub(crate) fn accept(state: WsState, peer: cloud::DeviceId, op: Op, stream: CloudStream) {
+        // One task per stream (§E.2); a panic here cannot take the actor down.
+        tokio::spawn(serve_stream(state, peer, op, stream));
+    }
+}
+
+async fn serve_stream(state: WsState, peer: cloud::DeviceId, op: Op, mut stream: CloudStream) {
+    match op {
+        Op::Attach => attach(state, peer, stream).await,
+        Op::Profiles => {
+            let body = profiles_body(&state);
+            send_reply(&mut stream, 200, "application/json", Bytes::from(body)).await;
+        }
+        Op::Upload {
+            convo,
+            name,
+            content_type,
+        } => {
+            let Some(body) = read_upload(&state, &mut stream).await else {
+                return;
+            };
+            let op = PeerOp::Upload {
+                convo: Uuid::from_bytes(convo),
+                name,
+                content_type,
+                body,
+            };
+            reply_with(&state, op, &mut stream).await;
+        }
+        Op::List => reply_with(&state, PeerOp::List, &mut stream).await,
+        Op::Kill { id } => {
+            let id = Uuid::from_bytes(id);
+            reply_with(&state, PeerOp::Kill { id }, &mut stream).await;
+        }
+        Op::Get(GetTarget::Image { id }) => {
+            reply_with(&state, PeerOp::GetImage { id }, &mut stream).await;
+        }
+        Op::Get(GetTarget::Upload { convo, id }) => {
+            // A malformed id is the router's plain 404 too (no oracle).
+            let op = match Uuid::parse_str(&id) {
+                Ok(id) => PeerOp::GetUpload {
+                    convo: Uuid::from_bytes(convo),
+                    id,
+                },
+                Err(_) => PeerOp::GetImage { id: String::new() },
+            };
+            reply_with(&state, op, &mut stream).await;
+        }
+    }
+}
+
+/// `Attach`: the same `serve_socket` a browser hits, with the server-side
+/// `CloudPeer` rules (§E.1). `Frame` ↔ `Text`; ping/pong aren't mapped
+/// (the session layer keeps liveness); `End`/`Reset` end the stream.
+async fn attach(state: WsState, peer: cloud::DeviceId, stream: CloudStream) {
+    // needs_setup has no registry, and `serve_socket` needs one.
+    if state.registry.is_none() {
+        let mut stream = stream;
+        let _ = stream.send(StreamMsg::Reset(reset::UNSUPPORTED)).await;
+        return;
+    }
+    let (tx, rx) = stream.split();
+    let sink: Pin<Box<dyn Sink<Message, Error = crate::cloud::CloudError> + Send>> =
+        Box::pin(tx.with_flat_map(|m: Message| {
+            futures::stream::iter(match m {
+                Message::Text(t) => Some(Ok(StreamMsg::Frame(t.to_string()))),
+                _ => None,
+            })
+        }));
+    let incoming: Pin<Box<dyn Stream<Item = Result<Message, Infallible>> + Send>> = Box::pin(
+        rx.take_while(|m| futures::future::ready(matches!(m, StreamMsg::Frame(_))))
+            .filter_map(|m| async move {
+                match m {
+                    StreamMsg::Frame(s) => Some(Ok(Message::Text(s.into()))),
+                    _ => None,
+                }
+            }),
+    );
+    serve_socket(
+        sink,
+        incoming,
+        state,
+        Principal::CloudPeer(DeviceId::from_bytes(peer)),
+    )
+    .await;
+}
+
+/// §E.3: the LOCAL profiles only (`machine` is `None`), as `{name, color}`;
+/// a `--profile` pin narrows it to the pinned one. Never remote rows.
+fn profiles_body(state: &WsState) -> Vec<u8> {
+    let rows: Vec<serde_json::Value> = state
+        .registry
+        .iter()
+        .flat_map(|r| {
+            let pin = r.profile_pin().map(str::to_string);
+            r.boot_catalog()
+                .infos()
+                .into_iter()
+                .filter(move |p| p.machine.is_none() && pin.as_deref().is_none_or(|n| n == p.name))
+        })
+        .map(|p| serde_json::json!({ "name": p.name, "color": p.color }))
+        .collect();
+    // The wire body is the bare array the actor parses (`Vec<ProfileInfo>`).
+    serde_json::to_vec(&rows).unwrap_or_default()
+}
+
+/// §E.4: buffer the peer's `Chunk`s until `End`, `Reset(TOO_LARGE)` as soon
+/// as the total passes `max_file_mb` (before the router; it re-checks).
+async fn read_upload(state: &WsState, stream: &mut CloudStream) -> Option<Bytes> {
+    let cap = u64::from(state.uploads.limits().max_file_mb) * 1024 * 1024;
+    let mut body: Vec<u8> = Vec::new();
+    loop {
+        match stream.next().await? {
+            StreamMsg::Chunk(c) => {
+                if (body.len() + c.len()) as u64 > cap {
+                    let _ = stream.send(StreamMsg::Reset(reset::TOO_LARGE)).await;
+                    return None;
+                }
+                body.extend_from_slice(&c);
+            }
+            StreamMsg::End => return Some(Bytes::from(body)),
+            StreamMsg::Reset(_) => return None,
+            _ => {
+                let _ = stream.send(StreamMsg::Reset(reset::PROTOCOL)).await;
+                return None;
+            }
+        }
+    }
+}
+
+/// Run `op` through the in-process routers and stream the response back:
+/// `Head`, `Chunk`s (≤ `MAX_CHUNK`), `End`. A non-2xx is still a reply.
+async fn reply_with(state: &WsState, op: PeerOp, stream: &mut CloudStream) {
+    let resp = serve_op(state, op).await;
+    let status = resp.status().as_u16();
+    let ct = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let length = resp
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+    let head = StreamMsg::Head {
+        status,
+        content_type: ct,
+        length,
+    };
+    if stream.send(head).await.is_err() {
+        return;
+    }
+    let mut body = resp.into_body().into_data_stream();
+    while let Some(chunk) = body.next().await {
+        let Ok(bytes) = chunk else {
+            let _ = stream.send(StreamMsg::Reset(reset::INTERNAL)).await;
+            return;
+        };
+        for piece in bytes.chunks(MAX_CHUNK) {
+            if stream.send(StreamMsg::Chunk(piece.to_vec())).await.is_err() {
+                return;
+            }
+        }
+    }
+    let _ = stream.send(StreamMsg::End).await;
+}
+
+/// A whole in-memory body as `Head` + `Chunk`s + `End`.
+async fn send_reply(stream: &mut CloudStream, status: u16, ct: &str, body: Bytes) {
+    let head = StreamMsg::Head {
+        status,
+        content_type: ct.to_string(),
+        length: Some(body.len() as u64),
+    };
+    if stream.send(head).await.is_err() {
+        return;
+    }
+    for piece in body.chunks(MAX_CHUNK) {
+        if stream.send(StreamMsg::Chunk(piece.to_vec())).await.is_err() {
+            return;
+        }
+    }
+    let _ = stream.send(StreamMsg::End).await;
+}
 
 /// The non-Attach ops (mirrors `cloud::Op` minus `Attach`/`Profiles`, §E.2).
 #[derive(Debug)]
@@ -249,6 +454,7 @@ profiles:
             active_alias: "local".into(),
             session_ttl: Duration::from_secs(3600),
             uploads,
+            directory: std::sync::Arc::new(crate::ui::web::remote_types::Directory::new()),
         };
         WebEnv {
             _home: home,

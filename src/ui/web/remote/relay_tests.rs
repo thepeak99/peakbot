@@ -364,6 +364,7 @@ async fn relay_env(
         active_alias: "local".into(),
         session_ttl: Duration::from_secs(3600),
         uploads: deps.uploads.clone(),
+        directory: std::sync::Arc::new(crate::ui::web::remote_types::Directory::new()),
     };
     let local = serve_local_ws(&state).await;
     RelayEnv {
@@ -422,7 +423,7 @@ async fn ws_connect(addr: SocketAddr) -> Ws {
     let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws?token={T_LOCAL}"))
         .await
         .expect("local ws upgrade");
-    WsStream::Direct(ws)
+    WsStream::Direct(Box::new(ws))
 }
 
 async fn ws_send(ws: &mut Ws, v: &Value) {

@@ -349,6 +349,13 @@ impl CloudHandle {
             .map_err(|_| CloudError::Io("the cloud actor stopped".into()))?
     }
 
+    /// Stop the actor (handle teardown): the relay socket closes, so the
+    /// device drops offline for its peers. Test seam for the "offline
+    /// computer" e2e case (a core can't otherwise be stopped in-process).
+    pub async fn shutdown(&self) {
+        let _ = self.cmd.send(CloudCmd::Stop).await;
+    }
+
     /// Genesis for an empty account (§G.2).
     pub async fn genesis(&self) -> Result<DeviceId, CloudError> {
         let kind = self.state.borrow().kind();
