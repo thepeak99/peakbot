@@ -102,16 +102,13 @@ function start(): void {
     // Network hiccup: open the stream anyway; EventSource retries natively.
     if (mine === epoch) openStream();
   };
-  let probe: Response | Promise<Response>;
+  let probe: Promise<Response>;
   try {
     probe = fetch("/api/cloud/state");
   } catch {
     return; // no fetch in this env (some test harnesses)
   }
-  // Real fetch always returns a Promise; a synchronous Response (test
-  // doubles) is handled in the same tick.
-  if (probe instanceof Promise) probe.then(onResponse, onFailure);
-  else onResponse(probe);
+  probe.then(onResponse, onFailure);
 }
 
 export const store: CloudStore = {
