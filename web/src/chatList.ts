@@ -1,5 +1,6 @@
 import type { ConversationSummary, WireMachineStatus } from "./state";
 import type { CatalogProfile, MachineId } from "./types";
+import type { Device } from "./cloud/types";
 
 export type Range = readonly [start: number, end: number];
 
@@ -216,11 +217,17 @@ export function machineOf(
   return catalog.find((p) => p.name === profile)?.machine ?? null;
 }
 
-/** null → "This device"; else the origin's hostname, display-only (ids and
- * filters keep the full origin, so two servers on one host differ only in
- * port and show the same name). The id is server-normalised, so no try/catch. */
-export function machineName(id: MachineId): string {
+/** null → "This device"; a classic remote origin → its hostname (display-only,
+ * ids and filters keep the full origin). A bare cloud `slug` (no `://`) is
+ * looked up in `cloudDevices` and falls back to the slug — it must NEVER hit
+ * `new URL` (that throws on a bare name).
+ *
+ * SKELETON (P4 §F.2): the slug lookup is not implemented yet, so a bare slug
+ * still falls through to `new URL` and throws — the regression tests are RED
+ * for the right reason (feature absent). */
+export function machineName(id: MachineId, cloudDevices: readonly Device[] = []): string {
   if (id === null) return LOCAL_MACHINE_NAME;
+  void cloudDevices; // consumed by the slug lookup once implemented
   return new URL(id).hostname;
 }
 
@@ -232,7 +239,9 @@ export function machineName(id: MachineId): string {
 export function deriveMachines(
   catalog: readonly CatalogProfile[],
   statuses: readonly WireMachineStatus[],
+  cloudDevices: readonly Device[] = [],
 ): Machine[] {
+  void cloudDevices; // SKELETON (P4 §F.2): not threaded into machineName yet.
   const localProfiles: string[] = [];
   const remoteOrder: string[] = [];
   const remoteProfiles = new Map<string, string[]>();

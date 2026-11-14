@@ -35,6 +35,7 @@ import {
 } from "./chatList";
 import type { ConversationSummary, WireMachineStatus } from "./state";
 import type { CatalogProfile } from "./types";
+import type { Device } from "./cloud/types";
 
 // ─── fixtures (design §3 convention) ──────────────────────────────────────
 
@@ -349,6 +350,33 @@ describe("machineName", () => {
   });
 });
 
+describe("machineName — cloud slugs (P4 §F.2)", () => {
+  const cloud: Device[] = [
+    { id: "aa".repeat(32), name: "Laptop", platform: "linux", online: true, slug: "laptop", self: true },
+    { id: "bb".repeat(32), name: "Desk", platform: "macos", online: null, slug: "desk", self: false },
+  ];
+
+  it("a slug with a matching cloud device → the device display name", () => {
+    expect(machineName("laptop", cloud)).toBe("Laptop");
+    expect(machineName("desk", cloud)).toBe("Desk");
+  });
+
+  it("a slug with NO match → the slug itself (never throws)", () => {
+    expect(machineName("ghost", cloud)).toBe("ghost");
+  });
+
+  it("a bare slug with no cloudDevices → the slug, and it must NEVER throw", () => {
+    // Regression: the old `new URL("laptop")` threw `TypeError: Invalid URL`.
+    expect(() => machineName("laptop")).not.toThrow();
+    expect(machineName("laptop")).toBe("laptop");
+  });
+
+  it("an origin URL ignores cloudDevices → the hostname (unchanged)", () => {
+    expect(machineName("https://h:7823", cloud)).toBe("h");
+    expect(machineName("https://bot.example.ts.net", cloud)).toBe("bot.example.ts.net");
+  });
+});
+
 describe("deriveMachines", () => {
   const st = (id: string, online: boolean): WireMachineStatus => ({ id, online });
   const ids = (m: Machine[]): (string | null)[] => m.map((x) => x.id);
@@ -390,6 +418,14 @@ describe("deriveMachines", () => {
   it("a status for an origin the catalog does not carry is ignored", () => {
     const got = deriveMachines(CAT, [st("https://ghost:1", false)]);
     expect(ids(got)).toEqual([null, HS, WB]);
+  });
+
+  it("a cloud machine (bare slug id) is named by its device name (P4 §F.2)", () => {
+    const cloud: Device[] = [
+      { id: "aa".repeat(32), name: "Laptop", platform: "linux", online: true, slug: "laptop", self: false },
+    ];
+    const got = deriveMachines([prof("work@laptop", "laptop")], [], cloud);
+    expect(got.map((m) => m.name)).toEqual(["Laptop"]);
   });
 
   it("an empty catalog derives no machines", () => {

@@ -21,6 +21,9 @@ export default defineConfig({
       // Settings shell tests: the .tsx files need a DOM (the pure-logic
       // .test.ts files in the same directory stay on `node`).
       ["src/settings/**/*.test.tsx", "jsdom"],
+      // Cloud pane/modal/banner are DOM components (design §G); the pure-logic
+      // `types.test.ts` / `store.test.ts` in the same directory stay on `node`.
+      ["src/cloud/**/*.test.tsx", "jsdom"],
     ],
     setupFiles: ["./vitest.setup.ts"],
   },
