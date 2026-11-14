@@ -13,15 +13,20 @@ export type CloudStoreState = {
   stale: boolean;
   busy: boolean;
   error: string | null;
+  /** The `error` code from the failing POST (design §D.5 mapping); null. */
+  error_code: string | null;
   dismissed: ReadonlySet<string>;
 };
 
 export type CloudStore = {
   subscribe(cb: () => void): () => void;
   getSnapshot(): CloudStoreState;
-  act(path: string, body?: unknown): Promise<void>;
+  /** One POST; resolves with the parsed JSON body (null if non-JSON). */
+  act(path: string, body?: unknown): Promise<unknown>;
   /** Hide a request's approver modal (Escape / Later). Sends nothing. */
   dismiss(letterId: string): void;
+  /** Un-hide a dismissed request (the pane's Review button). Sends nothing. */
+  undismiss(letterId: string): void;
   /** Test-only: tear down the live EventSource and reset all state. */
   reset(): void;
 };
@@ -32,6 +37,7 @@ const initialState = (): CloudStoreState => ({
   stale: false,
   busy: false,
   error: null,
+  error_code: null,
   dismissed: new Set<string>(),
 });
 
@@ -40,6 +46,10 @@ let es: EventSource | null = null;
 const listeners = new Set<() => void>();
 // Bumped by reset()/last-unsubscribe so a late GET /state can't open a stream.
 let epoch = 0;
+// The availability probe (GET /state, design §B) runs ONCE per app session:
+// `cloud_disabled` is a property of the server, not of the stream. `reset()`
+// (test-only) tears the stream down but keeps this knowledge.
+let availabilityKnown = false;
 
 function set(patch: Partial<CloudStoreState>): void {
   state = { ...state, ...patch };
@@ -53,6 +63,9 @@ function closeStream(): void {
 }
 
 function openStream(): void {
+  // jsdom (and other minimal envs) have no EventSource; the probe above
+  // already told us the API is up, so the app works read-only there.
+  if (typeof EventSource === "undefined") return;
   const src = new EventSource("/api/cloud/events");
   es = src;
   src.onopen = () => set({ stale: false });
@@ -70,9 +83,14 @@ function openStream(): void {
 
 /** Detect `cloud_disabled` (404) once, then open the single stream. */
 function start(): void {
+  if (availabilityKnown) {
+    if (state.available) openStream();
+    return;
+  }
   const mine = epoch;
   const onResponse = (res: Response): void => {
     if (mine !== epoch) return;
+    availabilityKnown = true;
     if (res.status === 404) {
       set({ available: false });
       return;
@@ -84,7 +102,12 @@ function start(): void {
     // Network hiccup: open the stream anyway; EventSource retries natively.
     if (mine === epoch) openStream();
   };
-  const probe: Response | Promise<Response> = fetch("/api/cloud/state");
+  let probe: Response | Promise<Response>;
+  try {
+    probe = fetch("/api/cloud/state");
+  } catch {
+    return; // no fetch in this env (some test harnesses)
+  }
   // Real fetch always returns a Promise; a synchronous Response (test
   // doubles) is handled in the same tick.
   if (probe instanceof Promise) probe.then(onResponse, onFailure);
@@ -103,7 +126,7 @@ export const store: CloudStore = {
   getSnapshot: () => state,
   async act(path, body) {
     if (state.busy) return;
-    set({ busy: true, error: null });
+    set({ busy: true, error: null, error_code: null });
     try {
       const res = await fetch(path, {
         method: "POST",
@@ -112,15 +135,24 @@ export const store: CloudStore = {
       });
       if (!res.ok) {
         let message = `HTTP ${res.status}`;
+        let code: string | null = null;
         try {
           const j = (await res.json()) as Partial<CloudError>;
           if (j.message) message = j.message;
+          if (typeof j.error === "string") code = j.error;
         } catch {
           /* non-JSON error body */
         }
-        set({ error: message });
+        set({ error: message, error_code: code });
         throw new Error(message);
       }
+      let data: unknown = null;
+      try {
+        data = await res.json();
+      } catch {
+        /* non-JSON success body */
+      }
+      return data;
     } catch (e) {
       if (state.error === null) set({ error: e instanceof Error ? e.message : String(e) });
       throw e;
@@ -130,6 +162,11 @@ export const store: CloudStore = {
   },
   dismiss(letterId) {
     set({ dismissed: new Set(state.dismissed).add(letterId) });
+  },
+  undismiss(letterId) {
+    const next = new Set(state.dismissed);
+    next.delete(letterId);
+    set({ dismissed: next });
   },
   reset() {
     closeStream();

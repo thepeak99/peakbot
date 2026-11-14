@@ -12,6 +12,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Transcript, type TranscriptHandle } from "./components/Transcript";
 import { EmptyTranscript } from "./components/EmptyTranscript";
 import { UpdateBanner } from "./components/UpdateBanner";
+import { CloudRoot } from "./cloud/CloudRoot";
+import { CLOUD_SETTINGS_EVENT } from "./cloud/openCloud";
 import { BashPanel } from "./components/BashPanel";
 import {
   ComposerSlot,
@@ -134,6 +136,18 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   // chat and its WebSocket stay mounted underneath. Gear + Ctrl+, / ⌘+, +
   // Esc are owned by the hook.
   const settingsView = useSettingsToggle();
+  // TrustBanner → "Open Cloud settings": open Settings AND jump to the Cloud
+  // pane (counter prop, so repeat clicks re-trigger).
+  const [cloudFocus, setCloudFocus] = useState(0);
+  const showSettings = settingsView.show; // stable useCallback
+  useEffect(() => {
+    function openCloudPane(): void {
+      showSettings();
+      setCloudFocus((n) => n + 1);
+    }
+    window.addEventListener(CLOUD_SETTINGS_EVENT, openCloudPane);
+    return () => window.removeEventListener(CLOUD_SETTINGS_EVENT, openCloudPane);
+  }, [showSettings]);
   // Back closes the overlay instead of leaving the page (on a phone the OS
   // Back at the SPA root exits the app). `settingsView.close` is a stable
   // useCallback, as the hook requires.
@@ -464,6 +478,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
       />
       )}
       <UpdateBanner />
+      <CloudRoot />
       {convoTabs && (
         <ConvoTabBar
           tabs={convoTabs.views}
@@ -640,6 +655,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
           convo={state?.conversation?.id ?? null}
           activeProfile={selection?.profile ?? null}
           onClose={settingsView.close}
+          cloudFocus={cloudFocus}
         />
       )}
 

@@ -4,7 +4,14 @@
 
 import type { ConfigErr, Seg } from "./types";
 
-export type Section = "providers" | "mcps" | "profiles" | "general" | "system" | "raw";
+export type Section =
+  | "providers"
+  | "mcps"
+  | "profiles"
+  | "general"
+  | "system"
+  | "raw"
+  | "cloud";
 
 export interface RouteTarget {
   section: Section;

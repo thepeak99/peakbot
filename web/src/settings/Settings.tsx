@@ -32,6 +32,8 @@ import { AgentPage } from "./agent";
 import { GeneralPane } from "./general";
 import { SystemPane } from "./system";
 import { RawPane } from "./raw";
+import { CloudPane } from "../cloud/CloudPane";
+import { useCloud } from "../cloud/useCloud";
 import { copyToRepoName } from "./profileOps";
 import { Crumbs } from "./widgets";
 import { ToastProvider, useToast } from "./Toast";
@@ -45,7 +47,12 @@ import { ToastProvider, useToast } from "./Toast";
  *    modal → popover → Settings).
  * The TopBar gear (tooltip `Settings  Ctrl ,`) calls the same toggle.
  */
-export function useSettingsToggle(): { open: boolean; toggle(): void; close(): void } {
+export function useSettingsToggle(): {
+  open: boolean;
+  show(): void;
+  toggle(): void;
+  close(): void;
+} {
   const [open, setOpen] = useState(false);
 
   useEffect(() => {
@@ -62,8 +69,9 @@ export function useSettingsToggle(): { open: boolean; toggle(): void; close(): v
   }, []);
 
   const toggle = useCallback(() => setOpen((o) => !o), []);
+  const show = useCallback(() => setOpen(true), []);
   const close = useCallback(() => setOpen(false), []);
-  return { open, toggle, close };
+  return { open, show, toggle, close };
 }
 
 export interface SettingsProps {
@@ -78,6 +86,9 @@ export interface SettingsProps {
   ref?: Ref<HTMLDivElement>;
   /** Mid-exit: still painted, but inert (no input, focus or AT). */
   leaving?: boolean;
+  /** Non-zero → jump to the Cloud pane (the TrustBanner opener, design §A.4).
+   *  A counter, so repeat clicks re-trigger the jump. */
+  cloudFocus?: number;
 }
 
 const SECTIONS: Record<Section, { label: string; desc: string }> = {
@@ -105,6 +116,10 @@ const SECTIONS: Record<Section, { label: string; desc: string }> = {
     label: "Raw YAML",
     desc: "The generated YAML for this scope, verbatim. Edits here replace the file on save.",
   },
+  cloud: {
+    label: "Cloud",
+    desc: "Cloud mode: sign in, approve new devices, and manage the devices on your account.",
+  },
 };
 
 const REPO_BANNER =
@@ -121,7 +136,7 @@ function asMap(v: unknown): Record<string, unknown> {
     : {};
 }
 
-export function Settings({ convo, onClose, activeProfile, ref, leaving }: SettingsProps) {
+export function Settings({ convo, onClose, activeProfile, ref, leaving, cloudFocus }: SettingsProps) {
   return (
     <ToastProvider>
       <SettingsInner
@@ -130,12 +145,13 @@ export function Settings({ convo, onClose, activeProfile, ref, leaving }: Settin
         activeProfile={activeProfile}
         ref={ref}
         leaving={leaving}
+        cloudFocus={cloudFocus}
       />
     </ToastProvider>
   );
 }
 
-function SettingsInner({ convo, onClose, activeProfile, ref, leaving }: SettingsProps) {
+function SettingsInner({ convo, onClose, activeProfile, ref, leaving, cloudFocus }: SettingsProps) {
   const { toast } = useToast();
   const [store] = useState(createStore);
   // The store is a plain object: a version counter is the re-render seam.
@@ -144,6 +160,14 @@ function SettingsInner({ convo, onClose, activeProfile, ref, leaving }: Settings
   const [scope, setScopeState] = useState<Scope>("global");
   const [meta, setMeta] = useState<SettingsMeta | null>(null);
   const [active, setActive] = useState<Section>("profiles");
+  // Cloud mode (P4): the pane is registered in the nav only when the server
+  // has cloud (the store's probe 404s it otherwise, design §C.1).
+  const cloud = useCloud();
+  // The TrustBanner opener: jump to the Cloud pane (a counter prop, so
+  // repeat clicks re-trigger).
+  useEffect(() => {
+    if (cloudFocus && cloud.available) setActive("cloud");
+  }, [cloudFocus, cloud.available]);
   // Profiles master-detail (spec §9.0: list → profile page → agent page, not
   // a tree): the open profile/agent inside the "profiles" section.
   const [profileSel, setProfileSel] = useState<{ profile: string | null; agent: string | null }>({
@@ -492,6 +516,7 @@ function SettingsInner({ convo, onClose, activeProfile, ref, leaving }: Settings
     {
       group: "MACHINE",
       items: [
+        ...(cloud.available ? [{ id: "cloud" as const, label: "Cloud", dot: "blue" as const }] : []),
         { id: "system", label: "System" },
       ],
     },
@@ -775,6 +800,8 @@ function SettingsInner({ convo, onClose, activeProfile, ref, leaving }: Settings
             )
           ) : activeSection === "general" ? (
             <GeneralPane />
+          ) : activeSection === "cloud" ? (
+            <CloudPane />
           ) : activeSection === "system" ? (
             <SystemPane />
           ) : (
