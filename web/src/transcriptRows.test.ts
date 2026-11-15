@@ -152,10 +152,10 @@ describe("startsNewDay", () => {
   });
 
   it("returns false when two messages are on the same local day", () => {
-    const msgs = [
-      wireMsg("2026-11-14T10:00:00Z"),
-      wireMsg("2026-11-14T15:00:00Z"),
-    ];
+    // Use local time construction to ensure same local day in any TZ
+    const a = new Date(2026, 10, 14, 10, 0, 0).toISOString();
+    const b = new Date(2026, 10, 14, 15, 0, 0).toISOString();
+    const msgs = [wireMsg(a), wireMsg(b)];
     expect(startsNewDay(msgs, 1)).toBe(false);
   });
 

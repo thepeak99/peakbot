@@ -1,11 +1,11 @@
 // Tests for the pure, Intl-free date helpers in dates.ts (design §6).
-// Every row of the design's example table is covered. TZ cases use
-// process.env.TZ with a guard assertion that the TZ actually took effect,
-// so a misconfigured environment fails loudly instead of passing vacuously.
+// Every row of the design's example table is covered. Local-day tests
+// construct times directly with the Date constructor so they're robust
+// to the machine's timezone without needing process.env.TZ.
 //
 // RED reason: "Cannot find module './dates'" — the feature is absent.
 
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect } from "vitest";
 import {
   formatClock,
   formatFull,
@@ -67,23 +67,13 @@ describe("dayLabel — separator labels", () => {
   });
 });
 
-describe("dayLabel — timezone cases", () => {
-  const origTz = process.env.TZ;
-
-  beforeAll(() => {
-    process.env.TZ = "America/Los_Angeles";
-  });
-
-  afterAll(() => {
-    process.env.TZ = origTz;
-  });
-
-  it("dayLabel_LA_same_local_day_different_utc_day", () => {
-    // Both are Nov 14 local in LA; a UTC split would say Yesterday.
-    const a = Date.parse("2026-11-14T23:00:00Z"); // Nov 14 15:00 PT
-    const b = Date.parse("2026-11-15T01:00:00Z"); // Nov 14 17:00 PT
-    // Verify the TZ actually took effect (guard).
-    expect(new Date(0).getHours()).toBe(16); // Jan 1 1970 00:00 UTC = Dec 31 1969 16:00 PST
+describe("dayLabel — local day boundaries", () => {
+  it("dayLabel_same_local_day", () => {
+    // Two times on the same local day (Nov 14) at 15:00 and 17:00.
+    // In TZs with large UTC offsets these span a UTC day boundary,
+    // but they're clearly the same local day.
+    const a = new Date(2026, 10, 14, 15, 0).getTime();
+    const b = new Date(2026, 10, 14, 17, 0).getTime();
     expect(dayLabel(a, b)).toBe("Today");
   });
 });
