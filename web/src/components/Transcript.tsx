@@ -22,7 +22,8 @@ import { Message } from "./Message";
 import { TranscriptNav } from "./TranscriptNav";
 import { adaptMessage } from "../adapt";
 import type { WireChatMessage } from "../state";
-import { estimateRowHeight } from "../transcriptRows";
+import { estimateRowHeight, startsNewDay, DAY_SEPARATOR_PX } from "../transcriptRows";
+import { dayLabel } from "../dates";
 import { PIN_THRESHOLD_PX, useTranscriptScroll } from "../useTranscriptScroll";
 
 export interface TranscriptHandle {
@@ -52,7 +53,9 @@ export function Transcript({ messages, drawerOpen, base = "", phone = false, ref
   const virtualizer = useVirtualizer<HTMLElement, HTMLDivElement>({
     count: messages.length,
     getScrollElement: () => sectionRef.current,
-    estimateSize: (i) => estimateRowHeight(messages[i]),
+    estimateSize: (i) =>
+      estimateRowHeight(messages[i]) +
+      (phone && startsNewDay(messages, i) ? DAY_SEPARATOR_PX : 0),
     overscan: 3,
     // A chat grows at the tail: anchor to the end so appends and height
     // corrections above the viewport don't shift the text being read.
@@ -138,6 +141,19 @@ export function Transcript({ messages, drawerOpen, base = "", phone = false, ref
               className="absolute left-0 top-0 w-full pb-3"
               style={{ transform: `translateY(${vi.start}px)` }}
             >
+              {phone && startsNewDay(messages, vi.index) && (
+                <div
+                  role="separator"
+                  aria-label={dayLabel(Date.parse(messages[vi.index].timestamp), Date.now())}
+                  className="flex items-center gap-2.5 pt-1.5 pb-2.5"
+                >
+                  <span className="h-px flex-1 bg-zinc-800" />
+                  <span className="text-[11px] font-medium tracking-[.02em] text-zinc-500">
+                    {dayLabel(Date.parse(messages[vi.index].timestamp), Date.now())}
+                  </span>
+                  <span className="h-px flex-1 bg-zinc-800" />
+                </div>
+              )}
               <Message message={adaptMessage(messages[vi.index], base)} phone={phone} />
             </div>
           ))}

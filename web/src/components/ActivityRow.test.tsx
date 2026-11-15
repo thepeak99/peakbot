@@ -5,7 +5,7 @@
 //
 // The contract under test:
 //
-//   <ActivityRow line={ActivityLine} counts?={StatusCounts} />
+//   <ActivityRow line={ActivityLine} status?={PhoneStatus} />
 //   ActivityLine = {kind:"step", step: WireChatMessage | null}
 //                | {kind:"working"} | {kind:"idle"}     (mobile redesign §2.5)
 //
@@ -26,7 +26,7 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { ActivityRow, type ActivityLine, type StatusCounts } from "./ActivityRow";
+import { ActivityRow, type ActivityLine, type PhoneStatus } from "./ActivityRow";
 import type { WireChatMessage } from "../state";
 
 // React 19's flushSync reads IS_REACT_ACT_ENVIRONMENT; set once so the
@@ -56,12 +56,12 @@ async function mount(stepValue: WireChatMessage | null): Promise<HTMLDivElement>
   return mountLine({ kind: "step", step: stepValue });
 }
 
-async function mountLine(line: ActivityLine, counts?: StatusCounts): Promise<HTMLDivElement> {
+async function mountLine(line: ActivityLine, status?: PhoneStatus): Promise<HTMLDivElement> {
   container = document.createElement("div");
   document.body.appendChild(container);
   await act(async () => {
     root = createRoot(container!);
-    root.render(<ActivityRow line={line} counts={counts} />);
+    root.render(<ActivityRow line={line} status={status} />);
   });
   return container;
 }
@@ -160,8 +160,8 @@ describe("ActivityRow — case 24", () => {
 //     "⏳ N tasks" / "☑ x/y todos" segments, each shown only when its count
 //     is > 0 (todos: total > 0). One row: `flex-nowrap whitespace-nowrap`.
 
-function counts(over: Partial<StatusCounts> = {}): StatusCounts {
-  return { tasks: 0, todosDone: 0, todosTotal: 0, onOpen: () => {}, ...over };
+function counts(over: Partial<PhoneStatus> = {}): PhoneStatus {
+  return { tasks: 0, todosDone: 0, todosTotal: 0, cwd: null, onOpen: () => {}, ...over };
 }
 
 const q = (el: HTMLElement, id: string): HTMLElement | null =>
@@ -254,9 +254,9 @@ describe("ActivityRow — AR5: tapping a count opens its panel", () => {
     const tasks = q(el, "activity-tasks")!;
     const todos = q(el, "activity-todos")!;
     expect(tasks.tagName).toBe("BUTTON");
-    expect(tasks.getAttribute("aria-label")).toBe("Open Tasks panel");
+    expect(tasks.getAttribute("aria-label")).toBe("2 running tasks");
     expect(todos.tagName).toBe("BUTTON");
-    expect(todos.getAttribute("aria-label")).toBe("Open Todo panel");
+    expect(todos.getAttribute("aria-label")).toBe("0 of 2 todos done");
 
     await act(async () => {
       tasks.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
@@ -278,6 +278,7 @@ describe("ActivityRow — AR8: the '·' separators (batch 1, B18)", () => {
     [...q(el, "activity-row")!.children]
       .map((c) => {
         const id = (c as HTMLElement).getAttribute("data-testid");
+        if (id === "activity-sep") return "·";
         if (id) return id;
         return (c as HTMLElement).textContent?.trim() === "·" ? "·" : null;
       })
@@ -353,5 +354,175 @@ describe("ActivityRow — C12: the box variant is unchanged with no counts", () 
     const wrapper = el.firstElementChild as HTMLElement;
     expect(wrapper.classList.contains("lg:mr-12")).toBe(true);
     expect(wrapper.classList.contains("mr-12")).toBe(false);
+  });
+
+});
+
+// ─── PhoneStatus redesign (design §5.2, §5.3) ─────────────────────────────
+//
+// StatusCounts is renamed PhoneStatus and gains a `cwd` field.
+// ActivityRow takes `status` instead of `counts`. The phone line becomes an
+// item list joined by "·" separators; it returns null when empty.
+
+function status(over: Partial<PhoneStatus> = {}): PhoneStatus {
+  return {
+    tasks: 0,
+    todosDone: 0,
+    todosTotal: 0,
+    cwd: null,
+    onOpen: () => {},
+    ...over,
+  };
+}
+
+describe("ActivityRow — PhoneStatus (design §5.2)", () => {
+  it("idle with tasks, todos, cwd shows all items in order", async () => {
+    const el = await mountLine(
+      { kind: "idle" },
+      status({ tasks: 2, todosDone: 6, todosTotal: 25, cwd: "/home/exe/infra" }),
+    );
+    expect(q(el, "activity-tasks")!.textContent).toBe("⏳ 2 tasks");
+    expect(q(el, "activity-todos")!.textContent).toBe("☑ 6/25 todos");
+    expect(q(el, "activity-dir")!.textContent).toContain("📁 infra");
+  });
+
+  it("working line shows compact counts (no 'tasks'/'todos' words)", async () => {
+    const el = await mountLine(
+      { kind: "working" },
+      status({ tasks: 2, todosDone: 6, todosTotal: 25, cwd: "/home/exe/infra" }),
+    );
+    expect(q(el, "activity-tasks")!.textContent).toBe("⏳ 2");
+    expect(q(el, "activity-todos")!.textContent).toBe("☑ 6/25");
+    expect(q(el, "activity-dir")!.textContent).toContain("📁 infra");
+  });
+
+  it("step line shows compact counts", async () => {
+    const s = step({ role: "toolcall", tool_name: "bash", content: "ls" });
+    const el = await mountLine(
+      { kind: "step", step: s },
+      status({ tasks: 2, todosDone: 6, todosTotal: 25, cwd: "/home/exe/infra" }),
+    );
+    expect(q(el, "activity-tasks")!.textContent).toBe("⏳ 2");
+    expect(q(el, "activity-todos")!.textContent).toBe("☑ 6/25");
+  });
+
+  it("aria-labels are 'N running tasks' and 'x of y todos done' in both states", async () => {
+    const idle = await mountLine(
+      { kind: "idle" },
+      status({ tasks: 2, todosDone: 6, todosTotal: 25 }),
+    );
+    expect(q(idle, "activity-tasks")!.getAttribute("aria-label")).toBe("2 running tasks");
+    expect(q(idle, "activity-todos")!.getAttribute("aria-label")).toBe("6 of 25 todos done");
+
+    const working = await mountLine(
+      { kind: "working" },
+      status({ tasks: 2, todosDone: 6, todosTotal: 25 }),
+    );
+    expect(q(working, "activity-tasks")!.getAttribute("aria-label")).toBe("2 running tasks");
+    expect(q(working, "activity-todos")!.getAttribute("aria-label")).toBe("6 of 25 todos done");
+  });
+
+  it("singular '1 running task' and '⏳ 1 task'", async () => {
+    const el = await mountLine(
+      { kind: "idle" },
+      status({ tasks: 1 }),
+    );
+    expect(q(el, "activity-tasks")!.textContent).toBe("⏳ 1 task");
+    expect(q(el, "activity-tasks")!.getAttribute("aria-label")).toBe("1 running task");
+  });
+
+  it("separators only between items (no leading/trailing)", async () => {
+    const el = await mountLine(
+      { kind: "working" },
+      status({ tasks: 2, todosDone: 6, todosTotal: 25, cwd: "/home/exe/infra" }),
+    );
+    // 4 items → 3 separators
+    const seps = el.querySelectorAll('[data-testid="activity-sep"]');
+    expect(seps.length).toBe(3);
+  });
+
+  it("working only → 0 separators, no leading ·", async () => {
+    const el = await mountLine(
+      { kind: "working" },
+      status({}),
+    );
+    expect(el.querySelectorAll('[data-testid="activity-sep"]').length).toBe(0);
+    expect(el.textContent).not.toContain("·");
+  });
+
+  it("working + dir → 1 separator", async () => {
+    const el = await mountLine(
+      { kind: "working" },
+      status({ cwd: "/home/exe/infra" }),
+    );
+    expect(el.querySelectorAll('[data-testid="activity-sep"]').length).toBe(1);
+  });
+
+  it("dir only → 0 separators", async () => {
+    const el = await mountLine(
+      { kind: "idle" },
+      status({ cwd: "/home/exe/infra" }),
+    );
+    expect(el.querySelectorAll('[data-testid="activity-sep"]').length).toBe(0);
+  });
+
+  it("step with sub-agent: the 🧩 role · is not counted as a separator", async () => {
+    const s = step({
+      role: "toolcall",
+      tool_name: "bash",
+      content: "curl https://example.com",
+      source: { kind: "sub_agent", role: "mid" },
+    });
+    const el = await mountLine(
+      { kind: "step", step: s },
+      status({ cwd: "/home/exe/infra" }),
+    );
+    // One separator between step and dir; the "🧩 mid ·" is part of the step label
+    expect(el.querySelectorAll('[data-testid="activity-sep"]').length).toBe(1);
+  });
+
+  it("nothing (idle, 0, 0, null) → renders nothing", async () => {
+    const el = await mountLine({ kind: "idle" }, status({}));
+    expect(el.querySelector('[data-testid="activity-row"]')).toBeNull();
+  });
+
+  it("tapping 📁 calls onOpen('directory')", async () => {
+    const onOpen = vi.fn();
+    const el = await mountLine(
+      { kind: "idle" },
+      status({ cwd: "/home/exe/infra", onOpen }),
+    );
+    const dir = q(el, "activity-dir")!;
+    await act(async () => {
+      dir.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    });
+    expect(onOpen).toHaveBeenCalledWith("directory");
+  });
+
+  it("dir item title is full path, text is basename", async () => {
+    const el = await mountLine(
+      { kind: "idle" },
+      status({ cwd: "/home/exe/infra" }),
+    );
+    const dir = q(el, "activity-dir")!;
+    expect(dir.getAttribute("title")).toBe("/home/exe/infra");
+    expect(dir.textContent).toContain("📁 infra");
+    expect(dir.textContent).not.toContain("/home/exe");
+  });
+
+  it("Windows path basename works", async () => {
+    const el = await mountLine(
+      { kind: "idle" },
+      status({ cwd: "C:\\proj\\x" }),
+    );
+    expect(q(el, "activity-dir")!.textContent).toContain("📁 x");
+  });
+
+  it("📁 item absent when cwd is null", async () => {
+    const el = await mountLine(
+      { kind: "idle" },
+      status({ tasks: 2, cwd: null }),
+    );
+    expect(q(el, "activity-dir")).toBeNull();
   });
 });

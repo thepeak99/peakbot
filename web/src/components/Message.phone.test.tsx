@@ -12,6 +12,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import { act, createElement, type ComponentType } from "react";
 import { createRoot } from "react-dom/client";
 import { Message } from "./Message";
+import { formatClock, formatFull, localeClock } from "../dates";
 import type { ChatMessage } from "../types";
 
 // X2 adds `phone?: boolean` to Message's props; until it lands the cast keeps
@@ -30,11 +31,13 @@ afterEach(() => {
   document.body.innerHTML = "";
 });
 
+const MSG_AT = 1732000000000; // fixed epoch for deterministic tests
+
 function msg(over: Partial<ChatMessage> = {}): ChatMessage {
   return {
     role: "agent",
     content: "hello",
-    timestamp: "10:14",
+    at: MSG_AT,
     ...over,
   };
 }
@@ -249,6 +252,127 @@ describe("Message — phone (phone: true)", () => {
   });
 });
 
+// ─── Phone timestamps (design §7.1) ──────────────────────────────────────
+//
+// Phone faces now show a tappable HH:MM under every message. Tapping toggles
+// to the full date format. User/system time is self-end; agent/summary/tool
+// time is self-start. Thinking-only messages have no empty prose box and the
+// time is outside the <details> border.
+
+function phoneMsg(over: Partial<ChatMessage> = {}): ChatMessage {
+  return {
+    role: "agent",
+    content: "hello",
+    at: MSG_AT,
+    ...over,
+  };
+}
+
+describe("Message — phone timestamps (design §7.1)", () => {
+  it("shows formatClock(at) under user and agent messages", async () => {
+    const { el, unmount } = await renderPhone(phoneMsg({ role: "user", content: "hi" }));
+    try {
+      expect(el.textContent).toContain(formatClock(MSG_AT));
+    } finally {
+      await unmount();
+    }
+
+    const { el: el2, unmount: unmount2 } = await renderPhone(phoneMsg({ content: "answer" }));
+    try {
+      expect(el2.textContent).toContain(formatClock(MSG_AT));
+    } finally {
+      await unmount2();
+    }
+  });
+
+  it("tapping the time toggles to formatFull(at) and back", async () => {
+    const { el, unmount } = await renderPhone(phoneMsg({ role: "user", content: "hi" }));
+    try {
+      const timeBtn = el.querySelector<HTMLButtonElement>("button.tabular-nums");
+      expect(timeBtn, "time button renders").not.toBeNull();
+      expect(timeBtn!.textContent).toContain(formatClock(MSG_AT));
+      expect(timeBtn!.getAttribute("aria-expanded")).toBe("false");
+
+      await act(async () => {
+        timeBtn!.click();
+      });
+      expect(timeBtn!.textContent).toContain(formatFull(MSG_AT));
+      expect(timeBtn!.getAttribute("aria-expanded")).toBe("true");
+
+      await act(async () => {
+        timeBtn!.click();
+      });
+      expect(timeBtn!.textContent).toContain(formatClock(MSG_AT));
+      expect(timeBtn!.getAttribute("aria-expanded")).toBe("false");
+    } finally {
+      await unmount();
+    }
+  });
+
+  it("user time is self-end; agent time is self-start", async () => {
+    const { el, unmount } = await renderPhone(phoneMsg({ role: "user", content: "hi" }));
+    try {
+      const userTime = el.querySelector("button.tabular-nums");
+      expect(userTime!.classList.contains("self-end")).toBe(true);
+    } finally {
+      await unmount();
+    }
+
+    const { el: el2, unmount: unmount2 } = await renderPhone(phoneMsg({ content: "answer" }));
+    try {
+      const agentTime = el2.querySelector("button.tabular-nums");
+      expect(agentTime!.classList.contains("self-start")).toBe(true);
+    } finally {
+      await unmount2();
+    }
+  });
+
+  it("thinking-only: no .markdown-body element, time not inside <details>", async () => {
+    const { el, unmount } = await renderPhone(
+      phoneMsg({ role: "agent", content: "", thinking: ["thinking step"] }),
+    );
+    try {
+      expect(el.querySelector(".markdown-body")).toBeNull();
+      const details = el.querySelector("details");
+      expect(details, "thinking <details> renders").not.toBeNull();
+      const time = el.querySelector("button.tabular-nums");
+      expect(time, "time renders").not.toBeNull();
+      expect(details!.contains(time!), "time is outside <details>").toBe(false);
+    } finally {
+      await unmount();
+    }
+  });
+
+  it("thinking + content: order is details → prose → time", async () => {
+    const { el, unmount } = await renderPhone(
+      phoneMsg({
+        role: "agent",
+        content: "the answer",
+        thinking: ["thinking step"],
+      }),
+    );
+    try {
+      const details = el.querySelector("details");
+      const prose = el.querySelector(".markdown-body");
+      const time = el.querySelector("button.tabular-nums");
+      expect(details).not.toBeNull();
+      expect(prose).not.toBeNull();
+      expect(time).not.toBeNull();
+      // In jsdom, getBoundingClientRect returns 0s, so check source order via
+      // the elements' position in the parent's children
+      const parent = prose!.parentElement!;
+      const children = [...parent.children];
+      const detailsIdx = children.indexOf(details!);
+      const proseIdx = children.indexOf(prose!);
+      const timeIdx = children.indexOf(time!);
+      expect(detailsIdx).toBeLessThan(proseIdx);
+      expect(proseIdx).toBeLessThan(timeIdx);
+    } finally {
+      await unmount();
+    }
+  });
+});
+
 describe("Message — desktop lock (no phone, R1)", () => {
   it("the desktop agent card still shows the role label and timestamp", async () => {
     const { el, unmount } = await renderDesktop(
@@ -256,7 +380,7 @@ describe("Message — desktop lock (no phone, R1)", () => {
     );
     try {
       expect(el.textContent).toContain("Shifu");
-      expect(el.textContent).toContain("10:14");
+      expect(el.textContent).toContain(localeClock(MSG_AT));
     } finally {
       await unmount();
     }
@@ -268,7 +392,7 @@ describe("Message — desktop lock (no phone, R1)", () => {
     );
     try {
       expect(el.textContent).toContain("You");
-      expect(el.textContent).toContain("10:14");
+      expect(el.textContent).toContain(localeClock(MSG_AT));
     } finally {
       await unmount();
     }

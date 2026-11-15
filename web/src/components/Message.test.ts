@@ -10,7 +10,7 @@ function full(): ChatMessage {
   return {
     role: "agent",
     content: "hello world",
-    timestamp: "10:14",
+    at: 1732000000000,
     toolName: "file_read",
     fromBackground: false,
     subAgentRole: undefined,
@@ -40,9 +40,9 @@ describe("sameMessage", () => {
     expect(sameMessage(a, b)).toBe(false);
   });
 
-  it("returns false when timestamp differs", () => {
+  it("returns false when at differs", () => {
     const a = full();
-    const b: ChatMessage = { ...a, timestamp: "10:15" };
+    const b: ChatMessage = { ...a, at: 1732000001000 };
     expect(sameMessage(a, b)).toBe(false);
   });
 
@@ -115,7 +115,7 @@ describe("sameMessage", () => {
     const withUndefined: ChatMessage = {
       role: "user",
       content: "hi",
-      timestamp: "10:14",
+      at: 1732000000000,
       toolName: undefined,
       fromBackground: undefined,
       subAgentRole: undefined,
@@ -123,14 +123,14 @@ describe("sameMessage", () => {
     const absent: ChatMessage = {
       role: "user",
       content: "hi",
-      timestamp: "10:14",
+      at: 1732000000000,
     };
     expect(sameMessage(withUndefined, absent)).toBe(true);
   });
 
   it("returns true for two minimal messages with only the required fields", () => {
-    const a: ChatMessage = { role: "system", content: "ready", timestamp: "10:14" };
-    const b: ChatMessage = { role: "system", content: "ready", timestamp: "10:14" };
+    const a: ChatMessage = { role: "system", content: "ready", at: 1732000000000 };
+    const b: ChatMessage = { role: "system", content: "ready", at: 1732000000000 };
     expect(sameMessage(a, b)).toBe(true);
   });
 });
@@ -483,7 +483,7 @@ function userWithAttachments(atts: AttachmentView[]): ChatMessage {
   return {
     role: "user",
     content: "what's in these?",
-    timestamp: "10:14",
+    at: 1732000000000,
     attachments: atts,
   };
 }

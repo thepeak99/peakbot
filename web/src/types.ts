@@ -20,7 +20,8 @@ export interface AttachmentView extends WireAttachment {
 export interface ChatMessage {
   role: MessageRole;
   content: string;
-  timestamp: string; // formatted "HH:MM"
+  /** The message instant, epoch ms (parsed once from the wire's RFC 3339 `timestamp`). */
+  at: number;
   toolName?: string;
   /** background-process origin badge (mirrors MessageSource::Background) */
   fromBackground?: boolean;

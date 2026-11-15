@@ -1,4 +1,5 @@
 import type { WireChatMessage } from "./state";
+import { sameLocalDay } from "./dates";
 
 /** O(1) seed estimate of a transcript row's pixel height, fed to the
  *  virtualizer's estimateSize. Never scans content — String.length is O(1).
@@ -46,4 +47,15 @@ export function firstLine(content: string | undefined): string {
     if (trimmed !== "") return trimmed;
   }
   return "";
+}
+
+/** Height of the phone day separator: padding-only, inside the measured row. */
+export const DAY_SEPARATOR_PX = 32;
+
+/** Row i opens a new local day: the first row, or a day change from row i-1. */
+export function startsNewDay(messages: WireChatMessage[], i: number): boolean {
+  return (
+    i === 0 ||
+    !sameLocalDay(Date.parse(messages[i - 1].timestamp), Date.parse(messages[i].timestamp))
+  );
 }

@@ -45,13 +45,6 @@ const TODO_STATUS_MAP: Record<WireTodoStatus, TodoStatus> = {
   cancelled: "cancelled",
 };
 
-/** ISO 8601 → local "HH:MM". Falls back to the raw string on parse failure. */
-function toClock(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-}
-
 export function adaptMessage(m: WireChatMessage, base = ""): ChatMessage {
   // ToolCall/ToolResult carry structured fields; the `content` already holds
   // the display string the TUI renders, so we pass it through verbatim.
@@ -68,7 +61,7 @@ export function adaptMessage(m: WireChatMessage, base = ""): ChatMessage {
   return {
     role: ROLE_MAP[m.role] ?? "system",
     content: m.content ?? "",
-    timestamp: toClock(m.timestamp),
+    at: Date.parse(m.timestamp),
     toolName: m.tool_name ?? undefined,
     fromBackground: m.source?.kind === "background",
     subAgentRole:

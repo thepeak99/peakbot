@@ -15,6 +15,7 @@ import {
 import { Lightbox } from "./Lightbox";
 import { MTAG } from "./phoneUi";
 import { firstLine } from "../transcriptRows";
+import { formatClock, formatFull, localeClock } from "../dates";
 
 // Per-role visual treatment. Mirrors the TUI's role glyphs/colours so the
 // web transcript reads the same way (src/ui/app_state.rs MessageRole +
@@ -91,7 +92,7 @@ export function sameMessage(a: ChatMessage, b: ChatMessage): boolean {
   return (
     a.role === b.role &&
     a.content === b.content &&
-    a.timestamp === b.timestamp &&
+    a.at === b.at &&
     a.toolName === b.toolName &&
     a.fromBackground === b.fromBackground &&
     a.subAgentRole === b.subAgentRole &&
@@ -240,7 +241,7 @@ function ToolRow({ message }: { message: ChatMessage }) {
   const [open, setOpen] = useState(false);
   const call = message.role === "toolCall";
   return (
-    <div>
+    <div className="flex flex-col">
       <button
         type="button"
         aria-expanded={open}
@@ -277,7 +278,24 @@ function ToolRow({ message }: { message: ChatMessage }) {
           {message.content}
         </div>
       )}
+      <MessageTime at={message.at} end={false} />
     </div>
+  );
+}
+
+// Tap toggles HH:MM <-> the full date; local state, so a row scrolled out of
+// the virtualizer overscan resets to the short form.
+function MessageTime({ at, end }: { at: number; end: boolean }) {
+  const [full, setFull] = useState(false);
+  return (
+    <button
+      type="button"
+      aria-expanded={full}
+      onClick={() => setFull((f) => !f)}
+      className={`mt-1 rounded-[5px] px-1 text-[10px] tabular-nums text-zinc-500 hover:text-zinc-300 ${end ? "self-end" : "self-start"}`}
+    >
+      {full ? formatFull(at) : formatClock(at)}
+    </button>
   );
 }
 
@@ -290,13 +308,14 @@ function PhoneMessage({ message }: { message: ChatMessage }) {
         <div className="max-w-[88%] whitespace-pre-wrap break-words rounded-[18px_18px_6px_18px] bg-zinc-800 px-3.5 py-2.5 text-[15px] leading-[1.4] text-zinc-100">
           {message.content}
         </div>
+        <MessageTime at={message.at} end />
       </div>
     );
   }
   if (role === "toolCall" || role === "toolResult") return <ToolRow message={message} />;
   const prose = role === "agent" ? "text-[15px] leading-[1.5] text-zinc-100" : "text-[13.5px] text-zinc-400";
   return (
-    <div>
+    <div className="flex flex-col">
       {(message.subAgentRole || message.fromBackground || role === "summary") && (
         <div className="mb-1 flex gap-1">
           {role === "summary" && <span className={MTAG}>summary</span>}
@@ -307,15 +326,18 @@ function PhoneMessage({ message }: { message: ChatMessage }) {
       {message.thinking && message.thinking.length > 0 && (
         <ThinkingBlocks blocks={message.thinking} />
       )}
-      <div className={`markdown-body md-phone max-w-[96%] break-words ${prose}`}>
-        <ReactMarkdown
-          remarkPlugins={[remarkGfm, remarkBreaks]}
-          rehypePlugins={[rehypeHighlight]}
-          components={PHONE_MARKDOWN_COMPONENTS}
-        >
-          {message.content}
-        </ReactMarkdown>
-      </div>
+      {message.content.trim() !== "" && (
+        <div className={`markdown-body md-phone max-w-[96%] break-words ${prose}`}>
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm, remarkBreaks]}
+            rehypePlugins={[rehypeHighlight]}
+            components={PHONE_MARKDOWN_COMPONENTS}
+          >
+            {message.content}
+          </ReactMarkdown>
+        </div>
+      )}
+      <MessageTime at={message.at} end={role === "system"} />
     </div>
   );
 }
@@ -349,7 +371,7 @@ function MessageView({ message, phone = false }: { message: ChatMessage; phone?:
             🧩 {message.subAgentRole}
           </span>
         )}
-        <span className="ml-auto tabular-nums text-zinc-600">{message.timestamp}</span>
+        <span className="ml-auto tabular-nums text-zinc-600">{localeClock(message.at)}</span>
       </div>
       {message.thinking && message.thinking.length > 0 && (
         <ThinkingBlocks blocks={message.thinking} />

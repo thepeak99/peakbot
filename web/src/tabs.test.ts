@@ -35,7 +35,7 @@
 // absent, not a typo in this test file.
 
 import { describe, it, expect } from "vitest";
-import { filterTabs, resolveActiveTab } from "./tabs";
+import { filterTabs, resolveActiveTab, tabVisible } from "./tabs";
 
 interface Tab {
   id: string;
@@ -169,5 +169,30 @@ describe("resolveActiveTab", () => {
     const visibleTabs = ["session", "todo", "agents"]; // files/tasks/bash hidden
     const shown = filterTabs(CANONICAL, visibleTabs);
     expect(resolveActiveTab("files", shown.map((t) => t.id))).toBe("session");
+  });
+
+});
+
+// ─── tabVisible (design §4.2) ──────────────────────────────────────────────
+//
+// tabVisible(id, visible) is the one "absent visible_tabs = no rule" check.
+// undefined → all tabs visible. Listed → visible. Unlisted → hidden.
+
+describe("tabVisible", () => {
+  it("undefined visible → true (no rule = all visible)", () => {
+    expect(tabVisible("directory", undefined)).toBe(true);
+    expect(tabVisible("session", undefined)).toBe(true);
+  });
+
+  it("listed → true", () => {
+    expect(tabVisible("directory", ["session", "directory", "agents"])).toBe(true);
+  });
+
+  it("unlisted → false", () => {
+    expect(tabVisible("directory", ["session", "agents"])).toBe(false);
+  });
+
+  it("empty list → all hidden", () => {
+    expect(tabVisible("session", [])).toBe(false);
   });
 });

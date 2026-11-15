@@ -23,7 +23,8 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { App } from "./App";
-import type { AppState, ConversationSummary, WireChatMessage, WireMachineStatus, WireWelcome } from "./state";
+import type { AppState, ConversationSummary, DirListing, WireChatMessage, WireMachineStatus, WireWelcome } from "./state";
+import { setBootEdition } from "./desktop";
 
 // ─── mocks ───────────────────────────────────────────────────────────────
 
@@ -99,7 +100,7 @@ interface FakeAgent {
   conversationsError: string | null;
   machines: WireMachineStatus[];
   commands: unknown[];
-  dirListing: null;
+  dirListing: null | DirListing;
   recentDirs: string[];
   error: string | null;
   send: ReturnType<typeof vi.fn>;
@@ -689,8 +690,8 @@ describe("App mobile sheet — AS: the inline status line", () => {
     const row = must("activity-row");
     expect(row.getAttribute("data-variant")).toBe("line");
     expect(must("activity-label").textContent).toContain("working…");
-    expect(must("activity-tasks").textContent).toBe("⏳ 2 tasks");
-    expect(must("activity-todos").textContent).toBe("☑ 1/3 todos");
+    expect(must("activity-tasks").textContent).toBe("⏳ 2");
+    expect(must("activity-todos").textContent).toBe("☑ 1/3");
   });
 
   it("idle with tasks or todos: counts only, no 'working…' (C10)", async () => {
@@ -1308,6 +1309,164 @@ describe("App desktop — option D: the desktop shell is always wide", () => {
     expect(rail, "the desktop drawer rail renders in the desktop shell at any width").not.toBeNull();
     expect(tid("panels-button"), "no phone panels button in the desktop shell").toBeNull();
     expect(panelsDialog(), "no phone sheet in the desktop shell").toBeNull();
+
+// ═══ DIR — the Directory tab (design §4, §7.3) ═════════════════════════
+
+describe("App mobile sheet — DIR: the Directory tab", () => {
+  it("idle with cwd shows only 📁 basename in the activity row", async () => {
+    hoisted.agent = makeAgent(
+      stateFor("c1", {
+        welcome: { ...WELCOME, cwd: "/home/exe" },
+      } as Partial<AppState>),
+    );
+    mount();
+    await flush();
+    expect(tid("activity-dir")).not.toBeNull();
+    expect(tid("activity-dir")!.textContent).toContain("📁 exe");
+    expect(tid("activity-tasks")).toBeNull();
+    expect(tid("activity-todos")).toBeNull();
+  });
+
+  it("tapping 📁 opens the sheet on the Directory tab", async () => {
+    hoisted.agent = makeAgent(
+      stateFor("c1", {
+        welcome: { ...WELCOME, cwd: "/home/exe" },
+      } as Partial<AppState>),
+    );
+    mount();
+    await flush();
+    click(must("activity-dir"));
+    await flush();
+    expect(panelsDialog()).not.toBeNull();
+    expect(
+      document.body.querySelector('[data-testid="panels-pill"][aria-selected="true"]')!.getAttribute("data-tab"),
+    ).toBe("directory");
+  });
+
+  it("pills order: directory first", async () => {
+    hoisted.agent = makeAgent(
+      stateFor("c1", {
+        welcome: { ...WELCOME, cwd: "/home/exe" },
+      } as Partial<AppState>),
+    );
+    mount();
+    await flush();
+    click(must("panels-button"));
+    await flush();
+    const tabs = pillTabs();
+    expect(tabs[0]).toBe("directory");
+  });
+
+  it("panels button opens directory (Q3 default)", async () => {
+    hoisted.agent = makeAgent(
+      stateFor("c1", {
+        welcome: { ...WELCOME, cwd: "/home/exe" },
+      } as Partial<AppState>),
+    );
+    mount();
+    await flush();
+    click(must("panels-button"));
+    await flush();
+    expect(
+      document.body.querySelector('[data-testid="panels-pill"][aria-selected="true"]')!.getAttribute("data-tab"),
+    ).toBe("directory");
+  });
+
+  it("visible_tabs without directory → no activity-dir, no directory pill", async () => {
+    hoisted.agent = makeAgent(
+      stateFor("c1", {
+        welcome: { ...WELCOME, cwd: "/home/exe" },
+        visible_tabs: ["session", "todo", "files", "tasks", "bash", "agents"],
+      } as Partial<AppState>),
+    );
+    mount();
+    await flush();
+    expect(tid("activity-dir")).toBeNull();
+    click(must("panels-button"));
+    await flush();
+    expect(pillTabs()).not.toContain("directory");
+  });
+
+  it("local edition local chat → no 📁", async () => {
+    setBootEdition("local");
+    hoisted.agent = makeAgent(
+      stateFor("c1", {
+        welcome: { ...WELCOME, cwd: "/home/exe" },
+        catalog: WIRE_CATALOG_LOCAL,
+        selection: { profile: "dev", agent: "team" },
+      } as Partial<AppState>),
+    );
+    mount();
+    await flush();
+    expect(tid("activity-dir")).toBeNull();
+  });
+
+  it("local edition remote profile → 📁 present", async () => {
+    setBootEdition("local");
+    hoisted.agent = makeAgent(
+      stateFor("c1", {
+        welcome: { ...WELCOME, cwd: "/srv/remote" },
+        catalog: WIRE_CATALOG_REMOTE,
+        selection: { profile: "home", agent: "team" },
+      } as Partial<AppState>),
+    );
+    mount();
+    await flush();
+    expect(tid("activity-dir")).not.toBeNull();
+  });
+
+  it("choose a dir in the tab → switch_cwd sent, sheet closes", async () => {
+    hoisted.agent = makeAgent(
+      stateFor("c1", {
+        welcome: { ...WELCOME, cwd: "/home/exe" },
+      } as Partial<AppState>),
+    );
+    mount();
+    await flush();
+    click(must("activity-dir"));
+    await flush();
+    // Simulate a dir_listing response for a different path
+    agentNow().dirListing = { path: "/other", parent: "/", entries: [], error: null };
+    await rerender();
+    await flush();
+    const useBtn = panelsDialog()!.querySelector('button');
+    expect(useBtn, "'Use this directory' button").not.toBeNull();
+    click(useBtn!);
+    await flush();
+    expect(agentNow().send).toHaveBeenCalledWith({ type: "switch_cwd", path: "/other" });
+    expect(panelsDialog(), "sheet closes after commit").toBeNull();
+  });
+
+  it("mobile shell phone width remote cwd → no bottom-bar", async () => {
+    setShell("mobile");
+    hoisted.agent = makeAgent(
+      stateFor("c1", {
+        welcome: { ...WELCOME, cwd: "/srv/remote" },
+        catalog: WIRE_CATALOG_REMOTE,
+        selection: { profile: "home", agent: "team" },
+      } as Partial<AppState>),
+    );
+    mount();
+    await flush();
+    expect(tid("bottom-bar")).toBeNull();
+  });
+
+  it("mobile shell ≥lg remote cwd → bottom-bar with cwd picker", async () => {
+    desktopWidth = true;
+    setShell("mobile");
+    hoisted.agent = makeAgent(
+      stateFor("c1", {
+        welcome: { ...WELCOME, cwd: "/srv/remote" },
+        catalog: WIRE_CATALOG_REMOTE,
+        selection: { profile: "home", agent: "team" },
+      } as Partial<AppState>),
+    );
+    mount();
+    await flush();
+    expect(tid("bottom-bar")).not.toBeNull();
+    expect(tid("bottom-bar")!.querySelector('button[title="/srv/remote"]')).not.toBeNull();
+  });
+});
     // The desktop shell has no Chats screen, so no phone ChatHeader (back button);
     // its <header> is the desktop TopBar.
     expect(tid("chat-back"), "no phone ChatHeader in the desktop shell").toBeNull();

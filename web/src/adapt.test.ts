@@ -948,6 +948,34 @@ describe("adaptMessage — attachments (T9)", () => {
   });
 });
 
+// ─── ChatMessage.at replaces timestamp (design §5.1) ──────────────────────
+//
+// adaptMessage now carries the raw instant as `at: number` (epoch ms parsed
+// once from the wire's RFC 3339 timestamp). The old `timestamp: string` field
+// is removed from the view type. sameMessage compares `at` instead.
+
+describe("adaptMessage — at field (design §5.1)", () => {
+  it("adaptMessage carries at = Date.parse(wire.timestamp)", () => {
+    const wireTs = "2026-11-14T20:14:03Z";
+    const adapted = adaptMessage({
+      role: "agent",
+      content: "hello",
+      timestamp: wireTs,
+    });
+    expect(adapted.at).toBe(Date.parse(wireTs));
+    expect(Number.isFinite(adapted.at)).toBe(true);
+  });
+
+  it("adaptMessage result has no timestamp field", () => {
+    const adapted = adaptMessage({
+      role: "agent",
+      content: "hello",
+      timestamp: "2026-11-14T20:14:03Z",
+    });
+    expect("timestamp" in adapted).toBe(false);
+  });
+});
+
 // T34 regression: the selection chip locked as soon as a system notice (e.g.
 // the `Profile: …` confirmation of a pick) landed. Mirrors the server's
 // StateManager::conversation_has_turns.

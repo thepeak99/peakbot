@@ -115,47 +115,49 @@ export function PanelsSheet({
         ) : null
       }
     >
-      <div className="relative flex-none">
-        <div
-          ref={stripRef}
-          role="tablist"
-          aria-label="Panels"
-          className="flex gap-2 overflow-x-auto px-4 pb-3 pt-1.5"
-          style={{ scrollbarWidth: "none" }}
-        >
-          {tabs.map((t) => {
-            const selected = active === t.id;
-            return (
-              <button
-                key={t.id}
-                type="button"
-                role="tab"
-                data-testid="panels-pill"
-                data-tab={t.id}
-                aria-selected={selected}
-                onClick={() => onActiveChange(t.id)}
-                className={`flex h-10 flex-none cursor-pointer items-center rounded-[20px] border px-[15px] text-sm transition-colors ${
-                  selected ? PILL_ON : PILL_OFF
-                }`}
-              >
-                {t.label}
-                {t.badge != null && t.badge > 0 && (
-                  <span
-                    data-testid="panels-pill-badge"
-                    className="ml-[7px] h-4 min-w-4 rounded-lg bg-sky-600 px-1 text-center font-mono text-[10px] font-semibold leading-4 text-white"
-                  >
-                    {t.badge}
-                  </span>
-                )}
-              </button>
-            );
-          })}
+      <div className="flex min-h-full flex-col">
+        <div className="relative flex-none">
+          <div
+            ref={stripRef}
+            role="tablist"
+            aria-label="Panels"
+            className="flex gap-2 overflow-x-auto px-4 pb-3 pt-1.5"
+            style={{ scrollbarWidth: "none" }}
+          >
+            {tabs.map((t) => {
+              const selected = active === t.id;
+              return (
+                <button
+                  key={t.id}
+                  type="button"
+                  role="tab"
+                  data-testid="panels-pill"
+                  data-tab={t.id}
+                  aria-selected={selected}
+                  onClick={() => onActiveChange(t.id)}
+                  className={`flex h-10 flex-none cursor-pointer items-center rounded-[20px] border px-[15px] text-sm transition-colors ${
+                    selected ? PILL_ON : PILL_OFF
+                  }`}
+                >
+                  {t.label}
+                  {t.badge != null && t.badge > 0 && (
+                    <span
+                      data-testid="panels-pill-badge"
+                      className="ml-[7px] h-4 min-w-4 rounded-lg bg-sky-600 px-1 text-center font-mono text-[10px] font-semibold leading-4 text-white"
+                    >
+                      {t.badge}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+          {/* Right-edge fade: the strip scrolls sideways (mock .pills::after). */}
+          <span aria-hidden className="pointer-events-none absolute inset-y-0 right-0 w-9 bg-gradient-to-r from-transparent to-zinc-900" />
         </div>
-        {/* Right-edge fade: the strip scrolls sideways (mock .pills::after). */}
-        <span aria-hidden className="pointer-events-none absolute inset-y-0 right-0 w-9 bg-gradient-to-r from-transparent to-zinc-900" />
-      </div>
-      <div role="tabpanel" className="min-h-0 px-4 pb-2 pt-1">
-        {activeTab?.content}
+        <div role="tabpanel" className="flex grow flex-col px-4 pb-2 pt-1">
+          {activeTab?.content}
+        </div>
       </div>
     </Sheet>
   );

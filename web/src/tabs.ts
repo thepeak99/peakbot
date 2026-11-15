@@ -16,6 +16,13 @@ export function filterTabs<T extends { id: string }>(
   return tabs.filter((t) => allowed.has(t.id));
 }
 
+/** The one "absent `visible_tabs` = no rule" check. `undefined` → all tabs
+ * visible. Listed → visible. Unlisted → hidden. Used by App to derive
+ * `browsableCwd` (the `directory` tab name gates the desktop cwd picker). */
+export function tabVisible(id: string, visible: string[] | undefined): boolean {
+  return visible === undefined || visible.includes(id);
+}
+
 /** Gear (and Ctrl+,) gate (§9.12 + `settings_available`): the Settings entry
  * points exist only when the server says Settings is available (false under a
  * `--profile` pin) AND the bound profile's `visible_tabs` still lists
@@ -26,10 +33,7 @@ export function settingsGearEnabled(
   settingsAvailable: boolean | undefined,
   visibleTabs: string[] | undefined,
 ): boolean {
-  return (
-    (settingsAvailable ?? true) &&
-    (visibleTabs === undefined || visibleTabs.includes("settings"))
-  );
+  return (settingsAvailable ?? true) && tabVisible("settings", visibleTabs);
 }
 
 /** Keep an open drawer pointed at a real tab after `visibleIds` changes.
