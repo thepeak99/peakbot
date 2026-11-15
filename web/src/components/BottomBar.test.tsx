@@ -147,7 +147,7 @@ describe("bottom bar mobile overflow (T34b)", () => {
     for (const sel of [
       '[data-testid="selection-chip"]',
       'button[title="Load a saved conversation"]',
-      'button[title="/work/repo"]',
+      'button[title="Load a saved conversation"]',
     ]) {
       expect(el.querySelector(sel) !== null, `chip ${sel} rendered`).toBe(true);
     }
@@ -231,9 +231,9 @@ describe("BottomBar — mobileChats (the Chats home shell)", () => {
     expect(el.querySelector('button[title="/work/repo"]'), "the cwd picker stays").not.toBeNull();
   });
 
-  it("B2: with nothing to show (Local edition, local chat) the bar renders null", async () => {
+  it("B2: mobileChats with nothing to show renders null", async () => {
     setBootEdition("local");
-    const el = await mountShell({ cwd: "/work/repo" });
+    const el = await mountShell({ cwd: null });
     expect(el.querySelector("footer"), "no empty bar").toBeNull();
     expect(el.querySelector('[data-testid="bottom-bar"]')).toBeNull();
     expect(el.innerHTML, "nothing rendered at all").toBe("");
@@ -261,5 +261,35 @@ describe("BottomBar — mobileChats (the Chats home shell)", () => {
     expect(el.querySelector('button[title="Load a saved conversation"]')).not.toBeNull();
     expect(el.querySelector('[data-testid="selection-chip"]'), "the chip renders in a browser").not.toBeNull();
     expect(el.querySelector("footer")!.classList.contains("lg:hidden")).toBe(true);
+  });
+
+});
+
+// ─── browsableCwd (design §4) ────────────────────────────────────────────
+//
+// The bottom bar's CwdPicker is now driven by the `cwd` prop (browsableCwd
+// from App). When cwd is null, no picker renders. The mobileChats mode
+// keeps the picker for remote chats at ≥lg.
+
+describe("BottomBar — browsableCwd (design §4)", () => {
+  it("browser mode: chip + conversations render, no cwd picker even with a cwd", async () => {
+    const el = await mount("/tmp/project");
+    expect(el.querySelector('[data-testid="selection-chip"]')).not.toBeNull();
+    expect(el.querySelector('button[title="Load a saved conversation"]')).not.toBeNull();
+    // In browser mode, the cwd picker is not in the bottom bar (it's in TopBar)
+    expect(el.querySelector('button[title="/tmp/project"]')).toBeNull();
+  });
+
+  it("mobileChats with cwd → only the cwd picker", async () => {
+    const el = await mount("/tmp/project", true);
+    expect(el.querySelector('[data-testid="bottom-bar"]')).not.toBeNull();
+    expect(el.querySelector('[data-testid="selection-chip"]')).toBeNull();
+    expect(el.querySelector('button[title="Load a saved conversation"]')).toBeNull();
+    expect(el.querySelector('button[title="/tmp/project"]')).not.toBeNull();
+  });
+
+  it("mobileChats without cwd → null", async () => {
+    const el = await mount(null, true);
+    expect(el.querySelector('[data-testid="bottom-bar"]')).toBeNull();
   });
 });

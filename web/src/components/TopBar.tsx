@@ -4,7 +4,6 @@ import type {
   InboundMessage,
   ModelInfo,
 } from "../state";
-import { isRemote } from "../state";
 import type { CatalogProfile, Selection, SubAgentRun } from "../types";
 import { CwdPicker } from "./CwdPicker";
 import { ConversationsPicker } from "./ConversationsPicker";
@@ -14,7 +13,6 @@ import { FocusToggle } from "./FocusToggle";
 import { PanelsButton, type PanelsButtonProps } from "./PanelsSheet";
 import { ThemeToggle } from "./ThemeToggle";
 import type { TaskNotifications } from "../useTaskNotifications";
-import { edition } from "../desktop";
 
 // Top status bar. Sessions trio (conversations + model + cwd) live here on
 // lg+ and migrate to the BottomBar on smaller screens. Right side carries the
@@ -134,19 +132,17 @@ export function TopBar({
           catalog={catalog}
         />
 
-        {/* The Local edition has no cwd of its own (the shell owns it); a
-            remote profile's cwd lives on the remote, reached via the relay. */}
-        {cwd &&
-          (edition() !== "local" || isRemote(selection?.profile ?? null, catalog ?? [])) && (
-            <CwdPicker
-              cwd={cwd}
-              hasTranscript={hasTranscript}
-              dirListing={dirListing}
-              recentDirs={recentDirs}
-              send={send}
-              onSwitchCwd={onSwitchCwd ?? (() => {})}
-            />
-          )}
+        {/* App passes `browsableCwd`: null hides the picker. */}
+        {cwd && (
+          <CwdPicker
+            cwd={cwd}
+            hasTranscript={hasTranscript}
+            dirListing={dirListing}
+            recentDirs={recentDirs}
+            send={send}
+            onSwitchCwd={onSwitchCwd ?? (() => {})}
+          />
+        )}
       </div>
 
       {isRunning && (

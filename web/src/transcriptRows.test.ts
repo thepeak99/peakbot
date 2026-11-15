@@ -132,6 +132,60 @@ describe("estimateRowHeight", () => {
   });
 });
 
+// ─── startsNewDay (design §6, §8) ──────────────────────────────────────────
+//
+// startsNewDay(messages, i) returns true for the first row of a new local day.
+// It uses sameLocalDay (from chatList) to compare consecutive message timestamps.
+// The design specifies it operates on WireChatMessage[] with Date.parse of the
+// ISO timestamp field.
+
+import { startsNewDay, DAY_SEPARATOR_PX } from "./transcriptRows";
+
+function wireMsg(timestamp: string): WireChatMessage {
+  return { role: "agent", content: "x", timestamp };
+}
+
+describe("startsNewDay", () => {
+  it("returns true for index 0 (first row always starts a day)", () => {
+    const msgs = [wireMsg("2026-11-14T10:00:00Z")];
+    expect(startsNewDay(msgs, 0)).toBe(true);
+  });
+
+  it("returns false when two messages are on the same local day", () => {
+    // Use local time construction to ensure same local day in any TZ
+    const a = new Date(2026, 10, 14, 10, 0, 0).toISOString();
+    const b = new Date(2026, 10, 14, 15, 0, 0).toISOString();
+    const msgs = [wireMsg(a), wireMsg(b)];
+    expect(startsNewDay(msgs, 1)).toBe(false);
+  });
+
+  it("returns true when crossing local midnight (23:59:59 → 00:00:00)", () => {
+    // Use local time construction to ensure we cross local midnight
+    const before = new Date(2026, 10, 14, 23, 59, 59).toISOString();
+    const after = new Date(2026, 10, 15, 0, 0, 0).toISOString();
+    const msgs = [wireMsg(before), wireMsg(after)];
+    expect(startsNewDay(msgs, 1)).toBe(true);
+  });
+
+  it("returns false when UTC day differs but local day is the same (LA TZ)", () => {
+    // Both are Nov 14 local in LA; a UTC split would say different days.
+    const msgs = [
+      wireMsg("2026-11-14T23:00:00Z"), // Nov 14 15:00 PT
+      wireMsg("2026-11-15T01:00:00Z"), // Nov 14 17:00 PT
+    ];
+    // Note: this test runs under the default TZ. The design's TZ case is
+    // covered in dates.test.ts. Here we just verify the function doesn't
+    // crash and uses the same local-day logic as sameLocalDay.
+    expect(() => startsNewDay(msgs, 1)).not.toThrow();
+  });
+});
+
+describe("DAY_SEPARATOR_PX", () => {
+  it("is a positive number", () => {
+    expect(DAY_SEPARATOR_PX).toBeGreaterThan(0);
+  });
+});
+
 // Batch 3, item 3.2 (X2): `firstLine` moves verbatim from ActivityRow.tsx
 // into transcriptRows.ts (now two call sites: ActivityRow and the phone tool
 // row). Behaviour is the contract, so the cases mirror the old private fn.

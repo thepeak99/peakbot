@@ -565,13 +565,15 @@ function bottomBarProps(
 describe("CwdPicker / cwd line per edition", () => {
   it("local: the top bar hides the cwd picker", () => {
     setBootEdition("local");
-    mount(<TopBar {...topBarProps(CWD)} />);
+    // App computes browsableCwd=null for local edition, so TopBar receives null
+    mount(<TopBar {...topBarProps(null)} />);
     expect(host.querySelector(`button[title="${CWD}"]`)).toBeNull();
   });
 
   it("local: the bottom bar hides the cwd picker", () => {
     setBootEdition("local");
-    mount(<BottomBar {...bottomBarProps(CWD)} />);
+    // App computes browsableCwd=null for local edition, so BottomBar receives null
+    mount(<BottomBar {...bottomBarProps(null)} />);
     expect(host.querySelector(`button[title="${CWD}"]`)).toBeNull();
   });
 
@@ -581,7 +583,8 @@ describe("CwdPicker / cwd line per edition", () => {
   });
 
   it("full: the bottom bar keeps the cwd picker (unchanged)", () => {
-    mount(<BottomBar {...bottomBarProps(CWD)} />);
+    // In mobileChats mode (mobile shell), the bottom bar shows the cwd picker
+    mount(<BottomBar {...bottomBarProps(CWD)} mobileChats />);
     expect(host.querySelector(`button[title="${CWD}"]`)).not.toBeNull();
   });
 
@@ -593,6 +596,7 @@ describe("CwdPicker / cwd line per edition", () => {
 
   it("local + remote profile: the top bar shows the cwd picker (relay forwards list_dir)", () => {
     setBootEdition("local");
+    // App computes browsableCwd=CWD for local edition + remote profile
     mount(<TopBar {...topBarProps(CWD, { catalog: REMOTE_CATALOG, selection: REMOTE_SEL })} />);
     expect(
       host.querySelector(`button[title="${CWD}"]`),
@@ -602,7 +606,13 @@ describe("CwdPicker / cwd line per edition", () => {
 
   it("local + remote profile: the bottom bar shows the cwd picker (relay forwards list_dir)", () => {
     setBootEdition("local");
-    mount(<BottomBar {...bottomBarProps(CWD, { catalog: REMOTE_CATALOG, selection: REMOTE_SEL })} />);
+    // App computes browsableCwd=CWD for local edition + remote profile
+    mount(
+      <BottomBar
+        {...bottomBarProps(CWD, { catalog: REMOTE_CATALOG, selection: REMOTE_SEL })}
+        mobileChats
+      />,
+    );
     expect(
       host.querySelector(`button[title="${CWD}"]`),
       "the relay owns the remote's cwd — the picker must be reachable",
@@ -616,9 +626,10 @@ describe("CwdPicker / cwd line per edition", () => {
     (origin) => {
       const catalog = localCatalog(origin);
       setBootEdition("local");
+      // App computes browsableCwd=null for local edition + local profile
       mount(
         <TopBar
-          {...topBarProps(CWD, {
+          {...topBarProps(null, {
             catalog,
             selection: { profile: catalog[0].name, agent: "team", subagentModels: {} },
           })}
@@ -633,9 +644,10 @@ describe("CwdPicker / cwd line per edition", () => {
     (origin) => {
       const catalog = localCatalog(origin);
       setBootEdition("local");
+      // App computes browsableCwd=null for local edition + local profile
       mount(
         <BottomBar
-          {...bottomBarProps(CWD, {
+          {...bottomBarProps(null, {
             catalog,
             selection: { profile: catalog[0].name, agent: "team", subagentModels: {} },
           })}
@@ -647,25 +659,29 @@ describe("CwdPicker / cwd line per edition", () => {
 
   it("local + null selection: the top bar keeps the cwd picker hidden", () => {
     setBootEdition("local");
-    mount(<TopBar {...topBarProps(CWD, { catalog: REMOTE_CATALOG, selection: null })} />);
+    // App computes browsableCwd=null when selection is null
+    mount(<TopBar {...topBarProps(null, { catalog: REMOTE_CATALOG, selection: null })} />);
     expect(host.querySelector(`button[title="${CWD}"]`)).toBeNull();
   });
 
   it("local + null selection: the bottom bar keeps the cwd picker hidden", () => {
     setBootEdition("local");
-    mount(<BottomBar {...bottomBarProps(CWD, { catalog: REMOTE_CATALOG, selection: null })} />);
+    // App computes browsableCwd=null when selection is null
+    mount(<BottomBar {...bottomBarProps(null, { catalog: REMOTE_CATALOG, selection: null })} />);
     expect(host.querySelector(`button[title="${CWD}"]`)).toBeNull();
   });
 
   it("local + profile not in catalog: the top bar keeps the cwd picker hidden", () => {
     setBootEdition("local");
-    mount(<TopBar {...topBarProps(CWD, { catalog: REMOTE_CATALOG, selection: GHOST_SEL })} />);
+    // App computes browsableCwd=null when profile not in catalog
+    mount(<TopBar {...topBarProps(null, { catalog: REMOTE_CATALOG, selection: GHOST_SEL })} />);
     expect(host.querySelector(`button[title="${CWD}"]`)).toBeNull();
   });
 
   it("local + profile not in catalog: the bottom bar keeps the cwd picker hidden", () => {
     setBootEdition("local");
-    mount(<BottomBar {...bottomBarProps(CWD, { catalog: REMOTE_CATALOG, selection: GHOST_SEL })} />);
+    // App computes browsableCwd=null when profile not in catalog
+    mount(<BottomBar {...bottomBarProps(null, { catalog: REMOTE_CATALOG, selection: GHOST_SEL })} />);
     expect(host.querySelector(`button[title="${CWD}"]`)).toBeNull();
   });
 });

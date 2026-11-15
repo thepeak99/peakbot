@@ -6,6 +6,17 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ### Features
 
+- **PeakBot Mobile: message dates, and the working folder moves to the status line.**
+  - On phones, the chat shows day dividers (Today, Yesterday, or the date) and a small time
+    under each message. Tap the time to see the full date and time.
+  - The line above the message box now always shows the working folder (📁 name). Tap it to
+    open the new **Directory** panel (first in the panels sheet) and pick a folder.
+  - The folder chip under the message box is gone. While a turn runs, the task and todo counts
+    are shortened.
+  - A profile can hide folder picking with `ui.tabs: { disabled: [directory] }`. This hides the
+    folder chip on desktop too. If a profile uses `ui.tabs: { only: [...] }`, add `directory`
+    to keep folder picking.
+  - Remote servers need this version for their folder picker to show.
 - **Cloud Mode (preview, API only): sign in, enroll devices, revoke, sign out.** With `general.cloud` set (restart required), `/api/cloud/*` lets this PeakBot log in to a relay, create the account's first device, show the six-word code a new device must match, approve or reject new devices (nothing is approved unless you explicitly choose it), revoke a device and sign out — a live feed of the state is at `/api/cloud/events`. No UI yet. Revoking or signing out removes a device's access at once.
 - **Cloud Mode:** a computer can now be controlled from another of your devices through the relay (CloudServe, `profile@device` tabs, merged conversation list); CloudLink starts at boot when `general.cloud` is set. Fixed a cloud-protocol mux bug (End is a half-close).
 - **Internal: remote-profile transport seam.** The remote-profile controller now rides an enum over transports (direct connection only, today) so Cloud Mode devices can join without touching the proxy, relay or listing code. User-visible: unknown `/r/` paths (anything that isn't an image or an upload fetch) are now refused with a local 404 without contacting the remote server.

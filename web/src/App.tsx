@@ -28,6 +28,7 @@ import { BottomBar } from "./components/BottomBar";
 import { ActivityRow } from "./components/ActivityRow";
 import { TabbedDrawer } from "./components/TabbedDrawer";
 import { PanelsSheet } from "./components/PanelsSheet";
+import { DirectoryBrowser } from "./components/DirectoryBrowser";
 import { StatsPanel } from "./components/StatsPanel";
 import { TodoPanel } from "./components/TodoPanel";
 import { BgPanel } from "./components/BgPanel";
@@ -52,7 +53,9 @@ import { ChatList } from "./components/ChatList";
 import { SelectionChip } from "./components/SelectionChip";
 import { focusView } from "./focus";
 import { epochKey, nextEpoch, type EpochState } from "./transcriptEpoch";
-import { filterTabs, resolveActiveTab, settingsGearEnabled } from "./tabs";
+import { filterTabs, resolveActiveTab, settingsGearEnabled, tabVisible } from "./tabs";
+import { isRemote } from "./state";
+import { edition } from "./desktop";
 import type { ViewFilter } from "./types";
 import {
   adaptBashPanel,
@@ -211,6 +214,16 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   // Scope the Session panel to the watched view (Global keeps grand totals).
   const scopedStats = stats ? scopeStatsToView(stats, view) : null;
   const welcome = state ? adaptWelcome(state) : null;
+  // The cwd the user may see and switch, or null. The Local edition has no cwd
+  // of its own (the shell owns it) unless the profile is remote; a profile hides
+  // it via ui.tabs "directory". This one value drives the phone row item, the
+  // Directory tab, the desktop TopBar picker and the mobile-shell footer picker.
+  const browsableCwd =
+    welcome?.cwd &&
+    tabVisible("directory", state?.visible_tabs) &&
+    (edition() !== "local" || isRemote(selection?.profile ?? null, catalog))
+      ? welcome.cwd
+      : null;
   const bash = state ? adaptBashPanel(state.bash_panel) : null;
   // Todos & files derive from the transcript. In the global view todos form a
   // one-level tree: each lane's list labeled by lane, sub-agent todos nested
@@ -242,7 +255,55 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   // server-queued and lost on Stop — the verb hook re-attaches instead.
   const busy = isRunning || pendingInput > 0;
 
+  // One-shot toast (e.g. `Next conversation: …` from the selection chip).
+  // A minimal local sink — the app has no global toast system; the Settings
+  // view keeps its own.
+  const [toast, setToast] = useState<string | null>(null);
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showToast = useCallback((message: string) => {
+    setToast(message);
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(null), 4000);
+  }, []);
+  useEffect(() => () => {
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+  }, []);
+
+  // Composer submits and cwd-picker commits route through the session-verb
+  // hook so a session verb never reaches a busy session.
+  const { submit, switchCwd } = useSessionVerbs({
+    agent,
+    busy,
+    cwd: welcome?.cwd ?? "",
+    loadConversation,
+    onError: showToast,
+  });
+
+  // Stable for the Sheet's back layer (useBackDismiss re-pushes on a new
+  // identity).
+  const closePanels = useCallback(() => setDrawerTab(null), []);
+
+  const directoryTab =
+    !isDesktop && browsableCwd
+      ? {
+          id: "directory",
+          label: "Directory",
+          content: (
+            <DirectoryBrowser
+              phone
+              cwd={browsableCwd}
+              hasTranscript={hasTranscript}
+              dirListing={dirListing}
+              recentDirs={recentDirs}
+              send={send}
+              onSwitchCwd={switchCwd}
+              onDone={closePanels}
+            />
+          ),
+        }
+      : null;
   const tabs = [
+    ...(directoryTab ? [directoryTab] : []),
     {
       id: "session",
       label: "Session",
@@ -328,9 +389,6 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
     !isDesktop && visibleTabs.length > 0
       ? { count: tasksN + open, onOpen: () => setDrawerTab(visibleTabIds[0]) }
       : undefined;
-  // Stable for the Sheet's back layer (useBackDismiss re-pushes on a new
-  // identity).
-  const closePanels = useCallback(() => setDrawerTab(null), []);
 
   // The gear (and Ctrl+,) exist only when the server says Settings is
   // available (`settings_available`, false under a --profile pin) AND the
@@ -342,20 +400,6 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
     state?.settings_available,
     state?.visible_tabs,
   );
-
-  // One-shot toast (e.g. `Next conversation: …` from the selection chip).
-  // A minimal local sink — the app has no global toast system; the Settings
-  // view keeps its own.
-  const [toast, setToast] = useState<string | null>(null);
-  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const showToast = useCallback((message: string) => {
-    setToast(message);
-    if (toastTimer.current) clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => setToast(null), 4000);
-  }, []);
-  useEffect(() => () => {
-    if (toastTimer.current) clearTimeout(toastTimer.current);
-  }, []);
 
   // The phone's two screens: the list overlay plus the always-mounted
   // conversation. `showToast` is stable; `null` outside the mobile shell.
@@ -382,16 +426,6 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
       setDrawerTab(resolveActiveTab(drawerTab, visibleTabIds));
     }
   }, [drawerTab, visibleTabIds]);
-
-  // Composer submits and cwd-picker commits route through the session-verb
-  // hook so a session verb never reaches a busy session.
-  const { submit, switchCwd } = useSessionVerbs({
-    agent,
-    busy,
-    cwd: welcome?.cwd ?? "",
-    loadConversation,
-    onError: showToast,
-  });
 
   const live: ComposerLive = {
     isRunning,
@@ -455,7 +489,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
         models={models}
         activeAlias={stats?.modelAlias || activeAlias}
         hasTranscript={hasTranscript}
-        cwd={welcome?.cwd ?? null}
+        cwd={browsableCwd}
         dirListing={dirListing}
         recentDirs={recentDirs}
         conversations={conversations}
@@ -538,7 +572,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
           {isDesktop && focusing && turnInFlight && (
             <ActivityRow line={{ kind: "step", step: focused?.activity ?? null }} />
           )}
-          {!isDesktop && (isRunning || tasksN > 0 || open > 0) && (
+          {!isDesktop && (
             <ActivityRow
               line={
                 isRunning
@@ -547,10 +581,11 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
                     : { kind: "working" }
                   : { kind: "idle" }
               }
-              counts={{
+              status={{
                 tasks: tasksN,
                 todosDone: total - open,
                 todosTotal: total,
+                cwd: browsableCwd,
                 onOpen: setDrawerTab,
               }}
             />
@@ -593,7 +628,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
         models={models}
         activeAlias={stats?.modelAlias || activeAlias}
         hasTranscript={hasTranscript}
-        cwd={welcome?.cwd ?? null}
+        cwd={browsableCwd}
         dirListing={dirListing}
         recentDirs={recentDirs}
         send={send}

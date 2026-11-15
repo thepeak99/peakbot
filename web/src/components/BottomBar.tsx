@@ -4,17 +4,16 @@ import type {
   InboundMessage,
   ModelInfo,
 } from "../state";
-import { isRemote } from "../state";
 import type { CatalogProfile, Selection } from "../types";
 import { CwdPicker } from "./CwdPicker";
 import { ConversationsPicker } from "./ConversationsPicker";
 import { SelectionChip } from "./SelectionChip";
-import { edition } from "../desktop";
 
 // Bottom status bar — mobile-only (hidden on lg+), except in the Chats home
 // shell (`mobileChats`): there the chat header owns the selection chip and the
 // Chats list replaces the conversations picker, so the bar holds only the
-// remote CwdPicker and renders nothing without it. Menus open upward (`dropUp`).
+// CwdPicker and renders nothing without a `cwd`. The browser phone shell keeps
+// chip + conversations; its cwd lives in the Directory tab. Menus open upward.
 export function BottomBar({
   conversations,
   conversationsError,
@@ -60,14 +59,10 @@ export function BottomBar({
   /** Toast sink for `Next conversation: …`. */
   onToast?(message: string): void;
   /** Chats home shell: drop the chip, the conversations picker and the
-   * `lg:hidden` gate; render null unless the CwdPicker shows. */
+   * `lg:hidden` gate; render null without a `cwd`. */
   mobileChats?: boolean;
 }) {
-  // The Local edition has no cwd of its own (the shell owns it); a remote
-  // profile's cwd lives on the remote, reached via the relay.
-  const showCwd =
-    Boolean(cwd) && (edition() !== "local" || isRemote(selection?.profile ?? null, catalog ?? []));
-  if (mobileChats && !showCwd) return null;
+  if (mobileChats && !cwd) return null;
 
   return (
     // flex-wrap (T34b): at ≤800 px the chips must not overflow the bar
@@ -110,7 +105,7 @@ export function BottomBar({
         </>
       )}
 
-      {cwd && showCwd && (
+      {mobileChats && cwd && (
         <CwdPicker
           cwd={cwd}
           hasTranscript={hasTranscript}

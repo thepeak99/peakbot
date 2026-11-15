@@ -1,6 +1,7 @@
 import type { ConversationSummary, WireMachineStatus } from "./state";
 import type { CatalogProfile, MachineId } from "./types";
 import type { Device } from "./cloud/types";
+import { MONTHS, sameLocalDay, yesterdayOf } from "./dates";
 
 export type Range = readonly [start: number, end: number];
 
@@ -22,22 +23,6 @@ export interface Activity {
 
 export const NO_ACTIVITY: Activity = { running: new Set(), unread: new Set() };
 
-// Month names from a fixed English array — the spec bans Intl, so a literal
-// table is the only stable source for relative-time labels.
-const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-
-// Compare local calendar fields, not UTC: a DST shift changes the UTC day while
-// the user's clock day stays the same.
-const dayKey = (d: Date): [number, number, number] => [d.getFullYear(), d.getMonth(), d.getDate()];
-const sameDay = (a: Date, b: Date): boolean => {
-  const [ay, am, ad] = dayKey(a);
-  const [by, bm, bd] = dayKey(b);
-  return ay === by && am === bm && ad === bd;
-};
-// The instant "one day before now" in the local calendar; the Date constructor
-// normalises month boundaries so 1 Jan -> 31 Dec needs no special cases.
-const yesterdayOf = (now: Date): Date => new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
-
 // Timestamp in ms, or undefined when the field is blank/unparseable. A blank
 // string is the old-server shape, so we treat it as unparseable on purpose.
 const when = (s: string): number | undefined => {
@@ -55,8 +40,8 @@ export function relativeTime(updatedAt: string, now: Date): string {
   if (diff < 60_000) return "just now";
   const min = Math.floor(diff / 60_000);
   if (min < 60) return `${min}m ago`;
-  if (sameDay(new Date(t), now)) return `${Math.floor(diff / 3_600_000)}h ago`;
-  if (sameDay(new Date(t), yesterdayOf(now))) return "Yesterday";
+  if (sameLocalDay(t, now.getTime())) return `${Math.floor(diff / 3_600_000)}h ago`;
+  if (sameLocalDay(t, yesterdayOf(now.getTime()))) return "Yesterday";
   const d = new Date(t);
   if (d.getFullYear() === now.getFullYear()) return `${d.getDate()} ${MONTHS[d.getMonth()]}`;
   return `${d.getDate()} ${MONTHS[d.getMonth()]} ${d.getFullYear()}`;
@@ -106,8 +91,8 @@ const kindOf = (c: ConversationSummary, now: Date): SectionKind => {
   if (c.active) return "live";
   const t = when(c.updated_at);
   if (t === undefined) return "earlier";
-  if (sameDay(new Date(t), now) || t > now.getTime()) return "today";
-  if (sameDay(new Date(t), yesterdayOf(now))) return "yesterday";
+  if (sameLocalDay(t, now.getTime()) || t > now.getTime()) return "today";
+  if (sameLocalDay(t, yesterdayOf(now.getTime()))) return "yesterday";
   return "earlier";
 };
 // Section labels, literal per the design table.

@@ -383,11 +383,18 @@ fn default_max_files() -> u32 {
     10
 }
 
-/// The seven Web tabs, in canonical order — the closed universe a profile's
-/// `ui.tabs` filter may name. The old `profile` tab is gone; `settings` gates
-/// the Settings gear.
-pub const TAB_NAMES: [&str; 7] = [
-    "session", "todo", "files", "tasks", "bash", "agents", "settings",
+/// The eight Web tabs, in canonical order — the closed universe a profile's
+/// `ui.tabs` filter may name. `directory` also gates the desktop cwd picker;
+/// `settings` gates the Settings gear.
+pub const TAB_NAMES: [&str; 8] = [
+    "directory",
+    "session",
+    "todo",
+    "files",
+    "tasks",
+    "bash",
+    "agents",
+    "settings",
 ];
 
 /// Outbound HTTP timeouts, applied to every client PeakBot builds (LLM calls,
@@ -1962,15 +1969,22 @@ max_image_bytes: 10485760
 
     // ── canonical name lists ─────────────────────────────────────────────
 
-    /// The canonical tab universe: exactly these seven names, in this order.
+    /// The canonical tab universe: exactly these eight names, in this order.
     #[test]
-    fn tab_names_is_the_seven_canonical_tabs_in_order() {
+    fn tab_names_is_the_eight_canonical_tabs_in_order() {
         assert_eq!(
             TAB_NAMES,
             [
-                "session", "todo", "files", "tasks", "bash", "agents", "settings"
+                "directory",
+                "session",
+                "todo",
+                "files",
+                "tasks",
+                "bash",
+                "agents",
+                "settings"
             ],
-            "TAB_NAMES must list the seven web tabs in canonical order"
+            "TAB_NAMES must list the eight web tabs in canonical order"
         );
         let mut seen = std::collections::HashSet::new();
         for name in TAB_NAMES {

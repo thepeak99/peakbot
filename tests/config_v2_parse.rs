@@ -478,7 +478,7 @@ fn rows() -> Vec<Row> {
         "F5",
         "providers:\n  - name: p\n    type: openai\n    api_key: k\n    models:\n      - name: m1\n        alias: a\n      - name: m2\n        alias: b\nprofiles:\n  p:\n    ui:\n      tabs:\n        only: [profile]\n    agents:\n      a:\n        model: a\n",
         vec![key("profiles"), key("p"), key("ui"), key("tabs")],
-        "unknown tab 'profile'. Known tabs: session, todo, files, tasks, bash, agents, settings.",
+        "unknown tab 'profile'. Known tabs: directory, session, todo, files, tasks, bash, agents, settings.",
     ));
 
     // V1 — embeddings dimensions == 0.
@@ -1489,9 +1489,16 @@ fn tabs_default_is_the_new_canonical_seven() {
     assert_eq!(
         cfg.catalog.profile("p").expect("p").tabs,
         [
-            "session", "todo", "files", "tasks", "bash", "agents", "settings"
+            "directory",
+            "session",
+            "todo",
+            "files",
+            "tasks",
+            "bash",
+            "agents",
+            "settings"
         ],
-        "default = all tabs, canonical order; `profile` is gone, `settings` is new"
+        "default = all tabs, canonical order; `directory` is new and first"
     );
 }
 
@@ -1510,7 +1517,38 @@ fn tabs_filtered_keep_canonical_order() {
     let cfg = parsed(yaml);
     assert_eq!(
         cfg.catalog.profile("p").expect("p").tabs,
-        ["session", "todo", "files", "tasks", "agents", "settings"]
+        [
+            "directory",
+            "session",
+            "todo",
+            "files",
+            "tasks",
+            "agents",
+            "settings"
+        ]
+    );
+}
+
+#[test]
+fn tabs_directory_is_filterable() {
+    // `disabled: [directory]` drops only it.
+    let yaml = "providers:\n  - name: p\n    type: openai\n    api_key: k\n    models:\n      - name: m1\n        alias: a\n      - name: m2\n        alias: b\nprofiles:\n  p:\n    ui:\n      tabs:\n        disabled: [directory]\n    agents:\n      a:\n        model: a\n";
+    let cfg = parsed(yaml);
+    assert_eq!(
+        cfg.catalog.profile("p").expect("p").tabs,
+        [
+            "session", "todo", "files", "tasks", "bash", "agents", "settings"
+        ],
+        "disabled: [directory] drops only directory"
+    );
+
+    // `only: [session]` excludes directory.
+    let yaml = "providers:\n  - name: p\n    type: openai\n    api_key: k\n    models:\n      - name: m1\n        alias: a\n      - name: m2\n        alias: b\nprofiles:\n  p:\n    ui:\n      tabs:\n        only: [session]\n    agents:\n      a:\n        model: a\n";
+    let cfg = parsed(yaml);
+    assert_eq!(
+        cfg.catalog.profile("p").expect("p").tabs,
+        ["session"],
+        "only: [session] excludes directory"
     );
 }
 

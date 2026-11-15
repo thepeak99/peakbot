@@ -28,7 +28,7 @@ afterEach(() => {
 const ID = `${"a".repeat(64)}.png`;
 
 function msg(role: ChatMessage["role"], content: string): ChatMessage {
-  return { role, content, timestamp: "10:14" };
+  return { role, content, at: 1732000000000 };
 }
 
 async function renderMessage(message: ChatMessage): Promise<{

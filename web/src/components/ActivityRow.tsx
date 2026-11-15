@@ -3,14 +3,16 @@
 // replaces the content, never stacks. Pure display — no state, no timers
 // (the dots are CSS-only).
 //
-// With `counts` (phone, below 1024px) it becomes one compact line instead of
-// the box: an optional label plus tappable task / todo counts that open their
-// panel. Without `counts` it is today's desktop row, unchanged.
+// With `status` (phone, below 1024px) it becomes one compact line instead of
+// the box: an optional label plus tappable task / todo counts and the cwd,
+// joined by "·" separators. Without `status` it is today's desktop row,
+// unchanged. The line returns null when it has no items.
 
 import type { JSX } from "react";
 import { Fragment } from "react";
 import type { WireChatMessage, WireRole } from "../state";
 import { firstLine } from "../transcriptRows";
+import { basename } from "../paths";
 
 // Display glyphs only — mirrors ROLE_META in Message.tsx, which is keyed by
 // the adapted view roles, so importing it would cross the wire/view seam.
@@ -31,30 +33,30 @@ export type ActivityLine =
   /** Phone, counts only. */
   | { kind: "idle" };
 
-export interface StatusCounts {
-  /** 0 when the Tasks tab is hidden. */
+export interface PhoneStatus {
+  /** Running bg tasks; 0 when the Tasks tab is hidden. */
   tasks: number;
   todosDone: number;
   /** 0 when the Todo tab is hidden. */
   todosTotal: number;
-  onOpen(tab: "tasks" | "todo"): void;
+  /** `browsableCwd`: null ⇒ no 📁 item (hidden tab / Local edition / no cwd). */
+  cwd: string | null;
+  onOpen(tab: "tasks" | "todo" | "directory"): void;
 }
 
-export function ActivityRow({ line, counts }: { line: ActivityLine; counts?: StatusCounts }) {
+export function ActivityRow({ line, status }: { line: ActivityLine; status?: PhoneStatus }) {
   const step = line.kind === "step" ? line.step : null;
   const label = step ? firstLine(step.content) || step.tool_name || step.role : "Thinking";
   const subRole = step?.source?.kind === "sub_agent" ? step.source.role : undefined;
 
-  if (counts) {
-    // The mock's .actline: a lead group (dot/glyph + "·" sub prefix + label,
-    // one .wk segment — no "·" inside it) then the count segments, joined
-    // by "·" separators. Every piece stays a direct child of the row root
-    // so the label is addressable there.
-    const lead =
-      line.kind !== "idle" ? (
+  if (status) {
+    const items: JSX.Element[] = [];
+
+    // Lead (working indicator or step label)
+    if (line.kind !== "idle") {
+      items.push(
         <Fragment key="lead">
           {line.kind === "working" ? (
-            // .pulse — 8px amber dot with the 4px halo (proto:173-174).
             <span
               aria-hidden
               className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-amber-500 shadow-[0_0_0_4px_rgba(245,158,11,0.2)]"
@@ -63,7 +65,6 @@ export function ActivityRow({ line, counts }: { line: ActivityLine; counts?: Sta
             <span aria-hidden>{step ? GLYPH[step.role] : "✦"}</span>
           )}
           {subRole && <span className="shrink-0">🧩 {subRole} ·</span>}
-          {/* .wk face: 13px amber for both working and the kept step line. */}
           <span
             data-testid="activity-label"
             className="min-w-0 truncate text-[13px] text-amber-500"
@@ -71,31 +72,64 @@ export function ActivityRow({ line, counts }: { line: ActivityLine; counts?: Sta
           >
             {line.kind === "step" ? label : "working…"}
           </span>
-        </Fragment>
-      ) : null;
-    const countSegs: JSX.Element[] = [];
-    if (counts.tasks > 0) {
-      countSegs.push(
+        </Fragment>,
+      );
+    }
+
+    // Tasks
+    if (status.tasks > 0) {
+      const taskText = line.kind !== "idle"
+        ? `⏳ ${status.tasks}`
+        : `⏳ ${status.tasks} ${status.tasks === 1 ? "task" : "tasks"}`;
+      const taskAria = `${status.tasks} running ${status.tasks === 1 ? "task" : "tasks"}`;
+      items.push(
         <CountButton
           key="tasks"
           testId="activity-tasks"
-          name="Open Tasks panel"
-          text={`⏳ ${counts.tasks} ${counts.tasks === 1 ? "task" : "tasks"}`}
-          onClick={() => counts.onOpen("tasks")}
+          name={taskAria}
+          text={taskText}
+          title={taskAria}
+          onClick={() => status.onOpen("tasks")}
         />,
       );
     }
-    if (counts.todosTotal > 0) {
-      countSegs.push(
+
+    // Todos
+    if (status.todosTotal > 0) {
+      const todoText = line.kind !== "idle"
+        ? `☑ ${status.todosDone}/${status.todosTotal}`
+        : `☑ ${status.todosDone}/${status.todosTotal} todos`;
+      const todoAria = `${status.todosDone} of ${status.todosTotal} todos done`;
+      items.push(
         <CountButton
           key="todos"
           testId="activity-todos"
-          name="Open Todo panel"
-          text={`☑ ${counts.todosDone}/${counts.todosTotal} todos`}
-          onClick={() => counts.onOpen("todo")}
+          name={todoAria}
+          text={todoText}
+          title={todoAria}
+          onClick={() => status.onOpen("todo")}
         />,
       );
     }
+
+    // Directory
+    if (status.cwd !== null) {
+      items.push(
+        <button
+          type="button"
+          data-testid="activity-dir"
+          aria-label={`Working directory ${status.cwd}`}
+          title={status.cwd}
+          onClick={() => status.onOpen("directory")}
+          className="flex h-8 shrink-0 cursor-pointer items-center gap-1 rounded-lg px-1.5 text-[11.5px] text-zinc-400 active:bg-zinc-800"
+        >
+          📁 {basename(status.cwd)}
+        </button>,
+      );
+    }
+
+    if (items.length === 0) return null;
+
     return (
       <div
         data-testid="activity-row"
@@ -104,18 +138,14 @@ export function ActivityRow({ line, counts }: { line: ActivityLine; counts?: Sta
         aria-live="polite"
         className="flex min-h-8 flex-nowrap items-center gap-1.5 overflow-hidden whitespace-nowrap px-3.5 text-[11px] leading-none text-zinc-500"
       >
-        {lead}
-        {countSegs.map((seg, i) => (
-          <Fragment key={seg.key ?? i}>
-            {(i > 0 || lead) && (
-              // .acsep — the 11px --bd2 "·" between segments (proto:204).
-              <span aria-hidden className="shrink-0 text-[11px] text-zinc-700">
-                ·
-              </span>
-            )}
-            {seg}
-          </Fragment>
-        ))}
+        {items.flatMap((item, i) =>
+          i === 0 ? [item] : [
+            <span key={`sep-${i}`} data-testid="activity-sep" aria-hidden className="shrink-0 text-[11px] text-zinc-700">
+              ·
+            </span>,
+            item,
+          ]
+        )}
       </div>
     );
   }
@@ -151,11 +181,13 @@ function CountButton({
   testId,
   name,
   text,
+  title,
   onClick,
 }: {
   testId: string;
   name: string;
   text: string;
+  title: string;
   onClick(): void;
 }) {
   return (
@@ -163,6 +195,7 @@ function CountButton({
       type="button"
       data-testid={testId}
       aria-label={name}
+      title={title}
       onClick={onClick}
       className="flex h-8 shrink-0 cursor-pointer items-center gap-1 rounded-lg px-1.5 text-[11.5px] text-zinc-400 active:bg-zinc-800"
     >
