@@ -75,6 +75,34 @@ async fn jwks(
 async fn authorize(
     axum::extract::State(st): axum::extract::State<Arc<Mutex<IdpInner>>>,
     axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+) -> axum::response::Html<String> {
+    let st = st.lock().unwrap();
+
+    if q.get("client_id").map(|s| s.as_str()) != Some(st.client_id.as_str()) {
+        panic!("authorize: wrong client_id");
+    }
+
+    // Return HTML with a "Sign in" form (simulates user gesture)
+    let mut fields = String::new();
+    for (k, v) in q.iter() {
+        fields.push_str(&format!(
+            "<input type=\"hidden\" name=\"{k}\" value=\"{v}\">"
+        ));
+    }
+    let html = format!(
+        "<html><head><title>Sign In</title></head><body><h1>Sign In</h1>\
+         <p>Click to approve the login request.</p>\
+         <form method=\"get\" action=\"/authorize/continue\">\
+         {fields}\
+         <button type=\"submit\">Sign in</button>\
+         </form></body></html>"
+    );
+    axum::response::Html(html)
+}
+
+async fn authorize_continue(
+    axum::extract::State(st): axum::extract::State<Arc<Mutex<IdpInner>>>,
+    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
 ) -> axum::response::Redirect {
     let mut st = st.lock().unwrap();
 
@@ -212,6 +240,10 @@ async fn spawn_idp() -> (String, String, String) {
         )
         .route("/jwks", axum::routing::get(jwks))
         .route("/authorize", axum::routing::get(authorize))
+        .route(
+            "/authorize/continue",
+            axum::routing::get(authorize_continue),
+        )
         .route("/token", axum::routing::post(token_endpoint))
         .with_state(inner.clone());
     tokio::spawn(async move {
@@ -267,26 +299,40 @@ async fn dev_relay_e2e_login_chain() {
     let loc = resp.headers().get("location").unwrap().to_str().unwrap();
     assert!(loc.starts_with(&idp_url), "step 1: should redirect to IdP");
 
-    // Step 2: FakeIdp /authorize auto-approves and redirects to relay's /oidc/callback
+    // Step 2: IdP /authorize returns HTML with a "Sign in" form (user gesture)
     let resp = http.get(loc).send().await.unwrap();
+    assert_eq!(resp.status(), 200, "step 2: /authorize should return HTML");
+    let html = resp.text().await.unwrap();
+    assert!(
+        html.contains("Sign in"),
+        "step 2: HTML should contain 'Sign in' button"
+    );
+    assert!(
+        html.contains("/authorize/continue"),
+        "step 2: HTML should contain form action /authorize/continue"
+    );
+
+    // Step 3: Simulate user clicking "Sign in" by calling /authorize/continue with same params
+    let continue_url = loc.replace("/authorize", "/authorize/continue");
+    let resp = http.get(&continue_url).send().await.unwrap();
     assert!(
         resp.status() == 302 || resp.status() == 303,
-        "step 2: /authorize should redirect, got {}",
+        "step 3: /authorize/continue should redirect, got {}",
         resp.status()
     );
     let loc = resp.headers().get("location").unwrap().to_str().unwrap();
     assert!(
         loc.contains("/oidc/callback"),
-        "step 2: should redirect to relay callback"
+        "step 3: should redirect to relay callback"
     );
 
-    // Step 3: Relay exchanges code, issues one-time code, redirects to app scheme
+    // Step 4: Relay exchanges code, issues one-time code, redirects to app scheme
     let resp = http.get(loc).send().await.unwrap();
-    assert_eq!(resp.status(), 302, "step 3: /oidc/callback should 302");
+    assert_eq!(resp.status(), 302, "step 4: /oidc/callback should 302");
     let final_loc = resp.headers().get("location").unwrap().to_str().unwrap();
     assert!(
         final_loc.starts_with("sh.shifu.mobile:/cb"),
-        "step 3: should redirect to app scheme, got {final_loc}"
+        "step 4: should redirect to app scheme, got {final_loc}"
     );
 
     // Parse the one-time code from the final redirect
@@ -298,7 +344,7 @@ async fn dev_relay_e2e_login_chain() {
         .expect("final redirect should have code");
     assert!(!code.is_empty(), "code should not be empty");
 
-    // Step 4: Device POSTs code + verifier to relay's /token
+    // Step 5: Device POSTs code + verifier to relay's /token
     let resp = http
         .post(format!("http://{addr}/token"))
         .json(&serde_json::json!({
@@ -308,7 +354,7 @@ async fn dev_relay_e2e_login_chain() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "step 4: /token should 200");
+    assert_eq!(resp.status(), 200, "step 5: /token should 200");
     let body: serde_json::Value = resp.json().await.unwrap();
     assert!(body["token"].is_string(), "should have token field");
 

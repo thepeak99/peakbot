@@ -97,6 +97,37 @@ async fn jwks(
 async fn authorize(
     axum::extract::State(st): axum::extract::State<Arc<Mutex<IdpInner>>>,
     axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+) -> axum::response::Html<String> {
+    let st = st.lock().unwrap();
+
+    // Validate client_id
+    if q.get("client_id").map(|s| s.as_str()) != Some(st.client_id.as_str()) {
+        panic!("authorize: wrong client_id");
+    }
+
+    // Build an HTML page with a "Sign in" button (form).
+    // This simulates the user gesture required on Chrome Android to
+    // trigger a custom-scheme redirect (sh.shifu.mobile:/cb).
+    let mut fields = String::new();
+    for (k, v) in q.iter() {
+        fields.push_str(&format!(
+            "<input type=\"hidden\" name=\"{k}\" value=\"{v}\">"
+        ));
+    }
+    let html = format!(
+        "<html><head><title>Sign In</title></head><body><h1>Sign In</h1>\
+         <p>Click to approve the login request.</p>\
+         <form method=\"get\" action=\"/authorize/continue\">\
+         {fields}\
+         <button type=\"submit\">Sign in</button>\
+         </form></body></html>"
+    );
+    axum::response::Html(html)
+}
+
+async fn authorize_continue(
+    axum::extract::State(st): axum::extract::State<Arc<Mutex<IdpInner>>>,
+    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
 ) -> axum::response::Redirect {
     let mut st = st.lock().unwrap();
 
@@ -237,6 +268,7 @@ async fn spawn_idp(bind: &str) -> String {
         .route("/.well-known/openid-configuration", get(discovery))
         .route("/jwks", get(jwks))
         .route("/authorize", get(authorize))
+        .route("/authorize/continue", get(authorize_continue))
         .route("/token", post(token_endpoint))
         .with_state(inner.clone());
     tokio::spawn(async move {
