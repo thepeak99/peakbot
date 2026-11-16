@@ -18,6 +18,9 @@ use url::{Url, form_urlencoded};
 use super::link::{CloudCmd, CloudError};
 use super::store::{SeedStore, SessionToken};
 
+/// How long a pending login (loopback or deep link) waits for its callback.
+pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// A prepared login: the auth URL to open, and the secrets the loopback
 /// listener needs to redeem the code. `verifier` is exposed (not secret
 /// once the challenge is derived from it in the S256 flow) so tests can
@@ -77,11 +80,8 @@ pub async fn listener(
     store: Arc<dyn SeedStore>,
     last_login_error: Arc<std::sync::Mutex<Option<String>>>,
 ) {
-    let result = tokio::time::timeout(
-        Duration::from_secs(300),
-        accept_one(base, tcp, &plan, &cmd, &store),
-    )
-    .await;
+    let result =
+        tokio::time::timeout(LOGIN_TIMEOUT, accept_one(base, tcp, &plan, &cmd, &store)).await;
     match result {
         Ok(Ok(())) => {
             // A fresh successful login clears the previous failure.
@@ -113,7 +113,7 @@ async fn accept_one(
         let Ok((stream, _)) = tcp.accept().await else {
             return Err(CloudError::Io("login listener closed".into()));
         };
-        let Ok((path, query, mut stream)) = read_request_head(stream).await else {
+        let Some((path, query, mut stream)) = read_request_head(stream).await else {
             continue;
         };
         if path != "/cb" {
@@ -136,11 +136,7 @@ async fn accept_one(
             respond(&mut stream, 400, "Bad Request", "missing code").await;
             continue;
         };
-        let token = redeem_token(&base, plan, code).await?;
-        store
-            .store_token(&token)
-            .map_err(|e| CloudError::Io(e.to_string()))?;
-        let _ = cmd.send(CloudCmd::TokenStored(token)).await;
+        finish(&base, plan, code, cmd, store).await?;
         respond(&mut stream, 200, "OK", "You can close this tab.").await;
         return Ok(());
     }
@@ -148,35 +144,72 @@ async fn accept_one(
 
 /// Read the HTTP request head (up to `\r\n\r\n`, 8 KiB cap); returns the
 /// target's path and query.
-async fn read_request_head(
-    mut tcp: TcpStream,
-) -> Result<(String, String, TcpStream), std::io::Error> {
-    let mut buf: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 1024];
-    while buf.len() < 8192 && !buf.windows(4).any(|w| w == b"\r\n\r\n") {
-        let n = tcp.read(&mut chunk).await?;
-        if n == 0 {
-            return Err(std::io::Error::other("connection closed"));
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    }
-    let head = String::from_utf8_lossy(&buf);
-    let first = head.lines().next().unwrap_or("");
-    let mut parts = first.split_whitespace();
-    parts.next(); // method
-    let target = parts.next().unwrap_or("");
-    let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    Ok((path.to_string(), query.to_string(), tcp))
+async fn read_request_head(stream: TcpStream) -> Option<(String, String, TcpStream)> {
+    let mut buf = [0u8; 8192];
+    let mut stream = stream;
+    let n = stream.read(&mut buf).await.ok()?;
+    let head = String::from_utf8_lossy(&buf[..n]);
+    let end = head.find("\r\n\r\n")?;
+    let lines: Vec<&str> = head[..end].lines().collect();
+    let first = lines.first()?;
+    let parts: Vec<&str> = first.split_whitespace().collect();
+    let target = parts.get(1)?;
+    let (path, query) = match target.find('?') {
+        Some(i) => (target[..i].to_string(), target[i + 1..].to_string()),
+        None => (target.to_string(), String::new()),
+    };
+    Some((path, query, stream))
 }
 
 async fn respond(tcp: &mut TcpStream, status: u16, text: &str, body: &str) {
-    let head = format!(
-        "HTTP/1.1 {status} {text}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
+    let msg = format!(
+        "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        status,
+        text,
+        body.len(),
+        body
     );
-    let _ = tcp.write_all(head.as_bytes()).await;
-    let _ = tcp.write_all(body.as_bytes()).await;
-    let _ = tcp.shutdown().await;
+    let _ = tcp.write_all(msg.as_bytes()).await;
+}
+
+/// The one redemption path both callback sources share: redeem `code`,
+/// persist the token, tell the actor to reconnect.
+pub async fn finish(
+    base: &Url,
+    plan: &LoginPlan,
+    code: &str,
+    cmd: &tokio::sync::mpsc::Sender<CloudCmd>,
+    store: &Arc<dyn SeedStore>,
+) -> Result<(), CloudError> {
+    let token = redeem_token(base, plan, code).await?;
+    store
+        .store_token(&token)
+        .map_err(|e| CloudError::Io(e.to_string()))?;
+    let _ = cmd.send(CloudCmd::TokenStored(token)).await;
+    Ok(())
+}
+
+/// Constant-time string equality (length is not secret).
+pub fn ct_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.bytes().zip(b.bytes()).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
+}
+
+/// Parse an inbound deep link against the app redirect (scheme + path must
+/// match, no host) → its query params. Errors never echo the URL (it
+/// carries the code).
+pub fn parse_deep_link(
+    redirect: &Url,
+    raw: &str,
+) -> Result<std::collections::HashMap<String, String>, CloudError> {
+    let url =
+        Url::parse(raw.trim()).map_err(|_| CloudError::Io("malformed callback link".into()))?;
+    if url.scheme() != redirect.scheme() || url.path() != redirect.path() || url.has_host() {
+        return Err(CloudError::Io("callback link is not for this app".into()));
+    }
+    Ok(url.query_pairs().into_owned().collect())
 }
 
 /// Redeem `code` against `{base}/token` with `plan.verifier` (the relay
