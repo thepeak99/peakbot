@@ -17,6 +17,7 @@ pub mod store;
 pub mod stream;
 
 pub mod keyring;
+pub mod migrate;
 
 pub use config::{CloudConfig, CloudDef};
 pub use link::{

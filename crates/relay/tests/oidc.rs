@@ -473,7 +473,11 @@ async fn app_scheme_login_completes_with_mobile_redirect() {
 #[tokio::test]
 async fn app_scheme_configured_still_rejects_wrong_scheme() {
     let t = TestRelay::spawn_with_app_scheme("sh.shifu.mobile").await;
-    for bad in ["com.evil.app:/cb", "sh.shifu.desktop:/cb", "javascript:alert(1)"] {
+    for bad in [
+        "com.evil.app:/cb",
+        "sh.shifu.desktop:/cb",
+        "javascript:alert(1)",
+    ] {
         let resp = match t.begin_login(bad).await {
             Ok(_) => panic!("redirect_uri {bad} must be rejected"),
             Err(r) => r,
