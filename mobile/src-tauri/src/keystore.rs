@@ -123,35 +123,65 @@ mod android {
 
     impl SeedStore for AndroidKeystore {
         fn load_seed(&self) -> io::Result<Option<Seed>> {
-            self.get(SEED_ACCOUNT)?.map(|b| decode_seed(&b)).transpose()
+            let result = self.get(SEED_ACCOUNT)?.map(|b| decode_seed(&b)).transpose();
+            match &result {
+                Ok(Some(_)) => tracing::debug!("load_seed: found"),
+                Ok(None) => tracing::debug!("load_seed: not found"),
+                Err(e) => tracing::debug!("load_seed: error: {}", e),
+            }
+            result
         }
 
         fn store_seed(&self, seed: &Seed) -> io::Result<()> {
-            self.entry(SEED_ACCOUNT)?
+            let result = self
+                .entry(SEED_ACCOUNT)?
                 .set_secret(encode_seed(seed).as_bytes())
-                .map_err(kr_io)
+                .map_err(kr_io);
+            match &result {
+                Ok(()) => tracing::debug!("store_seed: stored"),
+                Err(e) => tracing::debug!("store_seed: error: {}", e),
+            }
+            result
         }
 
         fn load_token(&self) -> io::Result<Option<SessionToken>> {
-            self.get(TOKEN_ACCOUNT)?
+            let result = self
+                .get(TOKEN_ACCOUNT)?
                 .map(|b| decode_token(b.to_vec()))
-                .transpose()
+                .transpose();
+            match &result {
+                Ok(Some(t)) => tracing::debug!("load_token: found (len {})", t.as_str().len()),
+                Ok(None) => tracing::debug!("load_token: not found"),
+                Err(e) => tracing::debug!("load_token: error: {}", e),
+            }
+            result
         }
 
         fn store_token(&self, token: &SessionToken) -> io::Result<()> {
-            self.entry(TOKEN_ACCOUNT)?
+            let result = self
+                .entry(TOKEN_ACCOUNT)?
                 .set_secret(token.as_str().as_bytes())
-                .map_err(kr_io)
+                .map_err(kr_io);
+            match &result {
+                Ok(()) => tracing::debug!("store_token: stored (len {})", token.as_str().len()),
+                Err(e) => tracing::debug!("store_token: error: {}", e),
+            }
+            result
         }
 
         fn clear_token(&self) -> io::Result<()> {
-            self.delete(TOKEN_ACCOUNT)
+            let result = self.delete(TOKEN_ACCOUNT);
+            match &result {
+                Ok(()) => tracing::debug!("clear_token: cleared"),
+                Err(e) => tracing::debug!("clear_token: error: {}", e),
+            }
+            result
         }
 
         fn wipe(&self) -> io::Result<()> {
-            // Both always attempted; the first failure is reported.
             let seed = self.delete(SEED_ACCOUNT);
             let token = self.delete(TOKEN_ACCOUNT);
+            tracing::debug!("wipe: seed={:?}, token={:?}", seed.is_ok(), token.is_ok());
             seed.and(token)
         }
     }

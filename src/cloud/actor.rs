@@ -2578,7 +2578,20 @@ pub async fn run(
         Connecting,
         Suspended,
     }
-    let mut stage = Stage::Idle(LogoutReason::Never);
+    // A token already in the store (an app restart) means connect at once:
+    // `Idle` waits for a `TokenStored` that only a fresh login sends, so
+    // starting there shows logged-out beside a perfectly good session.
+    let has_token = store_op({
+        let store = actor.store.clone();
+        move || store.load_token()
+    })
+    .await
+    .is_ok_and(|t| t.is_some());
+    let mut stage = if has_token {
+        Stage::Connecting
+    } else {
+        Stage::Idle(LogoutReason::Never)
+    };
     loop {
         match &stage {
             Stage::Idle(reason) => {

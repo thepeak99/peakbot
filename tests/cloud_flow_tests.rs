@@ -602,3 +602,38 @@ async fn retry_when_not_rejected_is_not_rejected() {
         "a refused retry must not redial (SAS unchanged)"
     );
 }
+
+/// P5: an app restart re-spawns the link over the SAME store + state dir.
+/// A stored token must reconnect at once (Active, same identity), never
+/// sit at `LoggedOut { Never }` waiting for a login that already happened.
+#[tokio::test]
+async fn restart_with_a_stored_token_reconnects_without_login() {
+    let fake = FakeRelay::spawn().await;
+    let a = spawn_device(1, "Phone", &fake, None);
+    a.login(&fake).await;
+    let id = a.handle.genesis().await.expect("genesis");
+    let _ = a.active().await;
+    assert!(a.store.load_token().expect("token").is_some());
+    a.handle.shutdown().await;
+
+    let cfg = peakbot::cloud::CloudConfig {
+        relay: peakbot::config::remote::Endpoint::LoopbackPlain {
+            origin: Url::parse(&fake.url()).expect("origin"),
+        },
+        state_dir: a.dir.path().to_path_buf(),
+        device_name: "Phone".to_string(),
+        platform: 1,
+    };
+    let again = peakbot::cloud::spawn_with_callback(
+        cfg,
+        a.store.clone(),
+        None,
+        peakbot::cloud::login::CallbackSource::Loopback,
+    );
+    let st = rig::wait_state(again.state(), |s| matches!(s, CloudState::Active { .. })).await;
+    assert!(
+        matches!(st, CloudState::Active { .. }),
+        "restart with a stored token must reach Active, got {st:?}"
+    );
+    assert_eq!(again.device_id(), Some(id), "same identity after restart");
+}
