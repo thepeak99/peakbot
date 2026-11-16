@@ -41,7 +41,7 @@ async fn active_one(fake: &FakeRelay) -> Dev {
 async fn suspend_closes_the_relay_socket_after_the_debounce() {
     let fake = FakeRelay::spawn().await;
     let a = active_one(&fake).await;
-    a.handle.set_foreground(false);
+    a.handle.set_foreground(false).await;
     tokio::time::sleep(Duration::from_millis(1000)).await;
     assert_eq!(
         fake.live_sockets(),
@@ -59,7 +59,7 @@ async fn no_redial_while_suspended() {
     let fake = FakeRelay::spawn().await;
     let a = active_one(&fake).await;
     let before = fake.ws_connects();
-    a.handle.set_foreground(false);
+    a.handle.set_foreground(false).await;
     assert!(wait_until(|| fake.live_sockets() == 0).await, "closed");
     tokio::time::sleep(Duration::from_millis(2500)).await;
     assert_eq!(fake.live_sockets(), 0, "still closed");
@@ -74,7 +74,7 @@ async fn no_redial_while_suspended() {
 async fn suspend_does_not_wipe_identity_or_chain() {
     let fake = FakeRelay::spawn().await;
     let a = active_one(&fake).await;
-    a.handle.set_foreground(false);
+    a.handle.set_foreground(false).await;
     assert!(wait_until(|| fake.live_sockets() == 0).await);
     let st = a.state();
     assert!(
@@ -102,9 +102,9 @@ async fn resume_redials_once_and_returns_to_active() {
     let fake = FakeRelay::spawn().await;
     let a = active_one(&fake).await;
     let before = fake.ws_connects();
-    a.handle.set_foreground(false);
+    a.handle.set_foreground(false).await;
     assert!(wait_until(|| fake.live_sockets() == 0).await, "closed");
-    a.handle.set_foreground(true);
+    a.handle.set_foreground(true).await;
     let st = rig::wait_state(a.handle.state(), |s| matches!(s, CloudState::Active { .. })).await;
     assert!(
         matches!(st, CloudState::Active { .. }),
@@ -123,9 +123,9 @@ async fn foreground_flap_within_the_debounce_never_suspends() {
     let fake = FakeRelay::spawn().await;
     let a = active_one(&fake).await;
     let before = fake.ws_connects();
-    a.handle.set_foreground(false);
+    a.handle.set_foreground(false).await;
     tokio::time::sleep(Duration::from_millis(800)).await;
-    a.handle.set_foreground(true);
+    a.handle.set_foreground(true).await;
     tokio::time::sleep(PAST_DEBOUNCE).await;
     assert_eq!(fake.live_sockets(), 1, "the socket never closed");
     assert_eq!(fake.ws_connects(), before, "and was never redialled");
@@ -137,7 +137,7 @@ async fn resume_without_a_prior_suspend_is_a_noop() {
     let fake = FakeRelay::spawn().await;
     let a = active_one(&fake).await;
     let before = fake.ws_connects();
-    a.handle.set_foreground(true);
+    a.handle.set_foreground(true).await;
     tokio::time::sleep(Duration::from_millis(800)).await;
     assert_eq!(fake.ws_connects(), before, "no redial when not suspended");
     assert_eq!(fake.live_sockets(), 1);
@@ -148,9 +148,9 @@ async fn suspend_while_logged_out_is_a_noop() {
     let fake = FakeRelay::spawn().await;
     let a = spawn_device(1, "Phone", &fake, None);
     assert!(matches!(a.state(), CloudState::LoggedOut { .. }));
-    a.handle.set_foreground(false);
+    a.handle.set_foreground(false).await;
     tokio::time::sleep(PAST_DEBOUNCE).await;
-    a.handle.set_foreground(true);
+    a.handle.set_foreground(true).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(
         matches!(a.state(), CloudState::LoggedOut { .. }),
@@ -190,9 +190,9 @@ async fn pending_enrollment_survives_suspend_resume_with_the_same_words_and_lett
     };
     let letter = requests[0].letter_id;
 
-    b.handle.set_foreground(false);
+    b.handle.set_foreground(false).await;
     tokio::time::sleep(PAST_DEBOUNCE).await;
-    b.handle.set_foreground(true);
+    b.handle.set_foreground(true).await;
     let st = rig::wait_state(b.handle.state(), |s| {
         matches!(s, CloudState::Pending { sas: Some(_), .. })
     })
