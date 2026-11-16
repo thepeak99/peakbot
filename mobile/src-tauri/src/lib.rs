@@ -16,6 +16,7 @@ mod ios;
 use std::path::PathBuf;
 
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use serde_json;
 use tauri::webview::Color;
 use tauri::{AppHandle, Manager, RunEvent, Url, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_log::log;
@@ -340,6 +341,8 @@ pub fn run() {
                 if let Ok(Some(urls)) = app.deep_link().get_current() {
                     let app = app.handle().clone();
                     for url in urls {
+                        let app = app.clone();
+                        let url = url.to_string();
                         tauri::async_runtime::spawn(async move {
                             deliver_deep_link(&app, url).await;
                         });
@@ -348,13 +351,13 @@ pub fn run() {
                 // P5 T8: deep-link while running — the user completed OAuth
                 // in the browser and the system opened the app via the deep
                 // link. Registered once in setup.
+                let handle = app.handle().clone();
                 app.deep_link().on_open_url(move |event| {
-                    let app = app.clone();
                     for url in event.urls() {
-                        let app = app.clone();
+                        let handle = handle.clone();
                         let url = url.to_string();
                         tauri::async_runtime::spawn(async move {
-                            deliver_deep_link(&app, url).await;
+                            deliver_deep_link(&handle, url).await;
                         });
                     }
                 });
