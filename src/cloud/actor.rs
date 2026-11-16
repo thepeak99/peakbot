@@ -2193,21 +2193,29 @@ impl Actor {
         let (open_tx, open_rx) = oneshot::channel();
         self.start_open(live, ws, device, Op::Profiles, open_tx)
             .await;
-        let mut stream = match open_rx.await {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                let _ = out.send(Err(e));
-                return;
-            }
-            Err(_) => {
-                let _ = out.send(Err(CloudError::Offline));
-                return;
-            }
-        };
-        // The read-reply dance runs OFF the actor loop: while it awaits the
-        // peer's `Head`, the loop must stay free to forward the socket
-        // frames CloudServe answers with (D: one owner, never blocked).
+        // Everything after `start_open` runs OFF the actor loop: with no
+        // live session the open only resolves once the loop reads the
+        // peer's handshake reply (or `Unreachable`), and while it awaits the
+        // peer's `Head` the loop must stay free to forward the socket frames
+        // CloudServe answers with (D: one owner, never blocked). Awaiting
+        // `open_rx` here deadlocked the actor on every cold request.
         tokio::spawn(async move {
+            let opened = tokio::time::timeout(
+                Duration::from_secs(constants::HANDSHAKE_TIMEOUT),
+                open_rx,
+            )
+            .await;
+            let mut stream = match opened {
+                Ok(Ok(Ok(s))) => s,
+                Ok(Ok(Err(e))) => {
+                    let _ = out.send(Err(e));
+                    return;
+                }
+                Ok(Err(_)) | Err(_) => {
+                    let _ = out.send(Err(CloudError::Offline));
+                    return;
+                }
+            };
             // The peer answers `Head, Chunk*, End` (mux S4); a `Reset` is a
             // refusal (a `Close{TRUST}` maps to the PROTOCOL reset code).
             let mut body = Vec::new();
