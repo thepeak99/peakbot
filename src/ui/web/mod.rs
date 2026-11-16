@@ -923,6 +923,20 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
     serve_socket(ws_sink, ws_stream, state, Principal::Token).await;
 }
 
+/// The catalog row for a `profile@device` cloud target (machine = the bare
+/// device slug, the cloud `MachineId`); the relay fills its agents.
+fn cloud_target_info(name: &str, target: &str) -> crate::config::resolve::ProfileInfo {
+    let slug = name.rsplit_once('@').map_or("", |(_, d)| d);
+    crate::config::resolve::ProfileInfo {
+        name: name.to_string(),
+        origin: "remote".to_string(),
+        overrides_global: false,
+        agents: Vec::new(),
+        color: crate::config::file::TabColor::derived(target),
+        machine: Some(slug.to_string()),
+    }
+}
+
 /// [`handle_socket`] over any transport that speaks axum WS `Message`s
 /// (p3-design §E.1): the axum path passes the split socket; CloudServe
 /// (PR-C) adapts its `Frame(String)` stream to `Message::Text`. The
@@ -987,7 +1001,9 @@ async fn serve_socket<Si, St, E>(
                         name: p.to_string(),
                         target_profile: target.clone(),
                         target_agent: None,
-                        catalog: Vec::new(),
+                        // One stub row so `relay::rewrite` keeps the target in
+                        // the chip's catalog (and fills its agents).
+                        catalog: vec![cloud_target_info(p, target)],
                     };
                     remote::relay::run(
                         ws_stream,
@@ -1016,6 +1032,9 @@ async fn serve_socket<Si, St, E>(
     // catalogue pays for the parse (a name has one kind per config; local
     // freshness is the session's own reload's job), as does an unpinned
     // attach on a relay-only boot catalogue.
+    let home_attach = profile.is_none()
+        && !relayed
+        && registry.boot_catalog().default_bound().is_none();
     let fresh = match profile
         .as_deref()
         .filter(|p| !boot_has_local(registry.boot_catalog(), p))
@@ -1024,12 +1043,7 @@ async fn serve_socket<Si, St, E>(
         // A relay-only config has no local session to mint, so an unpinned
         // attach takes the home remote's path. A relayed attach never does:
         // it keeps the E-CHAIN / local behaviour.
-        None if profile.is_none()
-            && !relayed
-            && registry.boot_catalog().default_bound().is_none() =>
-        {
-            Some(remote::fresh_home_attach())
-        }
+        None if home_attach => Some(remote::fresh_home_attach()),
         None => None,
     };
     let (remote_profile, fresh_catalog) = match fresh {
@@ -1043,6 +1057,17 @@ async fn serve_socket<Si, St, E>(
         }
         None => (None, Vec::new()),
     };
+
+    // Zero-local config (no local profile, no home remote): nothing to attach
+    // to. Tell the client with one typed frame and close — no session, no
+    // "failed to start session" error. Web unpinned, non-relayed attach only.
+    if home_attach && remote_profile.is_none() && fresh_catalog.iter().all(|i| i.origin == "remote")
+    {
+        let _ = out_tx.send(OutboundMessage::NoLocalProfile);
+        drop(out_tx);
+        let _ = writer_task.await;
+        return;
+    }
 
     // E-CHAIN (design §5.9): a relay may not reach through a remote profile.
     // Checked before `attach` so a refused chain never mints a session.
