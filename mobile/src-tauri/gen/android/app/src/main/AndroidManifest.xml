@@ -32,6 +32,13 @@
                 <!-- AndroidTV support -->
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
+            <!-- P5 T8: deep link for OAuth callback (sh.shifu.mobile:/cb) -->
+            <intent-filter android:autoVerify="false">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="sh.shifu.mobile" />
+            </intent-filter>
         </activity>
 
         <provider

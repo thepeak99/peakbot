@@ -44,6 +44,12 @@ impl Local {
         self.lock().is_some()
     }
 
+    /// P5 T8: the running core, if any — for deep-link delivery and
+    /// foreground signal forwarding.
+    pub fn core(&self) -> Option<&LocalCore> {
+        self.lock().as_ref().map(|r| &r.core)
+    }
+
     /// Start the core if it isn't running (re-serving it if its listener
     /// died) and return the URL the webview opens — never handed to JS.
     pub async fn ensure(&self) -> Result<Url, String> {

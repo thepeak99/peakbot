@@ -49,5 +49,19 @@
 	<string>Scan the pairing QR code shown by PeakBot.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>PeakBot connects to AI providers and servers on your local network.</string>
+	<!-- P5 T8: deep link for OAuth callback (sh.shifu.mobile:/cb) -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleURLName</key>
+			<string>sh.shifu.mobile</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>sh.shifu.mobile</string>
+			</array>
+		</dict>
+	</array>
 </dict>
 </plist>
