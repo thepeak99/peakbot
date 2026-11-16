@@ -52,7 +52,10 @@ async fn controller_fetches_host_profiles_cold() {
     let (_host, ctl) = enroll_pair(&fake, hook).await;
 
     let p = profiles_within(&ctl, ANSWER, "cold").await;
-    assert!(p.starts_with("Ok(") && p.contains("dev"), "host profiles: {p}");
+    assert!(
+        p.starts_with("Ok(") && p.contains("dev"),
+        "host profiles: {p}"
+    );
     // The link must still serve a second request (it is not wedged).
     let p = profiles_within(&ctl, ANSWER, "second").await;
     assert!(p.starts_with("Ok("), "second request: {p}");
@@ -71,7 +74,10 @@ async fn controller_fetches_host_profiles_after_suspend_resume() {
     active(&ctl).await;
 
     let p = profiles_within(&ctl, ANSWER, "after resume").await;
-    assert!(p.starts_with("Ok(") && p.contains("dev"), "host profiles: {p}");
+    assert!(
+        p.starts_with("Ok(") && p.contains("dev"),
+        "host profiles: {p}"
+    );
 }
 
 /// (iii) app restart: a new link on the same store + state dir boots from
@@ -100,7 +106,10 @@ async fn controller_fetches_host_profiles_after_restart_from_stored_token() {
     active(&ctl).await;
 
     let p = profiles_within(&ctl, ANSWER, "after restart").await;
-    assert!(p.starts_with("Ok(") && p.contains("dev"), "host profiles: {p}");
+    assert!(
+        p.starts_with("Ok(") && p.contains("dev"),
+        "host profiles: {p}"
+    );
 }
 
 /// (iv) the host is offline: the request errors within the bound.

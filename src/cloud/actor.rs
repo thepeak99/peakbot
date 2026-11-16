@@ -2200,11 +2200,9 @@ impl Actor {
         // CloudServe answers with (D: one owner, never blocked). Awaiting
         // `open_rx` here deadlocked the actor on every cold request.
         tokio::spawn(async move {
-            let opened = tokio::time::timeout(
-                Duration::from_secs(constants::HANDSHAKE_TIMEOUT),
-                open_rx,
-            )
-            .await;
+            let opened =
+                tokio::time::timeout(Duration::from_secs(constants::HANDSHAKE_TIMEOUT), open_rx)
+                    .await;
             let mut stream = match opened {
                 Ok(Ok(Ok(s))) => s,
                 Ok(Ok(Err(e))) => {
