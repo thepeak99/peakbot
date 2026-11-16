@@ -222,7 +222,8 @@ async fn spawn_idp(bind: &str) -> String {
     let es = p256::ecdsa::SigningKey::from_slice(&rand_bytes(32)).expect("p256 key");
     let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let url = format!("http://{addr}");
+    // Use 127.0.0.1 for the URL so the relay can reach it (0.0.0.0 is not routable)
+    let url = format!("http://127.0.0.1:{}", addr.port());
     let client_id = "relay-client-id".to_string();
     let client_secret = "s3cret-client-secret-value".to_string();
     let inner = Arc::new(Mutex::new(IdpInner {
@@ -252,7 +253,7 @@ async fn main() {
     // Build relay config
     let cfg = peakbot_relay::config::Config {
         bind: "0.0.0.0:8080".parse().unwrap(),
-        origin: peakbot_relay::config::Origin("http://0.0.0.0:8080".to_string()),
+        origin: peakbot_relay::config::Origin("http://localhost:8080".to_string()),
         db: "/tmp/peakbot-dev-relay.db".into(),
         app_scheme: Some("sh.shifu.mobile".to_string()),
         issuers: vec![peakbot_relay::config::Issuer {
@@ -276,5 +277,10 @@ async fn main() {
     println!();
     println!("The FakeIdp will auto-approve and redirect to sh.shifu.mobile:/cb?code=…&state=dev");
 
-    peakbot_relay::serve(cfg, listener).await.unwrap();
+    let handle = peakbot_relay::serve(cfg, listener).await.unwrap();
+    println!("Relay handle obtained, waiting for shutdown...");
+    // Wait for shutdown signal (never comes in this example, so runs forever)
+    tokio::signal::ctrl_c().await.unwrap();
+    println!("Shutting down...");
+    handle.shutdown().await;
 }
