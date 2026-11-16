@@ -58,6 +58,8 @@ struct Inner {
     mailboxes: std::sync::Mutex<HashMap<DeviceId, Vec<Mail>>>,
     /// Per-connection stop flags: token ⇒ flag.
     conns: std::sync::Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Total `/ws` connections ever accepted (redial counting, P5).
+    connects: std::sync::atomic::AtomicUsize,
     /// Decoded ToRelay messages, in order (the "no Hello on chain Err"
     /// and "ChainFetch before Hello" assertions read this).
     msgs: std::sync::Mutex<Vec<String>>,
@@ -165,6 +167,7 @@ impl FakeRelay {
             pending_cards: Default::default(),
             mailboxes: Default::default(),
             conns: Default::default(),
+            connects: Default::default(),
             msgs: Default::default(),
             ws_gate: AtomicBool::new(false),
             ws_gate_released: tokio::sync::Notify::new(),
@@ -226,6 +229,18 @@ impl FakeRelay {
             stop.store(true, Ordering::SeqCst);
         }
         self.inner.drops.send_modify(|n| *n += 1);
+    }
+
+    /// `/ws` connections open right now.
+    pub fn live_sockets(&self) -> usize {
+        self.inner.conns.lock().expect("conns").len()
+    }
+
+    /// `/ws` connections ever accepted (a redial bumps it).
+    pub fn ws_connects(&self) -> usize {
+        self.inner
+            .connects
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Is this token still accepted by `/ws`?
@@ -367,7 +382,7 @@ async fn login_start(
     let ok_redirect = q
         .redirect_uri
         .as_deref()
-        .is_some_and(|u| u.starts_with("http://127.0.0.1:"));
+        .is_some_and(|u| u.starts_with("http://127.0.0.1:") || u == "sh.shifu.mobile:/cb");
     if !ok_challenge || !ok_state || !ok_redirect {
         return Response::builder()
             .status(StatusCode::BAD_REQUEST)
@@ -485,6 +500,9 @@ async fn ws_upgrade(
 }
 
 async fn conn(inner: Arc<Inner>, token: String, mut ws: WebSocket) {
+    inner
+        .connects
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let stop = Arc::new(AtomicBool::new(false));
     inner
         .conns

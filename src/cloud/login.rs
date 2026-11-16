@@ -236,3 +236,29 @@ pub async fn logout_post(base: &Url, token: &SessionToken) -> Result<(), CloudEr
     }
     Ok(())
 }
+
+/// P5 C1: where the PKCE callback comes from. SKELETON — `spawn_with_callback`
+/// does not honour `DeepLink` yet.
+#[derive(Debug, Clone)]
+pub enum CallbackSource {
+    /// Desktop: a one-shot `127.0.0.1:0` listener.
+    Loopback,
+    /// Mobile: the OS delivers `sh.shifu.mobile:/cb?code&state`.
+    DeepLink(AppRedirect),
+}
+
+/// Parsed once at boot: scheme `sh.shifu.mobile`, path `/cb`, no host/fragment.
+#[derive(Debug, Clone)]
+pub struct AppRedirect(Url);
+
+impl AppRedirect {
+    /// The mobile app's redirect `sh.shifu.mobile:/cb` (design `AppRedirect::MOBILE`;
+    /// a fn because `Url` is not const-constructible).
+    pub fn mobile() -> Self {
+        Self(Url::parse("sh.shifu.mobile:/cb").expect("static redirect"))
+    }
+
+    pub fn url(&self) -> &Url {
+        &self.0
+    }
+}

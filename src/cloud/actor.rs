@@ -1990,6 +1990,7 @@ impl Actor {
                 self.do_profiles(live, ws, device, out).await;
                 None
             }
+            CloudCmd::Suspend | CloudCmd::Resume => None, // P5 skeleton
             CloudCmd::Stop => Some(RunEnd::Stopped),
         }
     }
@@ -2611,6 +2612,7 @@ pub async fn run(
                         actor.chain_cache = None;
                         let _ = out.send(Ok(LogoutOutcome { revoked: false }));
                     }
+                    CloudCmd::Suspend | CloudCmd::Resume => {} // P5 skeleton
                     CloudCmd::Stop => return,
                 }
             }
@@ -2652,6 +2654,7 @@ pub async fn run(
                         let _ = out.send(Ok(LogoutOutcome { revoked: false }));
                         stage = Stage::Idle(LogoutReason::SignedOut);
                     }
+                    CloudCmd::Suspend | CloudCmd::Resume => {} // P5 skeleton
                     CloudCmd::Stop => return,
                     _ => {}
                 }

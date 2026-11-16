@@ -144,6 +144,10 @@ pub enum FlowError {
     ChainBusy,
     UseLogout,
     LastDevice,
+    /// P5 E-F3: `login` while a login is already pending (never cancels the first).
+    LoginInFlight,
+    /// P5: `deliver_callback` with no DeepLink login pending.
+    NoLoginPending,
 }
 
 /// Directory slug per device (design F.5 / H.1): `slug(name)` =
@@ -262,6 +266,10 @@ pub enum CloudCmd {
         device: DeviceId,
         out: oneshot::Sender<Result<Vec<crate::cloud::session::ProfileInfo>, CloudError>>,
     },
+    /// P5: app backgrounded — close the ws, park reconnect (skeleton: ignored).
+    Suspend,
+    /// P5: app foregrounded — redial now (skeleton: ignored).
+    Resume,
     /// Stop the actor (handle teardown).
     Stop,
 }
@@ -305,6 +313,18 @@ impl CloudHandle {
         }));
         open_browser(auth_url);
         Ok(())
+    }
+
+    /// P5 T4: hand an inbound deep-link URL to the pending DeepLink login
+    /// (`NoLoginPending` / state mismatch ⇒ Err, slot kept). SKELETON.
+    pub async fn deliver_callback(&self, _url: &str) -> Result<(), CloudError> {
+        todo!("P5 T4: deliver_callback")
+    }
+
+    /// P5 T5: app foreground signal; `false` suspends after a 3 s debounce,
+    /// `true` resumes now. SKELETON.
+    pub fn set_foreground(&self, _fg: bool) {
+        todo!("P5 T5: set_foreground")
     }
 
     /// A login listener is running right now (G.1 step 5). The handle's
@@ -455,6 +475,18 @@ impl CloudHandle {
         rx.await
             .map_err(|_| CloudError::Io("the cloud actor stopped".into()))?
     }
+}
+
+/// P5: like [`spawn`] but with the OAuth callback source (desktop = `Loopback`).
+/// SKELETON: `callback` is ignored until T4.
+pub fn spawn_with_callback(
+    cfg: CloudConfig,
+    store: Arc<dyn SeedStore>,
+    inbound: Option<InboundHook>,
+    callback: login::CallbackSource,
+) -> CloudHandle {
+    let _ = callback;
+    spawn(cfg, store, inbound)
 }
 
 /// Spawn the process-wide actor (p3-design §D.6 / B8). Both editions;

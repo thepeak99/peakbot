@@ -6,8 +6,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use peakbot::cloud::login::{AppRedirect, CallbackSource};
 use peakbot::cloud::store::MemSeedStore;
-use peakbot::cloud::{CloudConfig, CloudHandle, CloudState, InboundHook, Seed, SeedStore, spawn};
+use peakbot::cloud::{
+    CloudConfig, CloudHandle, CloudState, InboundHook, Seed, SeedStore, spawn_with_callback,
+};
 use url::Url;
 
 use super::fake_relay::FakeRelay;
@@ -43,6 +46,27 @@ pub struct Dev {
 }
 
 pub fn spawn_device(n: u8, name: &str, fake: &FakeRelay, inbound: Option<InboundHook>) -> Dev {
+    spawn_device_with(n, name, fake, inbound, CallbackSource::Loopback)
+}
+
+/// P5: a mobile-style device — the OAuth callback arrives as a deep link.
+pub fn spawn_device_deeplink(n: u8, name: &str, fake: &FakeRelay) -> Dev {
+    spawn_device_with(
+        n,
+        name,
+        fake,
+        None,
+        CallbackSource::DeepLink(AppRedirect::mobile()),
+    )
+}
+
+pub fn spawn_device_with(
+    n: u8,
+    name: &str,
+    fake: &FakeRelay,
+    inbound: Option<InboundHook>,
+    callback: CallbackSource,
+) -> Dev {
     let dir = tempfile::tempdir().expect("tmp");
     let store = Arc::new(MemSeedStore::new());
     store.store_seed(&Seed::new([n; 64])).expect("seed");
@@ -54,7 +78,7 @@ pub fn spawn_device(n: u8, name: &str, fake: &FakeRelay, inbound: Option<Inbound
         device_name: name.to_string(),
         platform: 1,
     };
-    let handle = spawn(cfg, store.clone(), inbound);
+    let handle = spawn_with_callback(cfg, store.clone(), inbound, callback);
     Dev { handle, store, dir }
 }
 

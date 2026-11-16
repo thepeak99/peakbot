@@ -136,6 +136,8 @@ impl From<CloudError> for ApiError {
                 FlowError::ChainBusy => (StatusCode::CONFLICT, "chain_busy"),
                 FlowError::UseLogout => (StatusCode::BAD_REQUEST, "use_logout"),
                 FlowError::LastDevice => (StatusCode::CONFLICT, "last_device"),
+                FlowError::LoginInFlight => (StatusCode::CONFLICT, "login_in_flight"),
+                FlowError::NoLoginPending => (StatusCode::BAD_REQUEST, "no_login_pending"),
             },
         };
         Self::new(status, code, message)

@@ -22,7 +22,7 @@ pub mod migrate;
 pub use config::{CloudConfig, CloudDef};
 pub use link::{
     CloudError, CloudHandle, CloudState, CloudStateKind, DeviceInfo, EnrollRequestInfo, FlowError,
-    InboundHook, LogoutOutcome, LogoutReason, TrustError, spawn,
+    InboundHook, LogoutOutcome, LogoutReason, TrustError, spawn, spawn_with_callback,
 };
 pub use store::{Seed, SeedStore, SessionToken};
 
