@@ -121,24 +121,17 @@ impl Catalog {
     }
 
     /// The session's home: the first local profile, else the first remote
-    /// (file order).
-    pub fn home(&self) -> Home {
-        match self.default_bound() {
-            Some(bound) => Home::Local(bound),
-            None => {
-                // E2 + the per-entry errors make an empty catalog
-                // unconstructible; the backstop only names the invariant.
-                let remote = self
-                    .entries
-                    .iter()
-                    .find_map(|e| match e {
-                        CatalogEntry::Remote(r) => Some(Arc::clone(r)),
-                        _ => None,
-                    })
-                    .expect("a catalog without a local profile has a remote");
-                Home::Remote(remote)
-            }
+    /// (file order). `None` for a cloud-only config with zero profiles
+    /// (P5: the phone is a controller, it has no home of its own).
+    pub fn home(&self) -> Option<Home> {
+        if let Some(bound) = self.default_bound() {
+            return Some(Home::Local(bound));
         }
+        // No local profiles; look for the first remote.
+        self.entries.iter().find_map(|e| match e {
+            CatalogEntry::Remote(r) => Some(Home::Remote(Arc::clone(r))),
+            _ => None,
+        })
     }
 
     /// The first agent of the first LOCAL profile — a remote entry listed
@@ -572,7 +565,9 @@ impl Config {
             warnings: Vec::new(),
         };
 
-        if file.profiles.is_empty() {
+        // E2: zero profiles is valid iff general.cloud is set (phone cloud
+        // controller mode, P5). Otherwise, require at least one profile.
+        if file.profiles.is_empty() && file.general.cloud.is_none() {
             global_sink.push(vec![key("profiles")], E2_MESSAGE);
         }
         let mut entries: Vec<CatalogEntry> = Vec::new();

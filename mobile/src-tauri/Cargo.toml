@@ -17,6 +17,7 @@ tauri-build = { version = "2.7", features = [] }
 tauri = { version = "2.12.4", features = [] }
 tauri-plugin-opener = "2.7"
 tauri-plugin-log = "2.10"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
 # The nav guard's URL parsing and the error page's fragment encoding.
 url = "2"
 percent-encoding = "2"

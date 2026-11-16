@@ -5351,6 +5351,7 @@ dependencies = [
  "tauri-plugin-log",
  "tauri-plugin-opener",
  "tokio",
+ "tracing-subscriber",
  "url",
  "zeroize",
 ]

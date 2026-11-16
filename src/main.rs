@@ -203,14 +203,14 @@ const RELAY_ONLY_REFUSAL: &str = "every profile in config.yaml is a remote profi
 /// continue. Refuses exactly when the mode is TUI or stdio, the `--profile`
 /// pin is absent, and the home is remote — web mode always continues, and a
 /// pin already names a local profile (`start_bound` refuses a relay-only
-/// pin earlier).
+/// pin earlier). A cloud-only config (no home at all) is not refused.
 fn relay_only_refusal(
     mode: Mode,
     pin: Option<&str>,
-    home: &peakbot::config::resolve::Home,
+    home: &Option<peakbot::config::resolve::Home>,
 ) -> Option<&'static str> {
     let terminal = matches!(mode, Mode::Tui | Mode::Stdio);
-    (terminal && pin.is_none() && matches!(home, peakbot::config::resolve::Home::Remote(_)))
+    (terminal && pin.is_none() && matches!(home, Some(peakbot::config::resolve::Home::Remote(_))))
         .then_some(RELAY_ONLY_REFUSAL)
 }
 
@@ -596,8 +596,8 @@ async fn main() -> Result<()> {
     }
     // A relay-only config has no local profile to bind: TUI and stdio
     // refuse it at the boundary — web is exactly where it belongs.
-    if let Some(message) = relay_only_refusal(mode, cli.profile.as_deref(), &config.catalog.home())
-    {
+    let home = config.catalog.home();
+    if let Some(message) = relay_only_refusal(mode, cli.profile.as_deref(), &home) {
         exit_with(&[message.to_string()]);
     }
     // Validate the pin here, at the boundary, so a bad `--profile` gets the
@@ -861,10 +861,10 @@ mod tests {
     // The refused message is locked.
     const RELAY_ONLY_REFUSAL: &str = "every profile in config.yaml is a remote profile — remote profiles open in the web UI (run peakbot without --tui/--stdio)";
 
-    /// A relay-only catalog's `Home`: `Home::Remote` (the fixture parses
-    /// once relay-only configs are accepted; the refusal decision is what
-    /// is under test here).
-    fn relay_only_home() -> peakbot::config::resolve::Home {
+    /// A relay-only catalog's `Home`: `Some(Home::Remote)` (the fixture
+    /// parses once relay-only configs are accepted; the refusal decision is
+    /// what is under test here).
+    fn relay_only_home() -> Option<peakbot::config::resolve::Home> {
         use peakbot::config::resolve::{Config, ParseCtx, Source};
         let yaml = "profiles:\n  dev on nas:\n    remote:\n      url: https://nas.lan:7823\n      token: tok123\n      ca: sha256:3f9a0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab\n      profile: dev\n";
         let cfg = Config::parse(

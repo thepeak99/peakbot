@@ -307,6 +307,13 @@ fn is_foreground_resume(_event: &RunEvent) -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Route tracing events (e.g. embed.rs config errors) to stdout → logcat.
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_target(false)
+        .with_level(true)
+        .init();
+
     let builder = tauri::Builder::default()
         .plugin(
             tauri_plugin_log::Builder::new()

@@ -1450,12 +1450,13 @@ pub fn fresh_attach(
 
 /// The unpinned-attach counterpart of [`fresh_attach`]: the remote the
 /// config homes *right now* (a relay-only config has no local session to
-/// mint), plus the fresh catalogue. `None` when the fresh home is local.
+/// mint), plus the fresh catalogue. `None` when the fresh home is local or
+/// there is no home at all (cloud-only config with zero profiles, P5).
 pub fn fresh_home_attach() -> Result<(Option<Arc<RemoteProfile>>, Vec<ProfileInfo>), RemoteError> {
     let cfg = load_config()?;
     let remote = match cfg.catalog.home() {
-        crate::config::resolve::Home::Remote(r) => Some(r),
-        crate::config::resolve::Home::Local(_) => None,
+        Some(crate::config::resolve::Home::Remote(r)) => Some(r),
+        Some(crate::config::resolve::Home::Local(_)) | None => None,
     };
     Ok((remote, cfg.catalog.infos()))
 }

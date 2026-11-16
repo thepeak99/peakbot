@@ -134,7 +134,7 @@ pub fn web_boot(web: WebBoot, session: WebSession) -> anyhow::Result<WebUi> {
     let (deps, models, active_alias, migrate_error) = match session {
         WebSession::Ready(deps) => {
             let (models, active_alias) = match deps.config.catalog.home() {
-                Home::Local(_) => {
+                Some(Home::Local(_)) => {
                     let start = deps
                         .config
                         .catalog
@@ -144,7 +144,7 @@ pub fn web_boot(web: WebBoot, session: WebSession) -> anyhow::Result<WebUi> {
                     let models = build_models_snapshot(&deps.config.registry);
                     (models, active_alias)
                 }
-                Home::Remote(_) => (Vec::new(), String::new()),
+                Some(Home::Remote(_)) | None => (Vec::new(), String::new()),
             };
             (Some(deps), models, active_alias, None)
         }

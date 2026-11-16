@@ -1648,3 +1648,29 @@ fn shipped_examples_parse() {
         );
     }
 }
+
+// ---------- P5: cloud-only config (zero profiles) ----------
+
+/// A phone in cloud mode has no local profiles — it only connects to
+/// remote profiles via the cloud directory. A config with only
+/// `general.cloud` must parse.
+#[test]
+fn cloud_only_config_with_zero_profiles_parses() {
+    let yaml = "general:\n  cloud:\n    relay: \"http://localhost:8080\"\n";
+    let cfg = parse_global(yaml).expect("a cloud-only config must parse");
+    assert!(cfg.catalog.iter().count() == 0, "zero local profiles");
+    assert!(cfg.general.cloud.is_some(), "cloud must be set");
+}
+
+/// Without `general.cloud`, zero profiles is still an error (E2).
+#[test]
+fn zero_profiles_without_cloud_is_e2() {
+    let yaml = "providers:\n  - name: p\n    type: openai\n    api_key: k\n    models:\n      - name: m1\n        alias: a\nprofiles: {}\n";
+    let es = errs(parse_global(yaml));
+    assert_eq!(es.len(), 1, "exactly one error");
+    assert_eq!(es[0].path, vec![key("profiles")]);
+    assert_eq!(
+        es[0].message,
+        "declare at least one profile — the first one is the default"
+    );
+}
