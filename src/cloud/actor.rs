@@ -113,6 +113,8 @@ enum RunEnd {
     Stopped,
     /// `Cmd::Logout` completed: `LoggedOut{SignedOut}`.
     LoggedOut,
+    /// P5 T5: app backgrounded — park reconnect, keep state.
+    Suspended,
 }
 
 /// This device's identity, derived ONLY from the seed (§C): the keypair
@@ -1990,7 +1992,16 @@ impl Actor {
                 self.do_profiles(live, ws, device, out).await;
                 None
             }
-            CloudCmd::Suspend | CloudCmd::Resume => None, // P5 skeleton
+            CloudCmd::Suspend => {
+                // Close the socket; the run loop will observe it.
+                live.reset_all();
+                Some(RunEnd::Suspended)
+            }
+            CloudCmd::Resume => {
+                // No-op if already connected (the app came to the foreground
+                // but we're already live).
+                None
+            }
             CloudCmd::Stop => Some(RunEnd::Stopped),
         }
     }
@@ -2565,6 +2576,7 @@ pub async fn run(
         Idle(LogoutReason),
         Trust(TrustError),
         Connecting,
+        Suspended,
     }
     let mut stage = Stage::Idle(LogoutReason::Never);
     loop {
@@ -2612,7 +2624,7 @@ pub async fn run(
                         actor.chain_cache = None;
                         let _ = out.send(Ok(LogoutOutcome { revoked: false }));
                     }
-                    CloudCmd::Suspend | CloudCmd::Resume => {} // P5 skeleton
+                    CloudCmd::Suspend | CloudCmd::Resume => {} // no-op when logged out
                     CloudCmd::Stop => return,
                 }
             }
@@ -2654,9 +2666,26 @@ pub async fn run(
                         let _ = out.send(Ok(LogoutOutcome { revoked: false }));
                         stage = Stage::Idle(LogoutReason::SignedOut);
                     }
-                    CloudCmd::Suspend | CloudCmd::Resume => {} // P5 skeleton
+                    CloudCmd::Suspend | CloudCmd::Resume => {} // no-op in Trust
                     CloudCmd::Stop => return,
                     _ => {}
+                }
+            }
+            Stage::Suspended => {
+                // Parked: wait for Resume or Stop. Enrollment/chain state
+                // is preserved; no reconnect attempts.
+                let Some(cmd) = cmd_rx.recv().await else {
+                    return;
+                };
+                match cmd {
+                    CloudCmd::Resume => {
+                        // Reset backoff and redial immediately.
+                        actor.attempt = 0;
+                        stage = Stage::Connecting;
+                    }
+                    CloudCmd::Suspend => {} // already suspended
+                    CloudCmd::Stop => return,
+                    _ => {} // ignore other commands while suspended
                 }
             }
             Stage::Connecting => {
@@ -2689,6 +2718,19 @@ pub async fn run(
                     }
                     RunEnd::Stopped => return,
                     RunEnd::LoggedOut => stage = Stage::Idle(LogoutReason::SignedOut),
+                    RunEnd::Suspended => {
+                        live.reset_all();
+                        // Socket closed: don't leave a stale Pending/Active
+                        // published while parked (no new state kind).
+                        publish(
+                            &state,
+                            CloudState::Connecting {
+                                attempt: 0,
+                                last_error: Some("suspended".into()),
+                            },
+                        );
+                        stage = Stage::Suspended;
+                    }
                     RunEnd::Dropped(err, reset) => {
                         live.reset_all();
                         if let Some(out) = live.pending_genesis.take() {
@@ -2717,6 +2759,9 @@ pub async fn run(
                             _ = tokio::time::sleep(backoff_delay(actor.attempt)) => {}
                             cmd = cmd_rx.recv() => match cmd {
                                 Some(CloudCmd::Stop) => return,
+                                Some(CloudCmd::Suspend) => {
+                                    stage = Stage::Suspended;
+                                }
                                 Some(CloudCmd::Open { out, .. }) => {
                                     let _ = out.send(Err(CloudError::NotActive(
                                         CloudStateKind::Connecting,
@@ -2755,7 +2800,9 @@ pub async fn run(
                                 _ => {}
                             },
                         }
-                        stage = Stage::Connecting;
+                        if !matches!(stage, Stage::Suspended) {
+                            stage = Stage::Connecting;
+                        }
                     }
                 }
             }

@@ -263,6 +263,8 @@ pub struct CloudHandle {
     callback: login::CallbackSource,
     /// `last_login_error` of the API state (G.1 step 5).
     last_login_error: Arc<std::sync::Mutex<Option<String>>>,
+    /// P5 T5: pending `Suspend` task (3 s debounce). Aborted on `Resume`.
+    suspend_task: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 /// Actor commands (private; the handle is the only door in).
@@ -410,9 +412,32 @@ impl CloudHandle {
     }
 
     /// P5 T5: app foreground signal; `false` suspends after a 3 s debounce,
-    /// `true` resumes now. SKELETON.
-    pub fn set_foreground(&self, _fg: bool) {
-        todo!("P5 T5: set_foreground")
+    /// `true` resumes now. Suspend closes the relay socket; Resume redials.
+    pub fn set_foreground(&self, fg: bool) {
+        if !fg {
+            // Schedule suspend after 3 s debounce, cancellable by a foreground signal.
+            let mut slot = self.suspend_task.lock().unwrap();
+            if slot.is_some() {
+                return; // debounce already running
+            }
+            let cmd = self.cmd.clone();
+            let task = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                let _ = cmd.send(CloudCmd::Suspend).await;
+            });
+            *slot = Some(task);
+        } else {
+            // Cancel any pending suspend, resume immediately.
+            let mut slot = self.suspend_task.lock().unwrap();
+            if let Some(t) = slot.take() {
+                t.abort();
+            }
+            // Fire-and-forget: the actor handles Resume.
+            let cmd = self.cmd.clone();
+            tokio::spawn(async move {
+                let _ = cmd.send(CloudCmd::Resume).await;
+            });
+        }
     }
 
     /// A login listener is running right now (G.1 step 5). The handle's
@@ -614,6 +639,7 @@ pub fn spawn_inner(
         login_task: Arc::new(tokio::sync::Mutex::new(LoginSlot::Idle)),
         callback: callback.clone(),
         last_login_error: Arc::new(std::sync::Mutex::new(None)),
+        suspend_task: Arc::new(std::sync::Mutex::new(None)),
     };
     let id = match load_identity(&cfg, &*store) {
         Ok(id) => id,
