@@ -622,27 +622,31 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
         </DropOverlay>
       </div>
 
-   <BottomBar
-        conversations={conversations}
-        conversationsError={conversationsError}
-        models={models}
-        activeAlias={stats?.modelAlias || activeAlias}
-        hasTranscript={hasTranscript}
-        cwd={browsableCwd}
-        dirListing={dirListing}
-        recentDirs={recentDirs}
-        send={send}
-        onSwitchCwd={switchCwd}
-        onLoadConversation={loadConversation}
-        onReattach={reattach}
-        catalog={catalog}
-        selection={selection}
-        selectionLocked={selectionLocked}
-        profilePinned={state?.profile_pinned ?? false}
-        onToast={showToast}
-        mobileChats={chats !== null}
-      />
-   
+   {/* The phone app (mobileChats) drops the footer entirely at phone width —
+       cwd is reached via the activity-row 📁 → Directory tab. At ≥lg the
+       footer stays (existing behavior). */}
+      {(chats === null || isDesktop) && (
+        <BottomBar
+          conversations={conversations}
+          conversationsError={conversationsError}
+          models={models}
+          activeAlias={stats?.modelAlias || activeAlias}
+          hasTranscript={hasTranscript}
+          cwd={browsableCwd}
+          dirListing={dirListing}
+          recentDirs={recentDirs}
+          send={send}
+          onSwitchCwd={switchCwd}
+          onLoadConversation={loadConversation}
+          onReattach={reattach}
+          catalog={catalog}
+          selection={selection}
+          selectionLocked={selectionLocked}
+          profilePinned={state?.profile_pinned ?? false}
+          onToast={showToast}
+          mobileChats={chats !== null}
+        />
+      )}
 
       {/* One open-panel state, two surfaces; the relocation effect above
           covers both. */}
