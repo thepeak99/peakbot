@@ -459,6 +459,15 @@ impl TestRelay {
     }
 
     pub async fn spawn_idp(idp: FakeIdp) -> Self {
+        Self::spawn_idp_scheme(idp, None).await
+    }
+
+    /// Relay configured with `app_scheme` (P5 mobile deep-link redirect).
+    pub async fn spawn_with_app_scheme(scheme: &str) -> Self {
+        Self::spawn_idp_scheme(FakeIdp::spawn(false).await, Some(scheme.to_string())).await
+    }
+
+    pub async fn spawn_idp_scheme(idp: FakeIdp, app_scheme: Option<String>) -> Self {
         Self::raise_fd_limit();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -470,7 +479,7 @@ impl TestRelay {
             bind: addr,
             origin: peakbot_relay::config::Origin(format!("http://{addr}")),
             db: tmp.path().join("relay.db"),
-            app_scheme: None,
+            app_scheme,
             issuers: vec![peakbot_relay::config::Issuer {
                 name: "fake".to_string(),
                 url: idp.url.clone(),
