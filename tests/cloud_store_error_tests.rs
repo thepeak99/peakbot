@@ -1,7 +1,7 @@
 //! P5 T3 tests — an erroring `SeedStore` must never turn into "fresh
 //! install": no genesis, no fresh keygen, no seed write; a visible error
 //! state instead. Audit finding: `spawn` -> `load_identity` already maps a
-//! `load_seed` Err to a terminal `Trust(ChainInvalid("identity: ..."))`, so
+//! `load_seed` Err to a terminal `Trust(SeedStoreError("identity: ..."))`, so
 //! the error cases are expected GREEN today — they are regression guards
 //! for the mobile keystore, where an Err used to be indistinguishable from
 //! "no seed". Runs in both editions.

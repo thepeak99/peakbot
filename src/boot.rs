@@ -202,6 +202,25 @@ pub fn boot_cloud(
     store: Arc<dyn crate::cloud::SeedStore>,
     inbound: Option<crate::cloud::InboundHook>,
 ) -> Option<crate::cloud::CloudHandle> {
+    boot_cloud_with_callback(
+        config,
+        state_dir,
+        device_name,
+        store,
+        inbound,
+        crate::cloud::login::CallbackSource::Loopback,
+    )
+}
+
+/// [`boot_cloud`] with an explicit OAuth callback source (mobile: `DeepLink`).
+pub fn boot_cloud_with_callback(
+    config: &Config,
+    state_dir: PathBuf,
+    device_name: &str,
+    store: Arc<dyn crate::cloud::SeedStore>,
+    inbound: Option<crate::cloud::InboundHook>,
+    callback: crate::cloud::login::CallbackSource,
+) -> Option<crate::cloud::CloudHandle> {
     let Some(def) = &config.general.cloud else {
         return None;
     };
@@ -223,7 +242,7 @@ pub fn boot_cloud(
     {
         cloud.platform = 4;
     }
-    let handle = crate::cloud::spawn(cloud, store, inbound);
+    let handle = crate::cloud::spawn_with_callback(cloud, store, inbound, callback);
     crate::cloud::set_boot_handle(handle.clone());
     Some(handle)
 }

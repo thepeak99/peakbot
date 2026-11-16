@@ -210,5 +210,5 @@ export const request = (over: Partial<TestEnrollRequest> = {}): TestEnrollReques
 });
 
 export const trust = (
-  trust_error: "genesis_mismatch" | "fork" | "revoked" | "chain_invalid" = "fork",
+  trust_error: "genesis_mismatch" | "fork" | "revoked" | "chain_invalid" | "seed_store_error" = "fork",
 ): StateBody => snapshot({ state: "trust", trust_error });

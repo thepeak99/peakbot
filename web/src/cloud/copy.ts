@@ -103,6 +103,8 @@ export const COPY = {
     revoked: "This device was revoked by another of your devices.",
     chain_invalid:
       "Cloud trust error: the device history is invalid. Cloud is stopped.",
+    seed_store_error:
+      "This device can't read its secure key storage. Cloud is paused; nothing was reset.",
   },
 
   // D.5 error code → inline message

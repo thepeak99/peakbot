@@ -36,6 +36,8 @@ pub enum TrustError {
     Fork,
     Revoked,
     ChainInvalid(String),
+    /// The SeedStore failed to read the seed (keystore unavailable).
+    SeedStoreError(String),
 }
 
 /// The state kind, for `CloudError::NotActive` (a state without detail).
@@ -362,6 +364,14 @@ impl CloudHandle {
         self.last_login_error.lock().ok()?.clone()
     }
 
+    /// Record a login error for the API state (embedder-side failures, e.g.
+    /// a rejected deep-link callback).
+    pub fn set_login_error(&self, msg: String) {
+        if let Ok(mut g) = self.last_login_error.lock() {
+            *g = Some(msg);
+        }
+    }
+
     /// Open a stream to `device` for `op` (§D.5): Active + the peer in
     /// `chain.active` only; `Unreachable{to}` ⇒ `CloudError::Offline`.
     pub async fn open(&self, device: DeviceId, op: Op) -> Result<CloudStream, CloudError> {
@@ -514,7 +524,7 @@ pub fn spawn(
             // spawn() is infallible by the seam: an identity failure is a
             // terminal state and no actor runs (open() then reports Io).
             tracing::error!(error = %e, "cloud identity unavailable");
-            let (_tx, state_rx) = watch::channel(CloudState::Trust(TrustError::ChainInvalid(
+            let (_tx, state_rx) = watch::channel(CloudState::Trust(TrustError::SeedStoreError(
                 format!("identity: {e}"),
             )));
             return handle(state_rx, None);

@@ -332,6 +332,7 @@ impl CloudStateDto {
                     TrustError::Fork => "fork",
                     TrustError::Revoked => "revoked",
                     TrustError::ChainInvalid(_) => "chain_invalid",
+                    TrustError::SeedStoreError(_) => "seed_store_error",
                 }
                 .to_string(),
             },

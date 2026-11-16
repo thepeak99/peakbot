@@ -222,7 +222,7 @@ describe("state → view (one row per §A.1)", () => {
   });
 
   it("trust → the pane title/body for each trust_error", async () => {
-    for (const te of ["genesis_mismatch", "fork", "revoked", "chain_invalid"] as const) {
+    for (const te of ["genesis_mismatch", "fork", "revoked", "chain_invalid", "seed_store_error"] as const) {
       const el = await withState(trust(te));
       expect(text(el)).toContain(COPY.trust.paneTitle);
       expect(text(el)).toContain(COPY.trust.paneBody);
