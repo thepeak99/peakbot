@@ -1944,6 +1944,539 @@ else
     bad "T75 perma-crypto token crosses the build boundary as a BuildKit secret (Dockerfile cargo RUN + Makefile 8x + release.yml env/preflight), never a build-arg ($why75)"
 fi
 
+
+# ── Play release stage contract (T76–T85) ──────────────────────────────────
+# Tests for: scripts/play-version-code.sh, scripts/play-publish.sh,
+# the release-publish-play Makefile target, and the AAB build contract.
+
+# Play fake curl: routes on the last arg (URL), writes canned JSON to the
+# -o file, prints the status code for -w. Logs full argv to CURL_LOG.
+# Knobs: PLAY_STUB_BUNDLES (versionCodes already on Play, space-separated),
+# PLAY_STUB_UPLOAD_VC (versionCode the upload echoes back),
+# PLAY_STUB_CODE_<step> (per-step HTTP status, e.g. PLAY_STUB_CODE_upload=403).
+PLAY_D=$(mktemp -d); workdirs="$workdirs $PLAY_D"
+mkdir -p "$PLAY_D/bin"
+
+cat > "$PLAY_D/bin/curl" <<'PLAYFAKECURL'
+#!/bin/sh
+: "${CURL_LOG:?fake play curl needs CURL_LOG}"
+method=GET; url=''; body=''; fdata=''; data=''; ofile=''; wfmt=''; hdrs=''
+prev=''
+for a in "$@"; do
+  case "$prev" in
+    -X|--request)    method=$a; prev=''; continue ;;
+    -d|--data)       body=$a; prev=''; continue ;;
+    -F|--form)       fdata=$a; prev=''; continue ;;
+    --data-binary)   data=$a; prev=''; continue ;;
+    -o)              ofile=$a; prev=''; continue ;;
+    -w)              wfmt=$a; prev=''; continue ;;
+    -H|--header)     hdrs="$hdrs | $a"; prev=''; continue ;;
+  esac
+  case "$a" in
+    -I|--head)    method=HEAD; prev='' ;;
+    -*) prev=$a ;;
+    *) prev=''; if [ -z "$url" ]; then url=$a; fi ;;
+  esac
+done
+line="$method $url"
+[ -n "$body" ]  && line="$line BODY=$body"
+[ -n "$fdata" ] && line="$line FILE=$fdata"
+[ -n "$data" ]  && line="$line DATA=$data"
+[ -n "$hdrs" ]  && line="$line$hdrs"
+printf '%s\n' "$line" >> "$CURL_LOG"
+
+# Determine step from URL
+step='unknown'
+case "$url" in
+  *oauth2/token*) step='token' ;;
+  *applications/*/edits)
+    if [ "$method" = "POST" ]; then step='edits'; else step='unknown'; fi ;;
+  *edits/*/bundles)
+    if [ "$method" = "GET" ]; then step='bundles' ;;
+    if [ "$method" = "POST" ]; then step='upload' ;;
+  esac ;;
+  *edits/*/tracks/*) step='tracks' ;;
+  *edits/*:commit) step='commit' ;;
+esac
+
+# Read per-step failure code
+status_var="PLAY_STUB_CODE_${step}"
+status=${!status_var:-200}
+
+# Capture POST body to a file for inspection
+if [ -n "$body" ] && [ -n "$ofile" ]; then
+    case "$body" in
+      @*)
+        # Read the file content for logging
+        bodyfile=${body#@}
+        if [ -f "$bodyfile" ]; then
+            cp "$bodyfile" "$CURL_LOG.body.$step"
+        fi
+        ;;
+    esac
+fi
+
+# Route and respond
+resp='{}'
+case "$step" in
+  token)
+    status=${PLAY_STUB_CODE_token:-200}
+    if [ "$status" = "200" ]; then
+      resp='{"access_token":"ya29.SENTINEL_TOKEN","expires_in":3600}'
+    else
+      resp='{"error":"invalid_grant","error_description":"STUB_TOKEN_ERROR"}'
+    fi
+    ;;
+  edits)
+    status=${PLAY_STUB_CODE_edits:-200}
+    if [ "$status" = "200" ]; then
+      resp='{"id":"E-STUB-EDIT-ID"}'
+    else
+      resp='{"error":{"code":'$status',"message":"STUB_EDIT_ERROR"}}'
+    fi
+    ;;
+  bundles)
+    status=${PLAY_STUB_CODE_bundles:-200}
+    if [ "$status" = "200" ]; then
+      # Return existing bundles based on PLAY_STUB_BUNDLES
+      bundles_json='[]'
+      if [ -n "${PLAY_STUB_BUNDLES:-}" ]; then
+        # Build JSON array of versionCodes
+        first=1
+        bundles_json='['
+        for vc in $PLAY_STUB_BUNDLES; do
+          if [ "$first" = "1" ]; then first=0; else bundles_json="$bundles_json,"; fi
+          bundles_json="$bundles_json{\"versionCode\":$vc}"
+        done
+        bundles_json="$bundles_json]"
+      fi
+      resp="{\"bundles\":$bundles_json}"
+    else
+      resp='{"error":{"code":'$status',"message":"STUB_BUNDLES_ERROR"}}'
+    fi
+    ;;
+  upload)
+    status=${PLAY_STUB_CODE_upload:-200}
+    if [ "$status" = "200" ]; then
+      resp="{\"versionCode\":${PLAY_STUB_UPLOAD_VC:-2800099}}"
+    else
+      resp='{"error":{"code":'$status',"message":"STUB_DENIED"}}'
+    fi
+    ;;
+  tracks)
+    status=${PLAY_STUB_CODE_tracks:-200}
+    if [ "$status" = "200" ]; then
+      # Echo back the body
+      if [ -n "$body" ]; then
+        case "$body" in
+          @*)
+            bodyfile=${body#@}
+            if [ -f "$bodyfile" ]; then
+              resp=$(cat "$bodyfile")
+            fi
+            ;;
+          *)
+            resp="$body"
+            ;;
+        esac
+      fi
+    else
+      resp='{"error":{"code":'$status',"message":"STUB_TRACKS_ERROR"}}'
+    fi
+    ;;
+  commit)
+    status=${PLAY_STUB_CODE_commit:-200}
+    if [ "$status" = "200" ]; then
+      resp='{"id":"E-STUB-EDIT-ID"}'
+    else
+      resp='{"error":{"code":'$status',"message":"STUB_COMMIT_ERROR"}}'
+    fi
+    ;;
+esac
+
+if [ -n "$ofile" ]; then
+  printf '%s\n' "$resp" > "$ofile"
+else
+  printf '%s\n' "$resp"
+fi
+[ -n "$wfmt" ] && printf '%s\n' "$wfmt" | sed "s/%{http_code}/$status/g"
+exit 0
+PLAYFAKECURL
+chmod +x "$PLAY_D/bin/curl"
+
+# Generate a throwaway RSA key for fake service-account JSON
+PLAY_KEY_D=$(mktemp -d); workdirs="$workdirs $PLAY_KEY_D"
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$PLAY_KEY_D/key.pem" 2>/dev/null
+PLAY_KEY=$(cat "$PLAY_KEY_D/key.pem")
+PLAY_SA_JSON=$(printf '{"type":"service_account","project_id":"fake-project","private_key_id":"fake-key-id","private_key":"%s","client_email":"fake-sa@fake-project.iam.gserviceaccount.com","client_id":"123456789","auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token"}' "$PLAY_KEY")
+
+# Helper: run play-publish with the fake curl
+run_play_publish() {
+    # $1 = logfile, $2 = tag, $3+ = extra env vars
+    pp_log=$1; pp_tag=$2; shift 2
+    rm -f "$pp_log" "$pp_log.body.*"; : > "$pp_log"
+    PP_OUT=$( PATH="$PLAY_D/bin:$PATH" CURL_LOG="$pp_log" \
+        PLAY_SERVICE_ACCOUNT_JSON="$PLAY_SA_JSON" TMPDIR="$PLAY_D/tmp" \
+        $@ sh scripts/play-publish.sh sh.shifu.mobile \
+        "$PLAY_D/aab.aab" "$(sh scripts/play-version-code.sh "$pp_tag")" 2>&1 )
+    PP_RC=$?
+}
+
+# T76: play-version-code: worked examples
+t76=1; why76=""
+fail76() { t76=0; why76="${why76}${why76:+; }$1"; }
+for pair in "0.28.0:2800099" "0.28.1-rc.2:2800102" "0.28.1:2800199" "1.0.0:100000099" "20.999.999:2099999999"; do
+    ver=${pair%%:*}; want=${pair#*:}
+    if [ ! -f scripts/play-version-code.sh ]; then
+        fail76 "scripts/play-version-code.sh missing"
+        break
+    fi
+    got=$(sh scripts/play-version-code.sh "$ver" 2>/dev/null); rc=$?
+    if [ "$rc" -ne 0 ]; then
+        fail76 "$ver: exit $rc (want 0)"
+    elif [ "$got" != "$want" ]; then
+        fail76 "$ver: got $got (want $want)"
+    fi
+done
+if [ "$t76" -eq 1 ]; then
+    ok "T76 play-version-code: worked examples (0.28.0→2800099, 0.28.1-rc.2→2800102, etc.)"
+else
+    bad "T76 play-version-code: worked examples ($why76)"
+fi
+
+# T77: play-version-code: ordering + rejects
+t77=1; why77=""
+fail77() { t77=0; why77="${why77}${why77:+; }$1"; }
+if [ -f scripts/play-version-code.sh ]; then
+    # Ordering: 0.28.0 < 0.28.1-rc.1 < 0.28.1-rc.2 < 0.28.1 < 0.29.0-rc.1
+    v1=$(sh scripts/play-version-code.sh 0.28.0 2>/dev/null)
+    v2=$(sh scripts/play-version-code.sh 0.28.1-rc.1 2>/dev/null)
+    v3=$(sh scripts/play-version-code.sh 0.28.1-rc.2 2>/dev/null)
+    v4=$(sh scripts/play-version-code.sh 0.28.1 2>/dev/null)
+    v5=$(sh scripts/play-version-code.sh 0.29.0-rc.1 2>/dev/null)
+    if [ -z "$v1" ] || [ -z "$v2" ] || [ -z "$v3" ] || [ -z "$v4" ] || [ -z "$v5" ]; then
+        fail77 "ordering: some version codes are empty"
+    elif ! [ "$v1" -lt "$v2" ] || ! [ "$v2" -lt "$v3" ] || ! [ "$v3" -lt "$v4" ] || ! [ "$v4" -lt "$v5" ]; then
+        fail77 "ordering: $v1 < $v2 < $v3 < $v4 < $v5 failed"
+    fi
+    # Rejects: exit non-zero with empty stdout
+    for badver in "21.0.0" "0.1000.0" "0.28.1-rc.99" "0.28.1-beta.1" "v0.28.0" "0.28" "0.01.0" "0.0.1" "abc"; do
+        out=$(sh scripts/play-version-code.sh "$badver" 2>/dev/null); rc=$?
+        if [ "$rc" -eq 0 ]; then
+            fail77 "$badver: exit 0 (want non-zero)"
+        elif [ -n "$out" ]; then
+            fail77 "$badver: non-empty stdout '$out' (want empty)"
+        fi
+    done
+else
+    fail77 "scripts/play-version-code.sh missing"
+fi
+if [ "$t77" -eq 1 ]; then
+    ok "T77 play-version-code: ordering correct + rejects invalid versions"
+else
+    bad "T77 play-version-code: ordering + rejects ($why77)"
+fi
+
+# T78: play-publish: happy path
+t78=1; why78=""
+fail78() { t78=0; why78="${why78}${why78:+; }$1"; }
+if [ ! -f scripts/play-publish.sh ]; then
+    fail78 "scripts/play-publish.sh missing"
+else
+    # Create a fake AAB file
+    printf 'fake aab content' > "$PLAY_D/aab.aab"
+    run_play_publish "$PLAY_D/log-t78" 0.28.0
+    [ "$PP_RC" -eq 0 ] || { fail78 "exit $PP_RC (want 0): $(printf '%s' "$PP_OUT" | grep '❌' | head -1)"; }
+    # Check URL sequence: token → POST edits → GET bundles → POST upload → PUT tracks → POST commit
+    if [ -f "$PLAY_D/log-t78" ]; then
+        # token
+        grep -qF 'oauth2/token' "$PLAY_D/log-t78" || fail78 "no token request"
+        # POST edits
+        grep -qF 'POST.*applications/sh\.shifu\.mobile/edits ' "$PLAY_D/log-t78" || fail78 "no POST edits"
+        # GET bundles
+        grep -qF 'GET.*edits/E-STUB-EDIT-ID/bundles' "$PLAY_D/log-t78" || fail78 "no GET bundles"
+        # POST upload
+        grep -qF 'uploadType=media' "$PLAY_D/log-t78" || fail78 "no upload request"
+        # PUT tracks/internal
+        grep -qF 'PUT.*tracks/internal' "$PLAY_D/log-t78" || fail78 "no PUT tracks/internal"
+        # POST commit
+        grep -qF ':commit' "$PLAY_D/log-t78" || fail78 "no commit request"
+        # Check track body has correct versionCode and status
+        if [ -f "$PLAY_D/log-t78.body.tracks" ]; then
+            grep -qF '"versionCodes":["2800099"]' "$PLAY_D/log-t78.body.tracks" || fail78 "track body missing versionCodes 2800099"
+            grep -qF '"status":"draft"' "$PLAY_D/log-t78.body.tracks" || fail78 "track body missing status draft"
+        else
+            fail78 "track body file not captured"
+        fi
+    else
+        fail78 "curl log not created"
+    fi
+fi
+if [ "$t78" -eq 1 ]; then
+    ok "T78 play-publish: happy path (token→edits→bundles→upload→tracks→commit, correct track body)"
+else
+    bad "T78 play-publish: happy path ($why78)"
+fi
+
+# T79: play-publish: idempotent (versionCode already on Play)
+t79=1; why79=""
+fail79() { t79=0; why79="${why79}${why79:+; }$1"; }
+if [ -f scripts/play-publish.sh ]; then
+    printf 'fake aab content' > "$PLAY_D/aab.aab"
+    run_play_publish "$PLAY_D/log-t79" 0.28.0 PLAY_STUB_BUNDLES=2800099
+    [ "$PP_RC" -eq 0 ] || { fail79 "exit $PP_RC (want 0): $(printf '%s' "$PP_OUT" | grep '❌' | head -1)"; }
+    # No upload URL in log
+    if [ -f "$PLAY_D/log-t79" ]; then
+        grep -qF 'uploadType=media' "$PLAY_D/log-t79" && fail79 "upload occurred despite existing versionCode"
+        # PUT track and commit still happen
+        grep -qF 'PUT.*tracks/internal' "$PLAY_D/log-t79" || fail79 "PUT tracks/internal missing on idempotent run"
+        grep -qF ':commit' "$PLAY_D/log-t79" || fail79 "commit missing on idempotent run"
+    fi
+    # stdout mentions "already on Play"
+    printf '%s' "$PP_OUT" | grep -qi 'already on Play' || fail79 "output does not mention 'already on Play'"
+else
+    fail79 "scripts/play-publish.sh missing"
+fi
+if [ "$t79" -eq 1 ]; then
+    ok "T79 play-publish: idempotent (skips upload when versionCode exists, still commits)"
+else
+    bad "T79 play-publish: idempotent ($why79)"
+fi
+
+# T80: play-publish: status + usage
+t80=1; why80=""
+fail80() { t80=0; why80="${why80}${why80:+; }$1"; }
+if [ -f scripts/play-publish.sh ]; then
+    printf 'fake aab content' > "$PLAY_D/aab.aab"
+    # PLAY_RELEASE_STATUS=completed
+    run_play_publish "$PLAY_D/log-t80a" 0.28.0 PLAY_RELEASE_STATUS=completed
+    [ "$PP_RC" -eq 0 ] || { fail80 "completed status: exit $PP_RC (want 0)"; }
+    if [ -f "$PLAY_D/log-t80a.body.tracks" ]; then
+        grep -qF '"status":"completed"' "$PLAY_D/log-t80a.body.tracks" || fail80 "track body missing status completed"
+    fi
+    # Invalid status → exit 2, zero curl calls
+    rm -f "$PLAY_D/log-t80b"
+    PP_OUT=$( PATH="$PLAY_D/bin:$PATH" CURL_LOG="$PLAY_D/log-t80b" \
+        PLAY_SERVICE_ACCOUNT_JSON="$PLAY_SA_JSON" TMPDIR="$PLAY_D/tmp" \
+        PLAY_RELEASE_STATUS=live sh scripts/play-publish.sh sh.shifu.mobile "$PLAY_D/aab.aab" 2800099 2>&1 )
+    PP_RC=$?
+    [ "$PP_RC" -eq 2 ] || fail80 "invalid status: exit $PP_RC (want 2)"
+    [ ! -s "$PLAY_D/log-t80b" ] || fail80 "invalid status: curl was called (log not empty)"
+    # Missing AAB → exit 2, zero curl calls
+    rm -f "$PLAY_D/log-t80c"
+    PP_OUT=$( PATH="$PLAY_D/bin:$PATH" CURL_LOG="$PLAY_D/log-t80c" \
+        PLAY_SERVICE_ACCOUNT_JSON="$PLAY_SA_JSON" TMPDIR="$PLAY_D/tmp" \
+        sh scripts/play-publish.sh sh.shifu.mobile "$PLAY_D/missing.aab" 2800099 2>&1 )
+    PP_RC=$?
+    [ "$PP_RC" -eq 2 ] || fail80 "missing AAB: exit $PP_RC (want 2)"
+    [ ! -s "$PLAY_D/log-t80c" ] || fail80 "missing AAB: curl was called (log not empty)"
+    # Bad versionCode → exit 2, zero curl calls
+    rm -f "$PLAY_D/log-t80d"
+    PP_OUT=$( PATH="$PLAY_D/bin:$PATH" CURL_LOG="$PLAY_D/log-t80d" \
+        PLAY_SERVICE_ACCOUNT_JSON="$PLAY_SA_JSON" TMPDIR="$PLAY_D/tmp" \
+        sh scripts/play-publish.sh sh.shifu.mobile "$PLAY_D/aab.aab" abc 2>&1 )
+    PP_RC=$?
+    [ "$PP_RC" -eq 2 ] || fail80 "bad versionCode: exit $PP_RC (want 2)"
+    [ ! -s "$PLAY_D/log-t80d" ] || fail80 "bad versionCode: curl was called (log not empty)"
+    # Wrong arg count → exit 2, zero curl calls
+    rm -f "$PLAY_D/log-t80e"
+    PP_OUT=$( PATH="$PLAY_D/bin:$PATH" CURL_LOG="$PLAY_D/log-t80e" \
+        PLAY_SERVICE_ACCOUNT_JSON="$PLAY_SA_JSON" TMPDIR="$PLAY_D/tmp" \
+        sh scripts/play-publish.sh sh.shifu.mobile "$PLAY_D/aab.aab" 2>&1 )
+    PP_RC=$?
+    [ "$PP_RC" -eq 2 ] || fail80 "wrong arg count: exit $PP_RC (want 2)"
+    [ ! -s "$PLAY_D/log-t80e" ] || fail80 "wrong arg count: curl was called (log not empty)"
+else
+    fail80 "scripts/play-publish.sh missing"
+fi
+if [ "$t80" -eq 1 ]; then
+    ok "T80 play-publish: status completed works, usage errors exit 2 with zero curl calls"
+else
+    bad "T80 play-publish: status + usage ($why80)"
+fi
+
+# T81: play-publish: secret hygiene
+t81=1; why81=""
+fail81() { t81=0; why81="${why81}${why81:+; }$1"; }
+if [ -f scripts/play-publish.sh ]; then
+    printf 'fake aab content' > "$PLAY_D/aab.aab"
+    run_play_publish "$PLAY_D/log-t81" 0.28.0
+    [ "$PP_RC" -eq 0 ] || { fail81 "happy path failed: exit $PP_RC"; }
+    # Check that the private key base64, token, and JWT prefix don't appear
+    # in stdout, stderr, or the curl log (argv lines)
+    combined=$(printf '%s\n%s\n' "$PP_OUT" "$(cat "$PLAY_D/log-t81" 2>/dev/null)")
+    # Private key base64 body (look for a distinctive part)
+    key_b64=$(printf '%s' "$PLAY_KEY" | base64 -w0 | head -c 20)
+    if printf '%s' "$combined" | grep -qF "$key_b64"; then
+        fail81 "private key base64 appears in output or curl log"
+    fi
+    # Token
+    if printf '%s' "$combined" | grep -qF 'ya29.SENTINEL_TOKEN'; then
+        fail81 "access token appears in output or curl log"
+    fi
+    # JWT prefix
+    if printf '%s' "$combined" | grep -qF 'eyJ'; then
+        fail81 "JWT prefix appears in output or curl log"
+    fi
+    # Temp dir cleanup: check that TMPDIR is empty after success
+    if [ -d "$PLAY_D/tmp" ] && [ "$(ls -A "$PLAY_D/tmp" 2>/dev/null)" != "" ]; then
+        fail81 "temp dir not cleaned up after success"
+    fi
+    # Temp dir cleanup after failure
+    run_play_publish "$PLAY_D/log-t81f" 0.28.0 PLAY_STUB_CODE_upload=403
+    if [ -d "$PLAY_D/tmp" ] && [ "$(ls -A "$PLAY_D/tmp" 2>/dev/null)" != "" ]; then
+        fail81 "temp dir not cleaned up after failure"
+    fi
+else
+    fail81 "scripts/play-publish.sh missing"
+fi
+if [ "$t81" -eq 1 ]; then
+    ok "T81 play-publish: secret hygiene (no key/token/JWT in output or curl log, temp dir cleaned)"
+else
+    bad "T81 play-publish: secret hygiene ($why81)"
+fi
+
+# T82: play-publish: failure paths
+t82=1; why82=""
+fail82() { t82=0; why82="${why82}${why82:+; }$1"; }
+if [ -f scripts/play-publish.sh ]; then
+    printf 'fake aab content' > "$PLAY_D/aab.aab"
+    # Upload returns 403
+    run_play_publish "$PLAY_D/log-t82a" 0.28.0 PLAY_STUB_CODE_upload=403
+    [ "$PP_RC" -eq 1 ] || { fail82 "upload 403: exit $PP_RC (want 1)"; }
+    printf '%s' "$PP_OUT" | grep -qF 'HTTP 403' || fail82 "upload 403: output missing 'HTTP 403'"
+    printf '%s' "$PP_OUT" | grep -qF 'STUB_DENIED' || fail82 "upload 403: output missing 'STUB_DENIED'"
+    grep -qF ':commit' "$PLAY_D/log-t82a" 2>/dev/null && fail82 "upload 403: commit was called"
+    # Upload versionCode mismatch
+    run_play_publish "$PLAY_D/log-t82b" 0.28.0 PLAY_STUB_UPLOAD_VC=2800098
+    [ "$PP_RC" -eq 1 ] || { fail82 "upload mismatch: exit $PP_RC (want 1)"; }
+    grep -qF ':commit' "$PLAY_D/log-t82b" 2>/dev/null && fail82 "upload mismatch: commit was called"
+    # Token returns 400
+    run_play_publish "$PLAY_D/log-t82c" 0.28.0 PLAY_STUB_CODE_token=400
+    [ "$PP_RC" -eq 1 ] || { fail82 "token 400: exit $PP_RC (want 1)"; }
+    grep -qF 'applications/sh\.shifu\.mobile/edits ' "$PLAY_D/log-t82c" 2>/dev/null && fail82 "token 400: edits was called"
+else
+    fail82 "scripts/play-publish.sh missing"
+fi
+if [ "$t82" -eq 1 ]; then
+    ok "T82 play-publish: failure paths (upload 403, versionCode mismatch, token 400)"
+else
+    bad "T82 play-publish: failure paths ($why82)"
+fi
+
+# T83: release-publish-play: missing secret
+t83=1; why83=""
+fail83() { t83=0; why83="${why83}${why83:+; }$1"; }
+if ! grep -qE '^release-publish-play:' Makefile 2>/dev/null; then
+    fail83 "Makefile missing release-publish-play target"
+else
+    # Missing PLAY_SERVICE_ACCOUNT_JSON → non-zero, names the secret, zero curl calls
+    rm -f "$PLAY_D/log-t83a"
+    PP_OUT=$( cd "$root" && PATH="$PLAY_D/bin:$PATH" CURL_LOG="$PLAY_D/log-t83a" \
+        make release-publish-play TAG=0.28.0 OUTPUT_DIR="$PLAY_D/out" 2>&1 )
+    PP_RC=$?
+    [ "$PP_RC" -ne 0 ] || { fail83 "missing secret: exit 0 (want non-zero)"; }
+    printf '%s' "$PP_OUT" | grep -qF 'PLAY_SERVICE_ACCOUNT_JSON' || fail83 "missing secret: output does not name PLAY_SERVICE_ACCOUNT_JSON"
+    [ ! -s "$PLAY_D/log-t83a" ] || fail83 "missing secret: curl was called (log not empty)"
+    # Malformed JSON → exit 2, zero curl calls
+    rm -f "$PLAY_D/log-t83b"
+    PP_OUT=$( cd "$root" && PATH="$PLAY_D/bin:$PATH" CURL_LOG="$PLAY_D/log-t83b" \
+        PLAY_SERVICE_ACCOUNT_JSON='{"broken":true' \
+        make release-publish-play TAG=0.28.0 OUTPUT_DIR="$PLAY_D/out" 2>&1 )
+    PP_RC=$?
+    [ "$PP_RC" -eq 2 ] || fail83 "malformed JSON: exit $PP_RC (want 2)"
+    [ ! -s "$PLAY_D/log-t83b" ] || fail83 "malformed JSON: curl was called (log not empty)"
+fi
+if [ "$t83" -eq 1 ]; then
+    ok "T83 release-publish-play: missing/malformed secret fails fast with zero curl calls"
+else
+    bad "T83 release-publish-play: missing secret ($why83)"
+fi
+
+# T84: make release: ordering + assets
+t84=1; why84=""
+fail84() { t84=0; why84="${why84}${why84:+; }$1"; }
+E_OUT_PLAY=$(make -n release TAG="$V" PRUNE=1 CONTAINER_BUILDER=docker 2>&1)
+# mobile-android ANDROID_FORMAT=aab comes after release-build-android and before desktop-updater
+and_line=$(printf '%s\n' "$E_OUT_PLAY" | grep -nF 'release-build-android' | head -n1 | cut -d: -f1)
+aab_line=$(printf '%s\n' "$E_OUT_PLAY" | grep -nF 'ANDROID_FORMAT=aab' | head -n1 | cut -d: -f1)
+upd_line=$(printf '%s\n' "$E_OUT_PLAY" | grep -nF 'desktop-updater' | head -n1 | cut -d: -f1)
+pub_line=$(printf '%s\n' "$E_OUT_PLAY" | grep -nF 'release-publish-play' | head -n1 | cut -d: -f1)
+gh_line=$(printf '%s\n' "$E_OUT_PLAY" | grep -nF 'release-publish-github' | head -n1 | cut -d: -f1)
+if [ -z "$and_line" ]; then
+    fail84 "release-build-android not found in make -n release"
+elif [ -z "$aab_line" ]; then
+    fail84 "ANDROID_FORMAT=aab not found in make -n release"
+elif [ "$aab_line" -le "$and_line" ]; then
+    fail84 "ANDROID_FORMAT=aab (line $aab_line) is not after release-build-android (line $and_line)"
+fi
+if [ -n "$upd_line" ] && [ -n "$aab_line" ] && [ "$aab_line" -ge "$upd_line" ]; then
+    fail84 "ANDROID_FORMAT=aab (line $aab_line) is not before desktop-updater (line $upd_line)"
+fi
+if [ -z "$pub_line" ]; then
+    fail84 "release-publish-play not found in make -n release"
+elif [ -n "$gh_line" ] && [ "$pub_line" -le "$gh_line" ]; then
+    fail84 "release-publish-play (line $pub_line) is not after release-publish-github (line $gh_line)"
+fi
+# release-check invokes play-version-code.sh
+if ! grep -qF 'play-version-code.sh' Makefile 2>/dev/null; then
+    fail84 "Makefile does not reference play-version-code.sh"
+fi
+# RELEASE_ASSETS contains no .aab (T44 still passes with 10)
+assets_line=$(grep -E '^RELEASE_ASSETS[[:space:]]*[:?]?=' Makefile 2>/dev/null)
+if printf '%s' "$assets_line" | grep -qF '.aab'; then
+    fail84 "RELEASE_ASSETS contains .aab (should be Play-only)"
+fi
+# make -n release-publish-play output doesn't contain the value of a sentinel PLAY_SERVICE_ACCOUNT_JSON
+PP_OUT=$( cd "$root" && PLAY_SERVICE_ACCOUNT_JSON='SENTINEL_PLAY_JSON_VALUE' \
+    make -n release-publish-play TAG=0.28.0 OUTPUT_DIR="$PLAY_D/out" 2>&1 )
+if printf '%s' "$PP_OUT" | grep -qF 'SENTINEL_PLAY_JSON_VALUE'; then
+    fail84 "make -n release-publish-play leaks PLAY_SERVICE_ACCOUNT_JSON value"
+fi
+if [ "$t84" -eq 1 ]; then
+    ok "T84 make release: AAB build after android, before updater; Play publish last; no .aab in RELEASE_ASSETS"
+else
+    bad "T84 make release: ordering + assets ($why84)"
+fi
+
+# T85: build-android.sh aab contract (static)
+t85=1; why85=""
+fail85() { t85=0; why85="${why85}${why85:+; }$1"; }
+if [ ! -f mobile/scripts/build-android.sh ]; then
+    fail85 "mobile/scripts/build-android.sh missing"
+else
+    # Accepts apk|aab
+    if ! grep -qE 'apk|aab' mobile/scripts/build-android.sh; then
+        fail85 "build-android.sh does not accept apk/aab format argument"
+    fi
+    # aab branch requires all 4 /run/secrets files (no debug fallback)
+    if ! grep -qF '/run/secrets' mobile/scripts/build-android.sh; then
+        fail85 "build-android.sh does not reference /run/secrets for aab mode"
+    fi
+    # Passes --config built from play-version-code.sh
+    if ! grep -qF -- 'play-version-code.sh' mobile/scripts/build-android.sh; then
+        fail85 "build-android.sh does not call play-version-code.sh for versionCode"
+    fi
+    if ! grep -qF -- '--config' mobile/scripts/build-android.sh; then
+        fail85 "build-android.sh does not pass --config for versionCode injection"
+    fi
+    # Runs jarsigner -verify on the AAB
+    if ! grep -qF 'jarsigner' mobile/scripts/build-android.sh; then
+        fail85 "build-android.sh does not run jarsigner -verify on the AAB"
+    fi
+    # Makefile passes ANDROID_FORMAT and defaults to apk
+    if ! grep -qF 'ANDROID_FORMAT' Makefile; then
+        fail85 "Makefile does not define ANDROID_FORMAT"
+    fi
+    if ! grep -qE 'ANDROID_FORMAT[[:space:]]*\?=[[:space:]]*apk' Makefile; then
+        fail85 "Makefile ANDROID_FORMAT does not default to apk"
+    fi
+fi
+if [ "$t85" -eq 1 ]; then
+    ok "T85 build-android.sh aab contract (apk/aab arg, secrets required, versionCode via --config, jarsigner -verify)"
+else
+    bad "T85 build-android.sh aab contract ($why85)"
+fi
 # ── Summary ────────────────────────────────────────────────────────────────
 
 echo ""
