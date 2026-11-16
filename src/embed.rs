@@ -139,9 +139,9 @@ impl LocalCore {
     }
 
     /// P5 C3: app foreground signal.
-    pub fn set_foreground(&self, fg: bool) {
+    pub async fn set_foreground(&self, fg: bool) {
         if let Some(handle) = self.cloud.clone() {
-            handle.set_foreground(fg);
+            handle.set_foreground(fg).await;
         }
     }
 }

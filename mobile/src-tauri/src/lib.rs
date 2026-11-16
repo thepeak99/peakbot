@@ -224,19 +224,19 @@ async fn deliver_deep_link(app: &AppHandle, url: String) {
 
 /// P5 T8: the app came to the foreground again. Tell the core so it can
 /// resume its cloud socket after the 3 s background debounce.
-fn foreground(app: &AppHandle) {
+async fn foreground(app: &AppHandle) {
     let local = app.state::<Local>();
     if let Some(core) = local.core() {
-        core.set_foreground(true);
+        core.set_foreground(true).await;
     }
 }
 
 /// P5 T8: the app went to the background. The core debounces the
 /// background → suspend transition itself (3 s).
-fn background(app: &AppHandle) {
+async fn background(app: &AppHandle) {
     let local = app.state::<Local>();
     if let Some(core) = local.core() {
-        core.set_foreground(false);
+        core.set_foreground(false).await;
     }
 }
 
@@ -307,13 +307,6 @@ fn is_foreground_resume(_event: &RunEvent) -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Route tracing events (e.g. embed.rs config errors) to stdout → logcat.
-    tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_target(false)
-        .with_level(true)
-        .init();
-
     let builder = tauri::Builder::default()
         .plugin(
             tauri_plugin_log::Builder::new()
@@ -385,7 +378,8 @@ pub fn run() {
                     ..
                 }
             ) {
-                foreground(app);
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move { foreground(&app).await });
             }
             if matches!(
                 &event,
@@ -394,7 +388,8 @@ pub fn run() {
                     ..
                 }
             ) {
-                background(app);
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move { background(&app).await });
             }
             // Existing resume logic: re-serve the Local core if its listener
             // was reclaimed (iOS may have killed it while suspended).

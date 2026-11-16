@@ -413,7 +413,7 @@ impl CloudHandle {
 
     /// P5 T5: app foreground signal; `false` suspends after a 3 s debounce,
     /// `true` resumes now. Suspend closes the relay socket; Resume redials.
-    pub fn set_foreground(&self, fg: bool) {
+    pub async fn set_foreground(&self, fg: bool) {
         if !fg {
             // Schedule suspend after 3 s debounce, cancellable by a foreground signal.
             let mut slot = self.suspend_task.lock().unwrap();
