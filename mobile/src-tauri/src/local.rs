@@ -108,6 +108,12 @@ impl Local {
         let listener = bind(preferred)?;
         let port = listener.local_addr()?.port();
         let token = new_token()?;
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let core = {
+            let store = crate::keystore::new_store()?;
+            LocalCore::boot_with_store(token.clone(), store).await?
+        };
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let core = LocalCore::boot(token.clone()).await?;
         let serve = async_runtime::spawn(core.serve(listener));
         let running = Running {

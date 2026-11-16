@@ -1,6 +1,11 @@
 //! PeakBot Mobile — the Tauri glue: plugins, the main window and the nav
 //! guard. Decisions live in the pure `nav` module; the Local core's
 //! lifecycle in `local`. This file only wires them to Tauri.
+// OS secure storage for the cloud seed. On desktop only the pure
+// decode/classify fns build, for host unit tests.
+#[cfg(any(target_os = "android", target_os = "ios", test))]
+#[cfg_attr(test, allow(dead_code))]
+mod keystore;
 mod local;
 mod nav;
 // iOS glue: the edge-swipe back gesture + the data root's backup
