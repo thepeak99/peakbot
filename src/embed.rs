@@ -85,6 +85,29 @@ impl LocalCore {
         let router = self.router.clone();
         async move { axum::serve(listener, router).await }
     }
+
+    /// P5 C5: boot with an injected keystore (the phone's OS keystore). The
+    /// given `Arc<dyn SeedStore>` is wrapped in a MigratingSeedStore that
+    /// moves a legacy file seed into it once. A migration error disables
+    /// Cloud Mode with a visible error — it never boots a fresh genesis.
+    /// SKELETON.
+    pub async fn boot_with_store(
+        _token: String,
+        _keystore: std::sync::Arc<dyn crate::cloud::SeedStore>,
+    ) -> anyhow::Result<LocalCore> {
+        todo!("P5 T6: boot_with_store")
+    }
+
+    /// P5 C2: hand an inbound deep-link URL to the pending DeepLink login.
+    /// SKELETON.
+    pub async fn deliver_login_callback(&self, _url: &str) {
+        todo!("P5 T6: deliver_login_callback")
+    }
+
+    /// P5 C3: app foreground signal. SKELETON.
+    pub fn set_foreground(&self, _fg: bool) {
+        todo!("P5 T6: set_foreground")
+    }
 }
 
 impl Drop for LocalCore {
