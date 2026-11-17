@@ -7,16 +7,6 @@
 //!
 //! Edition gating (p3-design §A): only [`keyring`] is host-only. The Local
 //! edition builds the actor with `inbound = None` (controller-only).
-
-// Re-export the protocol core from peakbot-cloud so the rest of the crate
-// imports from `cloud::` uniformly.
-pub use peakbot_cloud::{
-    DeviceId, LetterId, SessionId, Head,
-    Error, Result,
-    h, mac, mac_verify, sign_tagged, verify_tagged,
-    card, chain, codec, constants, frames, handshake, letter, sas,
-};
-
 mod actor;
 pub mod config;
 pub mod enroll;

@@ -74,7 +74,9 @@ COPY build/ build/
 COPY --from=web /web/dist ./web/dist
 COPY src/ src/
 
-RUN touch src/main.rs && \
+# Touch ALL workspace .rs sources (not just main.rs) so cargo recompiles the
+# real cloud crate, not the empty stub that was baked into the dep cache.
+RUN find src crates -name '*.rs' -exec touch {} + && \
     cargo build --target ${TARGET} --release --locked
 
 FROM scratch
