@@ -123,6 +123,7 @@ impl From<CloudError> for ApiError {
             CloudError::Trust(_) => (StatusCode::CONFLICT, "trust"),
             CloudError::Offline => (StatusCode::GATEWAY_TIMEOUT, "offline"),
             CloudError::UnknownDevice => (StatusCode::NOT_FOUND, "unknown_device"),
+            CloudError::SelfTarget => (StatusCode::BAD_REQUEST, "self_target"),
             CloudError::Reset(c) if *c == cloud::constants::reset::PROTOCOL => {
                 (StatusCode::BAD_GATEWAY, "refused")
             }

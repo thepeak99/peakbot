@@ -1010,17 +1010,30 @@ impl Actor {
                 .await;
             return;
         }
-        // Tie-break (G.7): the LOWER DeviceId stays initiator.
+        // Tie-break (G.7): the LOWER DeviceId stays initiator. Only a live
+        // race counts — both sides mid-handshake as initiator. A peer that
+        // sends Hs1 while we hold an Open session has lost its side (e.g. a
+        // Suspend clears sessions without `Close`); refusing it would bounce
+        // every request off the stale session forever, so it is dropped
+        // and the peer re-established below.
         let we_win = self.id.id < from
-            && live.sessions.get(&from).is_some_and(|s| {
-                !matches!(&s.phase, Phase::Handshaking(Handshaking::Responder(_)))
-            });
+            && live
+                .sessions
+                .get(&from)
+                .is_some_and(|s| matches!(&s.phase, Phase::Handshaking(Handshaking::Initiator(_))));
         if we_win {
-            // We win (initiator, or established session as initiator):
-            // refuse the duplicate; the peer will respond to OUR Hs1.
+            // We win: refuse the duplicate; the peer will respond to OUR Hs1.
             self.send_close(ws, from, h1.sid, constants::close_reason::PROTOCOL)
                 .await;
             return;
+        }
+        if live
+            .sessions
+            .get(&from)
+            .is_some_and(|s| matches!(s.phase, Phase::Open(_)))
+        {
+            self.close_session(live, ws, from, constants::close_reason::NORMAL)
+                .await;
         }
         // We lose (or no session): become the responder, carrying our
         // queued opens over (they are re-bound once the session opens).
@@ -1329,6 +1342,22 @@ impl Actor {
                         if let Some((_, out)) = claim {
                             let _ = out.send(Err(CloudError::Reset(constants::reset::PROTOCOL)));
                         }
+                        // An out-of-sequence message on a stream we know is
+                        // that stream's fault: reset it, keep the session.
+                        // Bad Opens / unknown ids stay session-level.
+                        let known = !matches!(inner.msg, StreamMsg::Open(_))
+                            && o.streams.contains_key(&inner.stream);
+                        if known {
+                            if let Some(side) = o.streams.get(&inner.stream) {
+                                let _ = side
+                                    .to_caller
+                                    .try_send(StreamMsg::Reset(constants::reset::PROTOCOL));
+                            }
+                            self.drop_stream(o, inner.stream);
+                            self.send_reset(ws, o, from, inner.stream, constants::reset::PROTOCOL)
+                                .await;
+                            return None;
+                        }
                         Some(reason_for_cloud_err(e))
                     }
                 }
@@ -1618,6 +1647,12 @@ impl Actor {
         op: Op,
         out: oneshot::Sender<Result<CloudStream, CloudError>>,
     ) {
+        // A session to ourselves would send Hs1 through the relay back to
+        // this socket and never complete: refuse it before any handshake.
+        if device == self.id.id {
+            let _ = out.send(Err(CloudError::SelfTarget));
+            return;
+        }
         match live.sessions.get_mut(&device) {
             None => {
                 let Some(chain) = self.chain_cache.clone() else {

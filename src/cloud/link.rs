@@ -125,6 +125,8 @@ pub enum CloudError {
     Disabled,
     NotActive(CloudStateKind),
     UnknownDevice,
+    /// The target is this device itself: there is no peer to open to.
+    SelfTarget,
     Offline,
     Trust(TrustError),
     Reset(u16),
@@ -201,6 +203,7 @@ impl std::fmt::Display for CloudError {
             CloudError::Disabled => f.write_str("cloud mode is not configured"),
             CloudError::NotActive(kind) => write!(f, "cloud state is not active: {kind:?}"),
             CloudError::UnknownDevice => f.write_str("unknown device"),
+            CloudError::SelfTarget => f.write_str("the target is this device itself"),
             CloudError::Offline => f.write_str("device offline"),
             CloudError::Trust(e) => write!(f, "trust error: {e:?}"),
             CloudError::Reset(code) => write!(f, "stream reset: {code}"),

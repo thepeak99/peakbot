@@ -518,6 +518,7 @@ pub fn from_cloud(err: &crate::cloud::CloudError, name: &str) -> RemoteError {
         CloudError::UnknownDevice => RemoteError::NotFound {
             name: name.to_string(),
         },
+        CloudError::SelfTarget => cloud_down(name, "that is this device itself"),
         CloudError::Reset(code) => cloud_down(name, &reset_text(*code)),
         CloudError::Io(msg) => cloud_down(name, msg),
         CloudError::Flow(e) => cloud_down(name, &format!("{e:?}")),
