@@ -925,7 +925,7 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
 
 /// The catalog row for a `profile@device` cloud target (machine = the bare
 /// device slug, the cloud `MachineId`); the relay fills its agents.
-fn cloud_target_info(name: &str, target: &str) -> crate::config::resolve::ProfileInfo {
+pub fn cloud_target_info(name: &str, target: &str) -> crate::config::resolve::ProfileInfo {
     let slug = name.rsplit_once('@').map_or("", |(_, d)| d);
     crate::config::resolve::ProfileInfo {
         name: name.to_string(),
