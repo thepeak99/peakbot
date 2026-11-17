@@ -111,7 +111,7 @@ export function useAgent(): AgentConnection {
   const [commands, setCommands] = useState<SlashCommand[]>([]);
   const [dirListing, setDirListing] = useState<DirListing | null>(null);
   const [recentDirs, setRecentDirs] = useState<string[]>([]);
-  const [noLocal] = useState(false);
+  const [noLocal, setNoLocal] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // One per hook instance (lazy): the last-seen cache behind the invariant
   // "`state` always describes `convo`" (design §3).
@@ -281,6 +281,12 @@ export function useAgent(): AgentConnection {
             setError(msg.message);
             break;
           case "heartbeat":
+            break;
+          case "no_local_profile":
+            // Zero-local config: nothing to attach to. Detach handlers so the
+            // subsequent server-side close doesn't trigger a reconnect loop.
+            setNoLocal(true);
+            drop();
             break;
         }
       };
