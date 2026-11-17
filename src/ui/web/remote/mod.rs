@@ -41,8 +41,8 @@ use uuid::Uuid;
 
 use crate::config::remote::{CaFingerprint, Endpoint, RemoteProfile, Trust};
 use crate::config::resolve::{CatalogEntry, Config, ParseCtx, ProfileInfo, Source};
-use crate::paths;
 use crate::image_cache::valid_image_id;
+use crate::paths;
 use crate::ui::wire::ConversationSummaryWire;
 
 pub(super) mod listing;

@@ -49,7 +49,11 @@ fn init_shared_roots() {
             std::fs::create_dir_all(p).expect("root");
         }
         // Write a default config (won't be used directly by our cores)
-        std::fs::write(c.join("config.yaml"), "general:\n  context:\n    enabled: false\n").expect("cfg");
+        std::fs::write(
+            c.join("config.yaml"),
+            "general:\n  context:\n    enabled: false\n",
+        )
+        .expect("cfg");
         paths::init_roots(Roots {
             config: c,
             data: d,
@@ -73,6 +77,7 @@ fn parse(yaml: &str) -> Config {
 
 // ── a core: web server + CloudLink, all paths injected ───────────────────
 
+#[allow(dead_code)]
 struct Core {
     addr: SocketAddr,
     handle: CloudHandle,
@@ -81,7 +86,7 @@ struct Core {
 }
 
 impl Core {
-    async fn start(name: &str, seed: u8, yaml: &str, relay: &TestRelay) -> Core {
+    async fn start(name: &str, seed: u8, yaml: &str, _relay: &TestRelay) -> Core {
         init_shared_roots();
         let tmp = tempfile::tempdir().expect("core dir");
         // Write the config to the roots config dir so fresh_home_attach reads it.
@@ -134,11 +139,13 @@ impl Core {
         }
     }
 
+    #[allow(dead_code)]
     fn id_hex(&self) -> String {
         hex(&self.handle.device_id().expect("device id"))
     }
 }
 
+#[allow(dead_code)]
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
@@ -245,12 +252,18 @@ async fn zero_local_config_unpinned_attach_sends_no_local_profile_frame() {
     send(&mut w, json!({"type": "attach", "convo": null})).await;
 
     // The first meaningful frame must be `no_local_profile`.
-    let f = until_frame(&mut w, "no_local_profile", |f| f["type"] == "no_local_profile").await;
+    let f = until_frame(&mut w, "no_local_profile", |f| {
+        f["type"] == "no_local_profile"
+    })
+    .await;
     assert_eq!(f["type"], "no_local_profile", "frame type");
 
     // After the frame, the socket should close (no session minted).
     let closed = next_frame(&mut w, 3).await;
-    assert!(closed.is_none(), "socket should close after no_local_profile");
+    assert!(
+        closed.is_none(),
+        "socket should close after no_local_profile"
+    );
 }
 
 // ═══ case (b): local profile config → normal attach (regression) ═════════

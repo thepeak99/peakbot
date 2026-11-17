@@ -1032,9 +1032,8 @@ async fn serve_socket<Si, St, E>(
     // catalogue pays for the parse (a name has one kind per config; local
     // freshness is the session's own reload's job), as does an unpinned
     // attach on a relay-only boot catalogue.
-    let home_attach = profile.is_none()
-        && !relayed
-        && registry.boot_catalog().default_bound().is_none();
+    let home_attach =
+        profile.is_none() && !relayed && registry.boot_catalog().default_bound().is_none();
     let fresh = match profile
         .as_deref()
         .filter(|p| !boot_has_local(registry.boot_catalog(), p))
