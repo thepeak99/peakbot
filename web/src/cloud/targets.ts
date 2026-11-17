@@ -4,7 +4,7 @@
 // Pure function; the hook wires it to the cloud store.
 
 import { useEffect, useState } from "react";
-import type { WireProfileInfo } from "../state";
+import type { TabColor, WireProfileInfo } from "../state";
 import type { Device } from "./types";
 import { useCloudDevices } from "./useCloud";
 
@@ -32,7 +32,7 @@ export function toCloudRows(
         agents: [],
       };
       if (p.color !== undefined) {
-        row.color = p.color;
+        row.color = p.color as TabColor;
       }
       rows.push(row);
     }

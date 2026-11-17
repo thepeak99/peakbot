@@ -81,7 +81,7 @@ export function adaptMessage(m: WireChatMessage, base = ""): ChatMessage {
 }
 
 export function adaptStats(s: AppState): SessionStats {
-  if (!s.stats) return { lanes: [], inputTokens: 0, outputTokens: 0, apiCalls: 0, model: "", providerName: "", costUsd: 0 };
+  if (!s.stats) return { lanes: [], inputTokens: 0, outputTokens: 0, apiCalls: 0, model: "", provider: "", costUsd: 0, modelAlias: "" };
   const lanes = (s.stats.lanes ?? []).map((l) => ({
     lane: l.lane,
     inputTokens: l.input_tokens,
