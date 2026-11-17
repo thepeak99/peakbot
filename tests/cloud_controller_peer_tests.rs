@@ -124,3 +124,88 @@ async fn request_to_an_offline_peer_errors_within_the_bound() {
     let p = profiles_within(&ctl, OFFLINE_BOUND, "offline").await;
     assert!(p.starts_with("Err("), "an error, not a list: {p}");
 }
+
+/// The bound for "a clean answer, not a hang" (P5 task spec: ≤ 5 s).
+const BOUND: Duration = Duration::from_secs(5);
+
+/// Open an Attach stream to the host for an agent the host cannot build and
+/// return what the stream yields: the host's error frame, then the stream
+/// ending (End/Reset/None). A stream reset BEFORE any frame is the bug.
+async fn failed_attach(ctl: &Dev, what: &str) -> Vec<String> {
+    use cloud::frames::{Op, StreamMsg};
+    use futures::{SinkExt, StreamExt};
+    let run = async {
+        let mut s = ctl
+            .handle
+            .open(id_a(), Op::Attach)
+            .await
+            .map_err(|e| format!("open Attach: {e}"))?;
+        s.send(StreamMsg::Frame(
+            r#"{"type":"attach","profile":"dev","agent":"no-such-agent","relayed":true}"#
+                .to_string(),
+        ))
+        .await
+        .map_err(|e| format!("send attach frame: {e}"))?;
+        let mut seen = Vec::new();
+        while let Some(m) = s.next().await {
+            match m {
+                StreamMsg::Frame(f) => seen.push(f),
+                other => {
+                    seen.push(format!("{other:?}"));
+                    break;
+                }
+            }
+        }
+        Ok::<_, String>(seen)
+    };
+    tokio::time::timeout(BOUND, run)
+        .await
+        .unwrap_or_else(|_| panic!("{what}: attach hung > {BOUND:?}"))
+        .unwrap_or_else(|e| panic!("{what}: {e}"))
+}
+
+/// (v) P5 emulator bug: a session the HOST fails to start must not poison
+/// the peer session — the next requests still get answered.
+#[tokio::test]
+async fn failed_session_on_host_does_not_kill_the_peer_session() {
+    let fake = FakeRelay::spawn().await;
+    let (_core, hook) = boot_core(YAML).await;
+    let (_host, ctl) = enroll_pair(&fake, hook).await;
+    active(&ctl).await;
+
+    let first = failed_attach(&ctl, "first attach").await;
+    assert!(
+        first.first().is_some_and(|f| f.contains("\"error\"")),
+        "the host must answer a clean error frame: {first:?}"
+    );
+
+    let p = profiles_within(&ctl, BOUND, "after failed session").await;
+    assert!(
+        p.starts_with("Ok(") && p.contains("dev"),
+        "profiles after a failed session: {p}"
+    );
+
+    let second = failed_attach(&ctl, "second attach").await;
+    assert!(
+        second.first().is_some_and(|f| f.contains("\"error\"")),
+        "a second attempt must get a clean error again, not a reset: {second:?}"
+    );
+    let p = profiles_within(&ctl, BOUND, "after second failed session").await;
+    assert!(p.starts_with("Ok("), "profiles after two failures: {p}");
+}
+
+/// (vi) a request aimed at the device's OWN id is refused fast, not hung.
+#[tokio::test]
+async fn request_to_own_device_id_is_refused_within_the_bound() {
+    let fake = FakeRelay::spawn().await;
+    let (_core, hook) = boot_core(YAML).await;
+    let (_host, ctl) = enroll_pair(&fake, hook).await;
+    active(&ctl).await;
+
+    let me = ctl.handle.device_id().expect("own id");
+    let r = tokio::time::timeout(BOUND, ctl.handle.profiles(me))
+        .await
+        .unwrap_or_else(|_| panic!("profiles(self) hung > {BOUND:?}"));
+    let p = format!("{r:?}");
+    assert!(p.starts_with("Err("), "self-target must be an error: {p}");
+}
