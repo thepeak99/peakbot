@@ -192,6 +192,25 @@ async fn failed_session_on_host_does_not_kill_the_peer_session() {
     );
     let p = profiles_within(&ctl, BOUND, "after second failed session").await;
     assert!(p.starts_with("Ok("), "profiles after two failures: {p}");
+
+    // The phone drops its side silently (app backgrounded → Suspend clears
+    // its sessions with no `Close`), while the host keeps its Open one. The
+    // phone's fresh Hs1 must re-establish, not bounce off the stale session
+    // with `Close{PROTOCOL}` ("stream reset: 6" in ~8 ms on the emulator).
+    ctl.handle.set_foreground(false).await;
+    tokio::time::sleep(PAST_DEBOUNCE).await;
+    ctl.handle.set_foreground(true).await;
+    active(&ctl).await;
+    let p = profiles_within(&ctl, BOUND, "after the phone dropped its session").await;
+    assert!(
+        p.starts_with("Ok(") && p.contains("dev"),
+        "profiles after re-handshake: {p}"
+    );
+    let third = failed_attach(&ctl, "attach after re-handshake").await;
+    assert!(
+        third.first().is_some_and(|f| f.contains("\"error\"")),
+        "clean error after re-handshake: {third:?}"
+    );
 }
 
 /// (vi) a request aimed at the device's OWN id is refused fast, not hung.
