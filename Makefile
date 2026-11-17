@@ -196,6 +196,9 @@ mobile-android: mobile-android-image
 	  { printf '%s' "$$ANDROID_KEYSTORE_PASSWORD";   } > "$$secret_dir/ANDROID_KEYSTORE_PASSWORD"; \
 	  { printf '%s' "$$ANDROID_KEY_ALIAS";           } > "$$secret_dir/ANDROID_KEY_ALIAS"; \
 	  { printf '%s' "$$ANDROID_KEY_PASSWORD";        } > "$$secret_dir/ANDROID_KEY_PASSWORD"; \
+	  if [ -n "$${PERMA_CRYPTO_TOKEN:-}" ]; then \
+	    { printf '%s' "$$PERMA_CRYPTO_TOKEN"; } > "$$secret_dir/PERMA_CRYPTO_TOKEN"; \
+	  fi; \
 	  chmod 600 "$$secret_dir"/*; \
 	  secrets_mount="-v $$secret_dir:/run/secrets:z"; \
 	  echo "🔏 Release signing: /run/secrets tmpfs mount prepared (4 secrets)"; \

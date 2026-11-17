@@ -2477,6 +2477,40 @@ if [ "$t85" -eq 1 ]; then
 else
     bad "T85 build-android.sh aab contract ($why85)"
 fi
+
+# T86: mobile-android target plumbs PERMA_CRYPTO_TOKEN via the secrets dir
+# (the mobile build needs it for crates/cloud's private perma-crypto git dep,
+# same as the release-build-* targets — but via /run/secrets mount, not
+# BuildKit secrets, because mobile-android is a `docker run`, not `docker build`).
+t86=1; why86=""
+fail86() { t86=0; why86="${why86}${why86:+; }$1"; }
+# Makefile: the mobile-android target writes PERMA_CRYPTO_TOKEN to the secrets dir
+if ! grep -qF 'PERMA_CRYPTO_TOKEN' Makefile; then
+    fail86 "Makefile: no PERMA_CRYPTO_TOKEN reference in mobile-android target"
+fi
+# build-android.sh: reads the token from the secrets dir and configures git
+if ! grep -qF 'PERMA_CRYPTO_TOKEN' mobile/scripts/build-android.sh; then
+    fail86 "build-android.sh: does not reference PERMA_CRYPTO_TOKEN"
+fi
+if ! grep -qE 'secrets_dir.*PERMA_CRYPTO_TOKEN|PERMA_CRYPTO_TOKEN.*secrets_dir' mobile/scripts/build-android.sh; then
+    fail86 "build-android.sh: does not read PERMA_CRYPTO_TOKEN from the secrets dir"
+fi
+if ! grep -qF 'CARGO_NET_GIT_FETCH_WITH_CLI=true' mobile/scripts/build-android.sh; then
+    fail86 "build-android.sh: does not set CARGO_NET_GIT_FETCH_WITH_CLI=true"
+fi
+if ! grep -qF 'GIT_CONFIG_KEY_0' mobile/scripts/build-android.sh; then
+    fail86 "build-android.sh: does not configure git credentials via GIT_CONFIG_KEY_0"
+fi
+# The token must never appear in `make -n` output (dry-run shows the recipe text)
+E_OUT=$(make -n mobile-android ANDROID_FORMAT=aab ANDROID_KEYSTORE_B64=x ANDROID_KEYSTORE_PASSWORD=x ANDROID_KEY_ALIAS=x ANDROID_KEY_PASSWORD=x PERMA_CRYPTO_TOKEN=secret-token-xyz 2>&1 || true)
+if printf '%s' "$E_OUT" | grep -qF 'secret-token-xyz'; then
+    fail86 "PERMA_CRYPTO_TOKEN appears in make -n output (token leaked)"
+fi
+if [ "$t86" -eq 1 ]; then
+    ok "T86 mobile-android plumbs PERMA_CRYPTO_TOKEN via /run/secrets mount (not BuildKit secret, not argv, not env, not make -n output)"
+else
+    bad "T86 mobile-android plumbs PERMA_CRYPTO_TOKEN via /run/secrets mount ($why86)"
+fi
 # ── Summary ────────────────────────────────────────────────────────────────
 
 echo ""

@@ -90,6 +90,19 @@ version_code=$(sh "$root/scripts/play-version-code.sh" "$VERSION") \
     || { echo "❌ no Play versionCode for version '$VERSION'" >&2; exit 1; }
 cfg='{"bundle":{"android":{"versionCode":'"$version_code"'}}}'
 
+# crates/cloud pulls perma-crypto (a private git repo). The token arrives on
+# the /run/secrets mount (written by the Makefile when PERMA_CRYPTO_TOKEN is
+# set). Configure git with the insteadOf approach so cargo can fetch it —
+# same mechanism as the release Dockerfiles (BuildKit secret → insteadOf).
+if [ -f "$secrets_dir/PERMA_CRYPTO_TOKEN" ]; then
+    perma_token=$(cat "$secrets_dir/PERMA_CRYPTO_TOKEN")
+    export CARGO_NET_GIT_FETCH_WITH_CLI=true
+    export GIT_CONFIG_COUNT=1
+    export GIT_CONFIG_KEY_0="url.https://x-access-token:${perma_token}@git.patchnotes.com/ai-bots/perma-crypto.insteadOf"
+    export GIT_CONFIG_VALUE_0="https://git.patchnotes.com/ai-bots/perma-crypto"
+    echo "🔑 perma-crypto git credential configured (insteadOf)"
+fi
+
 # 1. The Local core embeds the SPA from web/dist, so it must match web/src:
 #    ALWAYS build it (a "build if absent" check silently shipped a stale SPA).
 #    This is the `make web` equivalent; restore the tracked .gitkeep Vite wipes.
