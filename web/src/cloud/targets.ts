@@ -87,7 +87,7 @@ export function useCloudTargets(): CloudTargets {
     return () => {
       cancelled = true;
     };
-  }, [sig]);
+  }, [sig, devices]);
 
   if (loading) {
     return { status: "loading" };
