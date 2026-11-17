@@ -81,6 +81,7 @@ export function adaptMessage(m: WireChatMessage, base = ""): ChatMessage {
 }
 
 export function adaptStats(s: AppState): SessionStats {
+  if (!s.stats) return { lanes: [], inputTokens: 0, outputTokens: 0, apiCalls: 0, model: "", providerName: "", costUsd: 0 };
   const lanes = (s.stats.lanes ?? []).map((l) => ({
     lane: l.lane,
     inputTokens: l.input_tokens,
@@ -135,6 +136,7 @@ export function scopeStatsToView(
 }
 
 export function adaptContext(s: AppState): ContextUsage {
+  if (!s.context) return { currentUsage: 0, windowSize: 0, compactionThreshold: 0 };
   return {
     currentUsage: s.context.current_usage,
     windowSize: s.context.window_size,
@@ -143,6 +145,7 @@ export function adaptContext(s: AppState): ContextUsage {
 }
 
 export function adaptBg(s: AppState): BgProcess[] {
+  if (!s.bg) return [];
   return s.bg.recent_summaries.map((b) => ({
     id: b.id,
     command: b.command,
