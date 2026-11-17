@@ -2017,7 +2017,7 @@ impl Actor {
             return;
         };
         let mut rng = Os;
-        let entry =
+        let entry: chain::ChainEntry =
             match enroll::approve_entry(&chain, &card, self.id.card.clone(), &self.id.sk, &mut rng)
             {
                 Ok(e) => e,
@@ -2067,7 +2067,7 @@ impl Actor {
             let _ = out.send(Err(CloudError::Io("rng failed".into())));
             return;
         }
-        let card = match DeviceCard::parse(&req.card) {
+        let card: DeviceCard = match DeviceCard::parse(&req.card) {
             Ok(c) => c,
             Err(_) => {
                 let _ = out.send(Err(CloudError::Io("requester card undecodable".into())));
@@ -2132,7 +2132,7 @@ impl Actor {
         // (`last_device`, G.5 step 4, is unreachable here: self is Active and
         // `target != self`, so ≥ 2 devices; see erratum E-F4.)
         let mut rng = Os;
-        let entry =
+        let entry: chain::ChainEntry =
             match enroll::revoke_entry(&chain, target, self.id.card.clone(), &self.id.sk, &mut rng)
             {
                 Ok(e) => e,
@@ -2264,7 +2264,7 @@ impl Actor {
             return;
         };
         let mut rng = Os;
-        let entry =
+        let entry: chain::ChainEntry =
             match enroll::approve_entry(&chain, &card, self.id.card.clone(), &self.id.sk, &mut rng)
             {
                 Ok(e) => e,
@@ -2306,7 +2306,7 @@ impl Actor {
             return;
         };
         let mut rng = Os;
-        let entry =
+        let entry: chain::ChainEntry =
             match enroll::revoke_entry(&chain, target, self.id.card.clone(), &self.id.sk, &mut rng)
             {
                 Ok(e) => e,

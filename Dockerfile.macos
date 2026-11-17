@@ -93,6 +93,7 @@ COPY build.rs ./
 COPY build/ build/
 COPY --from=web /web/dist ./web/dist
 COPY src/ src/
+COPY crates/ crates/
 
 # Touch ALL workspace .rs sources (not just main.rs) so cargo recompiles the
 # real cloud crate, not the empty stub that was baked into the dep cache.
