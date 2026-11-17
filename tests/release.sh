@@ -1955,7 +1955,7 @@ fi
 # PLAY_STUB_UPLOAD_VC (versionCode the upload echoes back),
 # PLAY_STUB_CODE_<step> (per-step HTTP status, e.g. PLAY_STUB_CODE_upload=403).
 PLAY_D=$(mktemp -d); workdirs="$workdirs $PLAY_D"
-mkdir -p "$PLAY_D/bin"
+mkdir -p "$PLAY_D/bin" "$PLAY_D/tmp"
 
 cat > "$PLAY_D/bin/curl" <<'PLAYFAKECURL'
 #!/bin/sh
@@ -1971,6 +1971,7 @@ for a in "$@"; do
     -o)              ofile=$a; prev=''; continue ;;
     -w)              wfmt=$a; prev=''; continue ;;
     -H|--header)     hdrs="$hdrs | $a"; prev=''; continue ;;
+    --max-time)      prev=''; continue ;;
   esac
   case "$a" in
     -I|--head)    method=HEAD; prev='' ;;
@@ -1989,19 +1990,18 @@ printf '%s\n' "$line" >> "$CURL_LOG"
 step='unknown'
 case "$url" in
   *oauth2/token*) step='token' ;;
-  *applications/*/edits)
-    if [ "$method" = "POST" ]; then step='edits'; else step='unknown'; fi ;;
-  *edits/*/bundles)
-    if [ "$method" = "GET" ]; then step='bundles' ;;
-    if [ "$method" = "POST" ]; then step='upload' ;;
-  esac ;;
+  *edits/*/bundles*)
+    if [ "$method" = "GET" ]; then step='bundles'; fi
+    if [ "$method" = "POST" ]; then step='upload'; fi ;;
   *edits/*/tracks/*) step='tracks' ;;
   *edits/*:commit) step='commit' ;;
+  *applications/*/edits)
+    if [ "$method" = "POST" ]; then step='edits'; else step='unknown'; fi ;;
 esac
 
 # Read per-step failure code
 status_var="PLAY_STUB_CODE_${step}"
-status=${!status_var:-200}
+eval "status=\${$status_var:-200}"
 
 # Capture POST body to a file for inspection
 if [ -n "$body" ] && [ -n "$ofile" ]; then
@@ -2108,7 +2108,7 @@ chmod +x "$PLAY_D/bin/curl"
 PLAY_KEY_D=$(mktemp -d); workdirs="$workdirs $PLAY_KEY_D"
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$PLAY_KEY_D/key.pem" 2>/dev/null
 PLAY_KEY=$(cat "$PLAY_KEY_D/key.pem")
-PLAY_SA_JSON=$(printf '{"type":"service_account","project_id":"fake-project","private_key_id":"fake-key-id","private_key":"%s","client_email":"fake-sa@fake-project.iam.gserviceaccount.com","client_id":"123456789","auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token"}' "$PLAY_KEY")
+PLAY_SA_JSON=$(jq -n --arg key "$PLAY_KEY" --arg email "fake-sa@fake-project.iam.gserviceaccount.com" --arg uri "https://fake-oauth.example.test/oauth2/token" '{"type":"service_account","project_id":"fake-project","private_key_id":"fake-key-id","private_key":$key,"client_email":$email,"client_id":"123456789","auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":$uri}')
 
 # Helper: run play-publish with the fake curl
 run_play_publish() {
@@ -2117,7 +2117,7 @@ run_play_publish() {
     rm -f "$pp_log" "$pp_log.body.*"; : > "$pp_log"
     PP_OUT=$( PATH="$PLAY_D/bin:$PATH" CURL_LOG="$pp_log" \
         PLAY_SERVICE_ACCOUNT_JSON="$PLAY_SA_JSON" TMPDIR="$PLAY_D/tmp" \
-        $@ sh scripts/play-publish.sh sh.shifu.mobile \
+        env "$@" sh scripts/play-publish.sh sh.shifu.mobile \
         "$PLAY_D/aab.aab" "$(sh scripts/play-version-code.sh "$pp_tag")" 2>&1 )
     PP_RC=$?
 }
@@ -2192,13 +2192,13 @@ else
         # token
         grep -qF 'oauth2/token' "$PLAY_D/log-t78" || fail78 "no token request"
         # POST edits
-        grep -qF 'POST.*applications/sh\.shifu\.mobile/edits ' "$PLAY_D/log-t78" || fail78 "no POST edits"
+        grep -qE 'POST.*applications/sh\.shifu\.mobile/edits ' "$PLAY_D/log-t78" || fail78 "no POST edits"
         # GET bundles
-        grep -qF 'GET.*edits/E-STUB-EDIT-ID/bundles' "$PLAY_D/log-t78" || fail78 "no GET bundles"
+        grep -qE 'GET.*edits/E-STUB-EDIT-ID/bundles' "$PLAY_D/log-t78" || fail78 "no GET bundles"
         # POST upload
         grep -qF 'uploadType=media' "$PLAY_D/log-t78" || fail78 "no upload request"
         # PUT tracks/internal
-        grep -qF 'PUT.*tracks/internal' "$PLAY_D/log-t78" || fail78 "no PUT tracks/internal"
+        grep -qE 'PUT.*tracks/internal' "$PLAY_D/log-t78" || fail78 "no PUT tracks/internal"
         # POST commit
         grep -qF ':commit' "$PLAY_D/log-t78" || fail78 "no commit request"
         # Check track body has correct versionCode and status
@@ -2229,7 +2229,7 @@ if [ -f scripts/play-publish.sh ]; then
     if [ -f "$PLAY_D/log-t79" ]; then
         grep -qF 'uploadType=media' "$PLAY_D/log-t79" && fail79 "upload occurred despite existing versionCode"
         # PUT track and commit still happen
-        grep -qF 'PUT.*tracks/internal' "$PLAY_D/log-t79" || fail79 "PUT tracks/internal missing on idempotent run"
+        grep -qE 'PUT.*tracks/internal' "$PLAY_D/log-t79" || fail79 "PUT tracks/internal missing on idempotent run"
         grep -qF ':commit' "$PLAY_D/log-t79" || fail79 "commit missing on idempotent run"
     fi
     # stdout mentions "already on Play"
@@ -2354,7 +2354,7 @@ if [ -f scripts/play-publish.sh ]; then
     # Token returns 400
     run_play_publish "$PLAY_D/log-t82c" 0.28.0 PLAY_STUB_CODE_token=400
     [ "$PP_RC" -eq 1 ] || { fail82 "token 400: exit $PP_RC (want 1)"; }
-    grep -qF 'applications/sh\.shifu\.mobile/edits ' "$PLAY_D/log-t82c" 2>/dev/null && fail82 "token 400: edits was called"
+    grep -qE 'applications/sh\.shifu\.mobile/edits ' "$PLAY_D/log-t82c" 2>/dev/null && fail82 "token 400: edits was called"
 else
     fail82 "scripts/play-publish.sh missing"
 fi

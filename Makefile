@@ -6,7 +6,7 @@
         mobile-ios \
         release release-check release-bump release-tag \
         release-build-linux release-build-windows release-build-macos release-build-android \
-        release-publish release-publish-shifu release-publish-github
+        release-publish release-publish-shifu release-publish-github release-publish-play
 
 # Config
 DOCKERFILE         := Dockerfile.windows
@@ -158,13 +158,16 @@ MOBILE_ANDROID_HOME_VOL    := peakbot-mobile-android-home
 MOBILE_ANDROID_GRADLE_VOL  := peakbot-mobile-android-gradle
 MOBILE_ANDROID_CARGO_VOL   := peakbot-mobile-android-cargo
 MOBILE_ANDROID_TARGET_VOL  := peakbot-mobile-android-target
+ANDROID_FORMAT ?= apk
 
-## mobile-android: Build the PeakBot Mobile Android APK. Runs
+## mobile-android: Build the PeakBot Mobile Android APK (or AAB). Runs
 ##                 mobile/scripts/build-android.sh INSIDE the toolchain
 ##                 container (worktree at /w): web/dist (always rebuilt) →
 ##                 npm ci → `npm run tauri -- android build --apk
 ##                 --target aarch64 --ci -- --locked` → smoke.
-##                 Release signing: ANDROID_KEYSTORE_B64 +
+##                 ANDROID_FORMAT=apk (default) or aab. For aab, the
+##                 ANDROID_KEYSTORE_* secrets are required (no debug
+##                 fallback). Release signing: ANDROID_KEYSTORE_B64 +
 ##                 ANDROID_KEYSTORE_PASSWORD + ANDROID_KEY_ALIAS +
 ##                 ANDROID_KEY_PASSWORD in the environment cross the
 ##                 container boundary as a tmpfs /run/secrets mount (a
@@ -197,6 +200,9 @@ mobile-android: mobile-android-image
 	  secrets_mount="-v $$secret_dir:/run/secrets:z"; \
 	  echo "🔏 Release signing: /run/secrets tmpfs mount prepared (4 secrets)"; \
 	else \
+	  if [ "$(ANDROID_FORMAT)" = "aab" ]; then \
+	    echo "❌ ANDROID_FORMAT=aab requires ANDROID_KEYSTORE_* secrets"; exit 1; \
+	  fi; \
 	  echo "ℹ️  no ANDROID_KEYSTORE_* secrets — debug-signed -debug.apk (never released)"; \
 	fi; \
 	"$$builder" run --rm --memory=12g --memory-swap=12g \
@@ -207,7 +213,7 @@ mobile-android: mobile-android-image
 	  -v "$(MOBILE_ANDROID_CARGO_VOL):/opt/cargo/registry:z" \
 	  $$secrets_mount \
 	  -w /w \
-	  "$$image" sh mobile/scripts/build-android.sh
+	  "$$image" sh mobile/scripts/build-android.sh "$(ANDROID_FORMAT)"
 
 
 ## mobile-ios: Build the PeakBot Mobile iOS .ipa. HOST SCRIPT on a
@@ -342,6 +348,7 @@ release-check:
 	if [ "$(TAG)" != "$(RELEASE_VERSION)" ]; then \
 	  echo "❌ TAG '$(TAG)' does not match the Cargo.toml version '$(RELEASE_VERSION)'"; exit 1; \
 	fi; \
+	sh scripts/play-version-code.sh "$(TAG)" >/dev/null || { echo "❌ Invalid version tag for Play versionCode: '$(TAG)'"; exit 1; }; \
 	sh desktop/scripts/check-version.sh; \
 	if [ ! -f "release-notes/$(TAG).md" ]; then \
 	  echo "❌ Release notes missing: release-notes/$(TAG).md"; exit 1; \
@@ -351,17 +358,19 @@ release-check:
 	fi; \
 	echo "✅ release-check passed: TAG=$(TAG)"
 
-## release: Full release pipeline — check, build all 10 assets, sign the
-##          updater artifacts, publish to Gitea, upload to the shifu bucket,
-##          publish to the GitHub mirror (bridge). CI runs this on tag push:
-##          make release TAG=<v>.
+## release: Full release pipeline — check, build all 10 assets + the signed
+##          AAB, sign the updater artifacts, publish to Gitea, upload to the
+##          shifu bucket, publish to the GitHub mirror (bridge), and publish
+##          the AAB to the Google Play internal track. CI runs this on tag
+##          push: make release TAG=<v>.
 ##          Explicit sequential recipe of sub-make calls: the per-platform
 ##          targets (release-build-*, desktop-*) are the single source of
 ##          truth for the build commands — nothing is inlined here.
 ##          Command-line vars (TAG, PRUNE, CONTAINER_BUILDER, GITEA_URL,
 ##          OWNER, REPO, OUTPUT_DIR) propagate to the sub-makes via
 ##          MAKEFLAGS; GITEA_TOKEN / GH_RELEASE_TOKEN / TAURI_SIGNING_* /
-##          SHIFU_S3_* ride along in the environment.
+##          SHIFU_S3_* / ANDROID_KEYSTORE_* / PLAY_SERVICE_ACCOUNT_JSON
+##          ride along in the environment.
 ##          Order matters: never run with -j.
 release:
 	@echo "🚀 Release $(RELEASE_VERSION) — sequential by design, do not run with -j"
@@ -376,10 +385,12 @@ release:
 	$(MAKE) desktop-windows
 	$(PRUNE_STEP)
 	$(MAKE) release-build-android
+	$(MAKE) mobile-android ANDROID_FORMAT=aab
 	$(MAKE) desktop-updater
 	$(MAKE) release-publish TAG=$(TAG)
 	$(MAKE) release-publish-shifu TAG=$(TAG)
 	$(MAKE) release-publish-github TAG=$(TAG)
+	$(MAKE) release-publish-play TAG=$(TAG)
 
 ## release-bump: Bump to VERSION (X.Y.Z or X.Y.Z-<prerelease>, required) on a
 ##               fresh release/<v> branch cut from origin/master — bump both
@@ -814,6 +825,36 @@ release-publish-github:
 	trap - EXIT; \
 	echo "✅ Published $$v to https://github.com/$(GH_MIRROR_REPO)/releases/tag/$$v"
 
+## release-publish-play: Publish the signed AAB to the Google Play internal
+##              track. Uses scripts/play-publish.sh with a service-account
+##              JWT (openssl RS256). Requires TAG + PLAY_SERVICE_ACCOUNT_JSON
+##              (Gitea secret); PLAY_RELEASE_STATUS (Gitea variable, default
+##              'draft') controls the track status. Idempotent: re-running
+##              with the same versionCode skips the upload. The AAB must
+##              already be built (make mobile-android ANDROID_FORMAT=aab).
+##              The secret is read in the recipe shell ($${...}) so make -n
+##              never prints it.
+PLAY_PACKAGE := sh.shifu.mobile
+release-publish-play:
+	@set -eu; \
+	v="$(TAG)"; \
+	if [ -z "$$v" ]; then \
+	  echo "❌ TAG is not set — pass TAG=<version> (expected: $(RELEASE_VERSION))"; exit 1; \
+	fi; \
+	[ -n "$${PLAY_SERVICE_ACCOUNT_JSON:-}" ] || { echo "❌ PLAY_SERVICE_ACCOUNT_JSON is empty — set the Google Play service-account JSON (Gitea secret PLAY_SERVICE_ACCOUNT_JSON)"; exit 1; }; \
+	command -v jq >/dev/null   || { echo "❌ 'jq' is required";   exit 1; }; \
+	command -v curl >/dev/null || { echo "❌ 'curl' is required"; exit 1; }; \
+	command -v openssl >/dev/null || { echo "❌ 'openssl' is required"; exit 1; }; \
+	printf '%s' "$$PLAY_SERVICE_ACCOUNT_JSON" | jq -e . >/dev/null 2>&1 || { echo "❌ PLAY_SERVICE_ACCOUNT_JSON is not valid JSON"; exit 2; }; \
+	aab="$(OUTPUT_DIR)/mobile/PeakBot-Mobile-$$v-android-arm64.aab"; \
+	if [ ! -f "$$aab" ]; then \
+	  echo "❌ AAB not found: $$aab — run 'make mobile-android ANDROID_FORMAT=aab' first"; exit 1; \
+	fi; \
+	vc=$$(sh scripts/play-version-code.sh "$$v"); \
+	echo "📱 Publishing $$aab to Google Play internal (versionCode $$vc)..."; \
+	PLAY_SERVICE_ACCOUNT_JSON="$$PLAY_SERVICE_ACCOUNT_JSON" PLAY_RELEASE_STATUS="$${PLAY_RELEASE_STATUS:-draft}" \
+	  sh scripts/play-publish.sh "$(PLAY_PACKAGE)" "$$aab" "$$vc"
+
 ## help: Show this help
 help:
 	@echo "PeakBot Makefile"
@@ -827,12 +868,14 @@ help:
 	@echo "Release usage (bump → PR → merge → tag; CI runs 'make release TAG=<v>'):"
 	@echo "  make release-bump VERSION=0.2.0   # cut release/0.2.0 from origin/master, bump, promote notes, push — open a PR"
 	@echo "  make release-tag                  # after the PR merges: annotated tag from release-notes/<v>.md + push"
-	@echo "  make release TAG=0.2.0            # full pipeline: release-check, build all 10 assets, sign updater,"
-	@echo "                                    # publish to Gitea, the shifu bucket + the GitHub mirror (bridge)"
+	@echo "  make release TAG=0.2.0            # full pipeline: release-check, build all 10 assets + AAB, sign updater,"
+	@echo "                                    # publish to Gitea, the shifu bucket, the GitHub mirror, and Google Play internal"
 	@echo "  make release TAG=0.2.0 PRUNE=1    # as above, pruning the container builder between platforms"
+	@echo "  make mobile-android ANDROID_FORMAT=aab  # build the upload-key-signed AAB (requires ANDROID_KEYSTORE_* secrets)"
+	@echo "  make release-publish-play TAG=0.2.0     # publish the AAB to Google Play internal (requires PLAY_SERVICE_ACCOUNT_JSON)"
 	@echo "  make desktop-updater              # sign the 3 updater artifacts + build latest.json (needs signing key)"
 	@echo "  make release-publish-shifu TAG=0.2.0  # upload to the shifu bucket + verify (idempotent re-run)"
-	@echo "  GITEA_TOKEN + GH_RELEASE_TOKEN + SHIFU_S3_*  # required for the publish steps (env vars)"
+	@echo "  GITEA_TOKEN + GH_RELEASE_TOKEN + SHIFU_S3_* + ANDROID_KEYSTORE_* + PLAY_SERVICE_ACCOUNT_JSON  # required for the publish steps (env vars)"
 	@echo ""
 	@echo "Release notes: release-notes/<v>.md is required — Gitea/GitHub release body + git tag message (no fallback)."
 	@echo ""
