@@ -169,7 +169,12 @@ if [ "$format" = aab ]; then
     ls -lh "$aab_out"
     # An AAB is a jar: jarsigner checks the signature (the upload key's
     # cert is the one the keystore holds; Play re-signs with its app key).
-    jarsigner -verify "$aab_out" \
-        || { echo "❌ jarsigner -verify failed on $aab_out" >&2; exit 1; }
+    # Its "signed in JarFile but not in JarInputStream" notes about every
+    # bundle entry are noise: keep the output for failures only.
+    jar_out=$(jarsigner -verify "$aab_out" 2>&1) \
+        || { printf '%s\n' "$jar_out" | head -n 20 >&2; echo "❌ jarsigner -verify failed on $aab_out" >&2; exit 1; }
+    printf '%s\n' "$jar_out" | grep -qF 'jar verified' \
+        || { printf '%s\n' "$jar_out" | head -n 20 >&2; echo "❌ jarsigner did not report 'jar verified' for $aab_out" >&2; exit 1; }
+    echo "jar verified."
     echo "✅ $aab_out (release-signed, jarsigner-verified, versionCode $version_code)"
 fi
