@@ -1064,6 +1064,9 @@ async fn serve_socket<Si, St, E>(
     {
         let _ = out_tx.send(OutboundMessage::NoLocalProfile);
         drop(out_tx);
+        // Brief pause so the frame is delivered before the close handshake;
+        // without it the client can see the close before reading the frame.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let _ = writer_task.await;
         return;
     }
