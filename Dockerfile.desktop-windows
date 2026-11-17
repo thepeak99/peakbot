@@ -14,7 +14,7 @@
 # The peakbot sidecar is staged into src-tauri/binaries/ and embedded as a
 # zstd payload by src-tauri/build.rs; the app extracts it on first launch.
 #
-# The base image is rust:1.91-trixie (not bookworm): trixie's NSIS 3.11
+# The base image is rust:1.100.0-trixie (not bookworm): trixie's NSIS 3.11
 # ships Include/Win/RestartManager.nsh, which Tauri's installer.nsi
 # includes. The RestartManager.nsh guard below is the real requirement.
 #
@@ -25,7 +25,7 @@
 # The S-W1..S-W6 smoke checks (desktop/scripts/smoke-windows.sh) run on
 # BOTH artifacts BEFORE the scratch export; any failure fails this build.
 
-FROM ghcr.io/rust-lang/rust:1.91-trixie AS build
+FROM rust:1.100.0-trixie AS build
 
 # clang lld llvm: xwin C/link + llvm-rc (tauri_winres compiles the
 # icon/version .rc into .rsrc) + llvm-objdump (the S-W3 import-table

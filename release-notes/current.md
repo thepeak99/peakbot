@@ -46,3 +46,7 @@ This file is the working draft for the next release. When a version is tagged, t
 - Mobile: each conversation keeps its own half-typed message again — switching chats from the chat list no longer carries text into the other conversation, and coming back restores your draft.
 - Opening a different chat no longer flashes the previous chat's messages. Your five most recently viewed chats now open instantly and refresh in place; any other chat shows an empty screen for a moment while it loads. Applies to the mobile chat list, desktop tabs and the conversations picker.
 - Mobile: the composer now respects the phone's bottom safe area — on phones with a home-indicator bar, the input field no longer sits under the gesture area.
+
+### Build
+
+- Rust toolchain bumped to 1.100.0 across all release Dockerfiles and CI, fixing container builds of current master (the previous 1.91.0 pin failed to compile the Cloud Mode code).

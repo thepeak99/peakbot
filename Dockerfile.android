@@ -30,7 +30,7 @@ RUN npm run build
 # Stage `builder`: owns the entire cargo build, including the final binary
 # that the scratch stage exports. This stage MUST be referenced by the final
 # `COPY --from=`, otherwise BuildKit will prune it along with the binary.
-FROM ghcr.io/rust-lang/rust:1.91-bookworm AS builder
+FROM rust:1.100.0-bookworm AS builder
 
 # arm64-v8a covers essentially every modern Android phone.
 ARG TARGET=aarch64-linux-android

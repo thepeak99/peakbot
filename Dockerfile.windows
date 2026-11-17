@@ -28,7 +28,7 @@ RUN npm run build
 # Stage `builder`: owns the entire cargo build, including the final .exe that
 # the scratch stage exports. This stage MUST be referenced by the final
 # `COPY --from=`, otherwise BuildKit will prune it along with the binary.
-FROM ghcr.io/rust-lang/rust:1.91-bookworm AS builder
+FROM rust:1.100.0-bookworm AS builder
 
 # Windows x86_64, MSVC ABI. Declared as an ARG (and re-declared in the
 # scratch stage — ARG scope is per-stage) so the desktop pipeline's

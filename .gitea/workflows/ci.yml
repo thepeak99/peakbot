@@ -13,7 +13,7 @@ jobs:
     name: fmt + clippy + test
     runs-on: dind
     timeout-minutes: 30
-    container: rust:1.95
+    container: rust:1.100.0
 
     env:
       CARGO_TERM_COLOR: always
@@ -40,7 +40,7 @@ jobs:
             "https://git.patchnotes.com/ai-bots/perma-crypto"
       # Release-pipeline contract tests (Makefile targets + .gitea/workflows/
       # release.yml): fast, no docker builds — run before the cargo gate.
-      # rust:1.95 lacks jq. The suite sets its own git identity in the
+      # rust:1.100.0 lacks jq. The suite sets its own git identity in the
       # throwaway clones.
       - name: Release pipeline contract tests
         run: |
@@ -101,7 +101,7 @@ jobs:
     name: desktop (core + Tauri glue)
     runs-on: dind
     timeout-minutes: 45
-    container: rust:1.95
+    container: rust:1.100.0
 
     env:
       CARGO_TERM_COLOR: always
@@ -164,7 +164,7 @@ jobs:
       # Auto-updater pipeline contract tests: latest.json manifest
       # (updater-manifest.sh) + the .app.tar.gz layout (assemble-app.sh,
       # rcodesign stubbed by the tests themselves). Hermetic; jq + zip from
-      # apt (rust:1.95 ships neither).
+      # apt (rust:1.100.0 ships neither).
       - name: Updater + macOS tarball contract tests
         run: |
           set -eu
@@ -178,7 +178,7 @@ jobs:
   # image (Dockerfile.mobile-android, `toolchain` stage).
   #
   # Runs on the Alpine host like release.yml — the `ci`/`desktop` jobs use a
-  # job-level `container:` (rust:1.95), which has no docker CLI or daemon
+  # job-level `container:` (rust:1.100.0), which has no docker CLI or daemon
   # access and cannot build/run containers. Here the host docker (the dind
   # runner ships it) does both.
   local-android:

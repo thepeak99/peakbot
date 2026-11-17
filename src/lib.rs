@@ -1,5 +1,7 @@
 //! PeakBot library - Core functionality for connecting to MCP servers and managing tools.
 
+extern crate cloud as peakbot_cloud;
+
 /// PeakBot binary version, baked in at compile time. The single source of truth
 /// for "what is this?" — the TUI welcome banner, the system prompt the model
 /// sees, and the `WelcomeState` payload sent over the WebSocket wire all read
