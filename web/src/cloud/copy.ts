@@ -125,6 +125,11 @@ export const COPY = {
     relay: "The cloud service didn't respond. Try again.",
     network: "Can't reach PeakBot. Try again.",
   },
+
+  // P5 — cloud picker empty state
+  empty: {
+    noMachines: "No machines yet. Connect one in Settings → Cloud.",
+  },
 } as const;
 
 export type Copy = typeof COPY;

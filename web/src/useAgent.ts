@@ -55,6 +55,10 @@ export interface AgentConnection {
    * (newest-first, deduped, existing dirs only, cwd excluded, max 8). Empty
    * until the first `request_recent_dirs` is answered. */
   recentDirs: string[];
+  /** Set after receiving the `no_local_profile` frame: the local config has
+   * no profiles to attach to. The SPA shows the cloud picker instead of
+   * reconnecting. */
+  noLocal: boolean;
   error: string | null;
   send: (msg: InboundMessage) => void;
   /** The conversation this socket is bound to: seeded from the URL, then
@@ -107,6 +111,7 @@ export function useAgent(): AgentConnection {
   const [commands, setCommands] = useState<SlashCommand[]>([]);
   const [dirListing, setDirListing] = useState<DirListing | null>(null);
   const [recentDirs, setRecentDirs] = useState<string[]>([]);
+  const [noLocal] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // One per hook instance (lazy): the last-seen cache behind the invariant
   // "`state` always describes `convo`" (design §3).
@@ -413,6 +418,7 @@ export function useAgent(): AgentConnection {
     commands,
     dirListing,
     recentDirs,
+    noLocal,
     error,
     send,
     convo,
