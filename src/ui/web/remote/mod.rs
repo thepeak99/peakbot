@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt;
 use std::io;
-use std::path::Path;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -40,7 +40,8 @@ use url::{Host, Url};
 use uuid::Uuid;
 
 use crate::config::remote::{CaFingerprint, Endpoint, RemoteProfile, Trust};
-use crate::config::resolve::{CatalogEntry, Config, LoadError, ParseCtx, ProfileInfo, RepoMode};
+use crate::config::resolve::{CatalogEntry, Config, ParseCtx, ProfileInfo, Source};
+use crate::paths;
 use crate::image_cache::valid_image_id;
 use crate::ui::wire::ConversationSummaryWire;
 
@@ -1413,15 +1414,24 @@ impl Directory {
 /// The global config only (repo files never define remotes, §5.11).
 fn load_config() -> Result<Config, RemoteError> {
     let ctx = ParseCtx { known_skills: &[] };
-    Config::load(Path::new("."), RepoMode::Ignore, &ctx).map_err(|e| RemoteError::Config {
-        message: match e {
-            LoadError::Invalid(errors) => crate::config_errors_summary(&errors),
-            LoadError::Missing(path) => format!("{} does not exist", path.display()),
-            LoadError::Legacy(path) => {
-                format!("{}: {}", path.display(), crate::config::resolve::L1_MESSAGE)
-            }
-            LoadError::Io(path, e) => format!("cannot read {}: {e}", path.display()),
-        },
+    // Use the roots config dir (set by tests via paths::init_roots), not the
+    // process cwd, so a fresh parse reads the same file the server booted with.
+    let config_path = paths::config_dir().unwrap_or_else(|| PathBuf::from("."));
+    let global_path = config_path.join("config.yaml");
+    if !global_path.exists() {
+        return Err(RemoteError::Config {
+            message: format!("{} does not exist", global_path.display()),
+        });
+    }
+    let text = std::fs::read_to_string(&global_path).map_err(|e| RemoteError::Config {
+        message: format!("cannot read {}: {e}", global_path.display()),
+    })?;
+    let global = Source {
+        path: &global_path,
+        text: &text,
+    };
+    Config::parse(global, None, &ctx).map_err(|errors| RemoteError::Config {
+        message: crate::config_errors_summary(&errors),
     })
 }
 

@@ -84,6 +84,9 @@ impl Core {
     async fn start(name: &str, seed: u8, yaml: &str, relay: &TestRelay) -> Core {
         init_shared_roots();
         let tmp = tempfile::tempdir().expect("core dir");
+        // Write the config to the roots config dir so fresh_home_attach reads it.
+        let config_dir = paths::config_dir().expect("roots set");
+        std::fs::write(config_dir.join("config.yaml"), yaml).expect("write config");
         let deps = boot::session_deps_in(
             parse(yaml),
             SkillRegistry::new(),
