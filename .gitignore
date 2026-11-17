@@ -16,6 +16,13 @@ output
 .test/
 
 scripts
+# The Google Play release scripts are part of the release pipeline
+# (Makefile release-check / release-publish-play); every other file under the
+# top-level scripts/ stays local scratch.
+!/scripts/
+/scripts/*
+!/scripts/play-publish.sh
+!/scripts/play-version-code.sh
 # PeakBot Desktop scripts must remain trackable (the bare 'scripts' above
 # matches any directory named 'scripts', e.g. desktop/scripts/).
 !desktop/scripts/

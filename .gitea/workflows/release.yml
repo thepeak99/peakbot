@@ -27,6 +27,14 @@ jobs:
       SHIFU_S3_ENDPOINT: ${{ vars.SHIFU_S3_ENDPOINT }}
       SHIFU_S3_ACCESS_KEY: ${{ secrets.SHIFU_S3_ACCESS_KEY }}
       SHIFU_S3_SECRET_KEY: ${{ secrets.SHIFU_S3_SECRET_KEY }}
+      # Google Play internal release (upload-key-signed AAB + Play Edits API).
+      ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+      # A Gitea VARIABLE (not a secret): draft (default when unset) | completed.
+      PLAY_RELEASE_STATUS: ${{ vars.PLAY_RELEASE_STATUS }}
 
     steps:
       - name: Checkout (no-node, pure git)
@@ -36,11 +44,11 @@ jobs:
             "https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git" \
             "$GITHUB_SHA"
           git checkout --detach FETCH_HEAD
-      - name: Install rclone (shifu uploads — not in the runner image)
-        run: apk add --no-cache rclone
+      - name: Install rclone + openssl (shifu uploads, Play JWT signing — not in the runner image)
+        run: apk add --no-cache rclone openssl
       - name: Check required tools and release secrets
         run: |
-          for t in make curl jq docker git awk rclone; do
+          for t in make curl jq docker git awk rclone openssl; do
             command -v "$t" >/dev/null || { echo "missing tool on runner: $t (add it to the runner image)"; exit 1; }
           done
           [ -n "$GITEA_TOKEN" ] || { echo "RELEASE_TOKEN secret missing/empty" >&2; exit 1; }
@@ -51,9 +59,14 @@ jobs:
           [ -n "$SHIFU_S3_ENDPOINT" ] || { echo "SHIFU_S3_ENDPOINT variable missing/empty" >&2; exit 1; }
           [ -n "$SHIFU_S3_ACCESS_KEY" ] || { echo "SHIFU_S3_ACCESS_KEY secret missing/empty" >&2; exit 1; }
           [ -n "$SHIFU_S3_SECRET_KEY" ] || { echo "SHIFU_S3_SECRET_KEY secret missing/empty" >&2; exit 1; }
-      - name: Release (check, build 10 assets, sign updater, publish)
+          [ -n "$ANDROID_KEYSTORE_B64" ] || { echo "ANDROID_KEYSTORE_B64 secret missing/empty" >&2; exit 1; }
+          [ -n "$ANDROID_KEYSTORE_PASSWORD" ] || { echo "ANDROID_KEYSTORE_PASSWORD secret missing/empty" >&2; exit 1; }
+          [ -n "$ANDROID_KEY_ALIAS" ] || { echo "ANDROID_KEY_ALIAS secret missing/empty" >&2; exit 1; }
+          [ -n "$ANDROID_KEY_PASSWORD" ] || { echo "ANDROID_KEY_PASSWORD secret missing/empty" >&2; exit 1; }
+          [ -n "$PLAY_SERVICE_ACCOUNT_JSON" ] || { echo "PLAY_SERVICE_ACCOUNT_JSON secret missing/empty" >&2; exit 1; }
+      - name: Release (check, build 10 assets + AAB, sign updater, publish, Play internal)
         run: |
           # No `origin` remote after the pure-git checkout — the Makefile
           # derives GITEA_URL/OWNER/REPO from it, so pass them explicitly.
-          # GH_RELEASE_TOKEN, TAURI_SIGNING_*, SHIFU_S3_* ride along via the job env.
+          # GH_RELEASE_TOKEN, TAURI_SIGNING_*, SHIFU_S3_*, ANDROID_KEY*, PLAY_* ride along via the job env.
           make release TAG="$GITHUB_REF_NAME" PRUNE=1 CONTAINER_BUILDER=docker GITEA_URL="$GITHUB_SERVER_URL" OWNER="${GITHUB_REPOSITORY%/*}" REPO="${GITHUB_REPOSITORY#*/}"

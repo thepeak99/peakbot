@@ -6,6 +6,7 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ### Features
 
+- **Android: releases now go to Google Play (internal track).** The release pipeline builds an upload-key-signed App Bundle and publishes it to the Google Play internal testing track (as a draft until the app is published). The bundle is Play-only; the 10 published release assets are unchanged.
 - **PeakBot Mobile: message dates, and the working folder moves to the status line.**
   - On phones, the chat shows day dividers (Today, Yesterday, or the date) and a small time
     under each message. Tap the time to see the full date and time.
