@@ -193,6 +193,8 @@ mod min_size_tests {
     /// unusable, but small enough that narrow window managers don't clip content.
     #[test]
     fn min_width_is_reasonable() {
-        assert!(MIN_WIDTH >= 320.0 && MIN_WIDTH <= 640.0);
+        const {
+            assert!(MIN_WIDTH >= 320.0 && MIN_WIDTH <= 640.0);
+        }
     }
 }
