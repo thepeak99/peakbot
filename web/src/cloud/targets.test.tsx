@@ -60,6 +60,113 @@ describe("useCloudTargets", () => {
 
     await testkitUnmount(container);
   });
+
+  it("refetches failed peer immediately on visibilitychange to visible", async () => {
+    const fetchMock = mockFetch(async (url) => {
+      if (url.includes("d1/profiles")) {
+        throw new Error("network error");
+      }
+      return json(200, {});
+    });
+
+    const container = await mountTargetsInspector();
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 100));
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Stub visibilityState and fire visibilitychange
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      get: () => "visible",
+    });
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+
+    // Should have retried immediately, not waiting for 2s backoff
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    await testkitUnmount(container);
+  });
+
+    it("stops retrying after unmount", async () => {
+    const fetchMock = mockFetch(async (url) => {
+      if (url.includes("d1/profiles")) {
+        throw new Error("network error");
+      }
+      return json(200, {});
+    });
+
+    const container = await mountTargetsInspector();
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 100));
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Unmount
+    await testkitUnmount(container);
+
+    // Wait longer than retry interval (use shorter wait to avoid timeout)
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 3000));
+    });
+
+    // Should still be 1 call - no retry after unmount
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  }, 8000);
+
+  it("does not refetch successful peer while another retries and caps backoff at 30s", async () => {
+    // Override mock to return two devices: d1 (ok), d2 (failing)
+    const { useCloudDevices } = await import("./useCloud");
+    useCloudDevices.mockReturnValue([
+      device({ id: "d1", slug: "desk1" }),
+      device({ id: "d2", slug: "desk2" }),
+    ]);
+
+    const fetchMock = mockFetch(async (url) => {
+      if (url.includes("d1/profiles")) {
+        return json(200, { items: [{ name: "p1" }] });
+      }
+      if (url.includes("d2/profiles")) {
+        throw new Error("network error");
+      }
+      return json(200, {});
+    });
+
+    const container = await mountTargetsInspector();
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 100));
+    });
+
+    // Both peers attempted once
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    // Wait through multiple backoff periods: 2s, 4s, 8s, 16s, 30s, 30s = 90s total
+    // d2 should have retried 6 times (count 7 total), d1 should still be 1
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 90000));
+    });
+
+    // d1 fetched once (successful, not retried)
+    const d1Calls = fetchMock.mock.calls.filter(
+      (c) => c[0].includes("d1/profiles")
+    ).length;
+    expect(d1Calls).toBe(1);
+
+    // d2: 1 initial + 6 retries = 7 calls (backoff: 2+4+8+16+30+30 = 90s)
+    const d2Calls = fetchMock.mock.calls.filter(
+      (c) => c[0].includes("d2/profiles")
+    ).length;
+    expect(d2Calls).toBe(7);
+
+    await testkitUnmount(container);
+
+    // Reset mock for other tests
+    useCloudDevices.mockReturnValue([device({ id: "d1", slug: "desk" })]);
+  }, 100000);
 });
 
 describe("toCloudRows", () => {
