@@ -843,6 +843,10 @@ where
             }
         }
     }
+    // Flush any buffered frames before sending the Close frame — otherwise
+    // the peer can see close before the final text frame (the no_local_profile
+    // race). This is cheap on loopback and correct everywhere.
+    let _ = sink.flush().await;
     let _ = sink.close().await;
 }
 
@@ -1064,9 +1068,9 @@ async fn serve_socket<Si, St, E>(
     {
         let _ = out_tx.send(OutboundMessage::NoLocalProfile);
         drop(out_tx);
-        // Brief pause so the frame is delivered before the close handshake;
-        // without it the client can see the close before reading the frame.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Writer task must drain the last frame before closing. Awaiting the
+        // task blocks until the writer loop finishes, which only happens after
+        // all queued frames are sent and the sink is closed.
         let _ = writer_task.await;
         return;
     }

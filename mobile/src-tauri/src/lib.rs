@@ -16,7 +16,6 @@ mod ios;
 use std::path::PathBuf;
 
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
-use serde_json;
 use tauri::webview::Color;
 use tauri::{AppHandle, Manager, RunEvent, Url, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_log::log;
