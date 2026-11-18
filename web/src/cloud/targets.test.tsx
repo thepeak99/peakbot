@@ -2,7 +2,7 @@
 // Pure function, no store, no hook — test the derivation directly.
 // Plus: hook retry behavior for failed peer profile fetches.
 
-import { describe, expect, it, vi, beforeEach, afterEach, beforeAll } from "vitest";
+import { describe, expect, it, vi, beforeAll } from "vitest";
 import { act } from "react";
 import { toCloudRows, useCloudTargets } from "./targets";
 import { device, selfDevice, mockFetch, json } from "./testkit";

@@ -3,7 +3,7 @@
 // Turns the live cloud device list into catalog rows the chip can render.
 // Pure function; the hook wires it to the cloud store.
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { TabColor, WireProfileInfo } from "../state";
 import type { Device } from "./types";
 import { useCloudDevices } from "./useCloud";
@@ -62,55 +62,97 @@ function sameRows(a: WireProfileInfo[], b: WireProfileInfo[]): boolean {
 
 const NO_ROWS: WireProfileInfo[] = [];
 
-/** Hook: derive cloud rows from the live cloud store. */
+/** Hook: derive cloud rows from the live cloud store, retrying failed peers. */
 export function useCloudTargets(): CloudTargets {
   const devices = useCloudDevices();
   const [rows, setRows] = useState<WireProfileInfo[]>(NO_ROWS);
   const [loading, setLoading] = useState(true);
 
-  // A primitive key of the eligible peers, computed in render. Every SSE
-  // event parses into a new `devices` array, so the effect must key on
-  // content, not identity; the effect reads the peers back from the key so
-  // it has no other dependency.
+  // Content key of eligible peers
   const peersKey = JSON.stringify(
     devices
       .filter((d) => !d.self && d.online !== false)
       .map((d): Peer => ({ id: d.id, slug: d.slug, self: d.self, online: d.online })),
   );
 
+  // Retry state stored in refs so it persists across effect re-runs
+  const failedPeers = useRef<Set<string>>(new Set());
+  const backoffs = useRef<Map<string, number>>(new Map());
+  const timers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const profilesRef = useRef<Record<string, Profile[]>>({});
+
   useEffect(() => {
     const peers = JSON.parse(peersKey) as Peer[];
-    const commit = (next: WireProfileInfo[]): void => {
-      setRows((prev) => (sameRows(prev, next) ? prev : next));
+    const ctrl = new AbortController();
+    let active = true;
+
+    failedPeers.current.clear();
+    backoffs.current.clear();
+    for (const t of timers.current.values()) clearTimeout(t);
+    timers.current.clear();
+    profilesRef.current = {};
+
+    const commit = () => {
+      if (!active || ctrl.signal.aborted) return;
       setLoading(false);
+      setRows((prev) => {
+        const next = toCloudRows(peers, profilesRef.current);
+        return sameRows(prev, next) ? prev : next;
+      });
     };
+
+    const fetchOne = async (p: Peer) => {
+      try {
+        const res = await fetch(`/api/cloud/devices/${p.id}/profiles`, { signal: ctrl.signal });
+        if (!res.ok) throw new Error("not ok");
+        profilesRef.current[p.id] = parseProfiles(await res.json());
+        failedPeers.current.delete(p.id);
+        const t = timers.current.get(p.id);
+        if (t) { clearTimeout(t); timers.current.delete(p.id); }
+      } catch {
+        if (ctrl.signal.aborted) return;
+        failedPeers.current.add(p.id);
+        const delay = backoffs.current.get(p.id) ?? 2000;
+        const t = setTimeout(() => {
+          if (failedPeers.current.has(p.id)) void fetchOne(p);
+        }, delay);
+        timers.current.set(p.id, t);
+        backoffs.current.set(p.id, Math.min(delay * 2, 30000));
+        return;
+      }
+      commit();
+    };
+
     if (peers.length === 0) {
-      commit(NO_ROWS);
+      setLoading(false);
+      setRows(NO_ROWS);
       return;
     }
 
-    const ctrl = new AbortController();
     setLoading(true);
-    const fetchOne = async (p: Peer): Promise<Profile[]> => {
-      try {
-        const res = await fetch(`/api/cloud/devices/${p.id}/profiles`, { signal: ctrl.signal });
-        return res.ok ? parseProfiles(await res.json()) : [];
-      } catch {
-        return []; // unreachable device (or aborted) → 0 rows
+    for (const p of peers) void fetchOne(p);
+
+    const onVis = () => {
+      if (document.visibilityState !== "visible") return;
+      for (const id of failedPeers.current) {
+        const t = timers.current.get(id);
+        if (t) { clearTimeout(t); timers.current.delete(id); }
+        backoffs.current.delete(id);
+        const peer = peers.find((p) => p.id === id);
+        if (peer) void fetchOne(peer);
       }
     };
-    void Promise.all(peers.map(fetchOne)).then((lists) => {
-      if (ctrl.signal.aborted) return;
-      const byId: Record<string, Profile[]> = {};
-      peers.forEach((p, i) => {
-        byId[p.id] = lists[i];
-      });
-      commit(toCloudRows(peers, byId));
-    });
-    return () => ctrl.abort();
+    document.addEventListener("visibilitychange", onVis);
+
+    return () => {
+      active = false;
+      ctrl.abort();
+      document.removeEventListener("visibilitychange", onVis);
+      for (const t of timers.current.values()) clearTimeout(t);
+      timers.current.clear();
+    };
   }, [peersKey]);
 
-  // Stable result identity: App's auto-select effect depends on this object.
   return useMemo<CloudTargets>(
     () => (loading ? { status: "loading" } : { status: "ready", rows }),
     [loading, rows],
