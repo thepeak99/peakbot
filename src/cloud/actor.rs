@@ -178,8 +178,15 @@ pub struct Actor {
     seen: letter::ReplaySet,
 }
 
-/// The live (socket-up) phase: everything here dies with the socket,
-/// which keeps "no sessions unless Active" unrepresentable.
+/// Outcome of handling inbound Data for a peer.
+enum DataOutcome {
+    /// Session exists and the frame was handled.
+    Handled,
+    /// No session exists for this peer — send a Close back (MISROUTED).
+    NoSession,
+    /// Session exists but must be closed with this reason.
+    Close(u8),
+}
 struct Live {
     /// `Welcome{pending}`: not in `chain.active` (letters-only mode).
     pending: bool,
@@ -985,11 +992,14 @@ impl Actor {
             PipeMsg::Hs1(h1) => self.on_hs1(live, ws, from, &h1).await,
             PipeMsg::Hs2(h2) => self.on_hs2(live, ws, from, &h2, state).await,
             PipeMsg::Hs3(h3) => self.on_hs3(live, ws, from, &h3, state).await,
-            PipeMsg::Data(d) => {
-                if let Some(reason) = self.on_data(live, ws, from, &d).await {
-                    self.close_session(live, ws, from, reason).await;
+            PipeMsg::Data(d) => match self.on_data(live, ws, from, &d).await {
+                DataOutcome::Handled => {}
+                DataOutcome::NoSession => {
+                    self.send_close(ws, from, d.sid, constants::close_reason::MISROUTED)
+                        .await;
                 }
-            }
+                DataOutcome::Close(reason) => self.close_session(live, ws, from, reason).await,
+            },
             PipeMsg::Close(c) => self.on_close(live, ws, c.sid).await,
         }
     }
@@ -1312,20 +1322,24 @@ impl Actor {
     }
 
     /// Inbound `Data` for an `Open` session: open → mux → route.
-    /// `Some(reason)` closes the session.
+    /// `NoSession` means the peer is stale (e.g. after restart) — the
+    /// caller sends a Close so the peer fails its request instead of
+    /// hanging. `Close(reason)` means an existing session must be closed.
     async fn on_data(
         &mut self,
         live: &mut Live,
         ws: &mut Ws,
         from: DeviceId,
         d: &Data,
-    ) -> Option<u8> {
-        let s = live.sessions.get_mut(&from)?;
+    ) -> DataOutcome {
+        let Some(s) = live.sessions.get_mut(&from) else {
+            return DataOutcome::NoSession;
+        };
         let Phase::Open(o) = &mut s.phase else {
-            return None;
+            return DataOutcome::Handled;
         };
         match o.rx.open(d) {
-            Ok(RecvOutcome::Dropped) => None,
+            Ok(RecvOutcome::Dropped) => DataOutcome::Handled,
             Ok(RecvOutcome::Inner(inner)) => {
                 let claim = if matches!(&inner.msg, StreamMsg::Open(op) if s.claim.as_ref().is_some_and(|(c, _)| c == op))
                 {
@@ -1336,15 +1350,12 @@ impl Actor {
                 match o.mux.feed(&inner) {
                     Ok(events) => {
                         self.route_inner(ws, from, o, &inner, claim, events).await;
-                        None
+                        DataOutcome::Handled
                     }
                     Err(e) => {
                         if let Some((_, out)) = claim {
                             let _ = out.send(Err(CloudError::Reset(constants::reset::PROTOCOL)));
                         }
-                        // An out-of-sequence message on a stream we know is
-                        // that stream's fault: reset it, keep the session.
-                        // Bad Opens / unknown ids stay session-level.
                         let known = !matches!(inner.msg, StreamMsg::Open(_))
                             && o.streams.contains_key(&inner.stream);
                         if known {
@@ -1356,13 +1367,13 @@ impl Actor {
                             self.drop_stream(o, inner.stream);
                             self.send_reset(ws, o, from, inner.stream, constants::reset::PROTOCOL)
                                 .await;
-                            return None;
+                            return DataOutcome::Handled;
                         }
-                        Some(reason_for_cloud_err(e))
+                        DataOutcome::Close(reason_for_cloud_err(e))
                     }
                 }
             }
-            Err(e) => Some(reason_for_cloud_err(e)),
+            Err(e) => DataOutcome::Close(reason_for_cloud_err(e)),
         }
     }
 

@@ -256,12 +256,8 @@ async fn controller_recovers_after_host_restart() {
         device_name: "Laptop".to_string(),
         platform: 1,
     };
-    let host_handle = spawn_with_callback(
-        host_cfg,
-        host.store.clone(),
-        hook,
-        CallbackSource::Loopback,
-    );
+    let host_handle =
+        spawn_with_callback(host_cfg, host.store.clone(), hook, CallbackSource::Loopback);
     let new_host = Dev {
         handle: host_handle,
         store: host.store,
