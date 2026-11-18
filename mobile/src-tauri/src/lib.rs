@@ -210,6 +210,7 @@ async fn resume_local(app: &AppHandle) {
 /// P5 T8: hand an inbound deep-link URL to the Local core's login flow.
 /// Only URLs with our registered scheme reach the core; the outcome is
 /// logged but the URL itself is never logged (it carries the OAuth code).
+#[allow(dead_code)]
 async fn deliver_deep_link(app: &AppHandle, url: String) {
     let local = app.state::<Local>();
     let core = local.core();
@@ -223,6 +224,7 @@ async fn deliver_deep_link(app: &AppHandle, url: String) {
 
 /// P5 T8: the app came to the foreground again. Tell the core so it can
 /// resume its cloud socket after the 3 s background debounce.
+#[allow(dead_code)]
 async fn foreground(app: &AppHandle) {
     let local = app.state::<Local>();
     if let Some(core) = local.core() {

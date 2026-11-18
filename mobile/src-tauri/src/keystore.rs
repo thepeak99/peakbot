@@ -305,8 +305,7 @@ mod tests {
     fn wrong_length_seed_is_invalid_data_not_none() {
         for len in [0usize, 1, 32, 63, 65, 128] {
             let err = decode_seed(&b64(&vec![7u8; len]))
-                .err()
-                .expect("must be Err");
+                .expect_err("must be Err");
             assert_eq!(err.kind(), io::ErrorKind::InvalidData, "len {len}");
         }
     }
@@ -314,7 +313,7 @@ mod tests {
     #[test]
     fn undecodable_seed_is_invalid_data() {
         for junk in [&b"not base64!!"[..], b"\xff\xfe\x00", b""] {
-            let err = decode_seed(junk).err().expect("must be Err");
+            let err = decode_seed(junk).expect_err("must be Err");
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         }
     }
@@ -332,7 +331,7 @@ mod tests {
             decode_token(b"abc-_123".to_vec()).unwrap().as_str(),
             "abc-_123"
         );
-        let err = decode_token(vec![0xff, 0xfe]).err().expect("must be Err");
+        let err = decode_token(vec![0xff, 0xfe]).expect_err("must be Err");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
