@@ -228,3 +228,61 @@ async fn request_to_own_device_id_is_refused_within_the_bound() {
     let p = format!("{r:?}");
     assert!(p.starts_with("Err("), "self-target must be an error: {p}");
 }
+
+/// (vii) RED repro — host restarts with the same identity; the controller's
+/// session table still has the old session as Open. The host's session table
+/// is empty, so it drops the controller's request frames silently. The
+/// controller's request hangs forever (no timeout on an established stream).
+/// After the fix, the first request should complete (Ok or Err) within 5 s,
+/// and a second request should succeed within 10 s.
+#[tokio::test]
+async fn controller_recovers_after_host_restart() {
+    let fake = FakeRelay::spawn().await;
+    let (_core, hook) = boot_core(YAML).await;
+    let (host, ctl) = enroll_pair(&fake, hook.clone()).await;
+    active(&ctl).await;
+
+    // Warm the session: controller sends a request to the host.
+    let p = profiles_within(&ctl, ANSWER, "warm").await;
+    assert!(p.starts_with("Ok("), "warm request: {p}");
+
+    // Host restarts (same identity, same store, same config).
+    host.handle.shutdown().await;
+    let host_cfg = CloudConfig {
+        relay: peakbot::config::remote::Endpoint::LoopbackPlain {
+            origin: Url::parse(&fake.url()).expect("origin"),
+        },
+        state_dir: PathBuf::from(host.dir.path()),
+        device_name: "Laptop".to_string(),
+        platform: 1,
+    };
+    let host_handle = spawn_with_callback(
+        host_cfg,
+        host.store.clone(),
+        hook,
+        CallbackSource::Loopback,
+    );
+    let new_host = Dev {
+        handle: host_handle,
+        store: host.store,
+        dir: host.dir,
+    };
+    active(&new_host).await;
+
+    // The controller's FIRST profiles request must complete (Ok or Err)
+    // within 5 s, not hang. The host has an empty session table; the
+    // controller still has the old session as Open. The bug: the request
+    // hangs.
+    let p = profiles_within(&ctl, BOUND, "after host restart").await;
+    // The host restarted and lost session state; the controller's old
+    // session is invalid. The request should fail (not hang).
+    assert!(
+        p.starts_with("Ok(") || p.starts_with("Err("),
+        "request after host restart must complete, not hang: {p}"
+    );
+
+    // A SECOND profiles request, issued after the first completes, must
+    // succeed (fresh handshake) within 10 s.
+    let p = profiles_within(&ctl, ANSWER, "second after host restart").await;
+    assert!(p.starts_with("Ok("), "second request: {p}");
+}
