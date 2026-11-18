@@ -304,8 +304,7 @@ mod tests {
     #[test]
     fn wrong_length_seed_is_invalid_data_not_none() {
         for len in [0usize, 1, 32, 63, 65, 128] {
-            let err = decode_seed(&b64(&vec![7u8; len]))
-                .expect_err("must be Err");
+            let err = decode_seed(&b64(&vec![7u8; len])).expect_err("must be Err");
             assert_eq!(err.kind(), io::ErrorKind::InvalidData, "len {len}");
         }
     }
