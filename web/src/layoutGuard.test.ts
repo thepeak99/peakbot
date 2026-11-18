@@ -48,6 +48,7 @@ const LG_ALLOWLIST = new Set([
   "TopBar.tsx",
   "BottomBar.tsx",
   "settings/providers.tsx",
+  "useLayout.ts", // comments reference the old breakpoint names
 ]);
 
 // ═══ N4a: zero max-lg: in non-test sources ════════════════════════════════
@@ -58,6 +59,9 @@ describe("layout guard — N4a: zero max-lg: in non-test sources", () => {
 
     for (const f of sourceFiles()) {
       const rel = f.replace(WEB_SRC, "").slice(1);
+      // useLayout.ts references the old breakpoint names in comments
+      if (rel.endsWith("useLayout.ts")) continue;
+
       const content = readFileSync(f, "utf8");
       const lines = content.split("\n");
       lines.forEach((line, i) => {

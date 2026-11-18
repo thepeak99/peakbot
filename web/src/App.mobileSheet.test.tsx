@@ -49,16 +49,17 @@ interface FakeMql {
   listeners: Set<(e: MediaQueryListEvent) => void>;
 }
 let mqls: FakeMql[] = [];
-let desktopWidth = false;
+let phoneViewport = false;
 
-const isDesktopQuery = (q: string): boolean => q.includes("min-width: 1024px");
+
+const isPhoneQuery = (q: string): boolean => q.includes("max-width: 1023px");
 
 function installMatchMedia(): void {
   mqls = [];
   vi.stubGlobal("matchMedia", (query: string) => {
     const mql: FakeMql = {
       query,
-      matches: isDesktopQuery(query) ? desktopWidth : false,
+      matches: isPhoneQuery(query) ? phoneViewport : false,
       listeners: new Set(),
     };
     mqls.push(mql);
@@ -77,12 +78,12 @@ function installMatchMedia(): void {
   });
 }
 
-/** Flip every `(min-width: 1024px)` query and notify its listeners. */
-async function setDesktop(on: boolean): Promise<void> {
-  desktopWidth = on;
+/** Flip the phone viewport query and notify its listeners. */
+async function setPhoneViewport(on: boolean): Promise<void> {
+  phoneViewport = on;
   await act(async () => {
     for (const m of mqls) {
-      if (!isDesktopQuery(m.query)) continue;
+      if (!isPhoneQuery(m.query)) continue;
       m.matches = on;
       for (const l of m.listeners) l({ matches: on, media: m.query } as MediaQueryListEvent);
     }
@@ -341,7 +342,7 @@ async function toList(): Promise<void> {
 const chatShown = (): boolean => tid("chat-back") !== null && tid("chat-list") === null;
 
 beforeEach(() => {
-  desktopWidth = false;
+  phoneViewport = false;
   setBootEdition(undefined); // module-level edition signal: never leak "local" across tests
   setShell("mobile");
   installMatchMedia();
@@ -412,9 +413,9 @@ describe("App mobile sheet — A1: full width on a phone", () => {
     mount();
     await flush();
     const composer = host.querySelector("textarea")!.closest(".border-t") as HTMLElement;
-    expect(composer.classList.contains("lg:pr-12")).toBe(true);
+    expect(composer.classList.contains("desktop:pr-12")).toBe(true);
     const empty = host.querySelector("section.overflow-y-auto") as HTMLElement;
-    expect(empty.classList.contains("lg:mr-12")).toBe(true);
+    expect(empty.classList.contains("desktop:mr-12")).toBe(true);
   });
 
   it("the transcript pane and TranscriptNav use the full width (nav: right-4 lg:right-14)", async () => {
@@ -434,14 +435,14 @@ describe("App mobile sheet — A1: full width on a phone", () => {
       mount();
       await flush();
       const pane = host.querySelector("[data-index]")!.closest("section") as HTMLElement;
-      expect(pane.classList.contains("lg:mr-12")).toBe(true);
+      expect(pane.classList.contains("desktop:mr-12")).toBe(true);
       expect(pane.classList.contains("mr-12")).toBe(false);
       const nav = [...host.querySelectorAll("div")].find((d) =>
         d.className.includes("pointer-events-none absolute bottom-4"),
       )!;
       expect(nav, "TranscriptNav renders").toBeDefined();
       expect(nav.classList.contains("right-4")).toBe(true);
-      expect(nav.classList.contains("lg:right-14")).toBe(true);
+      expect(nav.classList.contains("desktop:right-14")).toBe(true);
       expect(nav.classList.contains("right-14"), "no bare right-14").toBe(false);
       expect([...host.querySelectorAll(".mr-12, .pr-12")]).toEqual([]);
     } finally {
@@ -546,7 +547,7 @@ describe("App mobile sheet — A3: the header badge", () => {
 
 describe("App mobile sheet — A4: desktop width", () => {
   it("the rail is present, no panels button, no sheet", async () => {
-    desktopWidth = true;
+    phoneViewport = false;
     setShell("browser");
     hoisted.agent = makeAgent(withTabs());
     mount();
@@ -558,7 +559,7 @@ describe("App mobile sheet — A4: desktop width", () => {
   });
 
   it("the drawer handle opens the drawer body (the existing desktop path)", async () => {
-    desktopWidth = true;
+    phoneViewport = false;
     setShell("browser");
     hoisted.agent = makeAgent(withTabs());
     mount();
@@ -572,17 +573,18 @@ describe("App mobile sheet — A4: desktop width", () => {
     expect(host.querySelector('aside [role="tabpanel"]')!.textContent).toContain("sleep 100");
   });
 
-  it("the mobile shell at ≥1024px also gets the rail and no panels button", async () => {
-    desktopWidth = true;
+  it("the mobile shell at ≥1024px still gets phone layout (no rail, panels button)", async () => {
+    phoneViewport = false;
     hoisted.agent = makeAgent(withTabs());
     mount();
     await flush();
-    expect(host.querySelector('aside[aria-label="Side panels"]')).not.toBeNull();
-    expect(tid("panels-button")).toBeNull();
+    expect(host.querySelector('aside[aria-label="Side panels"]')).toBeNull();
+    expect(tid("panels-button")).not.toBeNull();
   });
 
   it("a phone browser (browser shell, <1024px) gets the TopBar panels button and the sheet", async () => {
     setShell("browser");
+    phoneViewport = true;
     hoisted.agent = makeAgent(withTabs());
     mount();
     await flush();
@@ -599,6 +601,7 @@ describe("App mobile sheet — A4: desktop width", () => {
 describe("App mobile sheet — A5: the viewport crosses 1024px with a panel open", () => {
   it("sheet → drawer on the SAME tab, releasing the back marker", async () => {
     setShell("browser");
+    phoneViewport = true;
     hoisted.agent = makeAgent(withTabs());
     mount();
     await flush();
@@ -608,7 +611,7 @@ describe("App mobile sheet — A5: the viewport crosses 1024px with a panel open
     await flush();
     const backSpy = vi.spyOn(window.history, "back");
 
-    await setDesktop(true);
+    await setPhoneViewport(false);
     await flush();
 
     expect(panelsDialog(), "the sheet unmounts").toBeNull();
@@ -619,7 +622,7 @@ describe("App mobile sheet — A5: the viewport crosses 1024px with a panel open
   });
 
   it("drawer → sheet on the same tab", async () => {
-    desktopWidth = true;
+    phoneViewport = false;
     setShell("browser");
     hoisted.agent = makeAgent(withTabs());
     mount();
@@ -630,7 +633,7 @@ describe("App mobile sheet — A5: the viewport crosses 1024px with a panel open
     click(handle);
     await flush();
 
-    await setDesktop(false);
+    await setPhoneViewport(true);
     await flush();
 
     expect(host.querySelector('aside[aria-label="Side panels"]'), "the drawer is gone").toBeNull();
@@ -761,7 +764,7 @@ describe("App mobile sheet — AS: the inline status line", () => {
   });
 
   it("C12: at ≥1024px the focus-mode row is the boxed desktop row with no counts", async () => {
-    desktopWidth = true;
+    phoneViewport = false;
     setShell("browser");
     window.localStorage.setItem("peakbot-focus", "on");
     hoisted.agent = makeAgent(withTabs({ is_running: true } as Partial<AppState>));
@@ -774,7 +777,7 @@ describe("App mobile sheet — AS: the inline status line", () => {
   });
 
   it("C12: at ≥1024px, idle or non-focus, there is no activity row", async () => {
-    desktopWidth = true;
+    phoneViewport = false;
     setShell("browser");
     hoisted.agent = makeAgent(withTabs());
     mount();
@@ -1171,11 +1174,11 @@ describe("App mobile sheet — B31: the watch banner", () => {
     );
     expect(count, "the count span exists").toBeDefined();
     expect(count!.textContent!.trim()).toBe("1 message");
-    expect(count!.classList.contains("max-lg:hidden"), "hidden below lg only").toBe(true);
+    expect(count!.classList.contains("phone:hidden"), "hidden below lg only").toBe(true);
   });
 
   it("desktop lock: at ≥1024px the banner still reads 'Watching ‹who›' with its message count, and Clear works", async () => {
-    desktopWidth = true;
+    phoneViewport = false;
     setShell("browser");
     hoisted.agent = makeAgent(
       stateFor("c1", {
@@ -1249,7 +1252,7 @@ describe("App mobile sheet — X2: the transcript rows follow the breakpoint", (
 
   it("at ≥1024px the rows keep today's labelled cards", async () => {
     await withViewport(async () => {
-      desktopWidth = true;
+      phoneViewport = false;
       setShell("browser");
       hoisted.agent = withRows();
       mount();
@@ -1341,7 +1344,7 @@ describe("App desktop — option D: the desktop shell is always wide", () => {
   });
 
   it("crossing the breakpoint DOWN inside the desktop shell never shows the phone layout", async () => {
-    desktopWidth = true;
+    phoneViewport = false;
     setShell("desktop");
     hoisted.agent = makeAgent(withTabs());
     mount();
@@ -1351,7 +1354,7 @@ describe("App desktop — option D: the desktop shell is always wide", () => {
       "wide desktop shell: the rail",
     ).not.toBeNull();
 
-    await setDesktop(false);
+    await setPhoneViewport(true);
     await flush();
 
     expect(
@@ -1364,6 +1367,7 @@ describe("App desktop — option D: the desktop shell is always wide", () => {
 
   it("the BROWSER at the same narrow width still gets the phone layout (regression guard)", async () => {
     setShell("browser");
+    phoneViewport = true;
     hoisted.agent = makeAgent(withTabs());
     mount();
     await flush();
@@ -1517,8 +1521,8 @@ describe("App mobile sheet — DIR: the Directory tab", () => {
     expect(tid("cwd-picker"), "no footer CwdPicker duplicating the activity-row 📁").toBeNull();
   });
 
-  it("mobile shell ≥lg remote cwd → bottom-bar with cwd picker", async () => {
-    desktopWidth = true;
+  it("mobile shell at any width: no bottom-bar (cwd via activity-row → Directory tab)", async () => {
+    phoneViewport = false;
     setShell("mobile");
     hoisted.agent = makeAgent(
       stateFor("c1", {
@@ -1529,8 +1533,9 @@ describe("App mobile sheet — DIR: the Directory tab", () => {
     );
     mount();
     await flush();
-    expect(tid("bottom-bar")).not.toBeNull();
-    expect(tid("bottom-bar")!.querySelector('button[title="/srv/remote"]')).not.toBeNull();
+    expect(tid("bottom-bar")).toBeNull();
+    // cwd is reachable via the activity-row 📁 → Directory tab
+    expect(tid("activity-dir")).not.toBeNull();
   });
 });
 
@@ -1548,7 +1553,7 @@ describe("App mobile sheet — B32: the fresh-chat empty state", () => {
     expect(hint, "the 'Nothing here yet' hint").toBeDefined();
     // lg:hidden is the contract: the hint is phone-only, the desktop render
     // is unchanged.
-    expect(hint!.classList.contains("lg:hidden"), "the hint is phone-only").toBe(true);
+    expect(hint!.classList.contains("desktop:hidden"), "the hint is phone-only").toBe(true);
   });
 });
 
@@ -1581,7 +1586,7 @@ describe("App mobile sheet — C17: the Bash pill badge", () => {
   });
 
   it("the drawer keeps the Bash badge (desktop lock)", async () => {
-    desktopWidth = true;
+    phoneViewport = false;
     setShell("browser");
     hoisted.agent = makeAgent(withBash());
     mount();

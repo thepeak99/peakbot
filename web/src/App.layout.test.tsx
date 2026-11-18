@@ -74,21 +74,7 @@ function installMatchMedia(): void {
   });
 }
 
-/** Flip the phone viewport query and fire its listeners. */
-async function setPhoneViewport(on: boolean): Promise<void> {
-  phoneViewport = on;
-  await act(async () => {
-    for (const m of mqls) {
-      if (!m.query.includes("max-width: 1023px")) continue;
-      m.matches = on;
-      for (const l of m.listeners) l({ matches: on, media: m.query } as MediaQueryListEvent);
-    }
-  });
-}
-
 // ─── fake agent + state fixtures ─────────────────────────────────────────
-
-const T = "2026-01-01T00:00:00Z";
 
 function stateFor(id: string | null): AppState {
   return {

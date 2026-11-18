@@ -16,7 +16,7 @@
 
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, createElement } from "react";
-import { createRoot, type Root } from "react-dom/client";
+import { createRoot } from "react-dom/client";
 
 // ─── N1: layoutOf matrix ─────────────────────────────────────────────────
 
@@ -114,13 +114,14 @@ async function setPhoneViewport(on: boolean): Promise<void> {
   });
 }
 
+import { useLayout } from "./useLayout";
+
 // Manual hook rendering via a wrapper component (no @testing-library/react).
 // The wrapper stores the hook's return value on document.body.dataset.layout
 // so we can read it from the test.
 let hookResult = "unknown";
 function LayoutTestWrapper() {
-  const mod = require("./useLayout");
-  hookResult = mod.useLayout();
+  hookResult = useLayout();
   return null;
 }
 

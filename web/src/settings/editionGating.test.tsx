@@ -582,10 +582,9 @@ describe("CwdPicker / cwd line per edition", () => {
     expect(host.querySelector(`button[title="${CWD}"]`)).not.toBeNull();
   });
 
-  it("full: the bottom bar keeps the cwd picker (unchanged)", () => {
-    // In mobileChats mode (mobile shell), the bottom bar shows the cwd picker
-    mount(<BottomBar {...bottomBarProps(CWD)} mobileChats />);
-    expect(host.querySelector(`button[title="${CWD}"]`)).not.toBeNull();
+  it("full: the bottom bar has no cwd picker (phone layout reaches it via activity-row)", () => {
+    mount(<BottomBar {...bottomBarProps(CWD)} />);
+    expect(host.querySelector(`button[title="${CWD}"]`)).toBeNull();
   });
 
   // ── the bug: local + a REMOTE profile keeps the picker ─────────────────
@@ -604,19 +603,15 @@ describe("CwdPicker / cwd line per edition", () => {
     ).not.toBeNull();
   });
 
-  it("local + remote profile: the bottom bar shows the cwd picker (relay forwards list_dir)", () => {
+  it("local + remote profile: the bottom bar has no cwd picker (phone uses activity-row)", () => {
     setBootEdition("local");
     // App computes browsableCwd=CWD for local edition + remote profile
     mount(
       <BottomBar
         {...bottomBarProps(CWD, { catalog: REMOTE_CATALOG, selection: REMOTE_SEL })}
-        mobileChats
       />,
     );
-    expect(
-      host.querySelector(`button[title="${CWD}"]`),
-      "the relay owns the remote's cwd — the picker must be reachable",
-    ).not.toBeNull();
+    expect(host.querySelector(`button[title="${CWD}"]`)).toBeNull();
   });
 
   // ── guards: local + NOT-remote stays hidden in both bars ───────────────

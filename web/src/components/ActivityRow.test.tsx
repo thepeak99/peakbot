@@ -349,10 +349,10 @@ describe("ActivityRow — C12: the box variant is unchanged with no counts", () 
     expect(q(el, "activity-todos")).toBeNull();
   });
 
-  it("the wrapper reserves the rail only from lg (lg:mr-12, no bare mr-12)", async () => {
+  it("the wrapper reserves the rail only from lg (desktop:mr-12, no bare mr-12)", async () => {
     const el = await mount(step({ role: "toolcall", tool_name: "bash", content: "ls" }));
     const wrapper = el.firstElementChild as HTMLElement;
-    expect(wrapper.classList.contains("lg:mr-12")).toBe(true);
+    expect(wrapper.classList.contains("desktop:mr-12")).toBe(true);
     expect(wrapper.classList.contains("mr-12")).toBe(false);
   });
 

@@ -415,12 +415,12 @@ export function Composer({
 
   return (
     // The phone face drops the band's border/background and pads out the
-    // bottom safe area (mock .cmpw 8/12 + .safeb sabot+10) — the max-lg:
+    // bottom safe area (mock .cmpw 8/12 + .safeb sabot+10) — the phone:
     // overrides win below 1024, desktop keeps the band untouched.
     <div
       hidden={hidden}
       data-testid={phone ? "composer" : undefined}
-      className="border-t border-zinc-800 bg-zinc-950 p-3 lg:pr-12 max-lg:border-t-0 max-lg:bg-transparent max-lg:px-3 max-lg:pt-2 max-lg:pb-[calc(env(safe-area-inset-bottom)+18px)]"
+      className="border-t border-zinc-800 bg-zinc-950 p-3 desktop:pr-12 phone:border-t-0 phone:bg-transparent phone:px-3 phone:pt-2 phone:pb-[calc(env(safe-area-inset-bottom)+18px)]"
     >
       <div className="mx-auto max-w-3xl">
         <div className="relative">
@@ -522,9 +522,9 @@ export function Composer({
           )}
 
           {/* Phone face: the mock's single 52px pill (r26, bd2 border, 3px
-              padding, soft shadow) — max-lg: only, the desktop box is
+              padding, soft shadow) — phone: only, the desktop box is
               untouched. */}
-          <div className="flex flex-col gap-2 rounded-xl border border-zinc-800 bg-zinc-900 p-2 focus-within:border-zinc-700 max-lg:min-h-[52px] max-lg:gap-0 max-lg:rounded-sheet max-lg:border-zinc-700 max-lg:p-[3px] max-lg:shadow-[0_2px_10px_rgba(0,0,0,0.25)] max-lg:light:shadow-[0_2px_10px_rgba(0,0,0,0.06)] max-lg:focus-within:border-zinc-700">
+          <div className="flex flex-col gap-2 rounded-xl border border-zinc-800 bg-zinc-900 p-2 focus-within:border-zinc-700 phone:min-h-[52px] phone:gap-0 phone:rounded-sheet phone:border-zinc-700 phone:p-[3px] phone:shadow-[0_2px_10px_rgba(0,0,0,0.25)] phone:light:shadow-[0_2px_10px_rgba(0,0,0,0.06)] phone:focus-within:border-zinc-700">
             {/* Inside the box (not the desktop-only hint row below) so it also
                 shows on touch: selecting a role filters the transcript, it does
                 not re-route input. */}
@@ -548,7 +548,7 @@ export function Composer({
             )}
 
             {attachments.pending.length > 0 && (
-              <div className="flex flex-wrap items-start gap-2 px-1 pt-1 max-lg:px-2.5 max-lg:pt-2">
+              <div className="flex flex-wrap items-start gap-2 px-1 pt-1 phone:px-2.5 phone:pt-2">
                 {attachments.pending.map((chip) => (
                   <AttachmentChip
                     key={chip.key}
@@ -568,7 +568,7 @@ export function Composer({
               </p>
             )}
 
-            <div className="flex items-end gap-2 max-lg:gap-0.5">
+            <div className="flex items-end gap-2 phone:gap-0.5">
               <input
                 ref={fileInputRef}
                 type="file"
@@ -606,7 +606,7 @@ export function Composer({
                 {...(android ? keepTextareaFocus : {})}
                 title="Attach files"
                 aria-label="Attach files"
-                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 disabled:cursor-not-allowed disabled:opacity-40 max-lg:h-11 max-lg:w-11 max-lg:rounded-full max-lg:text-zinc-400"
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 disabled:cursor-not-allowed disabled:opacity-40 phone:h-11 phone:w-11 phone:rounded-full phone:text-zinc-400"
               >
                 <svg
                   viewBox="0 0 24 24"
@@ -615,7 +615,7 @@ export function Composer({
                   strokeWidth={phone ? 1.8 : 2}
                   strokeLinecap="round"
                   strokeLinejoin="round"
-                  className="h-5 w-5 max-lg:h-6 max-lg:w-6"
+                  className="h-5 w-5 phone:h-6 phone:w-6"
                 >
                   {phone ? (
                     // The mock's round "+" attach (proto:406-408).
@@ -635,7 +635,7 @@ export function Composer({
                 onPaste={onPaste}
                 placeholder={placeholder}
                 style={{ minHeight: MIN_H_P, maxHeight: MAX_H_P }}
-                className="flex-1 resize-none overflow-y-auto bg-transparent px-2 py-1.5 text-sm text-zinc-100 placeholder-zinc-600 outline-none disabled:cursor-not-allowed max-lg:px-1.5 max-lg:py-[11px] max-lg:text-base max-lg:leading-[22px] max-lg:placeholder-zinc-500"
+                className="flex-1 resize-none overflow-y-auto bg-transparent px-2 py-1.5 text-sm text-zinc-100 placeholder-zinc-600 outline-none disabled:cursor-not-allowed phone:px-1.5 phone:py-[11px] phone:text-base phone:leading-[22px] phone:placeholder-zinc-500"
               />
               {isRunning && !hasContent ? (
                 // Empty box mid-turn: icon-only controls — labels would leave
@@ -656,7 +656,7 @@ export function Composer({
                           : "Resume sub-agent"
                       }
                       aria-label={subAgent.pause === "running" ? "Pause" : "Resume"}
-                      className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-amber-950/70 text-amber-300 hover:bg-amber-900/70 max-lg:m-px max-lg:mr-0.5 max-lg:h-[42px] max-lg:w-[42px] max-lg:rounded-full max-lg:bg-amber-500/14 max-lg:text-amber-400"
+                      className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-amber-950/70 text-amber-300 hover:bg-amber-900/70 phone:m-px phone:mr-0.5 phone:h-[42px] phone:w-[42px] phone:rounded-full phone:bg-amber-500/14 phone:text-amber-400"
                     >
                       {phone ? (
                         // The mock's face: an 18px two-bar icon while running,
@@ -689,13 +689,13 @@ export function Composer({
                     onClick={onStop}
                     title={stopLabel}
                     aria-label={stopLabel}
-                    className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-red-950/70 hover:bg-red-900/70 max-lg:m-px max-lg:h-[42px] max-lg:w-[42px] max-lg:rounded-full max-lg:bg-red-600/18 ${
+                    className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-red-950/70 hover:bg-red-900/70 phone:m-px phone:h-[42px] phone:w-[42px] phone:rounded-full phone:bg-red-600/18 ${
                       // A graceful stop is armed: a subtle pulse + ring on the
                       // existing red surface says "press again to stop now".
                       stopPending ? "animate-pulse ring-2 ring-red-500/60" : ""
                     }`}
                   >
-                    <span className="h-2.5 w-2.5 rounded-[2px] bg-red-400 max-lg:h-3.5 max-lg:w-3.5 max-lg:rounded-[3px] max-lg:bg-red-600" />
+                    <span className="h-2.5 w-2.5 rounded-[2px] bg-red-400 phone:h-3.5 phone:w-3.5 phone:rounded-[3px] phone:bg-red-600" />
                   </button>
                 </>
               ) : phone && !hasContent ? null : (
@@ -704,7 +704,7 @@ export function Composer({
                   onClick={submit}
                   disabled={!canSend}
                   title={sendBlockedReason}
-                  className="rounded-lg bg-emerald-700 px-3.5 py-1.5 text-sm font-medium text-white hover:bg-emerald-600 disabled:opacity-40 max-lg:m-px max-lg:h-[42px] max-lg:shrink-0 max-lg:rounded-[21px] max-lg:bg-emerald-700 max-lg:px-5 max-lg:py-0 max-lg:text-[15px] max-lg:font-semibold"
+                  className="rounded-lg bg-emerald-700 px-3.5 py-1.5 text-sm font-medium text-white hover:bg-emerald-600 disabled:opacity-40 phone:m-px phone:h-[42px] phone:shrink-0 phone:rounded-[21px] phone:bg-emerald-700 phone:px-5 phone:py-0 phone:text-[15px] phone:font-semibold"
                 >
                   {actionLabel}
                 </button>
@@ -721,7 +721,7 @@ export function Composer({
         )}
         {/* Hints are desktop-only — on touch screens they eat vertical real
             estate under the composer for no benefit. */}
-        <div className="mt-1.5 hidden flex-wrap items-center gap-x-3 gap-y-1 px-1 text-[11px] text-zinc-600 lg:flex">
+        <div className="mt-1.5 hidden flex-wrap items-center gap-x-3 gap-y-1 px-1 text-[11px] text-zinc-600 desktop:flex">
           {touchInput ? (
             <span>
               <kbd className="rounded bg-zinc-800 px-1 text-zinc-400">{actionLabel}</kbd> to dispatch
