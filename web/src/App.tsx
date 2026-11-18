@@ -170,8 +170,9 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   // Called once here (not in TopBar) so App can filter with the same value
   // the button renders — two useState copies would desync (plan §6.1).
   const focusMode = useFocusMode();
-  // The desktop drawer rail at ≥1024px or anywhere in the desktop app (its
-  // window is never narrower than that); below: the phone's Panels sheet.
+  // The desktop drawer rail (visible at any width in the desktop shell; the
+  // shell's useLayout sets data-layout="desktop" regardless of viewport).
+  // On phones: the Panels sheet instead.
   // The hook is always called, so hook order stays stable.
   
   const phone = useLayout() === "phone";

@@ -1268,10 +1268,11 @@ describe("App mobile sheet — X2: the transcript rows follow the breakpoint", (
 //
 // `window.peakbotShell = "desktop"` (the desktop app's init script,
 // desktop/src-tauri/src/window.rs) must force the DESKTOP layout at every
-// viewport width — the desktop window is sized ≥1024×600 (see the
-// MIN_WIDTH/MIN_HEIGHT tests in window.rs) and never shrinks into the phone
-// face. The phone layout stays the browser's (and the mobile shell's) at
-// <1024px.
+// viewport width. The window minimum is small (480×400) to accommodate
+// narrow window managers (Wayland tiling compositors) that ignore the
+// min-size hint; the layout decision lives in the SPA via useLayout, not
+// the window size. The phone layout stays the browser's (and the mobile
+// shell's) at <1024px with touch.
 //
 // RED before implementation: App derives the layout solely from
 // useMediaQuery("(min-width: 1024px)"), so a narrow desktop shell renders
