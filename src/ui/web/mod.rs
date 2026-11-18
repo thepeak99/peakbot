@@ -843,11 +843,13 @@ where
             }
         }
     }
-    // Flush any buffered frames before sending the Close frame — otherwise
-    // the peer can see close before the final text frame (the no_local_profile
-    // race). This is cheap on loopback and correct everywhere.
-    let _ = sink.flush().await;
-    let _ = sink.close().await;
+    // Bound teardown: a stalled peer may hang flush/close, but we must not
+    // wedge the writer task forever (a malicious client could hold us open).
+    let _ = tokio::time::timeout(Duration::from_millis(500), async {
+        let _ = sink.flush().await;
+        let _ = sink.close().await;
+    })
+    .await;
 }
 
 /// Which task ended the forward loop. Encoded as a type so teardown cannot
