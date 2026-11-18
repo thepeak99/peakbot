@@ -1,7 +1,7 @@
 // The single layout decision seam.
 //
 // Replaces the old split where JS (isDesktopShell || min-width:1024) and CSS
-// (lg:/max-lg: viewport breakpoints) disagreed — causing the 40px rail to
+// (Tailwind's large-breakpoint viewport rules) disagreed — causing the 40px rail to
 // overlap transcript/composer in a narrow desktop window.
 //
 // New rule: phone layout ONLY for the mobile shell (window.peakbotShell ===
@@ -11,7 +11,7 @@
 //
 // This hook mirrors the decision onto <html data-layout> so Tailwind's
 // @custom-variant phone and desktop selectors follow it, replacing all
-// lg:/max-lg: layout classes.
+// old viewport-width layout classes.
 
 import { useLayoutEffect } from "react";
 import { shell, type Shell } from "./desktop";

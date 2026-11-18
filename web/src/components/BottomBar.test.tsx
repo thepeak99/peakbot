@@ -61,7 +61,7 @@ const CONVERSATIONS: ConversationSummary[] = [
 let container: HTMLDivElement | null = null;
 let root: Root | null = null;
 
-async function mount(): Promise<HTMLDivElement> {
+async function mount(cwd?: string | null): Promise<HTMLDivElement> {
   container = document.createElement("div");
   document.body.appendChild(container);
   await act(async () => {
@@ -73,6 +73,9 @@ async function mount(): Promise<HTMLDivElement> {
         models={MODELS}
         activeAlias="sonnet"
         hasTranscript={true}
+        cwd={cwd ?? null}
+        dirListing={null}
+        recentDirs={[]}
         send={vi.fn((m: InboundMessage) => void m)}
         onLoadConversation={vi.fn()}
         catalog={CATALOG}
@@ -138,11 +141,11 @@ describe("bottom bar mobile overflow (T34b)", () => {
   });
 
   it("selection_conversations_and_cwd_chips_render", async () => {
-    const el = await mount();
+    const el = await mount("/home/u/project");
     for (const sel of [
       '[data-testid="selection-chip"]',
       'button[title="Load a saved conversation"]',
-      'button[title="Load a saved conversation"]',
+      'button[title="/home/u/project"]',
     ]) {
       expect(el.querySelector(sel) !== null, `chip ${sel} rendered`).toBe(true);
     }
@@ -153,5 +156,13 @@ describe("bottom bar mobile overflow (T34b)", () => {
     ]) {
       expect(el.querySelector(sel), `chip ${sel} must be gone`).toBeNull();
     }
+  });
+
+  it("without cwd only the selection and conversations chips render", async () => {
+    const el = await mount(null);
+    expect(el.querySelector('[data-testid="selection-chip"]')).not.toBeNull();
+    expect(el.querySelector('button[title="Load a saved conversation"]')).not.toBeNull();
+    // No cwd picker when cwd is null
+    expect(el.querySelector('button[title="/home/u/project"]')).toBeNull();
   });
 });

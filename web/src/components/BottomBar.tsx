@@ -1,24 +1,32 @@
 import type {
   ConversationSummary,
+  DirListing,
   InboundMessage,
   ModelInfo,
 } from "../state";
 import type { CatalogProfile, Selection } from "../types";
+import { CwdPicker } from "./CwdPicker";
 import { ConversationsPicker } from "./ConversationsPicker";
 import { SelectionChip } from "./SelectionChip";
 
 // Bottom status bar — phone layout only (hidden on desktop via lg:hidden).
 // App renders this only when not in the mobile shell (chats === null), so the
-// chip and conversations picker are always present.
+// chip and conversations picker are always present. The CwdPicker shows only
+// when cwd is provided (browsableCwd from App), following the same gating as
+// the TopBar's picker.
 export function BottomBar({
   conversations,
   conversationsError,
   models,
   activeAlias,
   hasTranscript,
+  cwd,
+  dirListing,
+  recentDirs,
   send,
   onLoadConversation,
   onReattach,
+  onSwitchCwd,
   catalog,
   selection,
   selectionLocked = false,
@@ -30,10 +38,15 @@ export function BottomBar({
   models: ModelInfo[];
   activeAlias: string;
   hasTranscript: boolean;
+  cwd: string | null;
+  dirListing: DirListing | null;
+  recentDirs: string[];
   send: (msg: InboundMessage) => void;
   onLoadConversation: (id: string, profile: string | null) => void;
   /** Chip pick across local/remote: re-attach on (profile, agent). */
   onReattach?(profile: string, agent?: string): void;
+  /** Commits a cwd picked in the CwdPicker (App routes busy/idle). */
+  onSwitchCwd?(path: string): void;
   // T32 chat chip (optional — absent ⇒ no chip, as on older servers).
   catalog?: CatalogProfile[];
   selection?: Selection | null;
@@ -77,6 +90,17 @@ export function BottomBar({
         dropUp
         catalog={catalog}
       />
+      {cwd && (
+        <CwdPicker
+          cwd={cwd}
+          hasTranscript={hasTranscript}
+          dirListing={dirListing}
+          recentDirs={recentDirs}
+          send={send}
+          onSwitchCwd={onSwitchCwd ?? (() => {})}
+          dropUp
+        />
+      )}
     </footer>
   );
 }
