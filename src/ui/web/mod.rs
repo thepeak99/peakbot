@@ -843,15 +843,7 @@ where
             }
         }
     }
-    // Bound teardown: a stalled peer may hang flush/close, but we must not
-    // wedge the writer task forever (a malicious client could hold us open).
-    // 5 s gives CI's slower network stack time to deliver the final frame
-    // (the no_local_profile race) while still preventing infinite hangs.
-    let _ = tokio::time::timeout(Duration::from_secs(5), async {
-        let _ = sink.flush().await;
-        let _ = sink.close().await;
-    })
-    .await;
+    let _ = sink.close().await;
 }
 
 /// Which task ended the forward loop. Encoded as a type so teardown cannot
@@ -1072,9 +1064,6 @@ async fn serve_socket<Si, St, E>(
     {
         let _ = out_tx.send(OutboundMessage::NoLocalProfile);
         drop(out_tx);
-        // Writer task must drain the last frame before closing. Awaiting the
-        // task blocks until the writer loop finishes, which only happens after
-        // all queued frames are sent and the sink is closed.
         let _ = writer_task.await;
         return;
     }
@@ -2948,18 +2937,11 @@ mod tests {
         // Advance past WRITE_TIMEOUT so the Sleep fires.
         tokio::time::advance(WRITE_TIMEOUT).await;
 
-        // Once the write timeout reaper tears down, the writer breaks out of
-        // the loop and enters the flush/close teardown path, which has its own
-        // 5 s bound. Yield to let the writer process the write timeout, then
-        // advance past the teardown timeout so the teardown completes.
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(5)).await;
-
-        // The writer task must complete promptly after the teardown timeout
-        // fires (the timeout resolution itself causes the break/close).
+        // Once the timeout reaper tears down, the writer task must complete
+        // promptly (the timeout resolution itself causes the break/close).
         tokio::time::timeout(Duration::from_secs(1), writer)
             .await
-            .expect("writer must exit within 1s after the teardown timeout fires")
+            .expect("writer must exit within 1s after the timeout reaper fires")
             .expect("writer task must not panic");
 
         // And producers see `Disconnected` afterwards.

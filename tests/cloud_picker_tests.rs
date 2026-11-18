@@ -40,6 +40,9 @@ type Ws =
 
 static ROOTS_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
 static ROOTS_ONCE: Once = Once::new();
+// Every attach re-reads the one process-global config.yaml, so a core owns
+// it for its whole lifetime; otherwise a parallel test overwrites it mid-attach.
+static CONFIG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn init_shared_roots() {
     ROOTS_ONCE.call_once(|| {
@@ -83,10 +86,12 @@ struct Core {
     handle: CloudHandle,
     _ui: WebUi,
     _tmp: tempfile::TempDir,
+    _config: tokio::sync::MutexGuard<'static, ()>,
 }
 
 impl Core {
     async fn start(name: &str, seed: u8, yaml: &str, _relay: &TestRelay) -> Core {
+        let config = CONFIG_LOCK.lock().await;
         init_shared_roots();
         let tmp = tempfile::tempdir().expect("core dir");
         // Write the config to the roots config dir so fresh_home_attach reads it.
@@ -136,6 +141,7 @@ impl Core {
             handle,
             _ui: ui,
             _tmp: tmp,
+            _config: config,
         }
     }
 
