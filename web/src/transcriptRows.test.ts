@@ -139,7 +139,7 @@ describe("estimateRowHeight", () => {
 // The design specifies it operates on WireChatMessage[] with Date.parse of the
 // ISO timestamp field.
 
-import { startsNewDay, DAY_SEPARATOR_PX } from "./transcriptRows";
+import { startsNewDay } from "./transcriptRows";
 
 function wireMsg(timestamp: string): WireChatMessage {
   return { role: "agent", content: "x", timestamp };
@@ -177,12 +177,6 @@ describe("startsNewDay", () => {
     // covered in dates.test.ts. Here we just verify the function doesn't
     // crash and uses the same local-day logic as sameLocalDay.
     expect(() => startsNewDay(msgs, 1)).not.toThrow();
-  });
-});
-
-describe("DAY_SEPARATOR_PX", () => {
-  it("is a positive number", () => {
-    expect(DAY_SEPARATOR_PX).toBeGreaterThan(0);
   });
 });
 
