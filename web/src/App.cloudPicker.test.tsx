@@ -127,4 +127,37 @@ describe("App — cloud picker (noLocal=true)", () => {
     await mountApp();
     expect(mockSwitchConvo).not.toHaveBeenCalled();
   });
+
+  // P5 bug: after "New chat" clears the profile, the noLocal auto-attach
+  // effect never re-runs because its deps (noLocal, cloudTargets) haven't
+  // changed — the socket closes and the user is stuck with an empty view.
+  // Expected fix: the effect must also trigger when connected drops.
+  it("re-attaches to the cloud target after a new-chat reconnect", async () => {
+    mockState.noLocal = true;
+    mockState.connected = true;
+    mockCloudTargets.rows = [
+      { name: "default@sandworm", origin: "remote", overrides_global: false, agents: [] },
+    ];
+
+    // Initial mount: noLocal=true, connected=true → first attach works.
+    await mountApp();
+    expect(mockSwitchConvo).toHaveBeenCalledTimes(1);
+    expect(mockSwitchConvo).toHaveBeenLastCalledWith(
+      null, "default@sandworm", undefined, expect.anything(),
+    );
+    mockSwitchConvo.mockClear();
+
+    // User clicks "New chat": switchConvo(null,null) internally clears the
+    // profile; the socket closes (connected=false), then reconnects.
+    // noLocal stays true; rows unchanged. The effect should re-run and
+    // attempt a second attach to the same cloud target.
+    mockState.connected = false;
+    await act(async () => {
+      root!.render(<App />);
+    });
+    expect(
+      mockSwitchConvo,
+      "a reconnect with noLocal=true must attempt another attach",
+    ).toHaveBeenCalledTimes(1);
+  });
 });

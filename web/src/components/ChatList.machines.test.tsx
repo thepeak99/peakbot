@@ -617,3 +617,45 @@ describe("ChatList machines — B5: the light online dot (A42)", () => {
     expect(dot.className, "the light theme paints the dot #16a34a").toContain("light:bg-[#16a34a]");
   });
 });
+
+// P5 bug: empty local catalog + cloud rows → FAB calls onNew(null) instead
+// of offering the cloud target, so the picker never renders and the user is
+// stuck. Expected fix: a single remote target should still open a picker or
+// at least call onNew with the remote profile.
+describe("ChatList machines — cloud-only new chat", () => {
+  it("offers the cloud target when the local catalog is empty", async () => {
+    const remoteCatalog: CatalogProfile[] = [
+      { name: "default@sandworm", origin: "remote", overridesGlobal: false, machine: "https://sandworm.local:7823", agents: [], color: "teal" },
+    ];
+    const remoteStatus: WireMachineStatus[] = [{ id: "https://sandworm.local:7823", online: true }];
+
+    const onNew = vi.fn();
+    const el = await render({
+      catalog: remoteCatalog,
+      machineStatus: remoteStatus,
+      conversations: [],
+      onNew,
+    });
+
+    // Single remote machine: no machine pill (machineUi requires ≥ 2), but
+    // the FAB should still know about the remote target.
+    expect(pill(el), "one machine ⇒ no pill").toBeNull();
+
+    const fab = el.querySelector<HTMLElement>('button[aria-label="New chat"]')!;
+    await act(async () => {
+      fab.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    });
+
+    // Bug today: onNew(null) because machineUi is false → no picker.
+    // Expected: onNew called with the remote profile, not null.
+    expect(onNew).toHaveBeenCalledTimes(1);
+    expect(
+      String(onNew.mock.calls[0]?.[0]),
+      "a remote-only catalog must target the remote, not null",
+    ).not.toBe("null");
+    expect(
+      String(onNew.mock.calls[0]?.[0]),
+      "the remote profile must be passed through",
+    ).toBe("default@sandworm");
+  });
+});
