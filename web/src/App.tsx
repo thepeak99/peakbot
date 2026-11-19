@@ -113,7 +113,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
       // last-used persistence).
       switchConvo(null, cloudTargets.rows[0].name, undefined, { type: "attach" });
     }
-  }, [noLocal, cloudTargets, switchConvo]);
+  }, [noLocal, connected, cloudTargets, switchConvo]);
 
   // The drop overlay on <main> feeds the active tab's composer slot.
   const activeSlot = useRef<ComposerSlotHandle>(null);

@@ -128,7 +128,11 @@ export function ChatList({
   };
   // The FAB: with a machine selected it starts on that machine's first
   // catalog profile; on All with machines it opens the picker.
-  const fabProfile = selectedMachine ? selectedMachine.profiles[0] : null;
+  const fabProfile = selectedMachine
+    ? selectedMachine.profiles[0]
+    : machines.length === 1 && machines[0].id !== null
+      ? machines[0].profiles[0]
+      : null;
   const fabDisabled = offline;
 
   const headerActions = (
