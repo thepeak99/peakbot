@@ -140,6 +140,105 @@ describe("state → view (one row per §A.1)", () => {
     expect(openSpy!.mock.calls[0]?.[0]).toBe("https://idp/cb?x=1");
   });
 
+// The Cloud sign-in AppImage bug: WebKitGTK drops a popup opened from an
+// async continuation, and `noopener` always returns null by spec — so the
+// user was left with a "Finish signing in in the new tab." note and no tab.
+// Intended contract: one code path for desktop and mobile —
+//   const w = window.open(auth_url, "_blank"); if (w) w.opener = null;
+//   else window.location.assign(auth_url);
+// plus a manual <a href=authUrl target=_blank rel=noopener> fallback.
+describe("sign-in navigation fallback (AppImage)", () => {
+  const AUTH = "https://idp/cb?x=1";
+  let loc: { assign: ReturnType<typeof vi.fn>; href: string };
+
+  beforeEach(() => {
+    loc = { assign: vi.fn(), href: "http://localhost/" };
+    // jsdom cannot navigate; record the assignment (firstRun.test.tsx pattern).
+    vi.stubGlobal("location", loc);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /** Render `logged_out`, click Sign in, and let the login reply settle. */
+  async function signInWith(reply: () => Promise<Response>): Promise<void> {
+    mockFetch((url) => {
+      if (url.endsWith("/api/cloud/state")) return Promise.resolve(json(200, loggedOut("never")));
+      if (url.endsWith("/api/cloud/login")) return Promise.resolve(reply());
+      return Promise.resolve(json(200, {}));
+    });
+    store.reset();
+    store.subscribe(() => {});
+    await flush();
+    FakeEventSource.last()?.emit("state", loggedOut("never"));
+    container = await render(<CloudPane />);
+    const btn = buttonByText(container!, COPY.btn.signIn);
+    expect(btn).toBeDefined();
+    await act(async () => {
+      btn!.click();
+      await Promise.resolve();
+    });
+    await flush();
+  }
+
+  it("opens the auth url with the two-argument form and severs opener on a returned handle", async () => {
+    const handle: { opener: Window | null } = { opener: {} as Window };
+    openSpy = vi.spyOn(window, "open").mockImplementation(() => handle as unknown as Window);
+    await signInWith(() => Promise.resolve(json(200, { auth_url: AUTH })));
+
+    expect(openSpy!.mock.calls[0]?.[0]).toBe(AUTH);
+    expect(openSpy!.mock.calls[0]?.[1]).toBe("_blank");
+    // No `noopener` feature string: it makes window.open return null per spec,
+    // which is exactly the handle the fallback needs.
+    expect(openSpy!.mock.calls[0]?.[2]).toBeUndefined();
+    expect(handle.opener).toBeNull();
+    expect(loc.assign).not.toHaveBeenCalled();
+  });
+
+  it("falls back to location.assign when window.open returns null", async () => {
+    openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
+    await signInWith(() => Promise.resolve(json(200, { auth_url: AUTH })));
+
+    expect(openSpy!.mock.calls[0]?.[1]).toBe("_blank");
+    expect(loc.assign).toHaveBeenCalledTimes(1);
+    expect(loc.assign).toHaveBeenCalledWith(AUTH);
+  });
+
+  it("renders a manual 'Open sign-in page' anchor after a successful sign in", async () => {
+    await signInWith(() => Promise.resolve(json(200, { auth_url: AUTH })));
+
+    const a = container!.querySelector<HTMLAnchorElement>(`a[href="${AUTH}"]`);
+    expect(a).not.toBeNull();
+    expect(a!.getAttribute("target")).toBe("_blank");
+    expect(a!.getAttribute("rel")).toBe("noopener");
+    expect(text(a!)).toContain("Open sign-in page");
+  });
+
+  it("renders a 409 login_in_flight as a pending note, not a red error", async () => {
+    await signInWith(() =>
+      Promise.resolve(json(409, { error: "login_in_flight", message: "login already in flight" })),
+    );
+
+    const all = text(container!);
+    expect(all).not.toContain(COPY.err.already_logged_in);
+
+    const red = [...container!.querySelectorAll(".text-red-400")].map(text).join(" ");
+    expect(red).not.toContain("login already in flight");
+    expect(red).not.toContain(COPY.err.already_logged_in);
+
+    // A muted note explains the pending sign-in instead of an error.
+    const muted = [...container!.querySelectorAll(".text-zinc-400")].map(text).join(" ").trim();
+    expect(muted.length).toBeGreaterThan(0);
+  });
+
+  it("still renders a truthful 409 already_logged_in as the red 'Already signed in.'", async () => {
+    await signInWith(() => Promise.resolve(json(409, { error: "already_logged_in" })));
+
+    expect(text(container!)).toContain(COPY.err.already_logged_in);
+  });
+});
+
   it("connecting → 'Connecting… (attempt N)' + the muted last_error", async () => {
     const el = await withState(connecting(3, "relay down"));
     expect(text(el)).toContain(COPY.connecting(3));
