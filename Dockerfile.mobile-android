@@ -15,7 +15,7 @@
 #   SDK platforms   android-36 + android-37.0 (compileSdk = targetSdk = 37; AGP pulls 36)
 #   build-tools     36.0.0 (AGP 9.3.1 wants it)
 #   NDK             28.2.13676358 (r28c: 16 KB page alignment by default, no cmake)
-#   Rust            1.95.0 + aarch64-linux-android + x86_64-linux-android (dev emulator APKs)
+#   Rust            1.100.0 + aarch64-linux-android + x86_64-linux-android (dev emulator APKs)
 #   cargo-ndk       4.1.2 (PR check)
 #   Node            22.23.4 (official tarball; no global @tauri-apps/cli — a global
 #                    CLI breaks the gradle callback; the APK build gets 2.12.4 via
@@ -27,7 +27,7 @@
 FROM docker.io/library/eclipse-temurin:17-jdk AS toolchain
 
 ARG NODE_VERSION=22.23.4
-ARG RUST_VERSION=1.95.0
+ARG RUST_VERSION=1.100.0
 ARG CARGO_NDK_VERSION=4.1.2
 ARG CMDLINE_TOOLS=13114758
 # NDK r28c — first NDK line whose default link flags produce 16 KB-aligned
@@ -45,7 +45,7 @@ RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-l
       | tar -xJ -C /opt && ln -s /opt/node-v${NODE_VERSION}-linux-x64 /opt/node
 ENV PATH=/opt/node/bin:$PATH
 
-# Rust 1.95.0 (minimal profile) + both Android targets + cargo-ndk 4.1.2.
+# Rust 1.100.0 (minimal profile) + both Android targets + cargo-ndk 4.1.2.
 # Cache mount on the registry only: downloads survive image rebuilds and CI
 # re-runs, while the toolchain and the cargo-ndk binary still land in the
 # image layer (a cache mount on /opt/cargo as a whole would keep them out).

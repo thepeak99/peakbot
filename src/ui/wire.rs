@@ -1370,6 +1370,17 @@ mod tests {
         );
     }
 
+    /// Additive-change pin: tool_args projection is a VALUE-level change
+    /// (we omit redundant fields), not a schema change (no new types, no
+    /// new field names). The relay's version gate must not see this.
+    #[test]
+    fn tool_args_projection_keeps_protocol_version_one() {
+        assert_eq!(
+            PROTOCOL_VERSION, 1,
+            "tool_args projection is value-level, not a schema change — version must stay at 1"
+        );
+    }
+
     #[test]
     fn attach_parses_with_profile_agent_and_relayed() {
         let m: InboundMessage = serde_json::from_str(

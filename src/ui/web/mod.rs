@@ -58,6 +58,7 @@
 use crate::session::SessionDeps;
 use crate::ui::AppState;
 use crate::ui::Ui;
+use crate::ui::app_state::MessageRole;
 use crate::ui::outbound::{OutboundRx, OutboundTx, outbound_channel};
 use crate::ui::ui_trait::builtin_commands;
 #[cfg(feature = "host")]
@@ -855,12 +856,52 @@ pub(crate) enum ForwardExit {
     StateEnded,
 }
 
-/// The SPA renders `content`, never `tool_result`; the raw
-/// payload (base64 images, long output) is most of the frame,
-/// so it stays server-side.
-fn strip_tool_results(mut state: AppState) -> AppState {
+/// The SPA reads `tool_args` only for file paths, todo replay, and delegate
+/// `role`/`parent_task_id` (adapt.ts); display uses `content`. ToolResult rows
+/// duplicate the call's args (6.5 MB here), so the projection nulls them.
+const WIRE_TOOL_ARGS: &[(&str, &[&str])] = &[
+    ("file_create", &["path"]),
+    ("file_str_replace", &["path"]),
+    ("file_insert", &["path"]),
+    ("file_read", &["path"]),
+    ("delegate", &["role", "parent_task_id"]),
+    ("todo", &[]), // verbatim passthrough
+];
+
+fn project_tool_args(tool: &str, args: &str) -> Option<String> {
+    let fields = WIRE_TOOL_ARGS
+        .iter()
+        .find(|(name, _)| *name == tool)
+        .map(|f| f.1);
+    let fields = fields?;
+    if fields.is_empty() {
+        return Some(args.to_string());
+    }
+    let obj: serde_json::Value = serde_json::from_str(args).ok()?;
+    let obj = obj.as_object()?;
+    let mut out = serde_json::Map::new();
+    for field in fields {
+        if let Some(val) = obj.get(*field) {
+            out.insert(field.to_string(), val.clone());
+        }
+    }
+    serde_json::to_string(&serde_json::Value::Object(out)).ok()
+}
+
+fn project_state_for_client(mut state: AppState) -> AppState {
     for m in &mut state.chat.messages {
-        m.tool_result = None;
+        match m.role {
+            MessageRole::ToolCall => {
+                if let (Some(tool), Some(args)) = (&m.tool_name, &m.tool_args) {
+                    m.tool_args = project_tool_args(tool, args);
+                }
+            }
+            MessageRole::ToolResult => {
+                m.tool_args = None;
+                m.tool_result = None;
+            }
+            _ => {}
+        }
     }
     state
 }
@@ -895,7 +936,7 @@ pub(crate) async fn forward_state(
                 let exit = app_state.exit_requested;
                 // Rewrite the already-cloned snapshot (not the shared state): /images/ links
                 // must never leak to disk, and stdio's separate publish path has no server.
-                let app_state = strip_tool_results(images.rewrite(app_state, &sm.session_cwd()));
+                let app_state = project_state_for_client(images.rewrite(app_state, &sm.session_cwd()));
                 if out.publish_state(Arc::new(app_state)).is_err() {
                     return ForwardExit::WriterGone;
                 }
@@ -3406,6 +3447,276 @@ mod tests {
                 .iter()
                 .any(|m| m.content.contains("INTERRUPTED")),
             "shared state must keep the INTERRUPTED banner"
+        );
+    }
+
+    // ─── tool_args projection (using real module-level functions) ──────────
+    use super::{project_state_for_client, project_tool_args};
+
+    #[test]
+    fn projection_file_read_keeps_only_path() {
+        let args = r#"{"path":"/tmp/foo.rs","start_line":10}"#;
+        let projected = project_tool_args("file_read", args).unwrap();
+        let obj: serde_json::Value = serde_json::from_str(&projected).unwrap();
+        assert_eq!(obj["path"], "/tmp/foo.rs");
+        assert!(
+            obj.get("start_line").is_none(),
+            "start_line must be dropped"
+        );
+    }
+
+    #[test]
+    fn projection_file_create_keeps_only_path() {
+        let args = r#"{"path":"/tmp/x.rs","file_text":"fn main(){}","purpose":"test"}"#;
+        let projected = project_tool_args("file_create", args).unwrap();
+        let obj: serde_json::Value = serde_json::from_str(&projected).unwrap();
+        assert_eq!(obj["path"], "/tmp/x.rs");
+        assert!(obj.get("file_text").is_none());
+        assert!(obj.get("purpose").is_none());
+    }
+
+    #[test]
+    fn projection_file_str_replace_keeps_only_path() {
+        let args = r#"{"path":"/tmp/x.rs","old_str":"a","new_str":"b"}"#;
+        let projected = project_tool_args("file_str_replace", args).unwrap();
+        let obj: serde_json::Value = serde_json::from_str(&projected).unwrap();
+        assert_eq!(obj["path"], "/tmp/x.rs");
+        assert!(obj.get("old_str").is_none());
+        assert!(obj.get("new_str").is_none());
+    }
+
+    #[test]
+    fn projection_file_insert_keeps_only_path() {
+        let args = r#"{"path":"/tmp/x.rs","insert_line":5,"insert_text":"hi"}"#;
+        let projected = project_tool_args("file_insert", args).unwrap();
+        let obj: serde_json::Value = serde_json::from_str(&projected).unwrap();
+        assert_eq!(obj["path"], "/tmp/x.rs");
+        assert!(obj.get("insert_line").is_none());
+        assert!(obj.get("insert_text").is_none());
+    }
+
+    #[test]
+    fn projection_delegate_keeps_role_and_parent_task_id() {
+        let args =
+            r#"{"role":"tester","task":"run tests","purpose":"verify fix","parent_task_id":42}"#;
+        let projected = project_tool_args("delegate", args).unwrap();
+        let obj: serde_json::Value = serde_json::from_str(&projected).unwrap();
+        assert_eq!(obj["role"], "tester");
+        assert_eq!(obj["parent_task_id"], 42);
+        assert!(obj.get("task").is_none(), "task must be dropped");
+        assert!(obj.get("purpose").is_none(), "purpose must be dropped");
+    }
+
+    #[test]
+    fn projection_delegate_omits_parent_task_id_when_absent() {
+        let args = r#"{"role":"pm","task":"write spec"}"#;
+        let projected = project_tool_args("delegate", args).unwrap();
+        let obj: serde_json::Value = serde_json::from_str(&projected).unwrap();
+        assert_eq!(obj["role"], "pm");
+        assert!(
+            obj.get("parent_task_id").is_none(),
+            "parent_task_id must be omitted when absent"
+        );
+        assert!(obj.get("task").is_none());
+    }
+
+    #[test]
+    fn projection_todo_keeps_verbatim() {
+        let args = r#"{"action":"add","tasks":["task 1","task 2"]}"#;
+        let projected = project_tool_args("todo", args).unwrap();
+        let obj: serde_json::Value = serde_json::from_str(&projected).unwrap();
+        assert_eq!(obj["action"], "add");
+        assert!(obj["tasks"].is_array());
+        assert_eq!(obj["tasks"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn projection_todo_update_keeps_verbatim() {
+        let args = r#"{"action":"update","task_id":1,"status":"completed"}"#;
+        let projected = project_tool_args("todo", args).unwrap();
+        let obj: serde_json::Value = serde_json::from_str(&projected).unwrap();
+        assert_eq!(obj["action"], "update");
+        assert_eq!(obj["task_id"], 1);
+        assert_eq!(obj["status"], "completed");
+    }
+
+    #[test]
+    fn projection_todo_remove_keeps_verbatim() {
+        let args = r#"{"action":"remove","task_id":2}"#;
+        let projected = project_tool_args("todo", args).unwrap();
+        let obj: serde_json::Value = serde_json::from_str(&projected).unwrap();
+        assert_eq!(obj["action"], "remove");
+        assert_eq!(obj["task_id"], 2);
+    }
+
+    #[test]
+    fn projection_bash_returns_none() {
+        let args = r#"{"command":"ls -la","purpose":"list files"}"#;
+        assert!(project_tool_args("bash", args).is_none());
+    }
+
+    #[test]
+    fn projection_think_returns_none() {
+        let args = r#"{"thought":"I should check the docs"}"#;
+        assert!(project_tool_args("think", args).is_none());
+    }
+
+    #[test]
+    fn projection_web_search_returns_none() {
+        let args = r#"{"query":"rust async","purpose":"research"}"#;
+        assert!(project_tool_args("web_search", args).is_none());
+    }
+
+    #[test]
+    fn projection_unknown_tool_returns_none() {
+        let args = r#"{"anything":"here"}"#;
+        assert!(project_tool_args("make_sandwich", args).is_none());
+    }
+
+    #[test]
+    fn projection_non_json_args_returns_none() {
+        assert!(project_tool_args("file_read", "not json at all").is_none());
+    }
+
+    #[test]
+    fn projection_json_array_not_object_returns_none() {
+        assert!(project_tool_args("file_read", "[1, 2, 3]").is_none());
+    }
+
+    #[test]
+    fn projection_json_string_not_object_returns_none() {
+        assert!(project_tool_args("file_read", "\"hello\"").is_none());
+    }
+
+    #[test]
+    fn projection_json_number_not_object_returns_none() {
+        assert!(project_tool_args("file_read", "42").is_none());
+    }
+
+    #[test]
+    fn projection_json_boolean_not_object_returns_none() {
+        assert!(project_tool_args("file_read", "true").is_none());
+    }
+
+    #[test]
+    fn projection_json_null_not_object_returns_none() {
+        assert!(project_tool_args("file_read", "null").is_none());
+    }
+
+    #[test]
+    fn projection_empty_string_returns_none() {
+        assert!(project_tool_args("file_read", "").is_none());
+    }
+
+    #[test]
+    fn projection_idempotent_file_read() {
+        let args = r#"{"path":"/tmp/foo.rs","start_line":10}"#;
+        let once = project_tool_args("file_read", args).unwrap();
+        let twice = project_tool_args("file_read", &once).unwrap();
+        assert_eq!(once, twice, "project(project(x)) must equal project(x)");
+    }
+
+    #[test]
+    fn projection_idempotent_delegate_with_parent() {
+        let args = r#"{"role":"tester","task":"run tests","parent_task_id":42}"#;
+        let once = project_tool_args("delegate", args).unwrap();
+        let twice = project_tool_args("delegate", &once).unwrap();
+        assert_eq!(once, twice, "project(project(x)) must equal project(x)");
+    }
+
+    #[test]
+    fn projection_idempotent_delegate_without_parent() {
+        let args = r#"{"role":"pm","task":"write spec"}"#;
+        let once = project_tool_args("delegate", args).unwrap();
+        let twice = project_tool_args("delegate", &once).unwrap();
+        assert_eq!(once, twice, "project(project(x)) must equal project(x)");
+    }
+
+    #[test]
+    fn projection_idempotent_todo() {
+        let args = r#"{"action":"add","tasks":["t1"]}"#;
+        let once = project_tool_args("todo", args).unwrap();
+        let twice = project_tool_args("todo", &once).unwrap();
+        assert_eq!(once, twice, "project(project(x)) must equal project(x)");
+    }
+
+    // ─── state projection (using real module-level functions) ──────────────
+
+    /// Build a minimal AppState carrying the given messages.
+    fn state_with_messages(messages: Vec<ChatMessage>) -> AppState {
+        use crate::ui::app_state::ChatState;
+        let mut chat = ChatState::new();
+        for m in messages {
+            chat.add_message(m);
+        }
+        AppState {
+            chat,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn state_projection_nulls_tool_args_on_tool_result_rows() {
+        // A ToolResult row duplicates the call's args. All SPA consumers gate
+        // on role === "toolcall", so the duplicate must not reach the wire.
+        let args = r#"{"path":"/tmp/big.rs","file_text":"...6 MB of source..."}"#;
+        let state = state_with_messages(vec![ChatMessage::tool_result(
+            "file_create",
+            args,
+            "created /tmp/big.rs",
+            Some("call-1".to_string()),
+        )]);
+
+        let projected = project_state_for_client(state);
+        let row = &projected.chat.messages[0];
+        assert!(
+            row.tool_args.is_none(),
+            "a ToolResult row's duplicated tool_args must be None on the wire"
+        );
+        assert!(
+            row.tool_result.is_none(),
+            "a ToolResult row's raw result must be None on the wire"
+        );
+        assert!(
+            !row.content.is_empty(),
+            "the display content must survive (the SPA renders it)"
+        );
+    }
+
+    #[test]
+    fn state_projection_projects_tool_args_on_tool_call_rows() {
+        // A ToolCall row keeps a projected args blob: file_create → path only.
+        let state = state_with_messages(vec![ChatMessage::tool_call(
+            "file_create",
+            r#"{"path":"/tmp/x.rs","file_text":"fn main(){}","purpose":"test"}"#,
+            Some("call-1".to_string()),
+        )]);
+
+        let projected = project_state_for_client(state);
+        let row = &projected.chat.messages[0];
+        let args = row
+            .tool_args
+            .as_deref()
+            .expect("a ToolCall row's args must be projected, not dropped");
+        let obj: serde_json::Value = serde_json::from_str(args).unwrap();
+        assert_eq!(obj["path"], "/tmp/x.rs");
+        assert!(obj.get("file_text").is_none());
+    }
+
+    #[test]
+    fn state_projection_keeps_projected_args_idempotent() {
+        // Running the projection twice must yield the same wire shape.
+        let state = state_with_messages(vec![ChatMessage::tool_call(
+            "file_read",
+            r#"{"path":"/tmp/foo.rs","start_line":10}"#,
+            None,
+        )]);
+        let once = project_state_for_client(state);
+        let args_once = once.chat.messages[0].tool_args.clone();
+        let twice = project_state_for_client(once);
+        assert_eq!(
+            twice.chat.messages[0].tool_args, args_once,
+            "project(project(x)) must equal project(x)"
         );
     }
 }

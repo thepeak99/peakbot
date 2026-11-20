@@ -1,6 +1,18 @@
 #!/bin/sh
 #
-# build-android.sh — PeakBot Mobile Android APK build.
+# build-android.sh [apk|aab] — PeakBot Mobile Android APK / AAB build.
+#
+# Format (first argument, default apk; `make mobile-android` passes
+# $(ANDROID_FORMAT)):
+#   apk  release APK when the secrets are present, else the debug APK.
+#   aab  Google Play bundle. REQUIRES all four secrets (an unsigned/debug
+#        AAB cannot go to Play): exits 1 BEFORE npm ci when one is missing.
+#        One gradle run (`--aab --apk`) yields the release-signed
+#        output/mobile/PeakBot-Mobile-<v>-android-arm64.aab (checked with
+#        jarsigner -verify) plus the sibling release APK, which goes
+#        through smoke-android.sh.
+# Every mode injects the Play versionCode from scripts/play-version-code.sh
+# through Tauri's `--config` merge (no committed state, gradle untouched).
 #
 # The single entry point for `make mobile-android` and CI. Runs INSIDE the
 # Dockerfile.mobile-android toolchain container with the worktree mounted at
@@ -31,6 +43,12 @@
 
 set -eu
 
+format=${1:-apk}
+case "$format" in
+    apk|aab) ;;
+    *) echo "usage: build-android.sh [apk|aab]" >&2; exit 2 ;;
+esac
+
 root=/w
 [ -d "$root/mobile" ] \
     || { echo "❌ $root/mobile not found — mount the worktree at /w" >&2; exit 1; }
@@ -42,6 +60,48 @@ VERSION=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
 [ -n "$VERSION" ] \
     || { echo "❌ could not read version from mobile/src-tauri/tauri.conf.json" >&2; exit 1; }
 echo "📱 PeakBot Mobile $VERSION (Android arm64)"
+
+# Signing: the four BuildKit secrets arrive on the tmpfs /run/secrets
+#      mount (the Makefile writes them there — never argv, never env of the
+#      build container). Decode the keystore and write keystore.properties
+#      to the same tmpfs; the committed gradle signingConfig
+#      (gen/android/app/build.gradle.kts) reads it via
+#      ANDROID_KEYSTORE_PROPERTIES. No secrets ⇒ the debug build
+#      (apk only; aab has no debug fallback).
+secrets_dir=/run/secrets
+have_secrets=0
+if [ -f "$secrets_dir/ANDROID_KEYSTORE_B64" ] \
+    && [ -f "$secrets_dir/ANDROID_KEYSTORE_PASSWORD" ] \
+    && [ -f "$secrets_dir/ANDROID_KEY_ALIAS" ] \
+    && [ -f "$secrets_dir/ANDROID_KEY_PASSWORD" ]; then
+    have_secrets=1
+fi
+
+# aab never falls back to debug: fail BEFORE the slow steps (npm ci, build).
+if [ "$format" = aab ] && [ "$have_secrets" = 0 ]; then
+    echo "❌ aab needs the ANDROID_KEYSTORE_* secrets (an unsigned/debug AAB cannot go to Play)" >&2
+    exit 1
+fi
+
+# Play versionCode: a pure function of the version (scripts/play-version-code.sh,
+# the single source of truth), injected via Tauri's --config merge in every
+# mode so each build of a version carries the same code.
+version_code=$(sh "$root/scripts/play-version-code.sh" "$VERSION") \
+    || { echo "❌ no Play versionCode for version '$VERSION'" >&2; exit 1; }
+cfg='{"bundle":{"android":{"versionCode":'"$version_code"'}}}'
+
+# crates/cloud pulls perma-crypto (a private git repo). The token arrives on
+# the /run/secrets mount (written by the Makefile when PERMA_CRYPTO_TOKEN is
+# set). Configure git with the insteadOf approach so cargo can fetch it —
+# same mechanism as the release Dockerfiles (BuildKit secret → insteadOf).
+if [ -f "$secrets_dir/PERMA_CRYPTO_TOKEN" ]; then
+    perma_token=$(cat "$secrets_dir/PERMA_CRYPTO_TOKEN")
+    export CARGO_NET_GIT_FETCH_WITH_CLI=true
+    export GIT_CONFIG_COUNT=1
+    export GIT_CONFIG_KEY_0="url.https://x-access-token:${perma_token}@git.patchnotes.com/ai-bots/perma-crypto.insteadOf"
+    export GIT_CONFIG_VALUE_0="https://git.patchnotes.com/ai-bots/perma-crypto"
+    echo "🔑 perma-crypto git credential configured (insteadOf)"
+fi
 
 # 1. The Local core embeds the SPA from web/dist, so it must match web/src:
 #    ALWAYS build it (a "build if absent" check silently shipped a stale SPA).
@@ -64,21 +124,6 @@ export CARGO_PROFILE_RELEASE_STRIP=true
 # step with it (a cold LTO release build at full nproc OOMs the container).
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-8}
 
-# 3+4. Signing: the four BuildKit secrets arrive on the tmpfs /run/secrets
-#      mount (the Makefile writes them there — never argv, never env of the
-#      build container). Decode the keystore and write keystore.properties
-#      to the same tmpfs; the committed gradle signingConfig
-#      (gen/android/app/build.gradle.kts) reads it via
-#      ANDROID_KEYSTORE_PROPERTIES. No secrets ⇒ the debug build.
-secrets_dir=/run/secrets
-have_secrets=0
-if [ -f "$secrets_dir/ANDROID_KEYSTORE_B64" ] \
-    && [ -f "$secrets_dir/ANDROID_KEYSTORE_PASSWORD" ] \
-    && [ -f "$secrets_dir/ANDROID_KEY_ALIAS" ] \
-    && [ -f "$secrets_dir/ANDROID_KEY_PASSWORD" ]; then
-    have_secrets=1
-fi
-
 if [ "$have_secrets" = 1 ]; then
     trap 'rm -f "$secrets_dir/keystore.jks" "$secrets_dir/keystore.properties"' EXIT
     base64 -d < "$secrets_dir/ANDROID_KEYSTORE_B64" > "$secrets_dir/keystore.jks"
@@ -91,19 +136,25 @@ if [ "$have_secrets" = 1 ]; then
     chmod 600 "$secrets_dir/keystore.jks" "$secrets_dir/keystore.properties"
     export ANDROID_KEYSTORE_PROPERTIES="$secrets_dir/keystore.properties"
     kind=release
-    tauri_build_args="--apk --target aarch64 --ci"
     out_name="PeakBot-Mobile-$VERSION-android-arm64.apk"
 else
     kind=debug
-    tauri_build_args="--apk --debug --target aarch64 --ci"
     out_name="PeakBot-Mobile-$VERSION-android-arm64-debug.apk"
 fi
 
-echo "🔨 tauri android build ($kind): npm run tauri -- android build $tauri_build_args -- --locked"
+if [ "$format" = aab ]; then
+    set -- --aab --apk --target aarch64 --ci
+elif [ "$kind" = release ]; then
+    set -- --apk --target aarch64 --ci
+else
+    set -- --apk --debug --target aarch64 --ci
+fi
+
+echo "🔨 tauri android build ($kind, $format, versionCode $version_code): npm run tauri -- android build $* --config <versionCode> -- --locked"
 cd "$root/mobile"
 # `-- --locked`: the extra args after `--` are passed to the cargo runner
 # (cargo-ndk), so the build uses the root workspace lock.
-npm run tauri -- android build $tauri_build_args -- --locked
+npm run tauri -- android build "$@" --config "$cfg" -- --locked
 
 # Tauri 2.12 lays the APK out at outputs/apk/universal/<kind>/app-universal-
 # <kind>.apk (older releases: outputs/apk/<kind>/app-<kind>.apk) — take the
@@ -119,3 +170,24 @@ cp "$apk_src" "$root/output/mobile/$out_name"
 ls -lh "$root/output/mobile/$out_name"
 sh "$root/mobile/scripts/smoke-android.sh" "$root/output/mobile/$out_name"
 echo "✅ $root/output/mobile/$out_name ($kind, smoked)"
+
+if [ "$format" = aab ]; then
+    aab_glob="$root/mobile/src-tauri/gen/android/app/build/outputs/bundle"
+    aab_src=""
+    for f in "$aab_glob"/*Release/*.aab; do aab_src=$f; break; done
+    [ -n "$aab_src" ] && [ -f "$aab_src" ] \
+        || { echo "❌ no AAB found under $aab_glob/*Release" >&2; exit 1; }
+    aab_out="$root/output/mobile/PeakBot-Mobile-$VERSION-android-arm64.aab"
+    cp "$aab_src" "$aab_out"
+    ls -lh "$aab_out"
+    # An AAB is a jar: jarsigner checks the signature (the upload key's
+    # cert is the one the keystore holds; Play re-signs with its app key).
+    # Its "signed in JarFile but not in JarInputStream" notes about every
+    # bundle entry are noise: keep the output for failures only.
+    jar_out=$(jarsigner -verify "$aab_out" 2>&1) \
+        || { printf '%s\n' "$jar_out" | head -n 20 >&2; echo "❌ jarsigner -verify failed on $aab_out" >&2; exit 1; }
+    printf '%s\n' "$jar_out" | grep -qF 'jar verified' \
+        || { printf '%s\n' "$jar_out" | head -n 20 >&2; echo "❌ jarsigner did not report 'jar verified' for $aab_out" >&2; exit 1; }
+    echo "jar verified."
+    echo "✅ $aab_out (release-signed, jarsigner-verified, versionCode $version_code)"
+fi

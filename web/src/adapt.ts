@@ -234,7 +234,9 @@ const FILE_TOOLS = new Set([...FILE_WRITE_TOOLS, "file_read"]);
 /**
  * Derive the list of files the agent touched from a transcript slice (#126).
  * No new backend state — the path lives in each file tool call's `tool_args`
- * JSON. Order is first-touch; `edits` counts write operations (reads don't
+ * JSON. Only file tools' `path` survives server projection (see
+ * project_tool_args in src/ui/web/mod.rs), so this works on the wire data.
+ * Order is first-touch; `edits` counts write operations (reads don't
  * count as edits). `kind` follows created > modified > read. Callers pass the
  * already-scoped message slice, so this doubles as the per-lane Files view.
  */
@@ -427,13 +429,29 @@ function isDelegateCall(m: WireChatMessage): boolean {
  * dropped. Scoped views use flatTree(todosFromMessages(...)) instead.
  */
 export function todoTree(messages: WireChatMessage[]): TodoNode[] {
-  const roster = deriveSubAgentRoster(messages);
+  // Single pass: assign each message to its delegation call, then partition
+  // into per-lane slices. No per-lane full scans — that was the O(lanes × N)
+  // bottleneck (~490k visits on 4k msgs / 40 lanes). Now O(N + lanes).
+  const keyByIndex = assignDelegationCalls(messages);
+  const laneOrder: string[] = [];
+  const laneMessages = new Map<string, WireChatMessage[]>();
+  for (let i = 0; i < messages.length; i++) {
+    const key = keyByIndex.get(i);
+    if (key) {
+      if (!laneMessages.has(key)) {
+        laneMessages.set(key, []);
+        laneOrder.push(key);
+      }
+      laneMessages.get(key)!.push(messages[i]);
+    }
+  }
+
   // No sub-agent activity at all ⇒ nothing to disambiguate: plain unlabeled
   // todos, so a single-agent conversation renders exactly as it did pre-agents
   // (no "Orchestrator" pill on every item). A `delegate` call with no sub-agent
   // turns (empty or malformed delegation) still counts as activity — the
   // orchestrator lane is real once it has delegated.
-  if (roster.length === 0 && !messages.some(isDelegateCall))
+  if (laneOrder.length === 0 && !messages.some(isDelegateCall))
     return flatTree(todosFromMessages(messages));
 
   // One ordered pass: replay the orchestrator lane's todo calls and bind each
@@ -441,7 +459,8 @@ export function todoTree(messages: WireChatMessage[]): TodoNode[] {
   const st = newReplay();
   const parentUidByKey = new Map<string, number>();
   const countByRole = new Map<string, number>();
-  for (const m of messages) {
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
     if (isDelegateCall(m)) {
       let args: { role?: unknown; parent_task_id?: unknown };
       try {
@@ -474,15 +493,19 @@ export function todoTree(messages: WireChatMessage[]): TodoNode[] {
   );
 
   const callsPerRole = new Map<string, number>();
-  for (const r of roster)
-    callsPerRole.set(r.role, (callsPerRole.get(r.role) ?? 0) + 1);
+  for (const key of laneOrder) {
+    const role = key.slice(0, key.lastIndexOf("#"));
+    callsPerRole.set(role, (callsPerRole.get(role) ?? 0) + 1);
+  }
   const unparented: TodoNode[] = [];
-  for (const call of roster) {
-    const lane = viewLabel(call.key, (callsPerRole.get(call.role) ?? 0) > 1);
-    const items = todosFromMessages(
-      filterMessagesByView(messages, call.key),
-    ).map((it) => ({ ...it, lane }));
-    const uid = parentUidByKey.get(call.key);
+  for (const key of laneOrder) {
+    const role = key.slice(0, key.lastIndexOf("#"));
+    const lane = viewLabel(key, (callsPerRole.get(role) ?? 0) > 1);
+    const items = todosFromMessages(laneMessages.get(key)!).map((it) => ({
+      ...it,
+      lane,
+    }));
+    const uid = parentUidByKey.get(key);
     const parent = uid === undefined ? undefined : nodeByUid.get(uid);
     if (parent) parent.children.push(...items);
     else for (const it of items) unparented.push({ item: it, children: [] });

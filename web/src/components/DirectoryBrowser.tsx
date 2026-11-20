@@ -154,6 +154,7 @@ export function DirectoryBrowser({
       {/* Commit bar. */}
       <div className={commitClass}>
         <button
+          data-testid="use-directory"
           onClick={() => commit(browsed ?? cwd)}
           className={commitBtnClass}
         >

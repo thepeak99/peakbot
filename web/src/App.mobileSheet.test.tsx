@@ -342,6 +342,7 @@ const chatShown = (): boolean => tid("chat-back") !== null && tid("chat-list") =
 
 beforeEach(() => {
   desktopWidth = false;
+  setBootEdition(undefined); // module-level edition signal: never leak "local" across tests
   setShell("mobile");
   installMatchMedia();
   vi.stubGlobal("fetch", vi.fn(async () => {
@@ -1309,6 +1310,67 @@ describe("App desktop — option D: the desktop shell is always wide", () => {
     expect(rail, "the desktop drawer rail renders in the desktop shell at any width").not.toBeNull();
     expect(tid("panels-button"), "no phone panels button in the desktop shell").toBeNull();
     expect(panelsDialog(), "no phone sheet in the desktop shell").toBeNull();
+    // The desktop shell has no Chats screen, so no phone ChatHeader (back button);
+    // its <header> is the desktop TopBar.
+    expect(tid("chat-back"), "no phone ChatHeader in the desktop shell").toBeNull();
+  });
+
+  it("a NARROW desktop-shell viewport keeps the desktop composer face ('Type a message…')", async () => {
+    setShell("desktop");
+    hoisted.agent = makeAgent(withTabs());
+    mount();
+    await flush();
+    // data-testid="composer" is the phone face's marker, so the desktop face has none.
+    expect(tid("composer"), "no phone composer face in the desktop shell").toBeNull();
+    const ta = host.querySelector("textarea") as HTMLTextAreaElement;
+    expect(ta, "the composer textarea renders").not.toBeNull();
+    expect(ta!.placeholder, "the desktop placeholder, not the phone's 'Message'").toBe("Type a message…");
+  });
+
+  it("a NARROW desktop-shell viewport keeps the desktop message labels ('You' / 'Shifu')", async () => {
+    await withViewport(async () => {
+      setShell("desktop");
+      hoisted.agent = withRows();
+      mount();
+      await flush();
+      const rows = [...host.querySelectorAll("[data-index]")].map((r) => r.textContent ?? "");
+      expect(rows.length, "rows render").toBe(2);
+      expect(rows.join("|"), "the user row keeps its 'You' label").toContain("You");
+      expect(rows.join("|"), "the agent row keeps its label").toContain("Shifu");
+    });
+  });
+
+  it("crossing the breakpoint DOWN inside the desktop shell never shows the phone layout", async () => {
+    desktopWidth = true;
+    setShell("desktop");
+    hoisted.agent = makeAgent(withTabs());
+    mount();
+    await flush();
+    expect(
+      host.querySelector('aside[aria-label="Side panels"] [role="tablist"]'),
+      "wide desktop shell: the rail",
+    ).not.toBeNull();
+
+    await setDesktop(false);
+    await flush();
+
+    expect(
+      host.querySelector('aside[aria-label="Side panels"] [role="tablist"]'),
+      "the rail survives the shrink",
+    ).not.toBeNull();
+    expect(tid("panels-button"), "no phone panels button after the shrink").toBeNull();
+    expect(panelsDialog(), "no phone sheet after the shrink").toBeNull();
+  });
+
+  it("the BROWSER at the same narrow width still gets the phone layout (regression guard)", async () => {
+    setShell("browser");
+    hoisted.agent = makeAgent(withTabs());
+    mount();
+    await flush();
+    expect(host.querySelector('aside[aria-label="Side panels"]'), "no drawer rail in a browser").toBeNull();
+    expect(tid("panels-button"), "the phone panels button renders in a browser").not.toBeNull();
+  });
+});
 
 // ═══ DIR — the Directory tab (design §4, §7.3) ═════════════════════════
 
@@ -1429,9 +1491,9 @@ describe("App mobile sheet — DIR: the Directory tab", () => {
     agentNow().dirListing = { path: "/other", parent: "/", entries: [], error: null };
     await rerender();
     await flush();
-    const useBtn = panelsDialog()!.querySelector('button');
-    expect(useBtn, "'Use this directory' button").not.toBeNull();
-    click(useBtn!);
+    const useBtn = must("use-directory");
+    expect(useBtn.textContent).toContain("Use this directory");
+    click(useBtn);
     await flush();
     expect(agentNow().send).toHaveBeenCalledWith({ type: "switch_cwd", path: "/other" });
     expect(panelsDialog(), "sheet closes after commit").toBeNull();
@@ -1448,7 +1510,11 @@ describe("App mobile sheet — DIR: the Directory tab", () => {
     );
     mount();
     await flush();
-    expect(tid("bottom-bar")).toBeNull();
+    // The footer is removed in the phone app: cwd is reached via the activity
+    // row 📁 / Directory tab, so no BottomBar and no duplicate CwdPicker.
+    expect(tid("activity-dir"), "cwd stays reachable via the activity row 📁").not.toBeNull();
+    expect(tid("bottom-bar"), "no footer BottomBar in the phone app").toBeNull();
+    expect(tid("cwd-picker"), "no footer CwdPicker duplicating the activity-row 📁").toBeNull();
   });
 
   it("mobile shell ≥lg remote cwd → bottom-bar with cwd picker", async () => {
@@ -1465,67 +1531,6 @@ describe("App mobile sheet — DIR: the Directory tab", () => {
     await flush();
     expect(tid("bottom-bar")).not.toBeNull();
     expect(tid("bottom-bar")!.querySelector('button[title="/srv/remote"]')).not.toBeNull();
-  });
-});
-    // The desktop shell has no Chats screen, so no phone ChatHeader (back button);
-    // its <header> is the desktop TopBar.
-    expect(tid("chat-back"), "no phone ChatHeader in the desktop shell").toBeNull();
-  });
-
-  it("a NARROW desktop-shell viewport keeps the desktop composer face ('Type a message…')", async () => {
-    setShell("desktop");
-    hoisted.agent = makeAgent(withTabs());
-    mount();
-    await flush();
-    // data-testid="composer" is the phone face's marker, so the desktop face has none.
-    expect(tid("composer"), "no phone composer face in the desktop shell").toBeNull();
-    const ta = host.querySelector("textarea") as HTMLTextAreaElement;
-    expect(ta, "the composer textarea renders").not.toBeNull();
-    expect(ta!.placeholder, "the desktop placeholder, not the phone's 'Message'").toBe("Type a message…");
-  });
-
-  it("a NARROW desktop-shell viewport keeps the desktop message labels ('You' / 'Shifu')", async () => {
-    await withViewport(async () => {
-      setShell("desktop");
-      hoisted.agent = withRows();
-      mount();
-      await flush();
-      const rows = [...host.querySelectorAll("[data-index]")].map((r) => r.textContent ?? "");
-      expect(rows.length, "rows render").toBe(2);
-      expect(rows.join("|"), "the user row keeps its 'You' label").toContain("You");
-      expect(rows.join("|"), "the agent row keeps its label").toContain("Shifu");
-    });
-  });
-
-  it("crossing the breakpoint DOWN inside the desktop shell never shows the phone layout", async () => {
-    desktopWidth = true;
-    setShell("desktop");
-    hoisted.agent = makeAgent(withTabs());
-    mount();
-    await flush();
-    expect(
-      host.querySelector('aside[aria-label="Side panels"] [role="tablist"]'),
-      "wide desktop shell: the rail",
-    ).not.toBeNull();
-
-    await setDesktop(false);
-    await flush();
-
-    expect(
-      host.querySelector('aside[aria-label="Side panels"] [role="tablist"]'),
-      "the rail survives the shrink",
-    ).not.toBeNull();
-    expect(tid("panels-button"), "no phone panels button after the shrink").toBeNull();
-    expect(panelsDialog(), "no phone sheet after the shrink").toBeNull();
-  });
-
-  it("the BROWSER at the same narrow width still gets the phone layout (regression guard)", async () => {
-    setShell("browser");
-    hoisted.agent = makeAgent(withTabs());
-    mount();
-    await flush();
-    expect(host.querySelector('aside[aria-label="Side panels"]'), "no drawer rail in a browser").toBeNull();
-    expect(tid("panels-button"), "the phone panels button renders in a browser").not.toBeNull();
   });
 });
 

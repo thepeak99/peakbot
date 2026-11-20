@@ -49,9 +49,6 @@ export function firstLine(content: string | undefined): string {
   return "";
 }
 
-/** Height of the phone day separator: padding-only, inside the measured row. */
-export const DAY_SEPARATOR_PX = 32;
-
 /** Row i opens a new local day: the first row, or a day change from row i-1. */
 export function startsNewDay(messages: WireChatMessage[], i: number): boolean {
   return (

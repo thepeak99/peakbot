@@ -30,7 +30,7 @@ RUN npm run build
 # Stage `builder`: owns the entire cargo build, including the final binary
 # that the scratch stage exports. This stage MUST be referenced by the final
 # `COPY --from=`, otherwise BuildKit will prune it along with the binary.
-FROM ghcr.io/rust-lang/rust:1.91-bookworm AS builder
+FROM rust:1.100.0-bookworm AS builder
 
 # arm64-v8a covers essentially every modern Android phone.
 ARG TARGET=aarch64-linux-android
@@ -103,8 +103,11 @@ COPY build.rs ./
 COPY build/ build/
 COPY --from=web /web/dist ./web/dist
 COPY src/ src/
+COPY crates/ crates/
 
-RUN touch src/main.rs && \
+# Touch ALL workspace .rs sources (not just main.rs) so cargo recompiles the
+# real cloud crate, not the empty stub that was baked into the dep cache.
+RUN find src crates -name '*.rs' -exec touch {} + && \
     cargo ndk -t ${TARGET} build --release
 
 # Export only the binary, named with the release/version + platform suffix so
