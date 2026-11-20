@@ -22,7 +22,7 @@ import { Message } from "./Message";
 import { TranscriptNav } from "./TranscriptNav";
 import { adaptMessage } from "../adapt";
 import type { WireChatMessage } from "../state";
-import { estimateRowHeight, startsNewDay, DAY_SEPARATOR_PX } from "../transcriptRows";
+import { estimateRowHeight, startsNewDay } from "../transcriptRows";
 import { dayLabel } from "../dates";
 import { PIN_THRESHOLD_PX, useTranscriptScroll } from "../useTranscriptScroll";
 
@@ -53,9 +53,11 @@ export function Transcript({ messages, drawerOpen, base = "", phone = false, ref
   const virtualizer = useVirtualizer<HTMLElement, HTMLDivElement>({
     count: messages.length,
     getScrollElement: () => sectionRef.current,
-    estimateSize: (i) =>
-      estimateRowHeight(messages[i]) +
-      (phone && startsNewDay(messages, i) ? DAY_SEPARATOR_PX : 0),
+    // The seed estimate must stay layout-independent: startsNewDay (which calls
+    // Date.parse twice per row) should only be computed at render for the rows
+    // that actually render, not during estimation. The day separator lives
+    // inside the measured row, so a small seed error self-corrects on measure.
+    estimateSize: (i) => estimateRowHeight(messages[i]),
     overscan: 3,
     // A chat grows at the tail: anchor to the end so appends and height
     // corrections above the viewport don't shift the text being read.

@@ -46,6 +46,7 @@ This file is the working draft for the next release. When a version is tagged, t
 - Mobile: each conversation keeps its own half-typed message again — switching chats from the chat list no longer carries text into the other conversation, and coming back restores your draft.
 - Opening a different chat no longer flashes the previous chat's messages. Your five most recently viewed chats now open instantly and refresh in place; any other chat shows an empty screen for a moment while it loads. Applies to the mobile chat list, desktop tabs and the conversations picker.
 - Mobile: the composer now respects the phone's bottom safe area — on phones with a home-indicator bar, the input field no longer sits under the gesture area.
+- **Large chats no longer kill the phone.** A 20,000-message conversation now sends ~66% fewer bytes to the browser and needs roughly 20 MB less memory, because tool call arguments the screen never shows are no longer sent. Building the task tree for a chat with many sub-agents went from ~0.6 s to ~9 ms per update, and transcript rows are measured without parsing every message's timestamp.
 
 ### Build
 

@@ -41,8 +41,10 @@ export interface WireChatMessage {
   content?: string;
   timestamp: string; // ISO 8601
   tool_name?: string;
+  // Survives server projection only for file tools (path), delegate (role,
+  // parent_task_id), and todo (verbatim). See project_tool_args in
+  // src/ui/web/mod.rs.
   tool_args?: string;
-  // Server-side only (stripped per frame by strip_tool_results); SPA renders content.
   call_id?: string;
   compacted?: boolean;
   source?: WireMessageSource;
