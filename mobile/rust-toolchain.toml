@@ -2,7 +2,7 @@
 # RUSTUP_TOOLCHAIN through, and rustup reads this file from cargo's cwd.
 # Android: arm64 for release; x86_64 only for dev emulator APKs (no armv7/i686).
 [toolchain]
-channel = "1.95.0"
+channel = "1.100.0"
 targets = [
   "aarch64-linux-android",
   "x86_64-linux-android",

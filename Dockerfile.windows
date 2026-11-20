@@ -28,7 +28,7 @@ RUN npm run build
 # Stage `builder`: owns the entire cargo build, including the final .exe that
 # the scratch stage exports. This stage MUST be referenced by the final
 # `COPY --from=`, otherwise BuildKit will prune it along with the binary.
-FROM ghcr.io/rust-lang/rust:1.91-bookworm AS builder
+FROM rust:1.100.0-bookworm AS builder
 
 # Windows x86_64, MSVC ABI. Declared as an ARG (and re-declared in the
 # scratch stage — ARG scope is per-stage) so the desktop pipeline's
@@ -105,8 +105,12 @@ COPY build.rs ./
 COPY build/ build/
 COPY --from=web /web/dist ./web/dist
 COPY src/ src/
+COPY crates/ crates/
 
-RUN touch src/main.rs && cargo xwin build --release --locked --target ${TARGET}
+# Touch ALL workspace .rs sources (not just main.rs) so cargo recompiles the
+# real cloud crate, not the empty stub that was baked into the dep cache.
+RUN find src crates -name '*.rs' -exec touch {} + && \
+    cargo xwin build --release --locked --target ${TARGET}
 
 # Stage the .exe under the two names it ships as (same bytes, one build):
 #  peakbot-windows-amd64-msvc.exe        — the desktop sidecar name; the

@@ -381,7 +381,7 @@ async fn genesis(State(s): State<CloudApiState>) -> ApiResult {
     if !first_device {
         return Err(CloudError::Flow(FlowError::NotPendingEmpty).into());
     }
-    let id = h.genesis().await?;
+    let id: DeviceId = h.genesis().await?;
     Ok(Json(json!({ "device_id": hex(&id) })))
 }
 
@@ -392,7 +392,7 @@ async fn devices(State(s): State<CloudApiState>) -> ApiResult {
         CloudState::Active { devices, .. } => {
             let own = h.device_id();
             Ok(Json(json!({
-                "self": own.map(|id| hex(&id)),
+                "self": own.map(|id: DeviceId| hex(&id)),
                 "devices": device_dtos(&devices, own),
             })))
         }
@@ -430,7 +430,7 @@ fn letter_id_from(body: &Bytes) -> Result<LetterId, ApiError> {
 
 async fn approve(State(s): State<CloudApiState>, body: Bytes) -> ApiResult {
     let h = handle(&s)?;
-    let id = h.approve(letter_id_from(&body)?).await?;
+    let id: DeviceId = h.approve(letter_id_from(&body)?).await?;
     Ok(Json(json!({ "device_id": hex(&id) })))
 }
 

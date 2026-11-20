@@ -206,7 +206,7 @@ grep_ok "T20 Dockerfile.desktop-windows exports via FROM scratch" 'FROM scratch'
 # libayatana-appindicator3-dev is installed it must ship with a comment
 # quoting the error it prevents.
 t21_violations=""
-for tok in 'llvm-rc --version' 'rust:1.91-bookworm' 'windows-x86_64.exe'; do
+for tok in 'llvm-rc --version' 'rust:1.100.0-bookworm' 'windows-x86_64.exe'; do
     if grep -qF -- "$tok" "$DFW" 2>/dev/null; then
         t21_violations="${t21_violations} '$tok'"
     fi
@@ -454,8 +454,8 @@ else
 fi
 
 # T43: the image is on trixie (its NSIS 3.11 ships RestartManager.nsh).
-grep_ok "T43 Dockerfile.desktop-windows is FROM ghcr.io/rust-lang/rust:1.91-trixie AS build" \
-    'FROM ghcr.io/rust-lang/rust:1.91-trixie AS build' "$DFW"
+grep_ok "T43 Dockerfile.desktop-windows is FROM rust:1.100.0-trixie AS build" \
+    'FROM rust:1.100.0-trixie AS build' "$DFW"
 
 # T44: NSIS + 7zip installed, the RestartManager.nsh header guard is present,
 # and the @tauri-apps/cli pin EQUALS the pin in Dockerfile.desktop-linux

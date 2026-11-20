@@ -34,7 +34,7 @@ mobile="$root/mobile"
 # brew is not on a non-login ssh PATH: extend for BOTH prefixes
 # (Intel /usr/local, Apple silicon /opt/homebrew) + the pinned node/cargo.
 # ~/.cargo/bin goes FIRST: brew may carry its own `rust` formula (axlotl:
-# 1.99.1) whose cargo ignores rust-toolchain.toml and has no iOS std.
+# 1.100.0) whose cargo ignores rust-toolchain.toml and has no iOS std.
 export PATH="$HOME/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:$HOME/.local/opt/node-v22.23.4-darwin-x64/bin:$PATH"
 # The pinned Xcode (axlotl: 26.3) — xcode-select may point elsewhere.
 export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode-26.3.0.app/Contents/Developer}"

@@ -58,7 +58,7 @@
 #   * no hardcoded team id: `DEVELOPMENT_TEAM` must be empty/placeholder,
 #     never a 10-char [A-Z0-9] id
 #
-# rust-toolchain.toml (guard, GREEN): channel = "1.95.0" + the three
+# rust-toolchain.toml (guard, GREEN): channel = "1.100.0" + the three
 #   apple-ios targets (aarch64-apple-ios, aarch64-apple-ios-sim,
 #   x86_64-apple-ios) — matched with the closing quote so the -sim
 #   entry cannot satisfy the device entry.
@@ -307,7 +307,7 @@ fi
 # The Xcode Rust phase ignores RUSTUP_TOOLCHAIN; rustup reads this file from
 # cargo's cwd. The closing quote in each target string keeps the -sim entry
 # from satisfying the device entry (and vice versa).
-grep_ok "toolchain pins channel = \"1.95.0\"" 'channel = "1.95.0"' "$RT"
+grep_ok "toolchain pins channel = \"1.100.0\"" 'channel = "1.100.0"' "$RT"
 grep_ok "toolchain lists aarch64-apple-ios" '"aarch64-apple-ios",' "$RT"
 grep_ok "toolchain lists aarch64-apple-ios-sim" '"aarch64-apple-ios-sim",' "$RT"
 grep_ok "toolchain lists x86_64-apple-ios" '"x86_64-apple-ios",' "$RT"
