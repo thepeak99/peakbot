@@ -683,3 +683,126 @@ async fn a_pending_phone_cannot_control_the_computer_until_approved() {
         "a clear refusal, never a session: {f}"
     );
 }
+
+/// Opening an EXISTING conversation from the phone must deliver `attached`,
+/// `ready` and — with no further client verb — the conversation's `state`.
+/// This is the SPA's `switchConvo` wire exactly: `attach{convo, profile}` on a
+/// fresh browser socket.
+#[tokio::test]
+async fn reopen_existing_convo_delivers_its_state() {
+    let relay = TestRelay::spawn().await;
+    let (computer, phone) = pair(&relay).await;
+
+    // Create a conversation through the phone's real /ws path.
+    let (mut tab, convo) = attach(&phone, "dev@computer").await;
+    turn(&mut tab, "hello computer").await;
+    tab.close(None).await.ok();
+    drop(tab);
+
+    // Phase A: the PC session is still live → registry.attach shares it.
+    let mut w = ws(&phone).await;
+    send(
+        &mut w,
+        json!({"type":"attach","convo":convo,"profile":"dev@computer"}),
+    )
+    .await;
+    until(&mut w, "attached (live share)", |f| f["type"] == "attached").await;
+    until(&mut w, "ready (live share)", |f| f["type"] == "ready").await;
+    let st = until(&mut w, "state (live share)", |f| f["type"] == "state").await;
+    assert_eq!(st["state"]["conversation"]["id"], convo.as_str());
+    assert!(
+        st["state"]["chat"]["messages"]
+            .as_array()
+            .is_some_and(|m| !m.is_empty()),
+        "a live reopen must carry the transcript: {st}"
+    );
+    w.close(None).await.ok();
+    drop(w);
+
+    // Phase B: end the live session, so the reopen is a disk resume.
+    let (status, body) = computer
+        .post(&format!("/api/conversations/{convo}/kill"), json!({}))
+        .await;
+    assert_eq!(status, 200, "kill: {body}");
+
+    let mut w = ws(&phone).await;
+    send(
+        &mut w,
+        json!({"type":"attach","convo":convo,"profile":"dev@computer"}),
+    )
+    .await;
+    let a = until(&mut w, "attached (resume)", |f| f["type"] == "attached").await;
+    assert_eq!(a["convo"], convo.as_str(), "resume binds the same id");
+    until(&mut w, "ready (resume)", |f| f["type"] == "ready").await;
+    let st = until(&mut w, "state (resume)", |f| f["type"] == "state").await;
+    assert_eq!(st["state"]["conversation"]["id"], convo.as_str());
+    assert!(
+        st["state"]["chat"]["messages"]
+            .as_array()
+            .is_some_and(|m| !m.is_empty()),
+        "a disk resume must carry the transcript: {st}"
+    );
+}
+
+/// A finished non-Attach op must release its mux slot (S4: the stream closes
+/// when BOTH directions end). The SPA polls the list every 4 s through one
+/// long-lived cloud session, so a one-slot-per-poll leak exhausts
+/// `MAX_STREAMS` and every later open — including a conversation Attach — is
+/// served from an unregistered stream id.
+#[tokio::test]
+async fn cloud_session_reclaims_finished_non_attach_streams() {
+    let relay = TestRelay::spawn().await;
+    let (computer, phone) = pair(&relay).await;
+    let device = computer.handle.device_id().expect("id");
+
+    for i in 0..cloud::constants::MAX_STREAMS {
+        let mut s = phone
+            .handle
+            .open(device, Op::List)
+            .await
+            .unwrap_or_else(|e| panic!("open list {i}: {e:?}"));
+        loop {
+            match tokio::time::timeout(WAIT, s.next())
+                .await
+                .unwrap_or_else(|_| panic!("op {i} reply in time"))
+            {
+                Some(StreamMsg::Head { .. } | StreamMsg::Chunk(_)) => {}
+                Some(StreamMsg::End) => break,
+                other => panic!("op {i}: unexpected {other:?}"),
+            }
+        }
+    }
+
+    // The reported wire: opening an existing conversation is an Attach. It
+    // must still be served after MAX_STREAMS completed list polls.
+    let mut s = phone
+        .handle
+        .open(device, Op::Attach)
+        .await
+        .expect("a completed op returns its slot");
+    s.send(StreamMsg::Frame(
+        json!({"type":"attach","profile":"dev","relayed":true}).to_string(),
+    ))
+    .await
+    .expect("attach frame");
+    let mut ready = false;
+    while let Some(msg) = tokio::time::timeout(WAIT, s.next())
+        .await
+        .unwrap_or_else(|_| panic!("attach reply in time after MAX_STREAMS ops"))
+    {
+        match msg {
+            StreamMsg::Frame(f) => {
+                if serde_json::from_str::<Value>(&f).is_ok_and(|v| v["type"] == "ready") {
+                    ready = true;
+                    break;
+                }
+            }
+            StreamMsg::Reset(code) => panic!(
+                "attach reset after {MAX_STREAMS} list polls: {code}",
+                MAX_STREAMS = cloud::constants::MAX_STREAMS
+            ),
+            _ => {}
+        }
+    }
+    assert!(ready, "attach reached the computer after MAX_STREAMS ops");
+}

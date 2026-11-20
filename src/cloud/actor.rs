@@ -1399,7 +1399,9 @@ impl Actor {
                 self.send_reset(ws, o, peer, inner.stream, constants::reset::CANCELLED)
                     .await;
             } else if matches!(inner.msg, StreamMsg::End) {
-                side.ended = true;
+                // A peer half-close, NOT ours: the caller still owes its
+                // `End` when it drops (see `on_out`'s `Gone` arm).
+                side.peer_ended = true;
             }
         }
         for ev in events {
@@ -1437,7 +1439,8 @@ impl Actor {
             StreamSide {
                 to_caller: actor_tx,
                 forward_stop: stop_tx,
-                ended: false,
+                sent_end: false,
+                peer_ended: false,
             },
         );
         self.spawn_forwarder(actor_rx, stop_rx, peer, id);
@@ -1458,60 +1461,34 @@ impl Actor {
     async fn on_out(&mut self, live: &mut Live, ws: &mut Ws, ev: ActorOut) {
         match ev {
             ActorOut::Out { peer, stream, msg } => {
-                let ended = matches!(msg, StreamMsg::End);
-                let Some(s) = live.sessions.get_mut(&peer) else {
-                    return;
-                };
-                let Phase::Open(o) = &mut s.phase else {
-                    return;
-                };
-                if !o.streams.contains_key(&stream) {
-                    return;
-                }
-                let inner = Inner {
-                    stream,
-                    msg: msg.clone(),
-                };
-                // The shared mux tracks BOTH directions, so our own sends
-                // are fed too (an illegal one resets that stream locally).
-                let events = match o.mux.feed(&inner) {
-                    Ok(ev) => ev,
-                    Err(_) => {
-                        if let Some(side) = o.streams.get(&stream) {
-                            let _ = side
-                                .to_caller
-                                .try_send(StreamMsg::Reset(constants::reset::PROTOCOL));
-                        }
-                        self.drop_stream(o, stream);
-                        return;
-                    }
-                };
-                match o.tx.seal(&frames::encode_inner(&inner)) {
-                    Ok(d) => {
-                        if let Some(side) = o.streams.get_mut(&stream).filter(|_| ended) {
-                            side.ended = true;
-                        }
-                        for ev in events {
-                            if let MuxEvent::Closed(id) | MuxEvent::Reset(id, _) = ev {
-                                self.drop_stream(o, id);
-                            }
-                        }
-                        self.send_data(ws, peer, d).await;
-                    }
-                    Err(_) => {
-                        // The record limit: the session is over (§9.6).
-                        self.close_session(live, ws, peer, constants::close_reason::LIMIT)
-                            .await;
-                    }
-                }
+                self.send_out(live, ws, peer, stream, msg).await;
             }
             ActorOut::Gone { peer, stream } => {
-                let ended = {
+                let flags = {
                     let Some(s) = live.sessions.get(&peer) else {
                         return;
                     };
-                    matches!(&s.phase, Phase::Open(o) if o.streams.get(&stream).is_some_and(|side| side.ended))
+                    match &s.phase {
+                        Phase::Open(o) => o
+                            .streams
+                            .get(&stream)
+                            .map(|side| (side.sent_end, side.peer_ended)),
+                        _ => None,
+                    }
                 };
+                let Some((sent_end, peer_ended)) = flags else {
+                    return;
+                };
+                // `End` is a HALF-close (S3/S4). If the peer already ended its
+                // direction, the caller's drop owes OUR `End`; without it the
+                // mux pair never closes and its slot leaks until MAX_STREAMS
+                // (the browser's 4 s list poll would exhaust it). Feeding the
+                // End through the normal path also sends the wire frame and
+                // retires the stream on `MuxEvent::Closed`.
+                if peer_ended && !sent_end {
+                    self.send_out(live, ws, peer, stream, StreamMsg::End).await;
+                    return;
+                }
                 let Some(s) = live.sessions.get_mut(&peer) else {
                     return;
                 };
@@ -1519,12 +1496,68 @@ impl Actor {
                     return;
                 };
                 self.drop_stream(o, stream);
-                if !ended {
-                    // Dropping a CloudStream sends Reset(CANCELLED) (§D.6)
-                    // unless `End` was already exchanged.
+                if !sent_end {
+                    // An early drop (no End either way) cancels the stream (§D.6).
                     self.send_reset(ws, o, peer, stream, constants::reset::CANCELLED)
                         .await;
                 }
+            }
+        }
+    }
+
+    /// Seal + send one caller-originated message through the shared mux.
+    async fn send_out(
+        &mut self,
+        live: &mut Live,
+        ws: &mut Ws,
+        peer: DeviceId,
+        stream: u32,
+        msg: StreamMsg,
+    ) {
+        let sent_end = matches!(msg, StreamMsg::End);
+        let Some(s) = live.sessions.get_mut(&peer) else {
+            return;
+        };
+        let Phase::Open(o) = &mut s.phase else {
+            return;
+        };
+        if !o.streams.contains_key(&stream) {
+            return;
+        }
+        let inner = Inner {
+            stream,
+            msg: msg.clone(),
+        };
+        // The shared mux tracks BOTH directions, so our own sends
+        // are fed too (an illegal one resets that stream locally).
+        let events = match o.mux.feed(&inner) {
+            Ok(ev) => ev,
+            Err(_) => {
+                if let Some(side) = o.streams.get(&stream) {
+                    let _ = side
+                        .to_caller
+                        .try_send(StreamMsg::Reset(constants::reset::PROTOCOL));
+                }
+                self.drop_stream(o, stream);
+                return;
+            }
+        };
+        match o.tx.seal(&frames::encode_inner(&inner)) {
+            Ok(d) => {
+                if let Some(side) = o.streams.get_mut(&stream).filter(|_| sent_end) {
+                    side.sent_end = true;
+                }
+                for ev in events {
+                    if let MuxEvent::Closed(id) | MuxEvent::Reset(id, _) = ev {
+                        self.drop_stream(o, id);
+                    }
+                }
+                self.send_data(ws, peer, d).await;
+            }
+            Err(_) => {
+                // The record limit: the session is over (§9.6).
+                self.close_session(live, ws, peer, constants::close_reason::LIMIT)
+                    .await;
             }
         }
     }
@@ -1754,7 +1787,8 @@ impl Actor {
             StreamSide {
                 to_caller: actor_tx,
                 forward_stop: stop_tx,
-                ended: false,
+                sent_end: false,
+                peer_ended: false,
             },
         );
         self.spawn_forwarder(actor_rx, stop_rx, peer, id);
