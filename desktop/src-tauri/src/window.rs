@@ -7,6 +7,7 @@ use std::sync::{Arc, RwLock};
 use tauri::webview::{NewWindowFeatures, NewWindowResponse};
 use tauri::{AppHandle, Manager, WebviewUrl, WindowEvent};
 use tauri_plugin_opener::OpenerExt;
+use tracing::{warn, error};
 
 use peakbot_desktop_core::controller::Action;
 use peakbot_desktop_core::nav::{NavDecision, classify_navigation};
@@ -46,7 +47,9 @@ pub fn create_main(app: &AppHandle, nav: Arc<RwLock<Option<String>>>) -> tauri::
                         NavDecision::Allow => true,
                         // Other http(s)/mailto: system browser, block in-app.
                         NavDecision::OpenExternal => {
-                            let _ = app.opener().open_url(url.to_string(), None::<&str>);
+                            if let Err(e) = app.opener().open_url(url.to_string(), None::<&str>) {
+                                warn!(err = %e, "failed to open URL in system browser (on_navigation)");
+                            }
                             false
                         }
                         // The reserved restart sentinel: block the
@@ -71,7 +74,9 @@ pub fn create_main(app: &AppHandle, nav: Arc<RwLock<Option<String>>>) -> tauri::
                     // system browser (DESIGN §4.8).
                     match classify_navigation(&url, nav.read().expect("nav poisoned").as_deref()) {
                         NavDecision::Allow | NavDecision::OpenExternal => {
-                            let _ = app.opener().open_url(url.to_string(), None::<&str>);
+                            if let Err(e) = app.opener().open_url(url.to_string(), None::<&str>) {
+                                error!(err = %e, "failed to open URL in system browser (on_new_window)");
+                            }
                         }
                         NavDecision::Restart => {
                             if let Some(tx) = app.try_state::<ActionTx>() {

@@ -358,9 +358,6 @@ async fn get_state(State(s): State<CloudApiState>) -> Result<Json<StateBody>, Ap
 
 async fn login(State(s): State<CloudApiState>) -> ApiResult {
     let h = handle(&s)?;
-    if h.login_in_flight().await {
-        return Err(CloudError::Flow(FlowError::AlreadyLoggedIn).into());
-    }
     let mut auth_url = None;
     h.login(|url| auth_url = Some(url)).await?;
     let url = auth_url.ok_or_else(|| {

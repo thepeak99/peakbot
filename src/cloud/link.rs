@@ -443,18 +443,6 @@ impl CloudHandle {
         }
     }
 
-    /// A login listener is running right now (G.1 step 5). The handle's
-    /// `login` cancels it (design G.1); the API instead refuses with
-    /// `already_logged_in` (H.1) so a double click cannot kill a flow the
-    /// user is completing in the browser (erratum E-F3).
-    pub async fn login_in_flight(&self) -> bool {
-        let mut slot = self.login_task.lock().await;
-        if slot.refresh() {
-            self.set_login_error("login timed out".into());
-        }
-        !matches!(*slot, LoginSlot::Idle)
-    }
-
     /// Logout = `POST /logout` (best effort) + WIPE (seed, token, chain,
     /// pin) → `LoggedOut{SignedOut}` (§G.6).
     pub async fn logout(&self) -> Result<LogoutOutcome, CloudError> {

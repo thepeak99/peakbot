@@ -13,6 +13,7 @@ export const COPY = {
   },
   btn: {
     signIn: "Sign in",
+    openSignInPage: "Open sign-in page",
     makeFirst: "Make this the first device",
     tryAgain: "Try again",
     review: "Review",
