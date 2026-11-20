@@ -87,9 +87,12 @@ prune_between() {
 
 build_sidecar_linux() {
     echo "🐧 Building peakbot sidecar (Dockerfile.linux)..."
+    [ -n "${PERMA_CRYPTO_TOKEN:-}" ] \
+        || { echo "❌ PERMA_CRYPTO_TOKEN is not set — export the read-only git.patchnotes.com token (crates/cloud's private perma-crypto git dep needs it)" >&2; exit 1; }
     mkdir -p output
     "$CONTAINER_BUILDER" build \
         --output type=local,dest=output \
+        --secret id=perma_crypto_token,env=PERMA_CRYPTO_TOKEN \
         -f Dockerfile.linux \
         .
     chmod +x output/peakbot-linux-amd64
@@ -130,9 +133,12 @@ build_desktop_macos() {
 
 build_sidecar_macos() {
     echo "🍎 Building peakbot sidecar (Dockerfile.macos)..."
+    [ -n "${PERMA_CRYPTO_TOKEN:-}" ] \
+        || { echo "❌ PERMA_CRYPTO_TOKEN is not set — export the read-only git.patchnotes.com token (crates/cloud's private perma-crypto git dep needs it)" >&2; exit 1; }
     mkdir -p output
     "$CONTAINER_BUILDER" build \
         --output type=local,dest=output \
+        --secret id=perma_crypto_token,env=PERMA_CRYPTO_TOKEN \
         -f Dockerfile.macos \
         .
     chmod +x output/peakbot-macos-universal2
@@ -141,10 +147,13 @@ build_sidecar_macos() {
 
 build_sidecar_windows() {
     echo "🪟 Building peakbot sidecar (Dockerfile.windows, msvc/cargo-xwin)..."
+    [ -n "${PERMA_CRYPTO_TOKEN:-}" ] \
+        || { echo "❌ PERMA_CRYPTO_TOKEN is not set — export the read-only git.patchnotes.com token (crates/cloud's private perma-crypto git dep needs it)" >&2; exit 1; }
     mkdir -p output
     "$CONTAINER_BUILDER" build \
         --build-arg TARGET=x86_64-pc-windows-msvc \
         --output type=local,dest=output \
+        --secret id=perma_crypto_token,env=PERMA_CRYPTO_TOKEN \
         -f Dockerfile.windows \
         .
     echo "✅ $(ls -lh output/peakbot-windows-amd64-msvc.exe)"
