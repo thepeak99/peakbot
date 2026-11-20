@@ -61,7 +61,7 @@ Dockerfile.desktop-macos
 
 | Component | Single responsibility | Why it exists |
 |---|---|---|
-| `core` crate | All decisions + std-only side-effect implementation behind the `Sys` trait | Unit-testable with plain `cargo test` in CI's `rust:1.95` container — no webkit, no display, no sidecar file (tauri-build *fails* if `externalBin` is missing, so tests must not live in the Tauri crate). |
+| `core` crate | All decisions + std-only side-effect implementation behind the `Sys` trait | Unit-testable with plain `cargo test` in CI's `rust:1.100.0` container — no webkit, no display, no sidecar file (tauri-build *fails* if `externalBin` is missing, so tests must not live in the Tauri crate). |
 | `core::controller` | The startup/mode state machine; owns the session child process | One owner of the child + phase ⇒ no locks, no races. Runs on one dedicated thread. |
 | `core::sys` (`RealSys`) | The only place that spawns processes, opens sockets, sends signals, touches files | Injectable seam; tests use a `FakeSys` with a virtual clock. |
 | `src-tauri` glue | Window(s), navigation guard, tray, native dialogs, 4 IPC commands for the local pages, exit hook | Tauri-specific; deliberately logic-free. |
@@ -744,7 +744,7 @@ labels `Retry`, `Open logs`, `Quit`; click →
 - **`Dockerfile.desktop-linux`:** `FROM ubuntu:22.04`; apt: `build-essential pkg-config
   libwebkit2gtk-4.1-dev libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf
   xdg-utils file xz-utils curl ca-certificates binutils`; Node 22 (nodesource); rustup
-  `--default-toolchain 1.91.0 --profile minimal`. `COPY desktop/ /src/desktop`; `ARG SIDECAR=output/peakbot-linux-amd64`;
+  `--default-toolchain 1.100.0 --profile minimal`. `COPY desktop/ /src/desktop`; `ARG SIDECAR=output/peakbot-linux-amd64`;
   `COPY ${SIDECAR} …/binaries/peakbot-x86_64-unknown-linux-gnu`; `chmod 755`; `sh scripts/check-version.sh`;
   `npx --yes @tauri-apps/cli@2.12.3 build --ci --bundles appimage` (in `src-tauri`, cargo gets `--locked` via
   `-- --locked`); copy to `/out/PeakBot-Desktop-${VERSION}-linux-x86_64.AppImage`;
@@ -758,7 +758,7 @@ labels `Retry`, `Open logs`, `Quit`; click →
   `sh macos/assemble-app.sh ${VERSION} target/universal2-apple-darwin/release/peakbot-desktop src-tauri/binaries/peakbot-aarch64-apple-darwin /out`;
   `RUN sh scripts/smoke-macos.sh /out/PeakBot-Desktop-${VERSION}-macos-universal.zip ${VERSION}`; scratch export.
   (Fallback if zigbuild `universal2` fails with Tauri: the spike recipe — two single-arch builds + `rcodesign macho-universal-create`.)
-- **`Dockerfile.desktop-windows`:** `FROM ghcr.io/rust-lang/rust:1.91-trixie` (trixie, not bookworm:
+- **`Dockerfile.desktop-windows`:** `FROM rust:1.100.0-trixie` (trixie, not bookworm:
   its NSIS 3.11 ships `Include/Win/RestartManager.nsh`, which Tauri's `installer.nsi` includes;
   `Dockerfile.windows` stays on bookworm — the sidecar build has no reason to change). apt:
   `clang lld llvm file nsis 7zip` (xwin C/link + `llvm-rc` for tauri_winres + `llvm-objdump` for
@@ -863,7 +863,7 @@ Note: quit PeakBot (tray **Quit PeakBot** / Cmd+Q) before deleting the app; the 
 | Port race | retry ≤3 on "already in use" | lock/handshake | Backend exits 1 with that message (Researcher) — cheap, deterministic. |
 | Orphan handling | pidfile reaper on next launch | PR_SET_PDEATHSIG | Portable, one mechanism; PDEATHSIG is Linux-only and thread-lifetime-subtle. |
 | Shutdown signals | SIGINT/SIGTERM → graceful shutdown (same pipe) | PDEATHSIG; Windows Job Object | Covers Linux logout and `kill`; crash/SIGKILL is covered by the reaper (R11). |
-| Logic placement | separate `core` crate | `src-tauri/src/core` module | tauri-build fails without the sidecar file and needs webkit; `core` tests run in the existing `rust:1.95` CI container. |
+| Logic placement | separate `core` crate | `src-tauri/src/core` module | tauri-build fails without the sidecar file and needs webkit; `core` tests run in the existing `rust:1.100.0` CI container. |
 | Concurrency | one controller thread + channel | async tasks + Mutex | Child process + phase have one owner; no locks; blocking dialogs are legal there. |
 | Readiness | `GET /commands?token=` 200 | parse stdout URL | Researcher-verified; 401 distinguishes "wrong server/token". |
 | macOS arch | universal zip | per-arch zips | One download; mirrors existing `peakbot-macos-universal2`; zigbuild `universal2` already proven in `Dockerfile.macos`. |

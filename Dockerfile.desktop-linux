@@ -50,9 +50,9 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && rm -rf /var/lib/apt/lists/*
 
 # Rust, pinned. The desktop workspace is edition 2024 (needs >= 1.85); the
-# glue is built with 1.91.0 (the toolchain this branch was developed on).
+# glue is built with 1.100.0 (the toolchain this branch was developed on).
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --profile minimal --default-toolchain 1.91.0
+        | sh -s -- -y --profile minimal --default-toolchain 1.100.0
 ENV PATH="/root/.cargo/bin:${PATH}"
 # Bound parallel codegen: a 32-way release build of the webkit-dependent Tauri
 # stack peaks past what a shared dev host can spare.

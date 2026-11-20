@@ -46,3 +46,13 @@ This file is the working draft for the next release. When a version is tagged, t
 - Mobile: each conversation keeps its own half-typed message again — switching chats from the chat list no longer carries text into the other conversation, and coming back restores your draft.
 - Opening a different chat no longer flashes the previous chat's messages. Your five most recently viewed chats now open instantly and refresh in place; any other chat shows an empty screen for a moment while it loads. Applies to the mobile chat list, desktop tabs and the conversations picker.
 - Mobile: the composer now respects the phone's bottom safe area — on phones with a home-indicator bar, the input field no longer sits under the gesture area.
+
+### Build
+
+- Rust toolchain bumped to 1.100.0 across all release Dockerfiles and CI, fixing container builds of current master (the previous 1.91.0 pin failed to compile the Cloud Mode code).
+## Rust toolchain 1.100.0 bump and container build fix
+
+Rust toolchain bumped from 1.95 to 1.100.0 (latest stable, 2026-11-09) across all release images and CI. The bump required several Rust 1.100.0 type-inference fixes (explicit  annotations in the Cloud API,  annotations in the cloud actor). The container dependency-cache build pattern also needed a fix: the workspace crates (, ) were being built from empty stubs because  didn't include the  directory; now  brings in the real content.
+## Rust toolchain 1.100.0 bump and container build fix
+
+Rust toolchain bumped from 1.95 to 1.100.0 (latest stable, 2026-11-09) across all release images and CI. The bump required several Rust 1.100.0 type-inference fixes (explicit DeviceId annotations in the Cloud API, chain::ChainEntry annotations in the cloud actor). The container dependency-cache build pattern also needed a fix: the workspace crates (crates/cloud, crates/relay) were being built from empty stubs because COPY src/ src/ didn't include the crates/ directory; now COPY crates/ crates/ brings in the real content.
