@@ -16,10 +16,13 @@ use crate::commands::ActionTx;
 
 pub const MAIN_LABEL: &str = "main";
 
-/// Minimum window size: the width matches the web `lg` breakpoint (1024px), so the
-/// window can never fall into the phone layout.
-const MIN_WIDTH: f64 = 1024.0;
-const MIN_HEIGHT: f64 = 600.0;
+/// Minimum window size: small enough that narrow window managers (e.g. Wayland
+/// tiling compositors that ignore the min-size hint) don't clip the content.
+/// The layout decision lives in the SPA (useLayout sets data-layout="desktop"
+/// for this shell regardless of viewport width), so the old lg-breakpoint
+/// constraint no longer applies.
+const MIN_WIDTH: f64 = 480.0;
+const MIN_HEIGHT: f64 = 400.0;
 
 /// The init script that tags this window's origin as the desktop shell. Byte-for-byte
 /// the mobile init-script's `peakbotShell` definition with `"desktop"` in place of
@@ -165,39 +168,33 @@ mod shell_marker_tests {
     }
 }
 
-// ─── window minimum size (option D) ─────────────────────────────────────
+// ─── window minimum size ──────────────────────────────────────────────────
 //
-// The SPA breaks at the 1024px web breakpoint (below it the phone layout
-// renders), so the desktop window must never be resizable into it: the
-// minimum is 1024×600 and the layout is always wide.
-//
-// RED before implementation: MIN_WIDTH / MIN_HEIGHT do not exist yet, so
-// this module fails to compile. `create_main` must size the window through
-// the constants (`.min_inner_size(MIN_WIDTH, MIN_HEIGHT)`).
+// The desktop window must not clip content at narrow widths (Wayland tiling
+// compositors can ignore the min-size hint). A small but sensible minimum
+// keeps the UI usable in tight layouts while allowing the SPA's useLayout
+// logic to pick the correct layout at any width.
 
 #[cfg(test)]
 mod min_size_tests {
     use super::{MIN_HEIGHT, MIN_WIDTH};
 
-    /// The web breakpoint (web/src/App.tsx): below 1024px the SPA renders
-    /// the phone layout, so the window must never be able to shrink there.
-    const WEB_BREAKPOINT_WIDTH: f64 = 1024.0;
-
     #[test]
-    fn min_width_is_1024() {
-        assert_eq!(MIN_WIDTH, 1024.0);
+    fn min_width_is_480() {
+        assert_eq!(MIN_WIDTH, 480.0);
     }
 
     #[test]
-    fn min_height_is_600() {
-        assert_eq!(MIN_HEIGHT, 600.0);
+    fn min_height_is_400() {
+        assert_eq!(MIN_HEIGHT, 400.0);
     }
 
+    /// The minimum width should be large enough that the UI doesn't become
+    /// unusable, but small enough that narrow window managers don't clip content.
     #[test]
-    fn min_width_never_dips_below_the_web_breakpoint() {
-        // const block: clippy denies `assert!` on constant expressions outside one.
+    fn min_width_is_reasonable() {
         const {
-            assert!(MIN_WIDTH >= WEB_BREAKPOINT_WIDTH);
+            assert!(MIN_WIDTH >= 320.0 && MIN_WIDTH <= 640.0);
         }
     }
 }

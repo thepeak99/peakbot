@@ -1,7 +1,7 @@
 // Batch 5 light theme (fix-plan items 5.10/5.11, A41/B34, B35/C18, R1, R4):
 // the phone light-colour remap — pure-white background, sky-400 #0369a1 and
-// emerald-400 #047857 accents — lives in ONE `@media (width < 64rem)` block
-// (64rem = 1024px, so desktop light keeps its tokens, R1) and restores the
+// emerald-400 #047857 accents — lives in `html.light[data-layout="phone"]`
+// (keyed on the unified layout decision, not viewport) and restores the
 // ORIGINAL values inside `[data-testid="settings-view"]` (Settings is
 // untouched, R4).
 //
@@ -9,10 +9,9 @@
 // convoTabBar.css.test.ts — the file is read as TEXT and the declarations
 // are pinned down.
 //
-// RED before implementation: the `@media (width < 64rem)` block does not
-// exist in index.css yet, so the in-block assertions fail on the missing
-// block (feature absent). The two leak guards already pass and must keep
-// passing: the remap must not land anywhere else.
+// The phone layout uses the data-layout attribute (useLayout.ts) rather than
+// a viewport media query, so the remap must live in [data-layout="phone"]
+// rules and never in the global html.light block.
 
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
@@ -23,48 +22,16 @@ const stripped = css.replace(/\/\*[\s\S]*?\*\//g, "");
 
 const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-/** The phone-scoping media query from items 5.10/5.11. */
-const MOBILE_MEDIA = /@media\s*\(\s*width\s*<\s*64rem\s*\)/;
+/** The phone-scoping selector from the unified layout design. */
 
-/** Body of the first block opened by `marker` (brace-matched). */
-function blockAfter(marker: RegExp): string | null {
-  const m = marker.exec(stripped);
-  if (!m) return null;
-  const open = stripped.indexOf("{", m.index);
-  let depth = 0;
-  for (let i = open; i < stripped.length; i++) {
-    if (stripped[i] === "{") depth++;
-    else if (stripped[i] === "}") {
-      depth--;
-      if (depth === 0) return stripped.slice(open + 1, i);
-    }
-  }
-  return null;
-}
-
-/** `stripped` with the first block opened by `marker` removed (with braces). */
-function withoutBlock(marker: RegExp): string {
-  const m = marker.exec(stripped);
-  if (!m) return stripped;
-  const open = stripped.indexOf("{", m.index);
-  let depth = 0;
-  for (let i = open; i < stripped.length; i++) {
-    if (stripped[i] === "{") depth++;
-    else if (stripped[i] === "}") {
-      depth--;
-      if (depth === 0) return stripped.slice(0, m.index) + stripped.slice(i + 1);
-    }
-  }
-  return stripped;
+/** Body of the first rule whose selector is exactly `selector`. */
+function ruleBody(selector: string): string | null {
+  const m = new RegExp(`${esc(selector)}\\s*\\{([^{}]*)\\}`).exec(stripped);
+  return m ? m[1] : null;
 }
 
 /** Body of the first rule whose selector is exactly `selector`, in `scope`.
  *  The boundary accepts `;` so a rule right after an `@import` matches too. */
-function ruleIn(scope: string | null, selector: string): string | null {
-  if (scope === null) return null;
-  const m = new RegExp(`(?:^|[};])\\s*${esc(selector)}\\s*\\{([^{}]*)\\}`).exec(scope);
-  return m ? m[1] : null;
-}
 
 /** Bodies of ALL rules whose selector is exactly `selector`, in `scope`. */
 function rulesIn(scope: string, selector: string): string[] {
@@ -98,33 +65,31 @@ function oklch(v: string | null): { l: string; c: string; h: string } | null {
   return { l, c: m[2], h: m[3] };
 }
 
-describe("index.css — batch 5 mobile light remap (items 5.10/5.11)", () => {
-  const mobileLight = () => blockAfter(MOBILE_MEDIA);
-  const light = () => ruleIn(mobileLight(), "html.light");
-  const settings = () => ruleIn(mobileLight(), 'html.light [data-testid="settings-view"]');
+describe("index.css — phone light remap (items 5.10/5.11)", () => {
+  const phoneLight = () => ruleBody('html.light[data-layout="phone"]');
+  const phoneSettings = () => ruleBody('html.light[data-layout="phone"] [data-testid="settings-view"]');
 
-  it("the remap sits inside @media (width < 64rem), scoped below 1024px (R1)", () => {
-    expect(mobileLight(), "the phone-scoped @media block must exist").not.toBeNull();
-    expect(light(), "the html.light remap must live inside it").not.toBeNull();
+  it("the remap lives in html.light[data-layout=\"phone\"] (unified layout decision)", () => {
+    expect(phoneLight(), "the phone-scoped remap must exist").not.toBeNull();
   });
 
   it("the phone light background is pure white (A41/B34)", () => {
     expect(
-      decl(light(), "--color-zinc-950"),
+      decl(phoneLight(), "--color-zinc-950"),
       "zinc-950 (the app background) remaps to #ffffff on the phone only",
     ).toBe("#ffffff");
   });
 
   it("the phone light accents remap sky-400 → #0369a1 and emerald-400 → #047857 (B35/C18)", () => {
-    expect(decl(light(), "--color-sky-400"), "the mock's light --link").toBe("#0369a1");
-    expect(decl(light(), "--color-emerald-400"), "the mock's light chip/dot green").toBe("#047857");
+    expect(decl(phoneLight(), "--color-sky-400"), "the mock's light --link").toBe("#0369a1");
+    expect(decl(phoneLight(), "--color-emerald-400"), "the mock's light chip/dot green").toBe("#047857");
   });
 
-  it("Settings keeps the original colours: the restore rule sits in the same media block (R4)", () => {
-    const body = settings();
+  it("Settings keeps the original colours: the restore rule is nested under [data-layout=\"phone\"] (R4)", () => {
+    const body = phoneSettings();
     expect(
       body,
-      'html.light [data-testid="settings-view"] must restore the originals inside the media block',
+      'html.light[data-layout="phone"] [data-testid="settings-view"] must restore the originals',
     ).not.toBeNull();
     expect(
       decl(body, "--color-zinc-950"),
@@ -136,9 +101,12 @@ describe("index.css — batch 5 mobile light remap (items 5.10/5.11)", () => {
   });
 });
 
-describe("index.css — the remap never leaks outside the phone media block (R1)", () => {
-  it("no --color-sky-400 / --color-emerald-400 definition outside @media (width < 64rem)", () => {
-    const outside = withoutBlock(MOBILE_MEDIA);
+describe("index.css — the remap never leaks outside [data-layout=\"phone\"] (R1)", () => {
+  it("no --color-sky-400 / --color-emerald-400 definition outside [data-layout=\"phone\"] rules", () => {
+    // Remove the two phone-specific rules
+    const outside = stripped
+      .replace(/html\.light\[data-layout="phone"\]\s*\{[^}]*\}/g, "")
+      .replace(/html\.light\[data-layout="phone"\]\s*\[data-testid="settings-view"\]\s*\{[^}]*\}/g, "");
     expect(
       outside,
       "the sky-400 accent remap must not touch the desktop light theme",

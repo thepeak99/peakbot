@@ -583,8 +583,7 @@ describe("CwdPicker / cwd line per edition", () => {
   });
 
   it("full: the bottom bar keeps the cwd picker (unchanged)", () => {
-    // In mobileChats mode (mobile shell), the bottom bar shows the cwd picker
-    mount(<BottomBar {...bottomBarProps(CWD)} mobileChats />);
+    mount(<BottomBar {...bottomBarProps(CWD)} />);
     expect(host.querySelector(`button[title="${CWD}"]`)).not.toBeNull();
   });
 
@@ -610,7 +609,6 @@ describe("CwdPicker / cwd line per edition", () => {
     mount(
       <BottomBar
         {...bottomBarProps(CWD, { catalog: REMOTE_CATALOG, selection: REMOTE_SEL })}
-        mobileChats
       />,
     );
     expect(

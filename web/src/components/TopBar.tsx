@@ -100,7 +100,7 @@ export function TopBar({
     // Top safe-area (notch / Dynamic Island) clearance; the
     // BottomBar already insets its bottom (pb-[max(0.5rem,env(...))]).
     <header className="relative z-30 flex min-h-14 items-center gap-3 border-b border-zinc-800 bg-zinc-950/80 px-4 py-2 pt-[env(safe-area-inset-top)] backdrop-blur">
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-2 shrink-0">
         <img src="/logo_shifu.png" alt="" className="h-6 w-6 rounded-sm" />
         <span className="font-semibold text-zinc-100">Shifu</span>
       </div>
@@ -146,7 +146,7 @@ export function TopBar({
       </div>
 
       {isRunning && (
-        <span className="flex items-center gap-1.5 text-xs text-amber-400">
+        <span className="flex items-center gap-1.5 text-xs text-amber-400 min-w-0">
           <span className="h-3 w-3 animate-spin rounded-full border-2 border-amber-400 border-t-transparent shrink-0" />
           working…
           {stopPending ? (
@@ -173,7 +173,7 @@ export function TopBar({
           stale sub_agent must not leak once the run has ended. Sky ties it to
           the sub-agent lane color used by the watching banner. */}
       {isRunning && subAgent && (
-        <span className="flex items-center gap-1.5 text-xs text-sky-400">
+        <span className="flex items-center gap-1.5 text-xs text-sky-400 min-w-0 overflow-hidden whitespace-nowrap">
           {subAgent.pause === "running" && (
             <>
               🧩 <span className="font-medium">{subAgent.role}</span>
@@ -190,7 +190,7 @@ export function TopBar({
         </span>
       )}
 
-      <div className="ml-auto flex items-center gap-4 font-mono text-[11px] tabular-nums text-zinc-500">
+      <div className="ml-auto flex items-center gap-4 font-mono text-[11px] tabular-nums text-zinc-500 shrink-0">
         {panels && <PanelsButton {...panels} />}
         <FocusToggle enabled={focusMode} onToggle={onToggleFocus} />
         <ThemeToggle />

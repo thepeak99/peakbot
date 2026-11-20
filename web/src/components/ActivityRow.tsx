@@ -151,7 +151,7 @@ export function ActivityRow({ line, status }: { line: ActivityLine; status?: Pho
   }
 
   return (
-    <div className="lg:mr-12 px-4 pb-2 sm:px-6 md:px-8">
+    <div className="desktop:mr-12 px-4 pb-2 sm:px-6 md:px-8">
       <div
         data-testid="activity-row"
         data-variant="box"
