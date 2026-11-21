@@ -20,9 +20,6 @@ pub struct Oidc {
     http: reqwest::Client,
     /// `{public_url}/oidc/callback` — derived, never configured (design §5.3).
     redirect_uri: String,
-    /// Loopback `http` endpoints are allowed only for loopback deployments
-    /// (tests), mirroring the `public_url` rule (design §5.3).
-    loopback_ok: bool,
 }
 
 impl Oidc {
@@ -32,19 +29,10 @@ impl Oidc {
             .timeout(HTTP_TIMEOUT)
             .build()
             .map_err(|_| OidcError::Other("http client".into()))?;
-        let loopback_ok = origin.starts_with("http://")
-            && matches!(
-                url::Url::parse(origin)
-                    .ok()
-                    .as_ref()
-                    .and_then(|u| u.host_str()),
-                Some("127.0.0.1") | Some("::1") | Some("localhost")
-            );
         Ok(Self {
             issuers,
             http,
             redirect_uri: format!("{origin}/oidc/callback"),
-            loopback_ok,
         })
     }
 
@@ -174,7 +162,8 @@ impl Oidc {
         Ok(doc)
     }
 
-    /// Endpoints must be https; loopback http only for loopback deployments.
+    /// Endpoints must be https; http only on loopback addresses, regardless
+    /// of the relay's public origin scheme.
     fn check_endpoint(&self, name: &str, endpoint: &str) -> Result<(), OidcError> {
         let u = url::Url::parse(endpoint).map_err(|_| OidcError::Discovery(name.into()))?;
         let loopback = matches!(
@@ -183,7 +172,7 @@ impl Oidc {
         );
         match u.scheme() {
             "https" => Ok(()),
-            "http" if loopback && self.loopback_ok => Ok(()),
+            "http" if loopback => Ok(()),
             _ => Err(OidcError::Discovery(name.into())),
         }
     }
