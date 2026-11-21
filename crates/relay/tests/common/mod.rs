@@ -18,6 +18,12 @@
 //! No sleeps: "nothing arrives" is asserted with a sentinel afterwards, and
 //! expiry goes through `sweep_at(t)` (design §9.1, R7: log in with real time,
 //! then `tokio::time::pause()` if a paused clock is needed).
+//!
+//! Shared across multiple integration test binaries; each compiles it
+//! independently and clippy can't see cross-binary usage, so dead-code
+//! analysis is suppressed at the module level (standard for shared test
+//! utilities in Rust workspaces).
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::path::Path;

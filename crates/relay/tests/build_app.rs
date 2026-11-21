@@ -12,8 +12,8 @@
 //!   2. The fingerprint format is `sha256:` + 64 lowercase hex chars
 //!      computed over the CA DER
 //!   3. The CA PEM corresponds to what's served by the example
-//! These cannot be written now without the implementation helper existing;
-//! adding them would produce only an unhelpful compile error.
+//!      (These cannot be written now without the implementation helper
+//!      existing; adding them would produce only an unhelpful compile error.)
 
 mod common;
 use common::*;
