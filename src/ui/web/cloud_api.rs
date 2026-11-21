@@ -123,6 +123,7 @@ impl From<CloudError> for ApiError {
             CloudError::Trust(_) => (StatusCode::CONFLICT, "trust"),
             CloudError::Offline => (StatusCode::GATEWAY_TIMEOUT, "offline"),
             CloudError::UnknownDevice => (StatusCode::NOT_FOUND, "unknown_device"),
+            CloudError::SelfTarget => (StatusCode::BAD_REQUEST, "self_target"),
             CloudError::Reset(c) if *c == cloud::constants::reset::PROTOCOL => {
                 (StatusCode::BAD_GATEWAY, "refused")
             }
@@ -136,6 +137,8 @@ impl From<CloudError> for ApiError {
                 FlowError::ChainBusy => (StatusCode::CONFLICT, "chain_busy"),
                 FlowError::UseLogout => (StatusCode::BAD_REQUEST, "use_logout"),
                 FlowError::LastDevice => (StatusCode::CONFLICT, "last_device"),
+                FlowError::LoginInFlight => (StatusCode::CONFLICT, "login_in_flight"),
+                FlowError::NoLoginPending => (StatusCode::BAD_REQUEST, "no_login_pending"),
             },
         };
         Self::new(status, code, message)
@@ -330,6 +333,7 @@ impl CloudStateDto {
                     TrustError::Fork => "fork",
                     TrustError::Revoked => "revoked",
                     TrustError::ChainInvalid(_) => "chain_invalid",
+                    TrustError::SeedStoreError(_) => "seed_store_error",
                 }
                 .to_string(),
             },
@@ -354,9 +358,6 @@ async fn get_state(State(s): State<CloudApiState>) -> Result<Json<StateBody>, Ap
 
 async fn login(State(s): State<CloudApiState>) -> ApiResult {
     let h = handle(&s)?;
-    if h.login_in_flight().await {
-        return Err(CloudError::Flow(FlowError::AlreadyLoggedIn).into());
-    }
     let mut auth_url = None;
     h.login(|url| auth_url = Some(url)).await?;
     let url = auth_url.ok_or_else(|| {

@@ -52,20 +52,37 @@ export function CloudPane() {
   const view = useCloud();
   const [confirm, setConfirm] = useState<Confirm | null>(null);
   const signout = (): void => setConfirm({ kind: "signout" });
+  // The url of the last sign-in attempt, so the pane can offer a manual link
+  // when the popup is blocked (WebKitGTK/AppImage) and we don't navigate.
+  const [authUrl, setAuthUrl] = useState<string | null>(null);
   const [signInOpened, setSignInOpened] = useState(false);
   const { snapshot, busy, error, error_code } = view;
+  // A `login_in_flight` 409 is a "keep waiting", not an error.
+  const visibleError = error_code === "login_in_flight" ? null : error;
 
   async function signIn(): Promise<void> {
+    setSignInOpened(false);
+    setAuthUrl(null);
     try {
       const res = (await store.act("/api/cloud/login")) as { auth_url?: string } | null;
-      if (res?.auth_url) {
-        // New tab on desktop; same tab on mobile (touch).
-        if (navigator.maxTouchPoints > 0) window.location.assign(res.auth_url);
-        else window.open(res.auth_url, "_blank", "noopener");
-        setSignInOpened(true);
+      const url = res?.auth_url;
+      if (!url) return;
+      setAuthUrl(url);
+      setSignInOpened(true);
+      // One path for desktop and mobile: noopener returns null by spec, so
+      // never pass it — sever `opener` on the handle and navigate in-tab if
+      // the popup was blocked.
+      let w: Window | null = null;
+      try {
+        w = window.open(url, "_blank");
+      } catch {
+        w = null;
       }
+      if (w) w.opener = null;
+      else window.location.assign(url);
     } catch {
-      /* the store holds the message */
+      // The store holds the message; a pending flow just keeps its note.
+      if (store.getSnapshot().error_code === "login_in_flight") setSignInOpened(true);
     }
   }
 
@@ -107,6 +124,18 @@ export function CloudPane() {
           <p>{COPY.loggedOut[snapshot.reason]}</p>
           {signInOpened && (
             <p className="mt-2 text-xs text-zinc-400">{COPY.signInOpened}</p>
+          )}
+          {authUrl && (
+            <p className="mt-1 text-xs">
+              <a
+                className="text-sky-400 underline"
+                href={authUrl}
+                target="_blank"
+                rel="noopener"
+              >
+                {COPY.btn.openSignInPage}
+              </a>
+            </p>
           )}
           <div className="mt-3">
             <button type="button" className={BTN} disabled={busy} onClick={() => void signIn()}>
@@ -313,7 +342,7 @@ export function CloudPane() {
         </SafeDialog>
       )}
       {signOut}
-      {statusLines(snapshot, error, error_code)}
+      {statusLines(snapshot, visibleError, error_code)}
       {body}
     </div>
   );

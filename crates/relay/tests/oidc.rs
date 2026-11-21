@@ -429,3 +429,65 @@ async fn one_time_code_reuse_invalid_grant() {
     let v: serde_json::Value = r2.json().await.unwrap();
     assert_eq!(v["error"].as_str(), Some("invalid_grant"));
 }
+
+// ── P5 (mobile): `app_scheme: sh.shifu.mobile` — the phone's deep-link redirect.
+
+const MOBILE_REDIRECT: &str = "sh.shifu.mobile:/cb";
+
+#[tokio::test]
+async fn app_scheme_login_completes_with_mobile_redirect() {
+    let t = TestRelay::spawn_with_app_scheme("sh.shifu.mobile").await;
+    let flow = t
+        .begin_login(MOBILE_REDIRECT)
+        .await
+        .expect("app-scheme redirect accepted");
+    let cb = t
+        .finish_login(
+            &flow,
+            &Mint {
+                sub: Some("mobile-user".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert_eq!(cb.error, None, "callback ok");
+    let loc = cb
+        .response
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .expect("302 Location")
+        .to_str()
+        .unwrap();
+    assert!(
+        loc.starts_with("sh.shifu.mobile:/cb?"),
+        "redirects to the app scheme: {loc}"
+    );
+    assert_eq!(cb.device_state.as_deref(), Some("dev-state-1"));
+    let code = cb.code.expect("one-time code");
+    let resp = t.get_token(&flow, &code).await;
+    assert_eq!(resp.status(), axum::http::StatusCode::OK, "redeem");
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert!(!v["token"].as_str().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn app_scheme_configured_still_rejects_wrong_scheme() {
+    let t = TestRelay::spawn_with_app_scheme("sh.shifu.mobile").await;
+    for bad in [
+        "com.evil.app:/cb",
+        "sh.shifu.desktop:/cb",
+        "javascript:alert(1)",
+    ] {
+        let resp = match t.begin_login(bad).await {
+            Ok(_) => panic!("redirect_uri {bad} must be rejected"),
+            Err(r) => r,
+        };
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST, "{bad}");
+    }
+}
+
+#[tokio::test]
+async fn app_scheme_configured_still_accepts_loopback() {
+    let t = TestRelay::spawn_with_app_scheme("sh.shifu.mobile").await;
+    assert!(t.begin_login("http://127.0.0.1:9/cb").await.is_ok());
+}

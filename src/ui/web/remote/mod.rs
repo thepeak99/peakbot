@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt;
 use std::io;
-use std::path::Path;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -40,8 +40,9 @@ use url::{Host, Url};
 use uuid::Uuid;
 
 use crate::config::remote::{CaFingerprint, Endpoint, RemoteProfile, Trust};
-use crate::config::resolve::{CatalogEntry, Config, LoadError, ParseCtx, ProfileInfo, RepoMode};
+use crate::config::resolve::{CatalogEntry, Config, ParseCtx, ProfileInfo, Source};
 use crate::image_cache::valid_image_id;
+use crate::paths;
 use crate::ui::wire::ConversationSummaryWire;
 
 pub(super) mod listing;
@@ -517,6 +518,7 @@ pub fn from_cloud(err: &crate::cloud::CloudError, name: &str) -> RemoteError {
         CloudError::UnknownDevice => RemoteError::NotFound {
             name: name.to_string(),
         },
+        CloudError::SelfTarget => cloud_down(name, "that is this device itself"),
         CloudError::Reset(code) => cloud_down(name, &reset_text(*code)),
         CloudError::Io(msg) => cloud_down(name, msg),
         CloudError::Flow(e) => cloud_down(name, &format!("{e:?}")),
@@ -1413,15 +1415,24 @@ impl Directory {
 /// The global config only (repo files never define remotes, §5.11).
 fn load_config() -> Result<Config, RemoteError> {
     let ctx = ParseCtx { known_skills: &[] };
-    Config::load(Path::new("."), RepoMode::Ignore, &ctx).map_err(|e| RemoteError::Config {
-        message: match e {
-            LoadError::Invalid(errors) => crate::config_errors_summary(&errors),
-            LoadError::Missing(path) => format!("{} does not exist", path.display()),
-            LoadError::Legacy(path) => {
-                format!("{}: {}", path.display(), crate::config::resolve::L1_MESSAGE)
-            }
-            LoadError::Io(path, e) => format!("cannot read {}: {e}", path.display()),
-        },
+    // Use the roots config dir (set by tests via paths::init_roots), not the
+    // process cwd, so a fresh parse reads the same file the server booted with.
+    let config_path = paths::config_dir().unwrap_or_else(|| PathBuf::from("."));
+    let global_path = config_path.join("config.yaml");
+    if !global_path.exists() {
+        return Err(RemoteError::Config {
+            message: format!("{} does not exist", global_path.display()),
+        });
+    }
+    let text = std::fs::read_to_string(&global_path).map_err(|e| RemoteError::Config {
+        message: format!("cannot read {}: {e}", global_path.display()),
+    })?;
+    let global = Source {
+        path: &global_path,
+        text: &text,
+    };
+    Config::parse(global, None, &ctx).map_err(|errors| RemoteError::Config {
+        message: crate::config_errors_summary(&errors),
     })
 }
 
@@ -1450,12 +1461,13 @@ pub fn fresh_attach(
 
 /// The unpinned-attach counterpart of [`fresh_attach`]: the remote the
 /// config homes *right now* (a relay-only config has no local session to
-/// mint), plus the fresh catalogue. `None` when the fresh home is local.
+/// mint), plus the fresh catalogue. `None` when the fresh home is local or
+/// there is no home at all (cloud-only config with zero profiles, P5).
 pub fn fresh_home_attach() -> Result<(Option<Arc<RemoteProfile>>, Vec<ProfileInfo>), RemoteError> {
     let cfg = load_config()?;
     let remote = match cfg.catalog.home() {
-        crate::config::resolve::Home::Remote(r) => Some(r),
-        crate::config::resolve::Home::Local(_) => None,
+        Some(crate::config::resolve::Home::Remote(r)) => Some(r),
+        Some(crate::config::resolve::Home::Local(_)) | None => None,
     };
     Ok((remote, cfg.catalog.infos()))
 }

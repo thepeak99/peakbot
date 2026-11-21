@@ -38,9 +38,21 @@ This file is the working draft for the next release. When a version is tagged, t
 ### Cloud Mode
 
 - Cloud: a rejected enrollment now shows as rejected, with a Try again action that sends a fresh enrollment request.
+- **Cloud Mode on the phone (Android and iOS app).**
+  - Sign in through the browser and return to the phone via an app deep link (`sh.shifu.mobile:/cb`).
+  - The phone enrolls as a controller-only device and is approved from an existing device after the 6 words match.
+  - The identity is stored in the Android Keystore or iOS Keychain, with a one-time migration from the old 0600 file.
+  - The phone reconnects when it returns to the foreground and pauses in the background.
+  - The chat picker lists the profiles of your cloud machines (`profile@machine`); a phone with no local profiles shows "No machines yet" and a link to Cloud settings.
+  - The picker retries machines that are temporarily unreachable and refreshes when the app comes back.
+  - Controlling a machine survives that machine restarting (stale sessions are reset instead of hanging).
+  - A dev relay example with a test sign-in page for local end-to-end testing.
 
 ### Fixes
+- **Android: mobile Cloud no longer remains suspended after backgrounding**, which blocked device/conversation loading.
 
+- Fixes Cloud stream-slot leak from list refreshes that eventually prevented opening remote conversations.
+- **Desktop AppImage Cloud sign-in now opens the browser.** If the system browser fails to launch, a manual "Open sign-in page" link appears in the pane as a fallback.
 - Narrow desktop windows (desktop app and browser) keep the desktop layout and no longer get cut off — the phone layout is now only for the phone app and phone browsers (narrow viewport with touch).
 - Phone app no longer shows a duplicate folder picker under the message box for remote profiles — the footer is removed at phone width; the working folder is reached via the activity-row 📁 → Directory tab.
 - **Web tokens with special characters work.** Tokens containing characters like `+`, `&`, `%`, `;` or spaces were rejected by the desktop app and broke links and cookies; the server now accepts correctly encoded tokens, and the links it prints are encoded.

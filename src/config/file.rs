@@ -34,6 +34,9 @@ pub struct ConfigFile {
     #[serde(default)]
     pub mcps: Vec<McpServerConfig>,
     /// REQUIRED ordered map; E2 is checked in `Config::parse`. First = default.
+    /// P5: a phone cloud controller has no profiles of its own — the field
+    /// is optional so a `general.cloud`-only config parses.
+    #[serde(default)]
     pub profiles: Named<ProfileEntry>,
     #[serde(default)]
     pub general: General,

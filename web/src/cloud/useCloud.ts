@@ -21,11 +21,16 @@ export function useCloud(): CloudView {
   );
 }
 
-/** `active.devices`, else `[]` (design §F.2 — the machine-name lookup list). */
-export function useCloudDevices(): Device[] {
+// One shared empty list: a fresh `[]` per render would hand consumers a new
+// identity every time and re-fire any effect/memo keyed on it.
+const NO_DEVICES: readonly Device[] = Object.freeze([]);
+
+/** `active.devices`, else `[]` (design §F.2 — the machine-name lookup list).
+ *  Referentially stable: same snapshot → same array. */
+export function useCloudDevices(): readonly Device[] {
   const view = useCloud();
   if (view.snapshot && view.snapshot.state === "active") {
     return view.snapshot.devices;
   }
-  return [];
+  return NO_DEVICES;
 }

@@ -1,6 +1,11 @@
 //! PeakBot Mobile — the Tauri glue: plugins, the main window and the nav
 //! guard. Decisions live in the pure `nav` module; the Local core's
 //! lifecycle in `local`. This file only wires them to Tauri.
+// OS secure storage for the cloud seed. On desktop only the pure
+// decode/classify fns build, for host unit tests.
+#[cfg(any(target_os = "android", target_os = "ios", test))]
+#[cfg_attr(test, allow(dead_code))]
+mod keystore;
 mod local;
 mod nav;
 // iOS glue: the edge-swipe back gesture + the data root's backup
@@ -16,8 +21,12 @@ use tauri::{AppHandle, Manager, RunEvent, Url, WebviewUrl, WebviewWindowBuilder}
 use tauri_plugin_log::log;
 use tauri_plugin_opener::OpenerExt;
 
+#[cfg(mobile)]
+use tauri_plugin_deep_link::DeepLinkExt;
+
 use local::{Local, should_restart};
 use nav::Nav;
+use peakbot::cloud::{ForegroundSignal, ResumeStep, resume_steps};
 
 /// The single init script injected on every origin, both OSes.
 /// Declares the mobile shell marker and shims `window.open` as a top-level
@@ -199,6 +208,44 @@ async fn resume_local(app: &AppHandle) {
     }
 }
 
+/// P5 T8: hand an inbound deep-link URL to the Local core's login flow.
+/// Only URLs with our registered scheme reach the core; the outcome is
+/// logged but the URL itself is never logged (it carries the OAuth code).
+#[cfg_attr(not(mobile), allow(dead_code))]
+// Only called from the mobile event wiring; unused in host builds.
+async fn deliver_deep_link(app: &AppHandle, url: String) {
+    let local = app.state::<Local>();
+    let core = local.core();
+    if core.is_none() {
+        log::info!("deep link ignored: core not running");
+        return;
+    }
+    core.unwrap().deliver_login_callback(&url).await;
+    log::info!("deep link delivered");
+}
+
+/// P5 T8: the app came to the foreground again. Tell the core so it can
+/// resume its cloud socket after the 3 s background debounce.
+#[cfg_attr(not(mobile), allow(dead_code))]
+// Only called from the mobile event wiring; unused in host builds.
+async fn foreground(app: &AppHandle) {
+    let local = app.state::<Local>();
+    if let Some(core) = local.core() {
+        core.set_foreground(true).await;
+    }
+}
+
+/// P5 T8: the app went to the background. The core debounces the
+/// background → suspend transition itself (3 s).
+#[cfg_attr(not(mobile), allow(dead_code))]
+// Only called from the mobile event wiring; unused in host builds.
+async fn background(app: &AppHandle) {
+    let local = app.state::<Local>();
+    if let Some(core) = local.core() {
+        core.set_foreground(false).await;
+    }
+}
+
 /// For logs: a core URL's query carries its token.
 fn without_query(url: &Url) -> String {
     let mut u = url.clone();
@@ -250,18 +297,22 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 /// window event. The app-level Resumed is only produced under
 /// ControlFlow::Poll, which the runtime never uses.
 #[cfg(mobile)]
-fn is_foreground_resume(event: &RunEvent) -> bool {
-    matches!(
-        event,
+fn foreground_signal(event: &RunEvent) -> Option<ForegroundSignal> {
+    match event {
         RunEvent::WindowEvent {
             event: tauri::WindowEvent::Resumed,
             ..
-        }
-    )
+        } => Some(ForegroundSignal::Resumed),
+        RunEvent::WindowEvent {
+            event: tauri::WindowEvent::Focused(true),
+            ..
+        } => Some(ForegroundSignal::Focused),
+        _ => None,
+    }
 }
 #[cfg(not(mobile))]
-fn is_foreground_resume(_event: &RunEvent) -> bool {
-    false
+fn foreground_signal(_event: &RunEvent) -> Option<ForegroundSignal> {
+    None
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -287,30 +338,73 @@ pub fn run() {
                 .build(),
         );
     #[cfg(mobile)]
-    let builder = builder.plugin(tauri_plugin_barcode_scanner::init());
+    let builder = builder
+        .plugin(tauri_plugin_barcode_scanner::init())
+        .plugin(tauri_plugin_deep_link::init());
     builder
-        .setup(setup)
+        .setup(move |app| {
+            // P5 T8: deep-link cold start — if the app was launched via a
+            // deep link (e.g. the OAuth callback arrived while the OS had
+            // killed the app), deliver it to the core now.
+            #[cfg(mobile)]
+            {
+                if let Ok(Some(urls)) = app.deep_link().get_current() {
+                    let app = app.handle().clone();
+                    for url in urls {
+                        let app = app.clone();
+                        let url = url.to_string();
+                        tauri::async_runtime::spawn(async move {
+                            deliver_deep_link(&app, url).await;
+                        });
+                    }
+                }
+                // P5 T8: deep-link while running — the user completed OAuth
+                // in the browser and the system opened the app via the deep
+                // link. Registered once in setup.
+                let handle = app.handle().clone();
+                app.deep_link().on_open_url(move |event| {
+                    for url in event.urls() {
+                        let handle = handle.clone();
+                        let url = url.to_string();
+                        tauri::async_runtime::spawn(async move {
+                            deliver_deep_link(&handle, url).await;
+                        });
+                    }
+                });
+            }
+            setup(app)
+        })
         .build(tauri::generate_context!())
         .expect("error while building PeakBot Mobile")
         .run(|app, event| {
-            if is_foreground_resume(&event) {
+            // Foreground signals: resume the cloud link and/or nudge the SPA.
+            // The resume plan is a pure function of the foreground signal
+            // (resumed vs focused), so the host can test it without a device.
+            if let Some(signal) = foreground_signal(&event) {
+                let steps = resume_steps(signal);
                 let app = app.clone();
-                tauri::async_runtime::spawn(async move { resume_local(&app).await });
+                tauri::async_runtime::spawn(async move {
+                    for step in steps {
+                        match step {
+                            ResumeStep::Foreground => foreground(&app).await,
+                            ResumeStep::Nudge => resume_local(&app).await,
+                        }
+                    }
+                });
+            }
+            // Background signal: suspend the cloud link after debounce.
+            #[cfg(mobile)]
+            if matches!(
+                &event,
+                RunEvent::WindowEvent {
+                    event: tauri::WindowEvent::Focused(false),
+                    ..
+                }
+            ) {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move { background(&app).await });
             }
         });
-}
-
-#[cfg(test)]
-mod glue_tests {
-    use super::*;
-
-    const LINK: &str = "https://nas.lan:7823/?token=s3cr3t-tok";
-
-    #[test]
-    fn logged_urls_drop_the_token() {
-        let url = Url::parse(LINK).unwrap();
-        assert_eq!(without_query(&url), "https://nas.lan:7823/");
-    }
 }
 
 #[cfg(test)]

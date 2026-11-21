@@ -13,6 +13,7 @@ export const COPY = {
   },
   btn: {
     signIn: "Sign in",
+    openSignInPage: "Open sign-in page",
     makeFirst: "Make this the first device",
     tryAgain: "Try again",
     review: "Review",
@@ -103,6 +104,8 @@ export const COPY = {
     revoked: "This device was revoked by another of your devices.",
     chain_invalid:
       "Cloud trust error: the device history is invalid. Cloud is stopped.",
+    seed_store_error:
+      "This device can't read its secure key storage. Cloud is paused; nothing was reset.",
   },
 
   // D.5 error code → inline message
@@ -122,6 +125,11 @@ export const COPY = {
     refused: "That device refused the request.",
     relay: "The cloud service didn't respond. Try again.",
     network: "Can't reach PeakBot. Try again.",
+  },
+
+  // P5 — cloud picker empty state
+  empty: {
+    noMachines: "No machines yet. Connect one in Settings → Cloud.",
   },
 } as const;
 

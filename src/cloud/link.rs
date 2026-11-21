@@ -36,6 +36,8 @@ pub enum TrustError {
     Fork,
     Revoked,
     ChainInvalid(String),
+    /// The SeedStore failed to read the seed (keystore unavailable).
+    SeedStoreError(String),
 }
 
 /// The state kind, for `CloudError::NotActive` (a state without detail).
@@ -123,6 +125,8 @@ pub enum CloudError {
     Disabled,
     NotActive(CloudStateKind),
     UnknownDevice,
+    /// The target is this device itself: there is no peer to open to.
+    SelfTarget,
     Offline,
     Trust(TrustError),
     Reset(u16),
@@ -144,6 +148,10 @@ pub enum FlowError {
     ChainBusy,
     UseLogout,
     LastDevice,
+    /// P5 E-F3: `login` while a login is already pending (never cancels the first).
+    LoginInFlight,
+    /// P5: `deliver_callback` with no DeepLink login pending.
+    NoLoginPending,
 }
 
 /// Directory slug per device (design F.5 / H.1): `slug(name)` =
@@ -195,6 +203,7 @@ impl std::fmt::Display for CloudError {
             CloudError::Disabled => f.write_str("cloud mode is not configured"),
             CloudError::NotActive(kind) => write!(f, "cloud state is not active: {kind:?}"),
             CloudError::UnknownDevice => f.write_str("unknown device"),
+            CloudError::SelfTarget => f.write_str("the target is this device itself"),
             CloudError::Offline => f.write_str("device offline"),
             CloudError::Trust(e) => write!(f, "trust error: {e:?}"),
             CloudError::Reset(code) => write!(f, "stream reset: {code}"),
@@ -211,6 +220,36 @@ impl std::error::Error for CloudError {}
 pub type InboundHook = Arc<dyn Fn(DeviceId, Op, CloudStream) + Send + Sync>;
 
 /// The caller's handle to the actor (the seam, §D.6).
+/// The pending login, if any (P5 §2).
+enum LoginSlot {
+    Idle,
+    /// Desktop: the loopback listener task.
+    Loopback(tokio::task::JoinHandle<()>),
+    /// Mobile: parked until `deliver_callback` or the deadline.
+    DeepLink {
+        plan: Box<login::LoginPlan>,
+        deadline: tokio::time::Instant,
+    },
+}
+
+impl LoginSlot {
+    /// Drop a finished/expired login; `true` if a deep link just timed out.
+    fn refresh(&mut self) -> bool {
+        let (done, timed_out) = match self {
+            Self::Idle => (false, false),
+            Self::Loopback(t) => (t.is_finished(), false),
+            Self::DeepLink { deadline, .. } => {
+                let late = tokio::time::Instant::now() >= *deadline;
+                (late, late)
+            }
+        };
+        if done {
+            *self = Self::Idle;
+        }
+        timed_out
+    }
+}
+
 #[derive(Clone)]
 pub struct CloudHandle {
     cmd: mpsc::Sender<CloudCmd>,
@@ -222,9 +261,13 @@ pub struct CloudHandle {
     device_id: Option<DeviceId>,
     /// One login listener at a time (G.1 step 5): the only lock, and it's
     /// outside the actor.
-    login_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    login_task: Arc<tokio::sync::Mutex<LoginSlot>>,
+    /// Where the PKCE callback comes from (set at boot).
+    callback: login::CallbackSource,
     /// `last_login_error` of the API state (G.1 step 5).
     last_login_error: Arc<std::sync::Mutex<Option<String>>>,
+    /// P5 T5: pending `Suspend` task (3 s debounce). Aborted on `Resume`.
+    suspend_task: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 /// Actor commands (private; the handle is the only door in).
@@ -262,6 +305,10 @@ pub enum CloudCmd {
         device: DeviceId,
         out: oneshot::Sender<Result<Vec<crate::cloud::session::ProfileInfo>, CloudError>>,
     },
+    /// P5: app backgrounded — close the ws, park reconnect (skeleton: ignored).
+    Suspend,
+    /// P5: app foregrounded — redial now (skeleton: ignored).
+    Resume,
     /// Stop the actor (handle teardown).
     Stop,
 }
@@ -281,42 +328,119 @@ impl CloudHandle {
         if self.state.borrow().kind() != CloudStateKind::LoggedOut {
             return Err(CloudError::Flow(FlowError::AlreadyLoggedIn));
         }
-        if let Some(t) = slot.take() {
-            t.abort();
+        if slot.refresh() {
+            self.set_login_error("login timed out".into());
         }
-        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .map_err(|e| CloudError::Io(e.to_string()))?;
-        let port = tcp
-            .local_addr()
-            .map(|a| a.port())
-            .map_err(|e| CloudError::Io(e.to_string()))?;
-        let redirect_uri = Url::parse(&format!("http://127.0.0.1:{port}/cb"))
-            .map_err(|e| CloudError::Io(e.to_string()))?;
+        // E-F3: a pending login is never cancelled by a second one.
+        if !matches!(*slot, LoginSlot::Idle) {
+            return Err(CloudError::Flow(FlowError::LoginInFlight));
+        }
         let mut rng = actor::Os;
-        let plan = login::plan_login(&self.base, &redirect_uri, &mut rng)?;
-        let auth_url = plan.auth_url.clone();
-        let cmd = self.cmd.clone();
-        let store = self.store.clone();
-        let last_err = self.last_login_error.clone();
-        let base = self.base.clone();
-        *slot = Some(tokio::spawn(async move {
-            login::listener(base, tcp, plan, cmd, store, last_err).await;
-        }));
+        let auth_url = match &self.callback {
+            login::CallbackSource::DeepLink(app) => {
+                let plan = login::plan_login(&self.base, app.url(), &mut rng)?;
+                let auth_url = plan.auth_url.clone();
+                *slot = LoginSlot::DeepLink {
+                    plan: Box::new(plan),
+                    deadline: tokio::time::Instant::now() + login::LOGIN_TIMEOUT,
+                };
+                auth_url
+            }
+            login::CallbackSource::Loopback => {
+                let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .map_err(|e| CloudError::Io(e.to_string()))?;
+                let port = tcp
+                    .local_addr()
+                    .map(|a| a.port())
+                    .map_err(|e| CloudError::Io(e.to_string()))?;
+                let redirect_uri = Url::parse(&format!("http://127.0.0.1:{port}/cb"))
+                    .map_err(|e| CloudError::Io(e.to_string()))?;
+                let plan = login::plan_login(&self.base, &redirect_uri, &mut rng)?;
+                let auth_url = plan.auth_url.clone();
+                let cmd = self.cmd.clone();
+                let store = self.store.clone();
+                let last_err = self.last_login_error.clone();
+                let base = self.base.clone();
+                *slot = LoginSlot::Loopback(tokio::spawn(async move {
+                    login::listener(base, tcp, plan, cmd, store, last_err).await;
+                }));
+                auth_url
+            }
+        };
         open_browser(auth_url);
         Ok(())
     }
 
-    /// A login listener is running right now (G.1 step 5). The handle's
-    /// `login` cancels it (design G.1); the API instead refuses with
-    /// `already_logged_in` (H.1) so a double click cannot kill a flow the
-    /// user is completing in the browser (erratum E-F3).
-    pub async fn login_in_flight(&self) -> bool {
-        self.login_task
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(|t| !t.is_finished())
+    /// P5 T4: hand an inbound deep-link URL to the pending DeepLink login.
+    /// No pending login => `NoLoginPending`; a malformed/foreign link or a
+    /// state mismatch => Err with the slot KEPT (stray link); an IdP
+    /// `error=` or a failed redemption => Err and the slot is freed.
+    pub async fn deliver_callback(&self, url: &str) -> Result<(), CloudError> {
+        let mut slot = self.login_task.lock().await;
+        if slot.refresh() {
+            self.set_login_error("login timed out".into());
+        }
+        let (LoginSlot::DeepLink { plan, .. }, login::CallbackSource::DeepLink(app)) =
+            (&*slot, &self.callback)
+        else {
+            return Err(CloudError::Flow(FlowError::NoLoginPending));
+        };
+        let params = login::parse_deep_link(app.url(), url)?;
+        if !params
+            .get("state")
+            .is_some_and(|s| login::ct_eq(s, &plan.state))
+        {
+            let e = CloudError::Io("callback state mismatch".into());
+            self.set_login_error(e.to_string());
+            return Err(e);
+        }
+        let outcome = match (params.get("error"), params.get("code")) {
+            (Some(err), _) => Err(CloudError::Io(format!("idp error: {err}"))),
+            (None, None) => return Err(CloudError::Io("callback without code".into())),
+            (None, Some(code)) => {
+                login::finish(&self.base, plan, code, &self.cmd, &self.store).await
+            }
+        };
+        *slot = LoginSlot::Idle;
+        match &outcome {
+            Ok(()) => {
+                if let Ok(mut g) = self.last_login_error.lock() {
+                    *g = None;
+                }
+            }
+            Err(e) => self.set_login_error(e.to_string()),
+        }
+        outcome
+    }
+
+    /// P5 T5: app foreground signal; `false` suspends after a 3 s debounce,
+    /// `true` resumes now. Suspend closes the relay socket; Resume redials.
+    pub async fn set_foreground(&self, fg: bool) {
+        if !fg {
+            // Schedule suspend after 3 s debounce, cancellable by a foreground signal.
+            let mut slot = self.suspend_task.lock().unwrap();
+            if slot.is_some() {
+                return; // debounce already running
+            }
+            let cmd = self.cmd.clone();
+            let task = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                let _ = cmd.send(CloudCmd::Suspend).await;
+            });
+            *slot = Some(task);
+        } else {
+            // Cancel any pending suspend, resume immediately.
+            let mut slot = self.suspend_task.lock().unwrap();
+            if let Some(t) = slot.take() {
+                t.abort();
+            }
+            // Fire-and-forget: the actor handles Resume.
+            let cmd = self.cmd.clone();
+            tokio::spawn(async move {
+                let _ = cmd.send(CloudCmd::Resume).await;
+            });
+        }
     }
 
     /// Logout = `POST /logout` (best effort) + WIPE (seed, token, chain,
@@ -340,6 +464,14 @@ impl CloudHandle {
     /// login, cleared by the next successful attempt.
     pub fn last_login_error(&self) -> Option<String> {
         self.last_login_error.lock().ok()?.clone()
+    }
+
+    /// Record a login error for the API state (embedder-side failures, e.g.
+    /// a rejected deep-link callback).
+    pub fn set_login_error(&self, msg: String) {
+        if let Ok(mut g) = self.last_login_error.lock() {
+            *g = Some(msg);
+        }
     }
 
     /// Open a stream to `device` for `op` (§D.5): Active + the peer in
@@ -457,6 +589,19 @@ impl CloudHandle {
     }
 }
 
+/// P5: like [`spawn`] but with the OAuth callback source (desktop = `Loopback`).
+pub fn spawn_with_callback(
+    cfg: CloudConfig,
+    store: Arc<dyn SeedStore>,
+    inbound: Option<InboundHook>,
+    callback: login::CallbackSource,
+) -> CloudHandle {
+    spawn_inner(cfg, store, inbound, callback)
+}
+
+/// Spawn the process-wide actor (p3-design §D.6 / B8). Both editions;
+/// Local passes `inbound = None`. No `general.cloud` ⇒ the caller does not
+/// spawn (state `Disabled` is the config-level absence).
 /// Spawn the process-wide actor (p3-design §D.6 / B8). Both editions;
 /// Local passes `inbound = None`. No `general.cloud` ⇒ the caller does not
 /// spawn (state `Disabled` is the config-level absence).
@@ -464,6 +609,15 @@ pub fn spawn(
     cfg: CloudConfig,
     store: Arc<dyn SeedStore>,
     inbound: Option<InboundHook>,
+) -> CloudHandle {
+    spawn_inner(cfg, store, inbound, login::CallbackSource::Loopback)
+}
+
+pub fn spawn_inner(
+    cfg: CloudConfig,
+    store: Arc<dyn SeedStore>,
+    inbound: Option<InboundHook>,
+    callback: login::CallbackSource,
 ) -> CloudHandle {
     let origin = cfg.relay.origin().clone();
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
@@ -473,8 +627,10 @@ pub fn spawn(
         base: origin.clone(),
         store: store.clone(),
         device_id,
-        login_task: Arc::new(tokio::sync::Mutex::new(None)),
+        login_task: Arc::new(tokio::sync::Mutex::new(LoginSlot::Idle)),
+        callback: callback.clone(),
         last_login_error: Arc::new(std::sync::Mutex::new(None)),
+        suspend_task: Arc::new(std::sync::Mutex::new(None)),
     };
     let id = match load_identity(&cfg, &*store) {
         Ok(id) => id,
@@ -482,7 +638,7 @@ pub fn spawn(
             // spawn() is infallible by the seam: an identity failure is a
             // terminal state and no actor runs (open() then reports Io).
             tracing::error!(error = %e, "cloud identity unavailable");
-            let (_tx, state_rx) = watch::channel(CloudState::Trust(TrustError::ChainInvalid(
+            let (_tx, state_rx) = watch::channel(CloudState::Trust(TrustError::SeedStoreError(
                 format!("identity: {e}"),
             )));
             return handle(state_rx, None);

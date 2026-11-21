@@ -14,6 +14,8 @@ import { EmptyTranscript } from "./components/EmptyTranscript";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { CloudRoot } from "./cloud/CloudRoot";
 import { CLOUD_SETTINGS_EVENT } from "./cloud/openCloud";
+import { useCloudTargets } from "./cloud/targets";
+import { NoMachines } from "./cloud/NoMachines";
 import { BashPanel } from "./components/BashPanel";
 import {
   ComposerSlot,
@@ -93,10 +95,25 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
     commands,
     dirListing,
     recentDirs,
+    noLocal,
     error,
     send,
     switchConvo,
   } = agent;
+
+  // P5 — cloud target picker (design §4). When noLocal is true (zero-local
+  // config), derive cloud targets and either auto-select the first or show
+  // the empty state.
+  const cloudTargets = useCloudTargets();
+  useEffect(() => {
+    if (!noLocal) return;
+    if (cloudTargets.status === "loading") return;
+    if (cloudTargets.rows.length > 0) {
+      // Auto-select the first cloud target (design: deterministic, no
+      // last-used persistence).
+      switchConvo(null, cloudTargets.rows[0].name, undefined, { type: "attach" });
+    }
+  }, [noLocal, connected, cloudTargets, switchConvo]);
 
   // The drop overlay on <main> feeds the active tab's composer slot.
   const activeSlot = useRef<ComposerSlotHandle>(null);
@@ -113,7 +130,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
 
   // Follow the newest message, but only while the user is pinned to the bottom
   // — the transcript owns that now (see `Transcript` + `useTranscriptScroll`).
-  const messageCount = state?.chat.messages.length ?? 0;
+  const messageCount = state?.chat?.messages?.length ?? 0;
   const transcriptRef = useRef<TranscriptHandle>(null);
 
   const notify = useTaskNotifications(isRunning);
@@ -180,7 +197,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   // Sub-agent roster: one entry per delegation call, in call order (Phase 2 +
   // per-call). Zero backend — derived from the transcript. A role delegated to
   // more than once yields several entries; the panel suffixes those "#n".
-  const roster = state ? deriveSubAgentRoster(state.chat.messages) : [];
+  const roster = state ? deriveSubAgentRoster(state.chat?.messages ?? []) : [];
   const multiCall = new Set(
     roster.filter((r) => r.n > 1).map((r) => r.role),
   );
@@ -189,8 +206,9 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
       ? null
       : viewLabel(view, multiCall.has(laneOf(view)));
 
+  const chat = Array.isArray(state?.chat) ? state.chat : (state?.chat?.messages ?? []);
   const visibleMessages = state
-    ? filterMessagesByView(state.chat.messages, view)
+    ? filterMessagesByView(chat, view)
     : [];
 
   // Focus is a transcript-rendering concern only — the side panels keep
@@ -225,7 +243,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
     (edition() !== "local" || isRemote(selection?.profile ?? null, catalog))
       ? welcome.cwd
       : null;
-  const bash = state ? adaptBashPanel(state.bash_panel) : null;
+  const bash = state?.bash_panel ? adaptBashPanel(state.bash_panel) : null;
   // Todos & files derive from the transcript. In the global view todos form a
   // one-level tree: each lane's list labeled by lane, sub-agent todos nested
   // under the orchestrator item they were delegated from (todoTree). A scoped
@@ -233,7 +251,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   // by design.
   const todos =
     state && view === "global"
-      ? todoTree(state.chat.messages)
+      ? todoTree(chat)
       : flatTree(todosFromMessages(visibleMessages));
   const bg = state ? adaptBg(state) : [];
   const context = state ? adaptContext(state) : null;
@@ -530,7 +548,10 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
       )}
 
       <div className="flex min-h-0 flex-1">
-        <DropOverlay onAdd={(f) => activeSlot.current?.add(f)}>
+        {noLocal && cloudTargets.status === "ready" && cloudTargets.rows.length === 0 ? (
+          <NoMachines />
+        ) : (
+          <DropOverlay onAdd={(f) => activeSlot.current?.add(f)}>
           {/* The scope banner is a static bar above the transcript: the
               scrolling element's only child must be the virtualizer's sized
               container, or the row offsets stop matching the scroll offset. */}
@@ -621,6 +642,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
             />
           )}
         </DropOverlay>
+        )}
       </div>
 
    {/* The phone app (mobileChats) drops the footer entirely at phone width —

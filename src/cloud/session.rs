@@ -76,5 +76,9 @@ pub struct StreamSide {
     pub forward_stop: oneshot::Sender<()>,
     /// The caller sent `End` on this direction: a later drop must not
     /// also send `Reset(CANCELLED)`.
-    pub ended: bool,
+    pub sent_end: bool,
+    /// The peer sent `End` on its direction. `End` is a HALF-close (S3/S4):
+    /// when the caller then drops, we still owe our own `End`, or the mux
+    /// pair never closes and its slot leaks until `MAX_STREAMS`.
+    pub peer_ended: bool,
 }

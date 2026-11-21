@@ -7,6 +7,7 @@ use std::sync::{Arc, RwLock};
 use tauri::webview::{NewWindowFeatures, NewWindowResponse};
 use tauri::{AppHandle, Manager, WebviewUrl, WindowEvent};
 use tauri_plugin_opener::OpenerExt;
+use tracing::{error, warn};
 
 use peakbot_desktop_core::controller::Action;
 use peakbot_desktop_core::nav::{NavDecision, classify_navigation};
@@ -33,61 +34,68 @@ pub const SHELL_MARKER_SCRIPT: &str =
 
 /// Create the `main` window on the bundled status page.
 pub fn create_main(app: &AppHandle, nav: Arc<RwLock<Option<String>>>) -> tauri::Result<()> {
-    let win =
-        tauri::WebviewWindowBuilder::new(app, MAIN_LABEL, WebviewUrl::App("index.html".into()))
-            .title("PeakBot")
-            .inner_size(1200.0, 800.0)
-            .min_inner_size(MIN_WIDTH, MIN_HEIGHT)
-            // Tauri re-runs init scripts on every load in this window, so one
-            // call covers the bundled page and the remote :7823 web UI alike.
-            .initialization_script(SHELL_MARKER_SCRIPT)
-            .on_navigation({
-                let app = app.clone();
-                let nav = nav.clone();
-                move |url: &tauri::Url| {
-                    match classify_navigation(url, nav.read().expect("nav poisoned").as_deref()) {
-                        NavDecision::Allow => true,
-                        // Other http(s)/mailto: system browser, block in-app.
-                        NavDecision::OpenExternal => {
-                            let _ = app.opener().open_url(url.to_string(), None::<&str>);
-                            false
-                        }
-                        // The reserved restart sentinel: block the
-                        // navigation; restart only the PeakBot server
-                        // (0.24, spec §8.4).
-                        NavDecision::Restart => {
-                            if let Some(tx) = app.try_state::<ActionTx>() {
-                                let _ = tx.0.send(Action::Restart);
-                            }
-                            false
-                        }
-                        // file:, data:, javascript:, …
-                        NavDecision::Block => false,
+    let win = tauri::WebviewWindowBuilder::new(
+        app,
+        MAIN_LABEL,
+        WebviewUrl::App("index.html".into()),
+    )
+    .title("PeakBot")
+    .inner_size(1200.0, 800.0)
+    .min_inner_size(MIN_WIDTH, MIN_HEIGHT)
+    // Tauri re-runs init scripts on every load in this window, so one
+    // call covers the bundled page and the remote :7823 web UI alike.
+    .initialization_script(SHELL_MARKER_SCRIPT)
+    .on_navigation({
+        let app = app.clone();
+        let nav = nav.clone();
+        move |url: &tauri::Url| {
+            match classify_navigation(url, nav.read().expect("nav poisoned").as_deref()) {
+                NavDecision::Allow => true,
+                // Other http(s)/mailto: system browser, block in-app.
+                NavDecision::OpenExternal => {
+                    if let Err(e) = app.opener().open_url(url.to_string(), None::<&str>) {
+                        warn!(err = %e, "failed to open URL in system browser (on_navigation)");
+                    }
+                    false
+                }
+                // The reserved restart sentinel: block the
+                // navigation; restart only the PeakBot server
+                // (0.24, spec §8.4).
+                NavDecision::Restart => {
+                    if let Some(tx) = app.try_state::<ActionTx>() {
+                        let _ = tx.0.send(Action::Restart);
+                    }
+                    false
+                }
+                // file:, data:, javascript:, …
+                NavDecision::Block => false,
+            }
+        }
+    })
+    .on_new_window({
+        let app = app.clone();
+        let nav = nav.clone();
+        move |url: tauri::Url, _features: NewWindowFeatures| {
+            // Never open an in-app popup; non-blocked URLs go to the
+            // system browser (DESIGN §4.8).
+            match classify_navigation(&url, nav.read().expect("nav poisoned").as_deref()) {
+                NavDecision::Allow | NavDecision::OpenExternal => {
+                    if let Err(e) = app.opener().open_url(url.to_string(), None::<&str>) {
+                        error!(err = %e, "failed to open URL in system browser (on_new_window)");
                     }
                 }
-            })
-            .on_new_window({
-                let app = app.clone();
-                let nav = nav.clone();
-                move |url: tauri::Url, _features: NewWindowFeatures| {
-                    // Never open an in-app popup; non-blocked URLs go to the
-                    // system browser (DESIGN §4.8).
-                    match classify_navigation(&url, nav.read().expect("nav poisoned").as_deref()) {
-                        NavDecision::Allow | NavDecision::OpenExternal => {
-                            let _ = app.opener().open_url(url.to_string(), None::<&str>);
-                        }
-                        NavDecision::Restart => {
-                            if let Some(tx) = app.try_state::<ActionTx>() {
-                                let _ = tx.0.send(Action::Restart);
-                            }
-                        }
-                        // file:, data:, javascript:, …
-                        NavDecision::Block => {}
+                NavDecision::Restart => {
+                    if let Some(tx) = app.try_state::<ActionTx>() {
+                        let _ = tx.0.send(Action::Restart);
                     }
-                    NewWindowResponse::Deny
                 }
-            })
-            .build()?;
+                // file:, data:, javascript:, …
+                NavDecision::Block => {}
+            }
+            NewWindowResponse::Deny
+        }
+    })
+    .build()?;
 
     // Linux: trust PeakBot's CA in the webview for the live backend
     // origin (design #377b §4.5) — macOS keeps WebKit's error page

@@ -12,6 +12,8 @@ pub mod config;
 pub mod enroll;
 pub mod link;
 pub mod login;
+pub mod migrate;
+pub mod resume_plan;
 pub mod session;
 pub mod store;
 pub mod stream;
@@ -21,8 +23,9 @@ pub mod keyring;
 pub use config::{CloudConfig, CloudDef};
 pub use link::{
     CloudError, CloudHandle, CloudState, CloudStateKind, DeviceInfo, EnrollRequestInfo, FlowError,
-    InboundHook, LogoutOutcome, LogoutReason, TrustError, spawn,
+    InboundHook, LogoutOutcome, LogoutReason, TrustError, spawn, spawn_with_callback,
 };
+pub use resume_plan::{ForegroundSignal, ResumeStep, resume_steps};
 pub use store::{Seed, SeedStore, SessionToken};
 
 // ── PR-C boot wiring: the process-wide handle the remote `Directory`

@@ -13,7 +13,7 @@ export type CloudState =
   | { state: "active"; devices: Device[]; requests: EnrollRequest[] }
   | {
       state: "trust";
-      trust_error: "genesis_mismatch" | "fork" | "revoked" | "chain_invalid";
+      trust_error: "genesis_mismatch" | "fork" | "revoked" | "chain_invalid" | "seed_store_error";
     };
 
 export type StateBody = CloudState & { last_login_error: string | null };
@@ -45,7 +45,7 @@ const isStr = (v: unknown): v is string => typeof v === "string";
 const isSix = (v: unknown): v is string[] =>
   Array.isArray(v) && v.length === 6 && v.every(isStr);
 
-const TRUST_ERRORS = ["genesis_mismatch", "fork", "revoked", "chain_invalid"];
+const TRUST_ERRORS = ["genesis_mismatch", "fork", "revoked", "chain_invalid", "seed_store_error"];
 const LOGOUT_REASONS = ["never", "expired", "signed_out"];
 
 function isDevice(v: unknown): v is Device {

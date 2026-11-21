@@ -20,12 +20,22 @@ use std::path::Path;
 pub struct LocalCore {
     router: axum::Router,
     reaper: Option<tokio::task::JoinHandle<()>>,
+    /// This core's own Cloud handle (the process-wide one is set once and
+    /// would go stale across a restart in the same process).
+    cloud: Option<crate::cloud::CloudHandle>,
 }
 
 impl LocalCore {
     /// Boot from `<config root>/config.yaml`; `paths::init_roots` must have
     /// run. `token` guards every route — other apps can reach loopback.
     pub async fn boot(token: String) -> anyhow::Result<LocalCore> {
+        Self::boot_inner(token, None).await
+    }
+
+    async fn boot_inner(
+        token: String,
+        keystore: Option<std::sync::Arc<dyn crate::cloud::SeedStore>>,
+    ) -> anyhow::Result<LocalCore> {
         // A blank token would match a bare `?token=`: the core would be open.
         anyhow::ensure!(!token.trim().is_empty(), "the Local core needs a token");
         let config_dir = crate::paths::config_dir().ok_or_else(|| {
@@ -42,6 +52,7 @@ impl LocalCore {
             WebSession::Ready(deps) => Some(deps.config.clone()),
             WebSession::NeedsSetup { .. } => None,
         };
+        let mut cloud = None;
         let mut ui = web_boot(
             WebBoot {
                 // The port is the embedder's, chosen per serve; this is only
@@ -58,19 +69,36 @@ impl LocalCore {
             session,
         )?;
         if let Some(config) = cloud_config
-            && let Some(handle) = crate::boot::boot_cloud(
-                &config,
-                cloud_state_dir()?,
-                &crate::boot::device_name(),
-                cloud_store(&config)?,
-                None,
-            )
+            && let Some(handle) = {
+                let (store, callback) = match keystore {
+                    Some(ks) => (
+                        migrated_store(ks, cloud_state_dir()?),
+                        crate::cloud::login::CallbackSource::DeepLink(
+                            crate::cloud::login::AppRedirect::mobile(),
+                        ),
+                    ),
+                    None => (
+                        cloud_store(&config)?,
+                        crate::cloud::login::CallbackSource::Loopback,
+                    ),
+                };
+                crate::boot::boot_cloud_with_callback(
+                    &config,
+                    cloud_state_dir()?,
+                    &crate::boot::device_name(),
+                    store,
+                    None,
+                    callback,
+                )
+            }
         {
+            cloud = Some(handle.clone());
             ui = ui.with_cloud(Some(handle));
         }
         Ok(LocalCore {
             router: ui.router(),
             reaper: ui.spawn_reaper(),
+            cloud,
         })
     }
 
@@ -84,6 +112,37 @@ impl LocalCore {
     ) -> impl Future<Output = std::io::Result<()>> + Send + use<> {
         let router = self.router.clone();
         async move { axum::serve(listener, router).await }
+    }
+
+    /// P5 C5: boot with an injected keystore (the phone's OS keystore). The
+    /// given `Arc<dyn SeedStore>` is wrapped in a MigratingSeedStore that
+    /// moves a legacy file seed into it once. A migration error pauses
+    /// Cloud Mode in a visible error state — it never boots a fresh genesis.
+    pub async fn boot_with_store(
+        token: String,
+        keystore: std::sync::Arc<dyn crate::cloud::SeedStore>,
+    ) -> anyhow::Result<LocalCore> {
+        Self::boot_inner(token, Some(keystore)).await
+    }
+
+    /// P5 C2: hand an inbound deep-link URL to the pending DeepLink login.
+    /// Never panics; a failure is stored as the login error.
+    pub async fn deliver_login_callback(&self, url: &str) {
+        let Some(handle) = self.cloud.clone() else {
+            tracing::warn!("login callback with Cloud Mode off");
+            return;
+        };
+        if let Err(e) = handle.deliver_callback(url).await {
+            tracing::warn!(error = %e, "login callback rejected");
+            handle.set_login_error(e.to_string());
+        }
+    }
+
+    /// P5 C3: app foreground signal.
+    pub async fn set_foreground(&self, fg: bool) {
+        if let Some(handle) = self.cloud.clone() {
+            handle.set_foreground(fg).await;
+        }
     }
 }
 
@@ -157,4 +216,51 @@ fn load_session(config_dir: &Path, boot_cwd: &Path) -> anyhow::Result<WebSession
         None,
         None,
     )))
+}
+
+/// Wrap the keystore in the one-shot migration. On a migration error the
+/// store handed to Cloud fails every call, so the actor lands in a visible
+/// `Trust(SeedStoreError)` state and never generates a fresh identity.
+fn migrated_store(
+    keystore: std::sync::Arc<dyn crate::cloud::SeedStore>,
+    dir: std::path::PathBuf,
+) -> std::sync::Arc<dyn crate::cloud::SeedStore> {
+    let legacy = crate::cloud::keyring::FileSeedStore::new(dir);
+    match crate::cloud::migrate::MigratingSeedStore::open(keystore, legacy) {
+        Ok(m) => std::sync::Arc::new(m),
+        Err(e) => {
+            tracing::error!(error = %e, "keystore migration failed; Cloud Mode paused");
+            std::sync::Arc::new(BrokenStore(e.to_string()))
+        }
+    }
+}
+
+/// Every call errors; see [`migrated_store`].
+struct BrokenStore(String);
+
+impl BrokenStore {
+    fn err<T>(&self) -> std::io::Result<T> {
+        Err(std::io::Error::other(self.0.clone()))
+    }
+}
+
+impl crate::cloud::SeedStore for BrokenStore {
+    fn load_seed(&self) -> std::io::Result<Option<crate::cloud::Seed>> {
+        self.err()
+    }
+    fn store_seed(&self, _: &crate::cloud::Seed) -> std::io::Result<()> {
+        self.err()
+    }
+    fn load_token(&self) -> std::io::Result<Option<crate::cloud::SessionToken>> {
+        self.err()
+    }
+    fn store_token(&self, _: &crate::cloud::SessionToken) -> std::io::Result<()> {
+        self.err()
+    }
+    fn clear_token(&self) -> std::io::Result<()> {
+        self.err()
+    }
+    fn wipe(&self) -> std::io::Result<()> {
+        self.err()
+    }
 }

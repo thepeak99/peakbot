@@ -42,6 +42,9 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
+# Dev OIDC harness (examples/dev_relay.rs): FakeIdp signing keys.
+p256 = { version = "0.13", features = ["ecdsa", "ecdh"] }
+rand = "0.9"
 
 [dev-dependencies]
 # Integration-test harness (design §9.1): the harness drives the relay

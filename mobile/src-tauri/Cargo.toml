@@ -17,6 +17,9 @@ tauri-build = { version = "2.7", features = [] }
 tauri = { version = "2.12.4", features = [] }
 tauri-plugin-opener = "2.7"
 tauri-plugin-log = "2.10"
+# Route core `tracing` events to logcat via the `log` crate (tauri_plugin_log
+# already forwards `log` records to logcat). No subscriber is installed here.
+tracing = { version = "0.1", features = ["log"] }
 # The nav guard's URL parsing and the error page's fragment encoding.
 url = "2"
 percent-encoding = "2"
@@ -29,22 +32,32 @@ peakbot = { path = "../..", default-features = false }
 tokio = { version = "1", features = ["net", "io-util", "time", "sync"] }
 getrandom = "0.4"
 anyhow = "1"
+# keystore.rs: the seed is stored base64; decode buffers are zeroized.
+base64 = "0.22"
+zeroize = "1"
 # The core reads `web/dist` from disk in debug builds; a phone has no such
 # path, so the app embeds the SPA in every profile (feature unification).
 rust-embed = { version = "8", features = ["debug-embed"] }
+# generate_context!() requires serde_json to be a direct dependency.
+serde_json = "1"
 
 # QR pairing (CAMERA via the barcode plugin) — mobile targets only.
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
 tauri-plugin-barcode-scanner = "2"
+# P5 T8: OAuth callback arrives as an OS deep link (sh.shifu.mobile:/cb).
+tauri-plugin-deep-link = "2"
+
+# OS secure storage for the cloud seed (P5 T7).
+[target.'cfg(target_os = "android")'.dependencies]
+keyring-core = "=1.0.1"
+android-native-keyring-store = "=1.0.0"
 
 # iOS glue: the WKWebView edge-swipe back gesture + the
 # NSURLIsExcludedFromBackupKey resource value on the data root — the raw
 # Objective-C bridge, iOS only. wry already pulls both crates for iOS; the
 # extra `NSError` feature unlocks NSURL::setResourceValue:forKey:error:.
+# security-framework: the Keychain-backed SeedStore (keystore.rs).
 [target.'cfg(target_os = "ios")'.dependencies]
+security-framework = "=3.7.0"
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSError"] }
-
-[dev-dependencies]
-# The capability tests read the ACL files.
-serde_json = "1"

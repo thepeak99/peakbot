@@ -328,6 +328,10 @@ pub(crate) enum OutboundMessage {
     /// Liveness beat: lets the client tell a dead upstream from a quiet one.
     /// Carries no fields, so a client that predates it ignores it as an unknown type.
     Heartbeat,
+    /// An unpinned web attach on a config with no local profile and no home
+    /// remote: there is nothing to attach to, so no session is minted. The
+    /// socket closes right after. Fieldless, so older clients ignore it.
+    NoLocalProfile,
 }
 
 /// How many recent conversations define "recent". Bounds *relevance*, not

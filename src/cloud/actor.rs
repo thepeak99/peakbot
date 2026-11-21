@@ -113,6 +113,8 @@ enum RunEnd {
     Stopped,
     /// `Cmd::Logout` completed: `LoggedOut{SignedOut}`.
     LoggedOut,
+    /// P5 T5: app backgrounded — park reconnect, keep state.
+    Suspended,
 }
 
 /// This device's identity, derived ONLY from the seed (§C): the keypair
@@ -176,8 +178,15 @@ pub struct Actor {
     seen: letter::ReplaySet,
 }
 
-/// The live (socket-up) phase: everything here dies with the socket,
-/// which keeps "no sessions unless Active" unrepresentable.
+/// Outcome of handling inbound Data for a peer.
+enum DataOutcome {
+    /// Session exists and the frame was handled.
+    Handled,
+    /// No session exists for this peer — send a Close back (MISROUTED).
+    NoSession,
+    /// Session exists but must be closed with this reason.
+    Close(u8),
+}
 struct Live {
     /// `Welcome{pending}`: not in `chain.active` (letters-only mode).
     pending: bool,
@@ -983,11 +992,14 @@ impl Actor {
             PipeMsg::Hs1(h1) => self.on_hs1(live, ws, from, &h1).await,
             PipeMsg::Hs2(h2) => self.on_hs2(live, ws, from, &h2, state).await,
             PipeMsg::Hs3(h3) => self.on_hs3(live, ws, from, &h3, state).await,
-            PipeMsg::Data(d) => {
-                if let Some(reason) = self.on_data(live, ws, from, &d).await {
-                    self.close_session(live, ws, from, reason).await;
+            PipeMsg::Data(d) => match self.on_data(live, ws, from, &d).await {
+                DataOutcome::Handled => {}
+                DataOutcome::NoSession => {
+                    self.send_close(ws, from, d.sid, constants::close_reason::MISROUTED)
+                        .await;
                 }
-            }
+                DataOutcome::Close(reason) => self.close_session(live, ws, from, reason).await,
+            },
             PipeMsg::Close(c) => self.on_close(live, ws, c.sid).await,
         }
     }
@@ -1008,17 +1020,30 @@ impl Actor {
                 .await;
             return;
         }
-        // Tie-break (G.7): the LOWER DeviceId stays initiator.
+        // Tie-break (G.7): the LOWER DeviceId stays initiator. Only a live
+        // race counts — both sides mid-handshake as initiator. A peer that
+        // sends Hs1 while we hold an Open session has lost its side (e.g. a
+        // Suspend clears sessions without `Close`); refusing it would bounce
+        // every request off the stale session forever, so it is dropped
+        // and the peer re-established below.
         let we_win = self.id.id < from
-            && live.sessions.get(&from).is_some_and(|s| {
-                !matches!(&s.phase, Phase::Handshaking(Handshaking::Responder(_)))
-            });
+            && live
+                .sessions
+                .get(&from)
+                .is_some_and(|s| matches!(&s.phase, Phase::Handshaking(Handshaking::Initiator(_))));
         if we_win {
-            // We win (initiator, or established session as initiator):
-            // refuse the duplicate; the peer will respond to OUR Hs1.
+            // We win: refuse the duplicate; the peer will respond to OUR Hs1.
             self.send_close(ws, from, h1.sid, constants::close_reason::PROTOCOL)
                 .await;
             return;
+        }
+        if live
+            .sessions
+            .get(&from)
+            .is_some_and(|s| matches!(s.phase, Phase::Open(_)))
+        {
+            self.close_session(live, ws, from, constants::close_reason::NORMAL)
+                .await;
         }
         // We lose (or no session): become the responder, carrying our
         // queued opens over (they are re-bound once the session opens).
@@ -1297,20 +1322,24 @@ impl Actor {
     }
 
     /// Inbound `Data` for an `Open` session: open → mux → route.
-    /// `Some(reason)` closes the session.
+    /// `NoSession` means the peer is stale (e.g. after restart) — the
+    /// caller sends a Close so the peer fails its request instead of
+    /// hanging. `Close(reason)` means an existing session must be closed.
     async fn on_data(
         &mut self,
         live: &mut Live,
         ws: &mut Ws,
         from: DeviceId,
         d: &Data,
-    ) -> Option<u8> {
-        let s = live.sessions.get_mut(&from)?;
+    ) -> DataOutcome {
+        let Some(s) = live.sessions.get_mut(&from) else {
+            return DataOutcome::NoSession;
+        };
         let Phase::Open(o) = &mut s.phase else {
-            return None;
+            return DataOutcome::Handled;
         };
         match o.rx.open(d) {
-            Ok(RecvOutcome::Dropped) => None,
+            Ok(RecvOutcome::Dropped) => DataOutcome::Handled,
             Ok(RecvOutcome::Inner(inner)) => {
                 let claim = if matches!(&inner.msg, StreamMsg::Open(op) if s.claim.as_ref().is_some_and(|(c, _)| c == op))
                 {
@@ -1321,17 +1350,30 @@ impl Actor {
                 match o.mux.feed(&inner) {
                     Ok(events) => {
                         self.route_inner(ws, from, o, &inner, claim, events).await;
-                        None
+                        DataOutcome::Handled
                     }
                     Err(e) => {
                         if let Some((_, out)) = claim {
                             let _ = out.send(Err(CloudError::Reset(constants::reset::PROTOCOL)));
                         }
-                        Some(reason_for_cloud_err(e))
+                        let known = !matches!(inner.msg, StreamMsg::Open(_))
+                            && o.streams.contains_key(&inner.stream);
+                        if known {
+                            if let Some(side) = o.streams.get(&inner.stream) {
+                                let _ = side
+                                    .to_caller
+                                    .try_send(StreamMsg::Reset(constants::reset::PROTOCOL));
+                            }
+                            self.drop_stream(o, inner.stream);
+                            self.send_reset(ws, o, from, inner.stream, constants::reset::PROTOCOL)
+                                .await;
+                            return DataOutcome::Handled;
+                        }
+                        DataOutcome::Close(reason_for_cloud_err(e))
                     }
                 }
             }
-            Err(e) => Some(reason_for_cloud_err(e)),
+            Err(e) => DataOutcome::Close(reason_for_cloud_err(e)),
         }
     }
 
@@ -1357,7 +1399,9 @@ impl Actor {
                 self.send_reset(ws, o, peer, inner.stream, constants::reset::CANCELLED)
                     .await;
             } else if matches!(inner.msg, StreamMsg::End) {
-                side.ended = true;
+                // A peer half-close, NOT ours: the caller still owes its
+                // `End` when it drops (see `on_out`'s `Gone` arm).
+                side.peer_ended = true;
             }
         }
         for ev in events {
@@ -1395,7 +1439,8 @@ impl Actor {
             StreamSide {
                 to_caller: actor_tx,
                 forward_stop: stop_tx,
-                ended: false,
+                sent_end: false,
+                peer_ended: false,
             },
         );
         self.spawn_forwarder(actor_rx, stop_rx, peer, id);
@@ -1416,60 +1461,34 @@ impl Actor {
     async fn on_out(&mut self, live: &mut Live, ws: &mut Ws, ev: ActorOut) {
         match ev {
             ActorOut::Out { peer, stream, msg } => {
-                let ended = matches!(msg, StreamMsg::End);
-                let Some(s) = live.sessions.get_mut(&peer) else {
-                    return;
-                };
-                let Phase::Open(o) = &mut s.phase else {
-                    return;
-                };
-                if !o.streams.contains_key(&stream) {
-                    return;
-                }
-                let inner = Inner {
-                    stream,
-                    msg: msg.clone(),
-                };
-                // The shared mux tracks BOTH directions, so our own sends
-                // are fed too (an illegal one resets that stream locally).
-                let events = match o.mux.feed(&inner) {
-                    Ok(ev) => ev,
-                    Err(_) => {
-                        if let Some(side) = o.streams.get(&stream) {
-                            let _ = side
-                                .to_caller
-                                .try_send(StreamMsg::Reset(constants::reset::PROTOCOL));
-                        }
-                        self.drop_stream(o, stream);
-                        return;
-                    }
-                };
-                match o.tx.seal(&frames::encode_inner(&inner)) {
-                    Ok(d) => {
-                        if let Some(side) = o.streams.get_mut(&stream).filter(|_| ended) {
-                            side.ended = true;
-                        }
-                        for ev in events {
-                            if let MuxEvent::Closed(id) | MuxEvent::Reset(id, _) = ev {
-                                self.drop_stream(o, id);
-                            }
-                        }
-                        self.send_data(ws, peer, d).await;
-                    }
-                    Err(_) => {
-                        // The record limit: the session is over (§9.6).
-                        self.close_session(live, ws, peer, constants::close_reason::LIMIT)
-                            .await;
-                    }
-                }
+                self.send_out(live, ws, peer, stream, msg).await;
             }
             ActorOut::Gone { peer, stream } => {
-                let ended = {
+                let flags = {
                     let Some(s) = live.sessions.get(&peer) else {
                         return;
                     };
-                    matches!(&s.phase, Phase::Open(o) if o.streams.get(&stream).is_some_and(|side| side.ended))
+                    match &s.phase {
+                        Phase::Open(o) => o
+                            .streams
+                            .get(&stream)
+                            .map(|side| (side.sent_end, side.peer_ended)),
+                        _ => None,
+                    }
                 };
+                let Some((sent_end, peer_ended)) = flags else {
+                    return;
+                };
+                // `End` is a HALF-close (S3/S4). If the peer already ended its
+                // direction, the caller's drop owes OUR `End`; without it the
+                // mux pair never closes and its slot leaks until MAX_STREAMS
+                // (the browser's 4 s list poll would exhaust it). Feeding the
+                // End through the normal path also sends the wire frame and
+                // retires the stream on `MuxEvent::Closed`.
+                if peer_ended && !sent_end {
+                    self.send_out(live, ws, peer, stream, StreamMsg::End).await;
+                    return;
+                }
                 let Some(s) = live.sessions.get_mut(&peer) else {
                     return;
                 };
@@ -1477,12 +1496,68 @@ impl Actor {
                     return;
                 };
                 self.drop_stream(o, stream);
-                if !ended {
-                    // Dropping a CloudStream sends Reset(CANCELLED) (§D.6)
-                    // unless `End` was already exchanged.
+                if !sent_end {
+                    // An early drop (no End either way) cancels the stream (§D.6).
                     self.send_reset(ws, o, peer, stream, constants::reset::CANCELLED)
                         .await;
                 }
+            }
+        }
+    }
+
+    /// Seal + send one caller-originated message through the shared mux.
+    async fn send_out(
+        &mut self,
+        live: &mut Live,
+        ws: &mut Ws,
+        peer: DeviceId,
+        stream: u32,
+        msg: StreamMsg,
+    ) {
+        let sent_end = matches!(msg, StreamMsg::End);
+        let Some(s) = live.sessions.get_mut(&peer) else {
+            return;
+        };
+        let Phase::Open(o) = &mut s.phase else {
+            return;
+        };
+        if !o.streams.contains_key(&stream) {
+            return;
+        }
+        let inner = Inner {
+            stream,
+            msg: msg.clone(),
+        };
+        // The shared mux tracks BOTH directions, so our own sends
+        // are fed too (an illegal one resets that stream locally).
+        let events = match o.mux.feed(&inner) {
+            Ok(ev) => ev,
+            Err(_) => {
+                if let Some(side) = o.streams.get(&stream) {
+                    let _ = side
+                        .to_caller
+                        .try_send(StreamMsg::Reset(constants::reset::PROTOCOL));
+                }
+                self.drop_stream(o, stream);
+                return;
+            }
+        };
+        match o.tx.seal(&frames::encode_inner(&inner)) {
+            Ok(d) => {
+                if let Some(side) = o.streams.get_mut(&stream).filter(|_| sent_end) {
+                    side.sent_end = true;
+                }
+                for ev in events {
+                    if let MuxEvent::Closed(id) | MuxEvent::Reset(id, _) = ev {
+                        self.drop_stream(o, id);
+                    }
+                }
+                self.send_data(ws, peer, d).await;
+            }
+            Err(_) => {
+                // The record limit: the session is over (§9.6).
+                self.close_session(live, ws, peer, constants::close_reason::LIMIT)
+                    .await;
             }
         }
     }
@@ -1616,6 +1691,12 @@ impl Actor {
         op: Op,
         out: oneshot::Sender<Result<CloudStream, CloudError>>,
     ) {
+        // A session to ourselves would send Hs1 through the relay back to
+        // this socket and never complete: refuse it before any handshake.
+        if device == self.id.id {
+            let _ = out.send(Err(CloudError::SelfTarget));
+            return;
+        }
         match live.sessions.get_mut(&device) {
             None => {
                 let Some(chain) = self.chain_cache.clone() else {
@@ -1706,7 +1787,8 @@ impl Actor {
             StreamSide {
                 to_caller: actor_tx,
                 forward_stop: stop_tx,
-                ended: false,
+                sent_end: false,
+                peer_ended: false,
             },
         );
         self.spawn_forwarder(actor_rx, stop_rx, peer, id);
@@ -1990,6 +2072,16 @@ impl Actor {
                 self.do_profiles(live, ws, device, out).await;
                 None
             }
+            CloudCmd::Suspend => {
+                // Close the socket; the run loop will observe it.
+                live.reset_all();
+                Some(RunEnd::Suspended)
+            }
+            CloudCmd::Resume => {
+                // No-op if already connected (the app came to the foreground
+                // but we're already live).
+                None
+            }
             CloudCmd::Stop => Some(RunEnd::Stopped),
         }
     }
@@ -2181,21 +2273,27 @@ impl Actor {
         let (open_tx, open_rx) = oneshot::channel();
         self.start_open(live, ws, device, Op::Profiles, open_tx)
             .await;
-        let mut stream = match open_rx.await {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                let _ = out.send(Err(e));
-                return;
-            }
-            Err(_) => {
-                let _ = out.send(Err(CloudError::Offline));
-                return;
-            }
-        };
-        // The read-reply dance runs OFF the actor loop: while it awaits the
-        // peer's `Head`, the loop must stay free to forward the socket
-        // frames CloudServe answers with (D: one owner, never blocked).
+        // Everything after `start_open` runs OFF the actor loop: with no
+        // live session the open only resolves once the loop reads the
+        // peer's handshake reply (or `Unreachable`), and while it awaits the
+        // peer's `Head` the loop must stay free to forward the socket frames
+        // CloudServe answers with (D: one owner, never blocked). Awaiting
+        // `open_rx` here deadlocked the actor on every cold request.
         tokio::spawn(async move {
+            let opened =
+                tokio::time::timeout(Duration::from_secs(constants::HANDSHAKE_TIMEOUT), open_rx)
+                    .await;
+            let mut stream = match opened {
+                Ok(Ok(Ok(s))) => s,
+                Ok(Ok(Err(e))) => {
+                    let _ = out.send(Err(e));
+                    return;
+                }
+                Ok(Err(_)) | Err(_) => {
+                    let _ = out.send(Err(CloudError::Offline));
+                    return;
+                }
+            };
             // The peer answers `Head, Chunk*, End` (mux S4); a `Reset` is a
             // refusal (a `Close{TRUST}` maps to the PROTOCOL reset code).
             let mut body = Vec::new();
@@ -2564,8 +2662,22 @@ pub async fn run(
         Idle(LogoutReason),
         Trust(TrustError),
         Connecting,
+        Suspended,
     }
-    let mut stage = Stage::Idle(LogoutReason::Never);
+    // A token already in the store (an app restart) means connect at once:
+    // `Idle` waits for a `TokenStored` that only a fresh login sends, so
+    // starting there shows logged-out beside a perfectly good session.
+    let has_token = store_op({
+        let store = actor.store.clone();
+        move || store.load_token()
+    })
+    .await
+    .is_ok_and(|t| t.is_some());
+    let mut stage = if has_token {
+        Stage::Connecting
+    } else {
+        Stage::Idle(LogoutReason::Never)
+    };
     loop {
         match &stage {
             Stage::Idle(reason) => {
@@ -2611,6 +2723,7 @@ pub async fn run(
                         actor.chain_cache = None;
                         let _ = out.send(Ok(LogoutOutcome { revoked: false }));
                     }
+                    CloudCmd::Suspend | CloudCmd::Resume => {} // no-op when logged out
                     CloudCmd::Stop => return,
                 }
             }
@@ -2652,8 +2765,26 @@ pub async fn run(
                         let _ = out.send(Ok(LogoutOutcome { revoked: false }));
                         stage = Stage::Idle(LogoutReason::SignedOut);
                     }
+                    CloudCmd::Suspend | CloudCmd::Resume => {} // no-op in Trust
                     CloudCmd::Stop => return,
                     _ => {}
+                }
+            }
+            Stage::Suspended => {
+                // Parked: wait for Resume or Stop. Enrollment/chain state
+                // is preserved; no reconnect attempts.
+                let Some(cmd) = cmd_rx.recv().await else {
+                    return;
+                };
+                match cmd {
+                    CloudCmd::Resume => {
+                        // Reset backoff and redial immediately.
+                        actor.attempt = 0;
+                        stage = Stage::Connecting;
+                    }
+                    CloudCmd::Suspend => {} // already suspended
+                    CloudCmd::Stop => return,
+                    _ => {} // ignore other commands while suspended
                 }
             }
             Stage::Connecting => {
@@ -2686,6 +2817,19 @@ pub async fn run(
                     }
                     RunEnd::Stopped => return,
                     RunEnd::LoggedOut => stage = Stage::Idle(LogoutReason::SignedOut),
+                    RunEnd::Suspended => {
+                        live.reset_all();
+                        // Socket closed: don't leave a stale Pending/Active
+                        // published while parked (no new state kind).
+                        publish(
+                            &state,
+                            CloudState::Connecting {
+                                attempt: 0,
+                                last_error: Some("suspended".into()),
+                            },
+                        );
+                        stage = Stage::Suspended;
+                    }
                     RunEnd::Dropped(err, reset) => {
                         live.reset_all();
                         if let Some(out) = live.pending_genesis.take() {
@@ -2714,6 +2858,9 @@ pub async fn run(
                             _ = tokio::time::sleep(backoff_delay(actor.attempt)) => {}
                             cmd = cmd_rx.recv() => match cmd {
                                 Some(CloudCmd::Stop) => return,
+                                Some(CloudCmd::Suspend) => {
+                                    stage = Stage::Suspended;
+                                }
                                 Some(CloudCmd::Open { out, .. }) => {
                                     let _ = out.send(Err(CloudError::NotActive(
                                         CloudStateKind::Connecting,
@@ -2752,7 +2899,9 @@ pub async fn run(
                                 _ => {}
                             },
                         }
-                        stage = Stage::Connecting;
+                        if !matches!(stage, Stage::Suspended) {
+                            stage = Stage::Connecting;
+                        }
                     }
                 }
             }

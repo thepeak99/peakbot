@@ -1906,9 +1906,10 @@ fi
 # T75: the cloud crate's private perma-crypto git dep must reach the
 # container builds as a BuildKit secret — mounted on a cargo RUN step in
 # each of the four Dockerfiles, threaded through every Makefile container
-# build (--secret id=perma_crypto_token,env=PERMA_CRYPTO_TOKEN) and
-# release.yml (secret → env + non-empty preflight) — and it must NEVER be
-# passed as a --build-arg (build-args are visible in image history/logs).
+# build (--secret id=perma_crypto_token,env=PERMA_CRYPTO_TOKEN) and the
+# desktop pipeline's sidecar builds (desktop/scripts/build-desktop.sh),
+# and release.yml (secret → env + non-empty preflight) — and it must NEVER
+# be passed as a --build-arg (build-args are visible in image history/logs).
 t75=1; why75=""
 fail75() { t75=0; why75="${why75}${why75:+; }$1"; }
 for df in Dockerfile.linux Dockerfile.windows Dockerfile.macos Dockerfile.android; do
@@ -1929,6 +1930,17 @@ t75_secret_n=$(grep -cF -- '--secret id=perma_crypto_token,env=PERMA_CRYPTO_TOKE
 t75_guard_n=$(grep -cF -- '[ -n "$(PERMA_CRYPTO_TOKEN)" ]' Makefile 2>/dev/null)
 [ "${t75_guard_n:-0}" -eq 8 ] \
     || fail75 "Makefile: expected 8 PERMA_CRYPTO_TOKEN non-empty guards, found ${t75_guard_n:-0}"
+# The desktop pipeline reuses the same Dockerfiles for its sidecar builds, so
+# build-desktop.sh must forward the secret (and fail loudly when it is absent)
+# exactly like the Makefile — otherwise `make desktop-linux` builds the
+# sidecar without the mount and the Dockerfile's secret step fails.
+t75_bd=desktop/scripts/build-desktop.sh
+t75_bd_secret_n=$(grep -cF -- '--secret id=perma_crypto_token,env=PERMA_CRYPTO_TOKEN' "$t75_bd" 2>/dev/null)
+[ "${t75_bd_secret_n:-0}" -eq 3 ] \
+    || fail75 "$t75_bd: expected 3 --secret id=perma_crypto_token,env=PERMA_CRYPTO_TOKEN (linux/macos/windows sidecar), found ${t75_bd_secret_n:-0}"
+t75_bd_guard_n=$(grep -cF -- '[ -n "${PERMA_CRYPTO_TOKEN:-}" ]' "$t75_bd" 2>/dev/null)
+[ "${t75_bd_guard_n:-0}" -eq 3 ] \
+    || fail75 "$t75_bd: expected 3 PERMA_CRYPTO_TOKEN non-empty guards, found ${t75_bd_guard_n:-0}"
 grep -qF 'secrets.PERMA_CRYPTO_TOKEN' "$RY" 2>/dev/null \
     || fail75 "release.yml: no secrets.PERMA_CRYPTO_TOKEN mapping"
 t75_mr_line=$(grep -nF -- 'make release' "$RY" 2>/dev/null | head -n 1 | cut -d: -f1)

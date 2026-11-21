@@ -91,6 +91,7 @@ describe("visibility", () => {
       fork: COPY.banner.fork,
       revoked: COPY.banner.revoked,
       chain_invalid: COPY.banner.chain_invalid,
+      seed_store_error: COPY.banner.seed_store_error,
     };
     for (const [te, copy] of Object.entries(cases)) {
       const el = await withState(trust(te as Parameters<typeof trust>[0]));

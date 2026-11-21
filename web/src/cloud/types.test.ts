@@ -45,7 +45,7 @@ describe("parseStateBody — the six tags round-trip", () => {
   });
 
   it("trust (all four errors)", () => {
-    for (const trust_error of ["genesis_mismatch", "fork", "revoked", "chain_invalid"] as const) {
+    for (const trust_error of ["genesis_mismatch", "fork", "revoked", "chain_invalid", "seed_store_error"] as const) {
       expect(parseStateBody({ state: "trust", trust_error, last_login_error: null }))
         .toEqual({ state: "trust", trust_error, last_login_error: null });
     }

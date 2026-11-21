@@ -148,7 +148,7 @@ async fn state_route_renders_logged_out_dto() {
 }
 
 #[tokio::test]
-async fn login_route_returns_auth_url_second_is_409() {
+async fn login_route_returns_auth_url_second_is_409_login_in_flight() {
     let fake = FakeRelay::spawn().await;
     let dev = spawn_device(1, "Laptop", &fake, None);
     let addr = spawn_app(
@@ -166,11 +166,15 @@ async fn login_route_returns_auth_url_second_is_409() {
         url.as_str().contains("/login?"),
         "the auth url starts the relay's /login flow, got {url}"
     );
-    // A second login while the first listener runs → 409 already_logged_in.
+    // A second login while the first listener runs → 409 login_in_flight.
+    // RED (regression): the API's duplicate precheck masked the handle's
+    // `LoginInFlight` as `already_logged_in`, so the pane showed a red
+    // "Already signed in." mid-flow. Removing the precheck lets the inner
+    // `CloudHandle::login` refusal (link.rs) surface truthfully here.
     let resp = c.post(api(addr, "/api/cloud/login")).send().await.unwrap();
     assert_eq!(resp.status(), 409, "one listener at a time (G.1 step 5)");
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(err_code(&body), "already_logged_in", "{body}");
+    assert_eq!(err_code(&body), "login_in_flight", "{body}");
 
     // Let the first flow finish.
     rig::drive_login(&fake, url).await;

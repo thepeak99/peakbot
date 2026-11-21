@@ -18,6 +18,9 @@ import type { CloudState, StateBody } from "./types";
 
 export type { CloudState, StateBody, Device, EnrollRequest } from "./types";
 
+// Track roots for proper unmount (container.remove() doesn't unmount createRoot).
+const roots = new WeakMap<HTMLDivElement, Root>();
+
 /** Copy the repo's `createRoot` + `act` harness (no testing-library).
  *  Returns the mounted container for `querySelector` assertions. */
 export async function render(element: ReactNode): Promise<HTMLDivElement> {
@@ -28,14 +31,14 @@ export async function render(element: ReactNode): Promise<HTMLDivElement> {
     root = createRoot(container);
     root.render(element);
   });
+  roots.set(container, root!);
   return container;
 }
 
 /** Unmount a container produced by `render`. */
 export async function unmount(container: HTMLDivElement): Promise<void> {
   await act(async () => {
-    // `createRoot` has no unmount on the node; the container's root is torn
-    // down by React when the container leaves the DOM.
+    roots.get(container)?.unmount();
     container.remove();
   });
 }
@@ -210,5 +213,5 @@ export const request = (over: Partial<TestEnrollRequest> = {}): TestEnrollReques
 });
 
 export const trust = (
-  trust_error: "genesis_mismatch" | "fork" | "revoked" | "chain_invalid" = "fork",
+  trust_error: "genesis_mismatch" | "fork" | "revoked" | "chain_invalid" | "seed_store_error" = "fork",
 ): StateBody => snapshot({ state: "trust", trust_error });

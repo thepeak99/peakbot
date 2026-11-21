@@ -47,7 +47,7 @@ fn parse(yaml: &str) -> Config {
 fn home_is_first_local_even_when_a_remote_is_listed_first() {
     let home = parse(REMOTE_FIRST_THEN_LOCAL).catalog.home();
     match home {
-        Home::Local(bound) => {
+        Some(Home::Local(bound)) => {
             assert_eq!(bound.profile.name, "dev", "the local profile is the home");
             assert_eq!(
                 bound.agent().main.name,
@@ -55,12 +55,13 @@ fn home_is_first_local_even_when_a_remote_is_listed_first() {
                 "the home binds the local profile's first agent"
             );
         }
-        Home::Remote(remote) => {
+        Some(Home::Remote(remote)) => {
             panic!(
                 "a catalog with a local profile homes local, got remote '{}'",
                 remote.name
             )
         }
+        None => panic!("catalog with local profile should have a home"),
     }
 }
 
@@ -70,13 +71,14 @@ fn home_is_first_local_even_when_a_remote_is_listed_first() {
 fn relay_only_home_is_the_first_remote() {
     let home = parse(RELAY_ONLY).catalog.home();
     match home {
-        Home::Local(bound) => panic!(
+        Some(Home::Local(bound)) => panic!(
             "a relay-only catalog homes a remote, got local '{}'",
             bound.profile.name
         ),
-        Home::Remote(remote) => {
+        Some(Home::Remote(remote)) => {
             assert_eq!(remote.name, "dev on nas", "the first remote is the home");
         }
+        None => panic!("relay-only catalog should have a remote home"),
     }
 }
 
@@ -104,7 +106,7 @@ fn default_bound_is_first_local_when_a_remote_is_listed_first() {
 #[test]
 fn home_remote_carries_the_remote_profile() {
     let home = parse(RELAY_ONLY).catalog.home();
-    let Home::Remote(remote) = home else {
+    let Some(Home::Remote(remote)) = home else {
         panic!("relay-only catalog homes the remote");
     };
     let _name: &String = &remote.name;

@@ -28,7 +28,7 @@ pub struct Local {
 }
 
 struct Running {
-    core: LocalCore,
+    core: std::sync::Arc<LocalCore>,
     port: u16,
     token: String,
     serve: JoinHandle<io::Result<()>>,
@@ -42,6 +42,12 @@ impl Local {
 
     pub fn is_running(&self) -> bool {
         self.lock().is_some()
+    }
+
+    /// P5 T8: the running core, if any — for deep-link delivery and
+    /// foreground signal forwarding.
+    pub fn core(&self) -> Option<std::sync::Arc<LocalCore>> {
+        self.lock().as_ref().map(|r| r.core.clone())
     }
 
     /// Start the core if it isn't running (re-serving it if its listener
@@ -108,7 +114,13 @@ impl Local {
         let listener = bind(preferred)?;
         let port = listener.local_addr()?.port();
         let token = new_token()?;
-        let core = LocalCore::boot(token.clone()).await?;
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let core = {
+            let store = crate::keystore::new_store()?;
+            std::sync::Arc::new(LocalCore::boot_with_store(token.clone(), store).await?)
+        };
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let core = std::sync::Arc::new(LocalCore::boot(token.clone()).await?);
         let serve = async_runtime::spawn(core.serve(listener));
         let running = Running {
             core,

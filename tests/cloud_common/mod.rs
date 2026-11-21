@@ -20,6 +20,7 @@
 #![allow(dead_code)]
 
 pub mod devices;
+pub mod failing_store;
 pub mod fake_relay;
 #[cfg(feature = "host")]
 pub mod host;
