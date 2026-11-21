@@ -291,11 +291,6 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(not(mobile))]
-fn is_foreground_resume(_event: &RunEvent) -> bool {
-    false
-}
-
 /// The one resume signal the runtime actually delivers on mobile: the
 /// window event. The app-level Resumed is only produced under
 /// ControlFlow::Poll, which the runtime never uses.
