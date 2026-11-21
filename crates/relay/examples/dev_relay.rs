@@ -72,6 +72,30 @@ fn rand_bytes(n: usize) -> Vec<u8> {
     b
 }
 
+/// OIDC authorize request query — typed so missing required fields are 400s.
+/// state/nonce default to empty; unknown fields are allowed.
+#[derive(serde::Deserialize)]
+struct AuthorizeQuery {
+    response_type: String,
+    client_id: String,
+    redirect_uri: String,
+    scope: String,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    nonce: String,
+    code_challenge: String,
+    #[serde(default)]
+    code_challenge_method: String,
+}
+
+/// Recover from a poisoned mutex. Single-statement codes.insert mutation
+/// can never leave the IdpInner struct corrupted, so the values are still
+/// usable after another task panicked under the lock.
+fn idp_lock(m: &Mutex<IdpInner>) -> std::sync::MutexGuard<'_, IdpInner> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 struct IdpInner {
     url: String,
     client_id: String,
@@ -87,7 +111,7 @@ struct IdpInner {
 async fn discovery(
     axum::extract::State(st): axum::extract::State<Arc<Mutex<IdpInner>>>,
 ) -> axum::Json<serde_json::Value> {
-    let st = st.lock().unwrap();
+    let st = idp_lock(&st);
     // In TLS mode, discovery's authorization_endpoint points at the public HTTPS
     // URL (on the same origin as the relay) so the phone can reach it. Issuer,
     // token_endpoint and jwks_uri stay loopback HTTP — the relay's Oidc client
@@ -121,19 +145,25 @@ fn es_jwk(key: &p256::ecdsa::SigningKey, kid: &str) -> serde_json::Value {
 async fn jwks(
     axum::extract::State(st): axum::extract::State<Arc<Mutex<IdpInner>>>,
 ) -> axum::Json<serde_json::Value> {
-    let st = st.lock().unwrap();
+    let st = idp_lock(&st);
     axum::Json(serde_json::json!({ "keys": [es_jwk(&st.es, "idp-es256")] }))
 }
 
 async fn authorize(
     axum::extract::State(st): axum::extract::State<Arc<Mutex<IdpInner>>>,
-    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
-) -> axum::response::Html<String> {
-    let st = st.lock().unwrap();
+    q: Result<axum::extract::Query<AuthorizeQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<axum::response::Html<String>, (axum::http::StatusCode, &'static str)> {
+    let q = q.map_err(|_| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            "missing required query params: client_id, redirect_uri, code_challenge",
+        )
+    })?;
+    let st = idp_lock(&st);
 
     // Validate client_id
-    if q.get("client_id").map(|s| s.as_str()) != Some(st.client_id.as_str()) {
-        panic!("authorize: wrong client_id");
+    if q.0.client_id != st.client_id {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "invalid client_id"));
     }
 
     // Build an HTML page with a "Sign in" button (form).
@@ -141,7 +171,17 @@ async fn authorize(
     // trigger a custom-scheme redirect (sh.shifu.mobile:/cb).
     // Use a relative action so it works at both / and /idp/ prefixes.
     let mut fields = String::new();
-    for (k, v) in q.iter() {
+    let q0 = &q.0;
+    for (k, v) in [
+        ("response_type", q0.response_type.clone()),
+        ("client_id", q0.client_id.clone()),
+        ("redirect_uri", q0.redirect_uri.clone()),
+        ("scope", q0.scope.clone()),
+        ("state", q0.state.clone()),
+        ("nonce", q0.nonce.clone()),
+        ("code_challenge", q0.code_challenge.clone()),
+        ("code_challenge_method", q0.code_challenge_method.clone()),
+    ] {
         fields.push_str(&format!(
             "<input type=\"hidden\" name=\"{k}\" value=\"{v}\">"
         ));
@@ -154,44 +194,47 @@ async fn authorize(
          <button type=\"submit\">Sign in</button>\
          </form></body></html>"
     );
-    axum::response::Html(html)
+    Ok(axum::response::Html(html))
 }
 
 async fn authorize_continue(
     axum::extract::State(st): axum::extract::State<Arc<Mutex<IdpInner>>>,
-    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
-) -> axum::response::Redirect {
-    let mut st = st.lock().unwrap();
+    q: Result<axum::extract::Query<AuthorizeQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<axum::response::Redirect, (axum::http::StatusCode, &'static str)> {
+    let q = q.map_err(|_| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            "missing required query params: client_id, redirect_uri, code_challenge",
+        )
+    })?;
 
-    // Validate client_id
-    if q.get("client_id").map(|s| s.as_str()) != Some(st.client_id.as_str()) {
-        panic!("authorize: wrong client_id");
+    // Parse redirect_uri before locking — invalid URL is a client error
+    let mut url = match url::Url::parse(&q.0.redirect_uri) {
+        Ok(u) => u,
+        Err(_) => {
+            return Err((axum::http::StatusCode::BAD_REQUEST, "invalid redirect_uri"));
+        }
+    };
+
+    // Validate client_id and mint code (both require lock)
+    let mut st = idp_lock(&st);
+    if q.0.client_id != st.client_id {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "invalid client_id"));
     }
-
-    // Extract required params
-    let redirect_uri = q
-        .get("redirect_uri")
-        .expect("authorize: missing redirect_uri")
-        .clone();
-    let state = q.get("state").cloned().unwrap_or_default();
-    let nonce = q.get("nonce").cloned().unwrap_or_default();
-    let challenge = q
-        .get("code_challenge")
-        .expect("authorize: missing code_challenge")
-        .clone();
 
     // Auto-approve: generate code and redirect
     let code = b64u(&rand_bytes(16));
-    st.codes.insert(code.clone(), (nonce, challenge));
+    st.codes.insert(
+        code.clone(),
+        (q.0.nonce.clone(), q.0.code_challenge.clone()),
+    );
 
-    // Build redirect URL with code and state
-    let mut url = url::Url::parse(&redirect_uri).expect("valid redirect_uri");
     url.query_pairs_mut()
         .clear()
         .append_pair("code", &code)
-        .append_pair("state", &state);
+        .append_pair("state", &q.0.state);
 
-    axum::response::Redirect::to(url.as_str())
+    Ok(axum::response::Redirect::to(url.as_str()))
 }
 
 #[derive(serde::Deserialize)]
@@ -216,7 +259,7 @@ async fn token_endpoint(
             axum::Json(serde_json::json!({"error": "invalid_request", "detail": format!("{e}")})),
         )
     })?;
-    let mut st = st.lock().unwrap();
+    let mut st = idp_lock(&st);
 
     // client_secret_basic
     let auth = headers
@@ -784,6 +827,301 @@ mod devca_tests {
         assert!(
             cert_path.exists() || key_path.exists(),
             "CA files must be written to the directory"
+        );
+    }
+}
+
+// ── IdP handler contract tests (TDD) ────────────────────────────────
+// Exercise the real IdP handlers via HTTP to verify they return proper
+// 400 responses (not panics/connection errors) for malformed requests,
+// and that a valid flow still works after rejected requests (no-poison
+// regression). These are written BEFORE the fix and should all be RED.
+
+#[cfg(test)]
+mod idp_tests {
+    use super::*;
+
+    /// Build a valid authorize query string with all OIDC fields.
+    fn valid_authorize_query(base: &str) -> String {
+        format!(
+            "{}?response_type=code&client_id=relay-client-id&redirect_uri=http://localhost:8080/oidc/callback&scope=openid&state=abc&nonce=def&code_challenge=iMnq5o6zALKXGivsnlom_0F5_WYda32GHkxlV7mq7hQ&code_challenge_method=S256",
+            base
+        )
+    }
+
+    /// Build an authorize query with a wrong client_id.
+    fn wrong_client_authorize_query(base: &str) -> String {
+        format!(
+            "{}?response_type=code&client_id=wrong-id&redirect_uri=http://localhost:8080/oidc/callback&scope=openid&state=abc&nonce=def&code_challenge=iMnq5o6zALKXGivsnlom_0F5_WYda32GHkxlV7mq7hQ&code_challenge_method=S256",
+            base
+        )
+    }
+
+    /// Build an authorize query missing code_challenge.
+    fn missing_challenge_authorize_query(base: &str) -> String {
+        format!(
+            "{}?response_type=code&client_id=relay-client-id&redirect_uri=http://localhost:8080/oidc/callback&scope=openid&state=abc&nonce=def",
+            base
+        )
+    }
+
+    /// Build a valid authorize_continue query string with all OIDC fields.
+    fn valid_continue_query(base: &str) -> String {
+        format!(
+            "{}?response_type=code&client_id=relay-client-id&redirect_uri=http://localhost:8080/oidc/callback&scope=openid&state=abc&nonce=def&code_challenge=iMnq5o6zALKXGivsnlom_0F5_WYda32GHkxlV7mq7hQ&code_challenge_method=S256",
+            base
+        )
+    }
+
+    /// Build an authorize_continue query missing redirect_uri.
+    fn missing_redirect_continue_query(base: &str) -> String {
+        format!(
+            "{}?response_type=code&client_id=relay-client-id&scope=openid&state=abc&nonce=def&code_challenge=iMnq5o6zALKXGivsnlom_0F5_WYda32GHkxlV7mq7hQ&code_challenge_method=S256",
+            base
+        )
+    }
+
+    /// Build an authorize_continue query with an invalid redirect_uri.
+    fn invalid_redirect_continue_query(base: &str) -> String {
+        format!(
+            "{}?response_type=code&client_id=relay-client-id&redirect_uri=not-a-url&scope=openid&state=abc&nonce=def&code_challenge=iMnq5o6zALKXGivsnlom_0F5_WYda32GHkxlV7mq7hQ&code_challenge_method=S256",
+            base
+        )
+    }
+
+    /// Build an authorize_continue query with a wrong client_id.
+    fn wrong_client_continue_query(base: &str) -> String {
+        format!(
+            "{}?response_type=code&client_id=wrong-id&redirect_uri=http://localhost:8080/oidc/callback&scope=openid&state=abc&nonce=def&code_challenge=iMnq5o6zALKXGivsnlom_0F5_WYda32GHkxlV7mq7hQ&code_challenge_method=S256",
+            base
+        )
+    }
+
+    /// Extract the code from a redirect URL.
+    fn extract_code(url: &str) -> Option<String> {
+        let parsed = url::Url::parse(url).ok()?;
+        for (k, v) in parsed.query_pairs() {
+            if k == "code" {
+                return Some(v.to_string());
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn authorize_without_params_returns_400() {
+        let (url, _state) = spawn_idp("127.0.0.1:0", None).await;
+        // No query params at all — should be 400 not a panic/connection error
+        let resp = reqwest::get(&format!("{}/authorize", url)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            400,
+            "/authorize without params should return 400"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_wrong_client_id_returns_400() {
+        let (url, _state) = spawn_idp("127.0.0.1:0", None).await;
+        let resp = reqwest::get(&wrong_client_authorize_query(&format!("{}/authorize", url)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            400,
+            "/authorize with wrong client_id should return 400"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_missing_code_challenge_returns_400() {
+        let (url, _state) = spawn_idp("127.0.0.1:0", None).await;
+        let resp = reqwest::get(&missing_challenge_authorize_query(&format!(
+            "{}/authorize",
+            url
+        )))
+        .await
+        .unwrap();
+        assert_eq!(
+            resp.status(),
+            400,
+            "/authorize missing code_challenge should return 400"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_continue_missing_redirect_uri_returns_400() {
+        let (url, _state) = spawn_idp("127.0.0.1:0", None).await;
+        let resp = reqwest::get(&missing_redirect_continue_query(&format!(
+            "{}/authorize/continue",
+            url
+        )))
+        .await
+        .unwrap();
+        assert_eq!(
+            resp.status(),
+            400,
+            "/authorize/continue missing redirect_uri should return 400"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_continue_invalid_redirect_uri_returns_400() {
+        let (url, _state) = spawn_idp("127.0.0.1:0", None).await;
+        let resp = reqwest::get(&invalid_redirect_continue_query(&format!(
+            "{}/authorize/continue",
+            url
+        )))
+        .await
+        .unwrap();
+        assert_eq!(
+            resp.status(),
+            400,
+            "/authorize/continue with invalid redirect_uri should return 400"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_continue_wrong_client_id_returns_400() {
+        let (url, _state) = spawn_idp("127.0.0.1:0", None).await;
+        let resp = reqwest::get(&wrong_client_continue_query(&format!(
+            "{}/authorize/continue",
+            url
+        )))
+        .await
+        .unwrap();
+        assert_eq!(
+            resp.status(),
+            400,
+            "/authorize/continue with wrong client_id should return 400"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_flow_works_after_rejected_requests() {
+        // Spawn IdP and issue several malformed requests that currently panic.
+        // After the fix, the IdP should survive and a valid flow should complete.
+        let (url, _state) = spawn_idp("127.0.0.1:0", None).await;
+
+        // First, hit the IdP with the malformed requests (these currently panic).
+        // Even if they fail, the IdP task keeps running (it's spawned separately).
+        // We don't assert on these — we're testing that they don't poison the IdP.
+        let _ = reqwest::get(&format!("{}/authorize", url)).await;
+        let _ = reqwest::get(&wrong_client_authorize_query(&format!("{}/authorize", url))).await;
+        let _ = reqwest::get(&wrong_client_continue_query(&format!(
+            "{}/authorize/continue",
+            url
+        )))
+        .await;
+
+        // Now test the valid full flow.
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+
+        // Step 1: GET /authorize with valid params → 200 HTML form
+        let resp = client
+            .get(&valid_authorize_query(&format!("{}/authorize", url)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "authorize should return 200 HTML form");
+        let html = resp.text().await.unwrap();
+        assert!(
+            html.contains("Sign In"),
+            "authorize should return HTML with 'Sign In' form"
+        );
+
+        // Step 2: GET /authorize/continue with valid params → 303 redirect with code
+        let resp = client
+            .get(&valid_continue_query(&format!(
+                "{}/authorize/continue",
+                url
+            )))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_redirection(),
+            "authorize/continue should return redirect"
+        );
+        let location = resp
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let code = extract_code(&location).expect("redirect URL should contain code param");
+
+        // Step 3: POST /token with the code → 200 JSON with id_token
+        let resp = client
+            .post(&format!("{}/token", url))
+            .basic_auth("relay-client-id", Some("s3cret-client-secret-value"))
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("code_verifier", "verifier"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "token endpoint should return 200");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body.get("id_token").is_some(),
+            "token response should contain id_token"
+        );
+
+        // Verify the id_token contains the expected nonce
+        let id_token = body["id_token"].as_str().unwrap();
+        let parts: Vec<&str> = id_token.split('.').collect();
+        assert_eq!(parts.len(), 3, "JWT should have 3 parts");
+        let payload_b64 = parts[1];
+        let payload_json: serde_json::Value = serde_json::from_slice(
+            &base64::Engine::decode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                payload_b64,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            payload_json["nonce"], "def",
+            "id_token nonce should match the authorize nonce"
+        );
+    }
+
+    /// Runtime test: deliberately poison the IdP's mutex and verify that
+    /// subsequent requests still work (lock helper recovers from poison).
+    /// Currently this will fail because the handlers use .lock().unwrap()
+    /// which panics on a poisoned mutex.
+    #[tokio::test]
+    async fn lock_helper_recovers_from_poisoned_mutex() {
+        let (url, state) = spawn_idp("127.0.0.1:0", None).await;
+
+        // Poison the mutex by panicking while holding the lock in a separate task.
+        let poison_task = tokio::spawn({
+            let s = state.clone();
+            async move {
+                let _locked = s.lock().unwrap();
+                // Panic while holding the lock to poison it.
+                panic!("poison the mutex");
+            }
+        });
+        // Wait for the poison task; the JoinError indicates the panic.
+        let _ = poison_task.await;
+
+        // Small delay to let the poison propagate.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Now make a request to the IdP — should still work after the fix.
+        let resp = reqwest::get(&format!("{}/jwks", url)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "jwks endpoint should still work after mutex is poisoned"
         );
     }
 }
