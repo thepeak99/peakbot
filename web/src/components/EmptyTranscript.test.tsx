@@ -1,6 +1,6 @@
 // Batch 3, items 3.10 (B32 keep-R): the empty transcript keeps the welcome
 // card, and gains the mock's centred "Nothing here yet" hint. The hint is
-// `lg:hidden` — the desktop render must be unchanged (R1), so that class IS
+// `desktop:hidden` — the desktop render must be unchanged (R1), so that class IS
 // the contract. The scoped "No messages from …" line is kept as well.
 
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -71,10 +71,10 @@ describe("EmptyTranscript (B32 keep-R)", () => {
     }
   });
 
-  it("the hint is phone-only: it carries lg:hidden so the desktop render is unchanged", async () => {
+  it("the hint is phone-only: it carries desktop:hidden so the desktop render is unchanged", async () => {
     const { el, unmount } = await render(WELCOME, null);
     try {
-      expect(hintOf(el)?.classList.contains("lg:hidden")).toBe(true);
+      expect(hintOf(el)?.classList.contains("desktop:hidden")).toBe(true);
     } finally {
       await unmount();
     }

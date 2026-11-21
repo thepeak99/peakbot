@@ -33,7 +33,7 @@ This file is the working draft for the next release. When a version is tagged, t
 - **PeakBot Mobile: selection and machine in the chat header.** The profile › agent › model line under the chat title is now the selection picker: tap it to open it as a bottom sheet (picking a model closes it; it locks after the first message). Chats on a remote server show the machine name in front of it. The bottom bar is gone in the phone app, except for the remote working-folder picker.
 - **PeakBot Mobile: machine selector.** When you have remote servers, the Chats screen gains a machine picker — All machines, This device, and each remote server — with online dots and conversation counts. It filters the chat list and profile chips, tags rows with their machine, and new chats start on the selected machine (a machine that is offline shows "is offline" and can't be started). With All selected, the + button asks which machine to start on.
 - **PeakBot Mobile: the phone now matches the approved design.** A fidelity pass aligned every phone screen to the approved mock: the chat header, composer and working line; the Chats list ("This device" for this machine, remotes by host only); message rendering — user bubbles, plain agent prose, collapsible tool rows, and code blocks with Copy and diff tints; the panels sheet chrome and the phone faces of the Todo, Tasks, Session, Files, Bash and Agents panels; the Profile/Agent/Model selection sheet; the restyled machine sheets; and a phone-only light palette. Desktop at 1024px and up is pixel-identical to before.
-- **PeakBot Desktop: always the wide layout.** The desktop app keeps the wide layout at any window size, and its minimum window size is now 1024×600.
+- **PeakBot Desktop: always the wide layout.** The desktop app keeps the wide layout at any window size, and its minimum window size is now 480×400 (enough for narrow tiling window managers).
 
 ### Cloud Mode
 
@@ -53,6 +53,7 @@ This file is the working draft for the next release. When a version is tagged, t
 
 - Fixes Cloud stream-slot leak from list refreshes that eventually prevented opening remote conversations.
 - **Desktop AppImage Cloud sign-in now opens the browser.** If the system browser fails to launch, a manual "Open sign-in page" link appears in the pane as a fallback.
+- Narrow desktop windows (desktop app and browser) keep the desktop layout and no longer get cut off — the phone layout is now only for the phone app and phone browsers (narrow viewport with touch).
 - Phone app no longer shows a duplicate folder picker under the message box for remote profiles — the footer is removed at phone width; the working folder is reached via the activity-row 📁 → Directory tab.
 - **Web tokens with special characters work.** Tokens containing characters like `+`, `&`, `%`, `;` or spaces were rejected by the desktop app and broke links and cookies; the server now accepts correctly encoded tokens, and the links it prints are encoded.
 - Mobile: each conversation keeps its own half-typed message again — switching chats from the chat list no longer carries text into the other conversation, and coming back restores your draft.

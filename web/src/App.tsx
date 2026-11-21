@@ -46,8 +46,8 @@ import type { TabsState } from "./convoTabs";
 import { useTaskNotifications } from "./useTaskNotifications";
 import { useTabIndicator } from "./useTabIndicator";
 import { useFocusMode } from "./useFocusMode";
-import { isDesktop as isDesktopShell } from "./desktop";
-import { useMediaQuery } from "./useMediaQuery";
+import { useLayout } from "./useLayout";
+
 import { useMobileChats } from "./useMobileChats";
 import { useScreenSlide } from "./useScreenSlide";
 import { ChatHeader } from "./components/ChatHeader";
@@ -187,11 +187,12 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   // Called once here (not in TopBar) so App can filter with the same value
   // the button renders — two useState copies would desync (plan §6.1).
   const focusMode = useFocusMode();
-  // The desktop drawer rail at ≥1024px or anywhere in the desktop app (its
-  // window is never narrower than that); below: the phone's Panels sheet.
+  // The desktop drawer rail (visible at any width in the desktop shell; the
+  // shell's useLayout sets data-layout="desktop" regardless of viewport).
+  // On phones: the Panels sheet instead.
   // The hook is always called, so hook order stays stable.
-  const wideViewport = useMediaQuery("(min-width: 1024px)");
-  const isDesktop = isDesktopShell() || wideViewport;
+  
+  const phone = useLayout() === "phone";
 
   // Sub-agent roster: one entry per delegation call, in call order (Phase 2 +
   // per-call). Zero backend — derived from the transcript. A role delegated to
@@ -302,7 +303,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   const closePanels = useCallback(() => setDrawerTab(null), []);
 
   const directoryTab =
-    !isDesktop && browsableCwd
+    phone && browsableCwd
       ? {
           id: "directory",
           label: "Directory",
@@ -333,44 +334,44 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
             peakbotVersion={welcome?.peakbotVersion}
             scopeLabel={scopeLabel}
             laneMessages={laneMessages}
-            phone={!isDesktop}
+            phone={phone}
           />
         ) : null,
     },
     {
       id: "todo",
       label: "Todo",
-      content: <TodoPanel nodes={todos} phone={!isDesktop} />,
+      content: <TodoPanel nodes={todos} phone={phone} />,
       // Per surface: every rendered row on desktop, the OPEN count on a
       // phone (the pill badge and the panels badge both read it).
-      badge: isDesktop
+      badge: !phone
         ? todos.reduce((n, node) => n + 1 + node.children.length, 0)
         : todoCounts(todos).open,
     },
     {
       id: "files",
       label: "Files",
-      content: <FilesPanel files={files} phone={!isDesktop} />,
+      content: <FilesPanel files={files} phone={phone} />,
       badge: files.length,
     },
     {
       id: "tasks",
       label: "Tasks",
-      content: <BgPanel processes={bg} phone={!isDesktop} />,
+      content: <BgPanel processes={bg} phone={phone} />,
       badge: runningBg,
     },
     {
       id: "bash",
       label: "Bash",
       content: bash ? (
-        <BashPanel panel={bash} phone={!isDesktop} />
+        <BashPanel panel={bash} phone={phone} />
       ) : (
-        <p className="text-sm text-zinc-600 max-lg:py-8 max-lg:text-center max-lg:text-zinc-500">
+        <p className="text-sm text-zinc-600 phone:py-8 phone:text-center phone:text-zinc-500">
           No bash command yet.
         </p>
       ),
       // Desktop-only: the phone mock's Bash pill carries no badge (C17).
-      badge: isDesktop && bash?.status === "running" ? 1 : undefined,
+      badge: !phone && bash?.status === "running" ? 1 : undefined,
     },
     {
       id: "agents",
@@ -380,11 +381,11 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
           boundAgent={boundAgent}
           active={view}
           // On a phone, Watch also closes the sheet to reveal the banner (X6).
-          onSelect={isDesktop ? setView : (v) => { setView(v); closePanels(); }}
+          onSelect={!phone ? setView : (v) => { setView(v); closePanels(); }}
           roster={roster}
           laneCalls={laneCalls}
           laneMessages={laneMessages}
-          phone={!isDesktop}
+          phone={phone}
         />
       ),
       badge: roster.length > 0 ? roster.length : undefined,
@@ -404,7 +405,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   const tasksN = shown("tasks") ? runningBg : 0;
   const { open, total } = shown("todo") ? todoCounts(todos) : { open: 0, total: 0 };
   const panels =
-    !isDesktop && visibleTabs.length > 0
+    phone && visibleTabs.length > 0
       ? { count: tasksN + open, onOpen: () => setDrawerTab(visibleTabIds[0]) }
       : undefined;
 
@@ -465,7 +466,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
     settingsEnabled,
     stopPending: state?.stop_pending ?? false,
     // One switch, decided once: the phone composer face (fidelity batch 1).
-    phone: !isDesktop,
+    phone,
     uploadLimits: state?.upload_limits ?? DEFAULT_UPLOAD_LIMITS,
   };
 
@@ -555,18 +556,18 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
               scrolling element's only child must be the virtualizer's sized
               container, or the row offsets stop matching the scroll offset. */}
           {scopeLabel && (
-            <div className="lg:mr-12 px-4 pt-4 max-lg:p-0 sm:px-6 md:px-8">
-              <div className="mx-auto flex max-w-5xl items-center justify-between rounded-md border border-sky-900/60 bg-sky-950/30 px-3 py-1.5 text-xs text-sky-300 max-lg:mx-0 max-lg:h-11 max-lg:max-w-none max-lg:gap-2 max-lg:rounded-none max-lg:border-0 max-lg:border-b max-lg:border-sky-400/35 max-lg:bg-sky-400/12 max-lg:px-4 max-lg:py-0 max-lg:text-[13.5px] max-lg:text-zinc-100 max-lg:light:bg-sky-700/8">
+            <div className="desktop:mr-12 px-4 pt-4 phone:p-0 sm:px-6 md:px-8">
+              <div className="mx-auto flex max-w-5xl items-center justify-between rounded-md border border-sky-900/60 bg-sky-950/30 px-3 py-1.5 text-xs text-sky-300 phone:mx-0 phone:h-11 phone:max-w-none phone:gap-2 phone:rounded-none phone:border-0 phone:border-b phone:border-sky-400/35 phone:bg-sky-400/12 phone:px-4 phone:py-0 phone:text-[13.5px] phone:text-zinc-100 phone:light:bg-sky-700/8">
                 <span>
-                  👁 Watching <span className="font-medium max-lg:font-semibold max-lg:text-sky-400">{scopeLabel}</span>
-                  <span className="ml-2 text-sky-500/70 max-lg:hidden">
+                  👁 Watching <span className="font-medium phone:font-semibold phone:text-sky-400">{scopeLabel}</span>
+                  <span className="ml-2 text-sky-500/70 phone:hidden">
                     {visibleMessages.length} message
                     {visibleMessages.length === 1 ? "" : "s"}
                   </span>
                 </span>
                 <button
                   onClick={() => setView("global")}
-                  className="cursor-pointer rounded px-1.5 py-0.5 text-sky-400 hover:bg-sky-900/40 max-lg:h-8 max-lg:rounded-2xl max-lg:bg-sky-400/18 max-lg:px-3 max-lg:py-0 max-lg:text-[13px] max-lg:font-semibold"
+                  className="cursor-pointer rounded px-1.5 py-0.5 text-sky-400 hover:bg-sky-900/40 phone:h-8 phone:rounded-2xl phone:bg-sky-400/18 phone:px-3 phone:py-0 phone:text-[13px] phone:font-semibold"
                 >
                   Clear
                 </button>
@@ -580,7 +581,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
               messages={transcriptMessages}
               drawerOpen={drawerOpen}
               base={base}
-              phone={!isDesktop}
+              phone={phone}
               ref={transcriptRef}
             />
           ) : (
@@ -590,10 +591,10 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
             />
           )}
 
-          {isDesktop && focusing && turnInFlight && (
+          {!phone && focusing && turnInFlight && (
             <ActivityRow line={{ kind: "step", step: focused?.activity ?? null }} />
           )}
-          {!isDesktop && (
+          {phone && (
             <ActivityRow
               line={
                 isRunning
@@ -647,7 +648,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
    {/* The phone app (mobileChats) drops the footer entirely at phone width —
        cwd is reached via the activity-row 📁 → Directory tab. At ≥lg the
        footer stays (existing behavior). */}
-      {(chats === null || isDesktop) && (
+      {chats === null && (
         <BottomBar
           conversations={conversations}
           conversationsError={conversationsError}
@@ -658,21 +659,20 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
           dirListing={dirListing}
           recentDirs={recentDirs}
           send={send}
-          onSwitchCwd={switchCwd}
           onLoadConversation={loadConversation}
           onReattach={reattach}
+          onSwitchCwd={switchCwd}
           catalog={catalog}
           selection={selection}
           selectionLocked={selectionLocked}
           profilePinned={state?.profile_pinned ?? false}
           onToast={showToast}
-          mobileChats={chats !== null}
         />
       )}
 
       {/* One open-panel state, two surfaces; the relocation effect above
           covers both. */}
-      {isDesktop ? (
+      {!phone ? (
         <TabbedDrawer
           tabs={visibleTabs}
           active={drawerTab}

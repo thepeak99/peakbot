@@ -38,16 +38,16 @@ interface FakeMql {
   listeners: Set<(e: MediaQueryListEvent) => void>;
 }
 let mqls: FakeMql[] = [];
-let desktopWidth = false;
+let phoneViewport = false;
 
-const isDesktopQuery = (q: string): boolean => q.includes("min-width: 1024px");
+const isPhoneQuery = (q: string): boolean => q.includes("max-width: 1023px");
 
 function installMatchMedia(): void {
   mqls = [];
   vi.stubGlobal("matchMedia", (query: string) => {
     const mql: FakeMql = {
       query,
-      matches: isDesktopQuery(query) ? desktopWidth : false,
+      matches: isPhoneQuery(query) ? phoneViewport : false,
       listeners: new Set(),
     };
     mqls.push(mql);
@@ -189,7 +189,7 @@ const tid = (id: string): HTMLElement | null =>
   document.body.querySelector<HTMLElement>(`[data-testid="${id}"]`);
 
 beforeEach(() => {
-  desktopWidth = true;
+  phoneViewport = false;
   setShell("browser");
   installMatchMedia();
   vi.stubGlobal("fetch", vi.fn(async () => {
