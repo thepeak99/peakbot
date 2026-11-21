@@ -125,9 +125,10 @@ const SECTIONS: Record<Section, { label: string; desc: string }> = {
 const REPO_BANNER =
   "The repo file may only contain profiles:. Repo profiles are listed first and the first one is the default for conversations started here. A repo profile with the same name as a global one replaces it entirely (no merge).";
 
-// The Local edition (phone build) hides the MCP, System and Raw YAML panes
-// (nav + collapsed select drop them); Profiles stays and is the default.
-const HIDDEN_LOCAL_SECTIONS: readonly Section[] = ["mcps", "system", "raw"];
+// The Local edition (phone build) hides the MCP and System panes because their
+// backend capabilities are unavailable on Local. Raw YAML stays because Local
+// serves the same config read/validate/write routes. Profiles stays as default.
+const HIDDEN_LOCAL_SECTIONS: readonly Section[] = ["mcps", "system"];
 
 /** A config map value (profiles / agents) as a plain record. */
 function asMap(v: unknown): Record<string, unknown> {
