@@ -28,10 +28,10 @@
 //    wizard all go through it).
 //
 // 4. Gating when `edition() === "local"`:
-//    - Settings hides the MCP, System and Raw YAML panes (nav buttons AND
-//      the collapsed `<select>); the Profiles pane stays VISIBLE — the
-//      phone manages its profiles (incl. remote ones) in the SPA; and
-//      General hides its "Web server" section;
+//    - Settings hides the MCP and System panes (nav buttons AND the
+//      collapsed `<select>`); the Profiles and Raw YAML panes stay
+//      VISIBLE — the phone manages its profiles (incl. remote ones) in
+//      the SPA; and General hides its "Web server" section;
 //    - the first-run wizard has no `web` step and no PATH fact (driven by
 //      the `meta` prop, which Boot passes from the same boot read);
 //    - the TopBar/BottomBar CwdPicker (cwd line) is hidden and the Bash
@@ -231,11 +231,11 @@ describe("edition() seam", () => {
 
 // ─── Settings panes per edition ───────────────────────────────────────────
 
-const HIDDEN_PANES = ["mcps", "system", "raw"] as const;
-const HIDDEN_LABELS = ["MCP servers", "System", "Raw YAML"];
+const HIDDEN_PANES = ["mcps", "system"] as const;
+const HIDDEN_LABELS = ["MCP servers", "System"];
 
 describe("Settings panes per edition", () => {
-  it("local: hides the MCP, System and Raw YAML panes and KEEPS Profiles", async () => {
+  it("local: hides the MCP and System panes but KEEPS Raw YAML and Profiles", async () => {
     stubSettingsFetch(meta({ boot: LOCAL_BOOT }));
     mount(<Settings convo={null} onClose={() => {}} />);
     await flush();
@@ -249,9 +249,14 @@ describe("Settings panes per edition", () => {
       host.querySelector('[data-testid="nav-profiles"]'),
       "Profiles stays visible in the Local edition",
     ).not.toBeNull();
+    // Raw YAML must be visible in Local edition
+    expect(
+      host.querySelector('[data-testid="nav-raw"]'),
+      "Raw YAML nav must be visible in the Local edition",
+    ).not.toBeNull();
 
     // The collapsed mobile section select must not offer the hidden panes
-    // either — and it MUST offer profiles.
+    // either — and it MUST offer profiles and raw.
     const select = host.querySelector('select[aria-label="Section"]');
     expect(select, "the section select must render").not.toBeNull();
     const values = [...(select as HTMLSelectElement).options].map((o) => o.value);
@@ -261,6 +266,7 @@ describe("Settings panes per edition", () => {
     expect(values).toContain("providers");
     expect(values).toContain("general");
     expect(values, "the profiles option stays").toContain("profiles");
+    expect(values, "the raw option must be present in Local").toContain("raw");
 
     // The active section head is a visible pane (Profiles is the default
     // active section and is no longer hidden on Local).
