@@ -237,6 +237,8 @@ async fn foreground(app: &AppHandle) {
 
 /// P5 T8: the app went to the background. The core debounces the
 /// background → suspend transition itself (3 s).
+#[cfg_attr(not(mobile), allow(dead_code))]
+// Only called from the mobile event wiring; unused in host builds.
 async fn background(app: &AppHandle) {
     let local = app.state::<Local>();
     if let Some(core) = local.core() {
