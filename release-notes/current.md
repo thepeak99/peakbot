@@ -49,6 +49,7 @@ This file is the working draft for the next release. When a version is tagged, t
   - A dev relay example with a test sign-in page for local end-to-end testing.
 
 ### Fixes
+- **Android: mobile Cloud no longer remains suspended after backgrounding**, which blocked device/conversation loading.
 
 - Fixes Cloud stream-slot leak from list refreshes that eventually prevented opening remote conversations.
 - **Desktop AppImage Cloud sign-in now opens the browser.** If the system browser fails to launch, a manual "Open sign-in page" link appears in the pane as a fallback.

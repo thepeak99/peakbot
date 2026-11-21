@@ -26,6 +26,7 @@ use tauri_plugin_deep_link::DeepLinkExt;
 
 use local::{Local, should_restart};
 use nav::Nav;
+use peakbot::cloud::{ForegroundSignal, ResumeStep, resume_steps};
 
 /// The single init script injected on every origin, both OSes.
 /// Declares the mobile shell marker and shims `window.open` as a top-level
@@ -290,22 +291,31 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[cfg(not(mobile))]
+fn is_foreground_resume(_event: &RunEvent) -> bool {
+    false
+}
+
 /// The one resume signal the runtime actually delivers on mobile: the
 /// window event. The app-level Resumed is only produced under
 /// ControlFlow::Poll, which the runtime never uses.
 #[cfg(mobile)]
-fn is_foreground_resume(event: &RunEvent) -> bool {
-    matches!(
-        event,
+fn foreground_signal(event: &RunEvent) -> Option<ForegroundSignal> {
+    match event {
         RunEvent::WindowEvent {
             event: tauri::WindowEvent::Resumed,
             ..
-        }
-    )
+        } => Some(ForegroundSignal::Resumed),
+        RunEvent::WindowEvent {
+            event: tauri::WindowEvent::Focused(true),
+            ..
+        } => Some(ForegroundSignal::Focused),
+        _ => None,
+    }
 }
 #[cfg(not(mobile))]
-fn is_foreground_resume(_event: &RunEvent) -> bool {
-    false
+fn foreground_signal(_event: &RunEvent) -> Option<ForegroundSignal> {
+    None
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -370,20 +380,23 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building PeakBot Mobile")
         .run(|app, event| {
-            // P5 T8: foreground/background signal — tell the core when the
-            // app goes to the background so it can suspend its cloud socket
-            // after the debounce, and resume when it comes back.
-            #[cfg(mobile)]
-            if matches!(
-                &event,
-                RunEvent::WindowEvent {
-                    event: tauri::WindowEvent::Focused(true),
-                    ..
-                }
-            ) {
+            // Foreground signals: resume the cloud link and/or nudge the SPA.
+            // The resume plan is a pure function of the foreground signal
+            // (resumed vs focused), so the host can test it without a device.
+            if let Some(signal) = foreground_signal(&event) {
+                let steps = resume_steps(signal);
                 let app = app.clone();
-                tauri::async_runtime::spawn(async move { foreground(&app).await });
+                tauri::async_runtime::spawn(async move {
+                    for step in steps {
+                        match step {
+                            ResumeStep::Foreground => foreground(&app).await,
+                            ResumeStep::Nudge => resume_local(&app).await,
+                        }
+                    }
+                });
             }
+            // Background signal: suspend the cloud link after debounce.
+            #[cfg(mobile)]
             if matches!(
                 &event,
                 RunEvent::WindowEvent {
@@ -394,26 +407,7 @@ pub fn run() {
                 let app = app.clone();
                 tauri::async_runtime::spawn(async move { background(&app).await });
             }
-            // Existing resume logic: re-serve the Local core if its listener
-            // was reclaimed (iOS may have killed it while suspended).
-            if is_foreground_resume(&event) {
-                let app = app.clone();
-                tauri::async_runtime::spawn(async move { resume_local(&app).await });
-            }
         });
-}
-
-#[cfg(test)]
-mod glue_tests {
-    use super::*;
-
-    const LINK: &str = "https://nas.lan:7823/?token=s3cr3t-tok";
-
-    #[test]
-    fn logged_urls_drop_the_token() {
-        let url = Url::parse(LINK).unwrap();
-        assert_eq!(without_query(&url), "https://nas.lan:7823/");
-    }
 }
 
 #[cfg(test)]

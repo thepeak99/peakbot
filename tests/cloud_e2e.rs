@@ -101,6 +101,18 @@ impl Core {
         init_shared_roots();
         let tmp = tempfile::tempdir().expect("core dir");
         let yaml = yaml_for(&tmp.path().join("convos"), Some(&relay.url()));
+        Self::start_with_yaml(name, seed, tmp, yaml, relay).await
+    }
+
+    /// Boot one core with an explicit YAML (the phone fixture has zero local
+    /// profiles, like the real controller-only install).
+    async fn start_with_yaml(
+        name: &str,
+        seed: u8,
+        tmp: tempfile::TempDir,
+        yaml: String,
+        _relay: &TestRelay,
+    ) -> Core {
         let deps = boot::session_deps_in(
             parse(&yaml),
             SkillRegistry::new(),
