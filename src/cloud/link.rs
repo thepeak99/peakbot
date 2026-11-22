@@ -17,6 +17,7 @@ use url::Url;
 use super::actor;
 use super::config::CloudConfig;
 use super::login;
+use super::relay_http::RelayHttp;
 use super::store::{PublicState, Seed, SeedStore, SessionToken};
 use super::stream::CloudStream;
 
@@ -254,8 +255,8 @@ impl LoginSlot {
 pub struct CloudHandle {
     cmd: mpsc::Sender<CloudCmd>,
     state: watch::Receiver<CloudState>,
-    /// The relay origin (login URLs, logout POST).
-    base: Url,
+    /// The shared HTTPS policy for this relay (TLS pinning, CA caching).
+    relay: Arc<RelayHttp>,
     store: Arc<dyn SeedStore>,
     /// This device's id (derived from the seed; `None` if the identity failed).
     device_id: Option<DeviceId>,
@@ -338,7 +339,7 @@ impl CloudHandle {
         let mut rng = actor::Os;
         let auth_url = match &self.callback {
             login::CallbackSource::DeepLink(app) => {
-                let plan = login::plan_login(&self.base, app.url(), &mut rng)?;
+                let plan = login::plan_login(self.relay.origin(), app.url(), &mut rng)?;
                 let auth_url = plan.auth_url.clone();
                 *slot = LoginSlot::DeepLink {
                     plan: Box::new(plan),
@@ -356,14 +357,14 @@ impl CloudHandle {
                     .map_err(|e| CloudError::Io(e.to_string()))?;
                 let redirect_uri = Url::parse(&format!("http://127.0.0.1:{port}/cb"))
                     .map_err(|e| CloudError::Io(e.to_string()))?;
-                let plan = login::plan_login(&self.base, &redirect_uri, &mut rng)?;
+                let plan = login::plan_login(self.relay.origin(), &redirect_uri, &mut rng)?;
                 let auth_url = plan.auth_url.clone();
                 let cmd = self.cmd.clone();
                 let store = self.store.clone();
                 let last_err = self.last_login_error.clone();
-                let base = self.base.clone();
+                let relay = self.relay.clone();
                 *slot = LoginSlot::Loopback(tokio::spawn(async move {
-                    login::listener(base, tcp, plan, cmd, store, last_err).await;
+                    login::listener(relay, tcp, plan, cmd, store, last_err).await;
                 }));
                 auth_url
             }
@@ -399,7 +400,7 @@ impl CloudHandle {
             (Some(err), _) => Err(CloudError::Io(format!("idp error: {err}"))),
             (None, None) => return Err(CloudError::Io("callback without code".into())),
             (None, Some(code)) => {
-                login::finish(&self.base, plan, code, &self.cmd, &self.store).await
+                login::finish(&self.relay, plan, code, &self.cmd, &self.store).await
             }
         };
         *slot = LoginSlot::Idle;
@@ -619,12 +620,15 @@ pub fn spawn_inner(
     inbound: Option<InboundHook>,
     callback: login::CallbackSource,
 ) -> CloudHandle {
-    let origin = cfg.relay.origin().clone();
+    // One RelayHttp per endpoint: shared across the actor, login, and logout
+    // paths. The CA is fetched once and cached.
+    let relay_http = Arc::new(RelayHttp::new(cfg.relay.clone()));
+    let origin = relay_http.origin().clone();
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let handle = |state_rx, device_id| CloudHandle {
         cmd: cmd_tx.clone(),
         state: state_rx,
-        base: origin.clone(),
+        relay: relay_http.clone(),
         store: store.clone(),
         device_id,
         login_task: Arc::new(tokio::sync::Mutex::new(LoginSlot::Idle)),
@@ -658,7 +662,7 @@ pub fn spawn_inner(
     };
     let (state_tx, state_rx) = watch::channel(initial);
     let h = handle(state_rx, Some(id.id));
-    let (actor, out_rx) = actor::Actor::new(cfg, store, public, inbound, id);
+    let (actor, out_rx) = actor::Actor::new(cfg, store, public, inbound, id, relay_http);
     tokio::spawn(actor::run(actor, cmd_rx, out_rx, state_tx));
     h
 }

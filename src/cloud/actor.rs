@@ -31,12 +31,10 @@ use cloud::{
 use futures::{SinkExt as _, StreamExt as _};
 use perma_crypto::v1;
 use rand_core::{CryptoRng, RngCore};
-use rustls::pki_types::pem::PemObject as _;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message as TMsg;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
-use url::Url;
 
 use super::config::CloudConfig;
 use super::enroll::{self, EnrollAttempt};
@@ -44,11 +42,9 @@ use super::link::{
     CloudCmd, CloudError, CloudState, CloudStateKind, DeviceInfo, EnrollRequestInfo, FlowError,
     InboundHook, LogoutOutcome, LogoutReason, TrustError,
 };
-use super::login;
 use super::session::{Handshaking, Open, Phase, Session, StreamSide};
 use super::store::{PublicState, Seed, SeedStore, SessionToken};
 use super::stream::CloudStream;
-use crate::config::remote::{CaFingerprint, Endpoint, Trust};
 
 type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -153,6 +149,8 @@ pub struct Actor {
     public: PublicState,
     inbound: Option<InboundHook>,
     id: Identity,
+    /// Shared HTTPS policy for the relay (TLS pinning, CA caching).
+    relay_http: Arc<super::relay_http::RelayHttp>,
     /// Pinned genesis hash (TOFU trust anchor, §C).
     pin: Option<[u8; 32]>,
     /// Raw cached entries (persisted after every successful sync).
@@ -323,6 +321,7 @@ impl Actor {
         public: PublicState,
         inbound: Option<InboundHook>,
         id: Identity,
+        relay_http: Arc<super::relay_http::RelayHttp>,
     ) -> (Self, mpsc::Receiver<ActorOut>) {
         let (out_tx, out_rx) = mpsc::channel(256);
         (
@@ -332,6 +331,7 @@ impl Actor {
                 public,
                 inbound,
                 id,
+                relay_http,
                 pin: None,
                 raw: Vec::new(),
                 chain_cache: None,
@@ -366,8 +366,11 @@ enum DialErr {
     Io(String),
 }
 
-async fn dial(cfg: &CloudConfig, token: &SessionToken) -> Result<Ws, DialErr> {
-    let origin = cfg.relay.origin();
+async fn dial(
+    relay_http: &super::relay_http::RelayHttp,
+    token: &SessionToken,
+) -> Result<Ws, DialErr> {
+    let origin = relay_http.origin();
     let host = origin
         .host_str()
         .map(str::to_string)
@@ -375,19 +378,15 @@ async fn dial(cfg: &CloudConfig, token: &SessionToken) -> Result<Ws, DialErr> {
     let port = origin
         .port_or_known_default()
         .ok_or_else(|| DialErr::Io("relay origin has no port".into()))?;
-    let (scheme, tls) = match &cfg.relay {
-        Endpoint::LoopbackPlain { .. } => ("ws".to_string(), None),
-        Endpoint::Tls {
-            trust: Trust::System,
-            ..
-        } => {
-            let c = crate::http::system_tls_config().map_err(|e| DialErr::Io(e.to_string()))?;
-            ("wss".to_string(), Some(Arc::new(c)))
-        }
-        Endpoint::Tls {
-            trust: Trust::PinnedCa(pin),
-            ..
-        } => ("wss".to_string(), Some(pinned_ca(origin, pin).await?)),
+    // The relay's TLS config is resolved and cached by RelayHttp once.
+    let cfg = relay_http
+        .tls_config()
+        .await
+        .map_err(|e| DialErr::Io(e.to_string()))?;
+    let (scheme, tls) = if cfg.is_some() {
+        ("wss".to_string(), cfg)
+    } else {
+        ("ws".to_string(), None)
     };
     let tcp = tokio::net::TcpStream::connect((host.clone(), port))
         .await
@@ -422,105 +421,6 @@ async fn dial(cfg: &CloudConfig, token: &SessionToken) -> Result<Ws, DialErr> {
         }
         Err(e) => Err(DialErr::Io(e.to_string())),
     }
-}
-
-/// Accepts any certificate (signatures still checked) — for the ONE CA
-/// bootstrap GET, whose response is then authenticated by the pin
-/// (same policy as the remote-profile bootstrap).
-#[derive(Debug)]
-struct NoVerify(Arc<rustls::crypto::CryptoProvider>);
-
-impl rustls::client::danger::ServerCertVerifier for NoVerify {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
-}
-
-/// `{origin}/peakbot-ca.crt` fetched unverified, fingerprint-checked
-/// against the pin, then the ONLY trusted root (p3-design §B: "same
-/// trust code as remote profiles").
-async fn pinned_ca(
-    origin: &Url,
-    pin: &CaFingerprint,
-) -> Result<Arc<rustls::ClientConfig>, DialErr> {
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let no_verify = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .map_err(|e| DialErr::Io(e.to_string()))?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerify(provider)))
-        .with_no_client_auth();
-    let client = reqwest::Client::builder()
-        .tls_backend_preconfigured(no_verify)
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| DialErr::Io(e.to_string()))?;
-    let url = origin
-        .join("peakbot-ca.crt")
-        .map_err(|e| DialErr::Io(e.to_string()))?;
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| DialErr::Io(e.to_string()))?;
-    if !resp.status().is_success() {
-        return Err(DialErr::Io(format!("CA fetch answered {}", resp.status())));
-    }
-    let pem = resp.text().await.map_err(|e| DialErr::Io(e.to_string()))?;
-    let der = rustls::pki_types::CertificateDer::from_pem_slice(pem.as_bytes())
-        .map_err(|_| DialErr::Io("the server CA is not a PEM certificate".into()))?;
-    if crate::ui::web::tls::der_fingerprint(&der) != pin.to_string() {
-        return Err(DialErr::Io("CA pin mismatch".into()));
-    }
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(der).map_err(|e| DialErr::Io(e.to_string()))?;
-    let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::aws_lc_rs::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .map_err(|e| DialErr::Io(e.to_string()))?
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-    Ok(Arc::new(cfg))
 }
 
 async fn send_to_relay(ws: &mut Ws, msg: &ToRelay) -> Result<(), ()> {
@@ -2016,13 +1916,15 @@ impl Actor {
                     .await
                     .is_ok();
                 }
-                let base = self.cfg.relay.origin().clone();
                 let store = self.store.clone();
                 // A failed relay /logout means the session (and thus the
                 // device's listing) survives: report `revoked: false`.
                 match store_op(move || store.load_token()).await {
                     Ok(Some(t)) => {
-                        revoked = revoked && login::logout_post(&base, &t).await.is_ok();
+                        revoked = revoked
+                            && super::relay_http::logout_post(&self.relay_http, &t)
+                                .await
+                                .is_ok();
                     }
                     _ => revoked = false,
                 }
@@ -2470,7 +2372,7 @@ impl Actor {
             Ok(None) => return RunEnd::NoToken,
             Err(e) => return RunEnd::Dropped(format!("store: {e}"), false),
         };
-        let mut ws = match dial(&self.cfg, &token).await {
+        let mut ws = match dial(&self.relay_http, &token).await {
             Ok(ws) => ws,
             Err(DialErr::Unauth) => {
                 // 401: delete the token ONLY (seed + pin survive, §C).

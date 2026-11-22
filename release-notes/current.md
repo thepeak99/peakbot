@@ -51,6 +51,7 @@ This file is the working draft for the next release. When a version is tagged, t
 
 ### Fixes
 - **Android: mobile Cloud no longer remains suspended after backgrounding**, which blocked device/conversation loading.
+- **Android: Cloud sign-in and sign-out work end to end.** The phone's cloud calls (sign-in token redemption, sign-out) now use the relay's pinned CA instead of the platform trust store, so a self-signed relay certificates verify correctly; the CA is fetched once and reused for every call. Signing out now wipes the device identity and token and closes the relay session, so the device no longer stays listed after signing out.
 
 - Fixes Cloud stream-slot leak from list refreshes that eventually prevented opening remote conversations.
 - **Desktop AppImage Cloud sign-in now opens the browser.** If the system browser fails to launch, a manual "Open sign-in page" link appears in the pane as a fallback.

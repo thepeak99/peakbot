@@ -16,7 +16,7 @@ use tokio::net::{TcpListener, TcpStream};
 use url::{Url, form_urlencoded};
 
 use super::link::{CloudCmd, CloudError};
-use super::store::{SeedStore, SessionToken};
+use super::store::SeedStore;
 
 /// How long a pending login (loopback or deep link) waits for its callback.
 pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
@@ -73,7 +73,7 @@ pub fn plan_login(
 /// `store_token`, tell the actor to reconnect. Records the failure in
 /// `last_login_error` (G.1 step 5).
 pub async fn listener(
-    base: Url,
+    relay: Arc<super::relay_http::RelayHttp>,
     tcp: TcpListener,
     plan: LoginPlan,
     cmd: tokio::sync::mpsc::Sender<CloudCmd>,
@@ -81,7 +81,7 @@ pub async fn listener(
     last_login_error: Arc<std::sync::Mutex<Option<String>>>,
 ) {
     let result =
-        tokio::time::timeout(LOGIN_TIMEOUT, accept_one(base, tcp, &plan, &cmd, &store)).await;
+        tokio::time::timeout(LOGIN_TIMEOUT, accept_one(relay, tcp, &plan, &cmd, &store)).await;
     match result {
         Ok(Ok(())) => {
             // A fresh successful login clears the previous failure.
@@ -103,7 +103,7 @@ pub async fn listener(
 }
 
 async fn accept_one(
-    base: Url,
+    relay: Arc<super::relay_http::RelayHttp>,
     tcp: TcpListener,
     plan: &LoginPlan,
     cmd: &tokio::sync::mpsc::Sender<CloudCmd>,
@@ -136,7 +136,7 @@ async fn accept_one(
             respond(&mut stream, 400, "Bad Request", "missing code").await;
             continue;
         };
-        finish(&base, plan, code, cmd, store).await?;
+        finish(&relay, plan, code, cmd, store).await?;
         respond(&mut stream, 200, "OK", "You can close this tab.").await;
         return Ok(());
     }
@@ -175,13 +175,13 @@ async fn respond(tcp: &mut TcpStream, status: u16, text: &str, body: &str) {
 /// The one redemption path both callback sources share: redeem `code`,
 /// persist the token, tell the actor to reconnect.
 pub async fn finish(
-    base: &Url,
+    relay: &super::relay_http::RelayHttp,
     plan: &LoginPlan,
     code: &str,
     cmd: &tokio::sync::mpsc::Sender<CloudCmd>,
     store: &Arc<dyn SeedStore>,
 ) -> Result<(), CloudError> {
-    let token = redeem_token(base, plan, code).await?;
+    let token = super::relay_http::redeem_token(relay, plan, code).await?;
     store
         .store_token(&token)
         .map_err(|e| CloudError::Io(e.to_string()))?;
@@ -210,64 +210,6 @@ pub fn parse_deep_link(
         return Err(CloudError::Io("callback link is not for this app".into()));
     }
     Ok(url.query_pairs().into_owned().collect())
-}
-
-/// Redeem `code` against `{base}/token` with `plan.verifier` (the relay
-/// asserts the S256 relationship server-side).
-pub async fn redeem_token(
-    base: &Url,
-    plan: &LoginPlan,
-    code: &str,
-) -> Result<SessionToken, CloudError> {
-    let url = base
-        .join("token")
-        .map_err(|e| CloudError::Io(e.to_string()))?;
-    let resp = reqwest::Client::new()
-        .post(url)
-        .json(&serde_json::json!({ "code": code, "code_verifier": plan.verifier }))
-        .send()
-        .await
-        .map_err(|e| CloudError::Io(e.to_string()))?;
-    if !resp.status().is_success() {
-        return Err(CloudError::Io(format!(
-            "token endpoint answered {}",
-            resp.status()
-        )));
-    }
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| CloudError::Io(e.to_string()))?;
-    let token = body
-        .get("token")
-        .and_then(|t| t.as_str())
-        .ok_or_else(|| CloudError::Io("no token in reply".into()))?;
-    Ok(SessionToken::new(token.to_string()))
-}
-
-/// `POST {base}/logout` with Bearer (the relay endpoint is idempotent).
-/// Best effort with a 5 s bound: the failure must NOT stop the local wipe
-/// (p3-design §G.6), but it IS reported — a dead relay session means the
-/// device stays listed, so the API answers `revoked: false`.
-pub async fn logout_post(base: &Url, token: &SessionToken) -> Result<(), CloudError> {
-    let url = base
-        .join("logout")
-        .map_err(|e| CloudError::Io(e.to_string()))?;
-    let req = reqwest::Client::new()
-        .post(url)
-        .header("Authorization", format!("Bearer {}", token.as_str()))
-        .send();
-    let resp = tokio::time::timeout(Duration::from_secs(5), req)
-        .await
-        .map_err(|_| CloudError::Io("relay /logout timed out".into()))?
-        .map_err(|e| CloudError::Io(e.to_string()))?;
-    if !resp.status().is_success() {
-        return Err(CloudError::Io(format!(
-            "relay /logout answered {}",
-            resp.status()
-        )));
-    }
-    Ok(())
 }
 
 /// P5 C1: where the PKCE callback comes from. SKELETON — `spawn_with_callback`

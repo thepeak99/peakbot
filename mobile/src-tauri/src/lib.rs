@@ -220,6 +220,7 @@ async fn deliver_deep_link(app: &AppHandle, url: String) {
         log::info!("deep link ignored: core not running");
         return;
     }
+    log::info!("login callback received");
     core.unwrap().deliver_login_callback(&url).await;
     log::info!("deep link delivered");
 }

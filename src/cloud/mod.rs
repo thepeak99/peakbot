@@ -13,6 +13,7 @@ pub mod enroll;
 pub mod link;
 pub mod login;
 pub mod migrate;
+pub mod relay_http;
 pub mod resume_plan;
 pub mod session;
 pub mod store;

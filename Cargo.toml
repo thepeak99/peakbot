@@ -336,6 +336,10 @@ jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_r
 # `axum::extract::Form` (the harness's FakeIdp `/token` endpoint); unifies
 # with the lib's axum features.
 axum = { version = "0.8", default-features = false, features = ["form"] }
+# `http_body_util::BodyExt` for the test server body collection (the relay
+# tests use WebSocket frames, so they don't need this; the cloud TLS tests
+# need to inspect HTTP POST body content).
+http-body-util = "0.1"
 
 # No debuginfo for test builds: cold codegen of the large lib test binary
 # OOMs at debuginfo=2 (host and CI). Mirrors CI's CARGO_PROFILE_TEST_DEBUG=0.
