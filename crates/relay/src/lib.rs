@@ -59,13 +59,11 @@ pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && bool::from(a.ct_eq(b))
 }
 
-/// Serve the relay on the given listener (design §5.4). The test seam is the
-/// production entry point; spawns the 60 s sweeper (design §4.7).
-pub async fn serve(
-    cfg: config::Config,
-    listener: tokio::net::TcpListener,
-) -> anyhow::Result<RelayHandle> {
-    let addr = listener.local_addr()?;
+/// Build the relay router and lifecycle handle without binding the public
+/// socket. Callers that want to add custom routes (e.g. /probe) and serve on
+/// their own listener use this; the production entry point is `serve`.
+pub async fn build_app(cfg: config::Config) -> anyhow::Result<(axum::Router, RelayHandle)> {
+    let addr = cfg.bind;
     let path = cfg.db.clone();
     let store = tokio::task::spawn_blocking(move || store::Store::open(&path))
         .await?
@@ -87,12 +85,6 @@ pub async fn serve(
         shutdown: shutdown_rx.clone(),
     };
     let app = http::router(state);
-    let server_stop = shutdown_rx.clone();
-    let server = tokio::spawn(async move {
-        let _ = axum::serve(listener, app)
-            .with_graceful_shutdown(stopped(server_stop))
-            .await;
-    });
     let sweeper = {
         let (db, hub, logins) = (db.clone(), hub.clone(), logins.clone());
         let stop = shutdown_rx;
@@ -106,14 +98,36 @@ pub async fn serve(
             }
         })
     };
-    Ok(RelayHandle {
-        addr,
-        db,
-        hub,
-        logins,
-        shutdown: shutdown_tx,
-        tasks: vec![server, sweeper],
-    })
+    Ok((
+        app,
+        RelayHandle {
+            addr,
+            db,
+            hub,
+            logins,
+            shutdown: shutdown_tx,
+            tasks: vec![sweeper],
+        },
+    ))
+}
+
+/// Serve the relay on the given listener (design §5.4). The test seam is the
+/// production entry point; spawns the 60 s sweeper (design §4.7).
+pub async fn serve(
+    cfg: config::Config,
+    listener: tokio::net::TcpListener,
+) -> anyhow::Result<RelayHandle> {
+    let addr = listener.local_addr()?;
+    let (app, mut handle) = build_app(cfg).await?;
+    handle.addr = addr;
+    let server_stop = handle.shutdown.subscribe();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(stopped(server_stop))
+            .await;
+    });
+    handle.tasks.push(server);
+    Ok(handle)
 }
 
 /// One sweeper pass (design §4.7), shared by the timer and `sweep_at`.

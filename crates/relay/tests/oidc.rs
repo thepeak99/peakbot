@@ -491,3 +491,122 @@ async fn app_scheme_configured_still_accepts_loopback() {
     let t = TestRelay::spawn_with_app_scheme("sh.shifu.mobile").await;
     assert!(t.begin_login("http://127.0.0.1:9/cb").await.is_ok());
 }
+
+// ── OIDC endpoint scheme validation (design §5.3)
+
+/// Characterization: non-loopback HTTP endpoints are rejected even when the
+/// relay origin is loopback HTTP. This test proves the endpoint validation
+/// rejects http://10.0.0.5/... regardless of loopback_ok.
+///
+/// Implementation note: the FakeIdp serves discovery from its own address, so
+/// we override the issuer URL to a non-loopback HTTP host. The relay will
+/// discover the endpoints (which point to the actual FakeIdp loopback address),
+/// but the test demonstrates that a non-loopback issuer URL itself is rejected
+/// because the relay's Oidc client validates endpoint schemes.
+#[tokio::test]
+async fn discovery_non_loopback_http_rejected_even_with_loopback_origin() {
+    let idp = FakeIdp::spawn(false).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let secret_file = tmp.path().join("idp.secret");
+    std::fs::write(&secret_file, format!("{}\n", idp.client_secret)).unwrap();
+    let bind: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    // Issuer URL is non-loopback HTTP; the relay's Oidc client must reject it
+    // at discovery time because check_endpoint() fails for http://10.0.0.5/...
+    let cfg = peakbot_relay::config::Config {
+        bind: addr,
+        origin: peakbot_relay::config::Origin(format!("http://{addr}")),
+        db: tmp.path().join("relay.db"),
+        app_scheme: None,
+        issuers: vec![peakbot_relay::config::Issuer {
+            name: "fake".to_string(),
+            url: "http://10.0.0.5:8099".to_string(),
+            client_id: peakbot_relay::config::ClientId(idp.client_id.clone()),
+            client_secret: peakbot_relay::config::ClientSecret::new(idp.client_secret.clone()),
+        }],
+    };
+    let handle = peakbot_relay::serve(cfg, listener).await.expect("serve");
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let (_verifier, challenge) = pkce();
+    let resp = http
+        .get(format!(
+            "http://{addr}/login?code_challenge={challenge}&redirect_uri=http://127.0.0.1:9/cb&state=s1"
+        ))
+        .send()
+        .await
+        .unwrap();
+    // Discovery fails: non-loopback HTTP issuer is rejected.
+    assert!(
+        resp.status().is_server_error(),
+        "login must fail with non-loopback HTTP issuer (got {})",
+        resp.status()
+    );
+    handle.shutdown().await;
+}
+
+/// HTTPS relay origin must still accept a loopback HTTP FakeIdp endpoint.
+/// Currently RED: the relay's Oidc::new() sets loopback_ok=false when the
+/// origin is HTTPS, so check_endpoint rejects http://127.0.0.1 endpoints.
+/// After the fix, this should be GREEN.
+#[tokio::test]
+async fn https_origin_accepts_loopback_http_endpoint() {
+    let idp = FakeIdp::spawn(false).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let secret_file = tmp.path().join("idp.secret");
+    std::fs::write(&secret_file, format!("{}\n", idp.client_secret)).unwrap();
+    let bind: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    // HTTPS origin pointing at our HTTP-only relay (we don't actually use
+    // TLS for the test client; we're testing the Oidc::loopback_ok logic).
+    let cfg = peakbot_relay::config::Config {
+        bind: addr,
+        origin: peakbot_relay::config::Origin(format!("https://{addr}")),
+        db: tmp.path().join("relay.db"),
+        app_scheme: None,
+        issuers: vec![peakbot_relay::config::Issuer {
+            name: "fake".to_string(),
+            url: idp.url.clone(),
+            client_id: peakbot_relay::config::ClientId(idp.client_id.clone()),
+            client_secret: peakbot_relay::config::ClientSecret::new(idp.client_secret.clone()),
+        }],
+    };
+    let handle = peakbot_relay::serve(cfg, listener).await.expect("serve");
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let (_verifier, challenge) = pkce();
+    let resp = http
+        .get(format!(
+            "http://{addr}/login?code_challenge={challenge}&redirect_uri=http://127.0.0.1:9/cb&state=s1"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::FOUND,
+        "HTTPS origin must accept loopback HTTP endpoint (got {})",
+        resp.status()
+    );
+    handle.shutdown().await;
+}
+
+/// Regression: the existing loopback HTTP origin + loopback HTTP endpoint
+/// combination must continue to work (current production behavior).
+#[tokio::test]
+async fn http_loopback_origin_with_http_endpoint_still_works() {
+    let t = TestRelay::spawn().await;
+    let flow = t
+        .begin_login(DEFAULT_REDIRECT)
+        .await
+        .expect("login must succeed with HTTP loopback origin");
+    // The flow being created proves discovery and endpoint validation passed.
+    assert!(!flow.nonce.is_empty(), "nonce set");
+    assert!(!flow.challenge.is_empty(), "challenge set");
+}

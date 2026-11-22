@@ -39,6 +39,7 @@ This file is the working draft for the next release. When a version is tagged, t
 ### Cloud Mode
 
 - Cloud: a rejected enrollment now shows as rejected, with a Try again action that sends a fresh enrollment request.
+- **TLS dev relay for testing on the LAN.** The dev relay example now supports `--tls --host <ip>` mode with a self-signed CA (reused across runs, pin printed on startup). This makes testing Cloud sign-in on a real phone possible without port forwarding; the CA can be installed on the phone or pinned in `general.cloud.ca`. The production relay stays plain HTTP.
 - **Cloud Mode on the phone (Android and iOS app).**
   - Sign in through the browser and return to the phone via an app deep link (`sh.shifu.mobile:/cb`).
   - The phone enrolls as a controller-only device and is approved from an existing device after the 6 words match.
