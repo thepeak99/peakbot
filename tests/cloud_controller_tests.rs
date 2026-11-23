@@ -142,6 +142,7 @@ async fn upstream_cloud_body_streams_the_uploaded_bytes() {
                 convo: convo_bytes,
                 name: "blob.bin".into(),
                 content_type: "application/octet-stream".into(),
+                length: None,
             },
         )
         .await
@@ -232,11 +233,13 @@ async fn read_upload_id(stream: &mut CloudStream) -> String {
 /// `bytes_stream()` errors (it never yields bytes, never hangs).
 #[tokio::test]
 async fn upstream_cloud_body_without_a_head_is_a_protocol_error() {
-    let (tx, rx) = tokio::sync::mpsc::channel(8);
-    tx.send(StreamMsg::Chunk(vec![1, 2, 3]))
+    let (actor_tx, rx) = tokio::sync::mpsc::channel(8);
+    actor_tx
+        .send(StreamMsg::Chunk(vec![1, 2, 3]))
         .await
         .expect("seed a Chunk first");
-    let up = Upstream::from_cloud(CloudStream::new(tx, rx));
+    let (caller_tx, _caller_rx) = futures::channel::mpsc::channel(8);
+    let up = Upstream::from_cloud(CloudStream::new(caller_tx, rx));
     let mut stream = up.bytes_stream();
     match stream.next().await {
         Some(Ok(_)) => panic!("no bytes may flow before a Head"),

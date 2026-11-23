@@ -9,6 +9,7 @@
 
 use std::convert::Infallible;
 use std::pin::Pin;
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
@@ -17,7 +18,7 @@ use axum::http::{Method, Request, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use bytes::Bytes;
-use cloud::constants::{MAX_CHUNK, reset};
+use cloud::constants::{CREDIT_GRANT, CREDIT_STALL_SECS, MAX_CHUNK, RECV_STALL_SECS, reset};
 use cloud::frames::{GetTarget, Op, StreamMsg};
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use tower::ServiceExt;
@@ -55,18 +56,8 @@ async fn serve_stream(state: WsState, peer: cloud::DeviceId, op: Op, mut stream:
             convo,
             name,
             content_type,
-        } => {
-            let Some(body) = read_upload(&state, &mut stream).await else {
-                return;
-            };
-            let op = PeerOp::Upload {
-                convo: Uuid::from_bytes(convo),
-                name,
-                content_type,
-                body,
-            };
-            reply_with(&state, op, &mut stream).await;
-        }
+            length,
+        } => upload(state, convo, name, content_type, length, stream).await,
         Op::List => reply_with(&state, PeerOp::List, &mut stream).await,
         Op::Kill { id } => {
             let id = Uuid::from_bytes(id);
@@ -144,34 +135,230 @@ fn profiles_body(state: &WsState) -> Vec<u8> {
     serde_json::to_vec(&rows).unwrap_or_default()
 }
 
-/// §E.4: buffer the peer's `Chunk`s until `End`, `Reset(TOO_LARGE)` as soon
-/// as the total passes `max_file_mb` (before the router; it re-checks).
-async fn read_upload(state: &WsState, stream: &mut CloudStream) -> Option<Bytes> {
+/// Per-message stall budgets for bulk tunnel records (approved: 60 s sender
+/// waiting for credit, 120 s receiver waiting for data). Each record resets
+/// the clock, so a steadily progressing transfer is never capped.
+const SEND_STALL: Duration = Duration::from_secs(CREDIT_STALL_SECS);
+const RECV_STALL: Duration = Duration::from_secs(RECV_STALL_SECS);
+
+/// How a tunnel-fed upload body ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UploadBodyEnd {
+    End,
+    Reset,
+    Cancelled,
+    TooLarge,
+    Stalled,
+    Protocol,
+}
+
+/// `Op::Upload`: the same `POST /api/uploads` handler the browser hits, fed
+/// by a request body streamed from the tunnel. A declared over-cap length
+/// fast-fails before any body/disk activity; the actual byte count resets
+/// `TOO_LARGE` before the router when it passes `max_file_mb`.
+async fn upload(
+    state: WsState,
+    convo: [u8; 16],
+    name: String,
+    content_type: String,
+    length: Option<u64>,
+    mut stream: CloudStream,
+) {
     let cap = u64::from(state.uploads.limits().max_file_mb) * 1024 * 1024;
-    let mut body: Vec<u8> = Vec::new();
-    loop {
-        match stream.next().await? {
-            StreamMsg::Chunk(c) => {
-                if (body.len() + c.len()) as u64 > cap {
-                    let _ = stream.send(StreamMsg::Reset(reset::TOO_LARGE)).await;
-                    return None;
+    if let Some(len) = length
+        && len > cap
+    {
+        let _ = stream
+            .send_timed(StreamMsg::Reset(reset::TOO_LARGE), SEND_STALL)
+            .await;
+        return;
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+    let body = Body::from_stream(futures::stream::poll_fn(move |cx| rx.poll_recv(cx)));
+    let Some(req) =
+        build_upload_request(Uuid::from_bytes(convo), &name, &content_type, length, body)
+    else {
+        let _ = stream
+            .send_timed(StreamMsg::Reset(reset::INTERNAL), SEND_STALL)
+            .await;
+        return;
+    };
+
+    // The handler and the tunnel reader run together: the reader applies
+    // credit and the hard cap, the handler streams into the staging store.
+    // Only a complete End lets the handler's response win; every abnormal
+    // body end drops the handler (its staging guard cleans up) and resets.
+    let (end, response) = {
+        let reader = read_upload_body(&mut stream, tx, cap);
+        tokio::pin!(reader);
+        let handler = serve_request(&state, req);
+        tokio::pin!(handler);
+        tokio::select! {
+            r = &mut reader => {
+                // `Cancelled` means the handler dropped/closed its body:
+                // it has therefore finished, and its response (415/400/…)
+                // is authoritative. `End` likewise hands the result over.
+                match r {
+                    UploadBodyEnd::End | UploadBodyEnd::Cancelled => {
+                        let resp = handler.await;
+                        (r, Some(resp))
+                    }
+                    _ => (r, None),
                 }
-                body.extend_from_slice(&c);
             }
-            StreamMsg::End => return Some(Bytes::from(body)),
-            StreamMsg::Reset(_) => return None,
-            _ => {
-                let _ = stream.send(StreamMsg::Reset(reset::PROTOCOL)).await;
-                return None;
+            h = &mut handler => (UploadBodyEnd::End, Some(h)),
+        }
+    };
+
+    if let Some(resp) = response {
+        send_response(&mut stream, resp).await;
+        return;
+    }
+    match end {
+        UploadBodyEnd::TooLarge => {
+            let _ = stream
+                .send_timed(StreamMsg::Reset(reset::TOO_LARGE), SEND_STALL)
+                .await;
+        }
+        UploadBodyEnd::Stalled | UploadBodyEnd::Cancelled => {
+            let _ = stream
+                .send_timed(StreamMsg::Reset(reset::CANCELLED), SEND_STALL)
+                .await;
+        }
+        UploadBodyEnd::Protocol => {
+            let _ = stream
+                .send_timed(StreamMsg::Reset(reset::PROTOCOL), SEND_STALL)
+                .await;
+        }
+        UploadBodyEnd::Reset | UploadBodyEnd::End => {}
+    }
+}
+
+/// How a bounded body-channel send ended.
+enum BodySend {
+    Sent,
+    /// The handler dropped its body: it finished early, so its response is
+    /// authoritative.
+    Closed,
+    /// The handler neither consumed nor dropped within the receive-stall
+    /// budget: a stalled consumer, not an early response.
+    TimedOut,
+}
+
+/// Push one piece into the handler's bounded body channel, bounded by the
+/// receive-stall budget. A hung consumer must reset this upload instead of
+/// blocking the reader forever; a steadily progressing transfer is never
+/// capped (the clock is per send).
+async fn send_body(
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    item: Result<Bytes, std::io::Error>,
+    within: Duration,
+) -> BodySend {
+    match tokio::time::timeout(within, tx.send(item)).await {
+        Ok(Ok(())) => BodySend::Sent,
+        Ok(Err(_)) => BodySend::Closed,
+        Err(_) => BodySend::TimedOut,
+    }
+}
+
+/// Feed the request body from the tunnel, returning credit as bytes are
+/// consumed. `cap` is enforced here — before the router — so an oversize
+/// upload resets `TOO_LARGE` without a `Head`.
+async fn read_upload_body(
+    stream: &mut CloudStream,
+    tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    cap: u64,
+) -> UploadBodyEnd {
+    let mut total = 0u64;
+    let mut since_grant = 0u32;
+    loop {
+        match stream.next_timed(RECV_STALL).await {
+            Ok(Some(StreamMsg::Chunk(c))) => {
+                total = total.saturating_add(c.len() as u64);
+                if total > cap {
+                    let _ = send_body(
+                        &tx,
+                        Err(std::io::Error::other(
+                            "upload exceeds the configured max_file_mb",
+                        )),
+                        RECV_STALL,
+                    )
+                    .await;
+                    return UploadBodyEnd::TooLarge;
+                }
+                since_grant = since_grant.saturating_add(c.len() as u32);
+                match send_body(&tx, Ok(Bytes::from(c)), RECV_STALL).await {
+                    BodySend::Sent => {}
+                    // The handler finished early (e.g. 415/400): its own
+                    // response is authoritative.
+                    BodySend::Closed => return UploadBodyEnd::Cancelled,
+                    // It neither read nor dropped: treat as a stall so this
+                    // upload resets and its handler (and staging) is dropped.
+                    BodySend::TimedOut => return UploadBodyEnd::Stalled,
+                }
+                if since_grant >= CREDIT_GRANT {
+                    if stream
+                        .send_timed(StreamMsg::Credit { bytes: since_grant }, SEND_STALL)
+                        .await
+                        .is_err()
+                    {
+                        return UploadBodyEnd::Stalled;
+                    }
+                    since_grant = 0;
+                }
+            }
+            Ok(Some(StreamMsg::End)) => return UploadBodyEnd::End,
+            Ok(Some(StreamMsg::Reset(_))) => {
+                let _ = send_body(
+                    &tx,
+                    Err(std::io::Error::other("peer reset the upload")),
+                    RECV_STALL,
+                )
+                .await;
+                return UploadBodyEnd::Reset;
+            }
+            Ok(Some(_)) => {
+                let _ = send_body(
+                    &tx,
+                    Err(std::io::Error::other("protocol fault in upload body")),
+                    RECV_STALL,
+                )
+                .await;
+                return UploadBodyEnd::Protocol;
+            }
+            Ok(None) => {
+                let _ = send_body(
+                    &tx,
+                    Err(std::io::Error::other("upload stream closed")),
+                    RECV_STALL,
+                )
+                .await;
+                return UploadBodyEnd::Reset;
+            }
+            Err(_) => {
+                let _ = send_body(
+                    &tx,
+                    Err(std::io::Error::other("upload body stalled")),
+                    RECV_STALL,
+                )
+                .await;
+                return UploadBodyEnd::Stalled;
             }
         }
     }
 }
 
-/// Run `op` through the in-process routers and stream the response back:
-/// `Head`, `Chunk`s (≤ `MAX_CHUNK`), `End`. A non-2xx is still a reply.
+/// Run `op` through the in-process routers and stream the response back.
 async fn reply_with(state: &WsState, op: PeerOp, stream: &mut CloudStream) {
     let resp = serve_op(state, op).await;
+    send_response(stream, resp).await;
+}
+
+/// `Head`, `Chunk`s (≤ `MAX_CHUNK`), `End`. When the response declares a
+/// length, the sender verifies it exactly: a short or overlong body resets
+/// the stream instead of ending a clean (truncated) 200.
+async fn send_response(stream: &mut CloudStream, resp: Response) {
     let status = resp.status().as_u16();
     let ct = resp
         .headers()
@@ -189,22 +376,46 @@ async fn reply_with(state: &WsState, op: PeerOp, stream: &mut CloudStream) {
         content_type: ct,
         length,
     };
-    if stream.send(head).await.is_err() {
+    if stream.send_timed(head, SEND_STALL).await.is_err() {
         return;
     }
     let mut body = resp.into_body().into_data_stream();
+    let mut sent = 0u64;
     while let Some(chunk) = body.next().await {
         let Ok(bytes) = chunk else {
-            let _ = stream.send(StreamMsg::Reset(reset::INTERNAL)).await;
+            let _ = stream
+                .send_timed(StreamMsg::Reset(reset::INTERNAL), SEND_STALL)
+                .await;
             return;
         };
         for piece in bytes.chunks(MAX_CHUNK) {
-            if stream.send(StreamMsg::Chunk(piece.to_vec())).await.is_err() {
+            if let Some(expected) = length
+                && sent + piece.len() as u64 > expected
+            {
+                let _ = stream
+                    .send_timed(StreamMsg::Reset(reset::INTERNAL), SEND_STALL)
+                    .await;
                 return;
             }
+            if stream
+                .send_timed(StreamMsg::Chunk(piece.to_vec()), SEND_STALL)
+                .await
+                .is_err()
+            {
+                return;
+            }
+            sent += piece.len() as u64;
         }
     }
-    let _ = stream.send(StreamMsg::End).await;
+    if let Some(expected) = length
+        && sent != expected
+    {
+        let _ = stream
+            .send_timed(StreamMsg::Reset(reset::INTERNAL), SEND_STALL)
+            .await;
+        return;
+    }
+    let _ = stream.send_timed(StreamMsg::End, SEND_STALL).await;
 }
 
 /// A whole in-memory body as `Head` + `Chunk`s + `End`.
@@ -214,52 +425,50 @@ async fn send_reply(stream: &mut CloudStream, status: u16, ct: &str, body: Bytes
         content_type: ct.to_string(),
         length: Some(body.len() as u64),
     };
-    if stream.send(head).await.is_err() {
+    if stream.send_timed(head, SEND_STALL).await.is_err() {
         return;
     }
     for piece in body.chunks(MAX_CHUNK) {
-        if stream.send(StreamMsg::Chunk(piece.to_vec())).await.is_err() {
+        if stream
+            .send_timed(StreamMsg::Chunk(piece.to_vec()), SEND_STALL)
+            .await
+            .is_err()
+        {
             return;
         }
     }
-    let _ = stream.send(StreamMsg::End).await;
+    let _ = stream.send_timed(StreamMsg::End, SEND_STALL).await;
 }
 
-/// The non-Attach ops (mirrors `cloud::Op` minus `Attach`/`Profiles`, §E.2).
+/// The non-Attach ops (mirrors `cloud::Op` minus `Attach`/`Profiles`/`Upload`,
+/// §E.2). `Upload` is streamed separately because its body is a tunnel
+/// stream, not an in-memory `Bytes`.
 #[derive(Debug)]
 pub(super) enum PeerOp {
     List,
-    Kill {
-        id: Uuid,
-    },
-    GetImage {
-        id: String,
-    },
-    GetUpload {
-        convo: Uuid,
-        id: Uuid,
-    },
-    Upload {
-        convo: Uuid,
-        name: String,
-        content_type: String,
-        body: Bytes,
-    },
+    Kill { id: Uuid },
+    GetImage { id: String },
+    GetUpload { convo: Uuid, id: Uuid },
 }
 
 /// Answer one request/response op in process (A2): the same router (and so
 /// the same validation, size limits and no-existence-oracle 404s) as the
 /// HTTP routes, via `tower::ServiceExt::oneshot`.
 pub(super) async fn serve_op(state: &WsState, op: PeerOp) -> Response {
-    let router = Router::new()
-        .route("/images/{id}", get(images::image_handler))
-        .merge(uploads::router(state.uploads.clone()))
-        .merge(conversations::router(state.clone()));
     let Some(req) = build_request(op) else {
         // Only a malformed constant/encoded part fails — unreachable in
         // practice, but the seam must not panic the socket task.
         return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "bad op").into_response();
     };
+    serve_request(state, req).await
+}
+
+/// Run one already-built request through the same in-process routers.
+async fn serve_request(state: &WsState, req: Request<Body>) -> Response {
+    let router = Router::new()
+        .route("/images/{id}", get(images::image_handler))
+        .merge(uploads::router(state.uploads.clone()))
+        .merge(conversations::router(state.clone()));
     match router.oneshot(req).await {
         Ok(resp) => resp,
         Err(never) => match never {},
@@ -267,32 +476,38 @@ pub(super) async fn serve_op(state: &WsState, op: PeerOp) -> Response {
 }
 
 fn build_request(op: PeerOp) -> Option<Request<Body>> {
-    let (method, uri, body) = match op {
-        PeerOp::List => (Method::GET, "/api/conversations".to_string(), None),
-        PeerOp::Kill { id } => (Method::POST, format!("/api/conversations/{id}/kill"), None),
-        PeerOp::GetImage { id } => (Method::GET, format!("/images/{}", enc(&id)), None),
-        PeerOp::GetUpload { convo, id } => {
-            (Method::GET, format!("/api/uploads/{convo}/{id}"), None)
-        }
-        PeerOp::Upload {
-            convo,
-            name,
-            content_type,
-            body,
-        } => (
-            Method::POST,
-            format!("/api/uploads?convo={convo}&name={}", enc(&name)),
-            Some((content_type, body)),
-        ),
+    let (method, uri) = match op {
+        PeerOp::List => (Method::GET, "/api/conversations".to_string()),
+        PeerOp::Kill { id } => (Method::POST, format!("/api/conversations/{id}/kill")),
+        PeerOp::GetImage { id } => (Method::GET, format!("/images/{}", enc(&id))),
+        PeerOp::GetUpload { convo, id } => (Method::GET, format!("/api/uploads/{convo}/{id}")),
     };
-    let builder = Request::builder().method(method).uri(uri);
-    let built = match body {
-        Some((ct, bytes)) => builder
-            .header(header::CONTENT_TYPE, ct)
-            .body(Body::from(bytes)),
-        None => builder.body(Body::empty()),
-    };
-    built.ok()
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
+        .ok()
+}
+
+/// The upload request the browser would send: query rebuilt from typed
+/// parts, the declared length as `Content-Length` (so the handler can
+/// fast-fail before reading), and a streaming body from the tunnel.
+fn build_upload_request(
+    convo: Uuid,
+    name: &str,
+    content_type: &str,
+    length: Option<u64>,
+    body: Body,
+) -> Option<Request<Body>> {
+    let uri = format!("/api/uploads?convo={convo}&name={}", enc(name));
+    let mut builder = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, content_type);
+    if let Some(len) = length {
+        builder = builder.header(header::CONTENT_LENGTH, len);
+    }
+    builder.body(body).ok()
 }
 
 /// The op parts are constants or percent-encoded; encode for the query/URI.
@@ -692,16 +907,15 @@ profiles:
         assert_eq!(img.status(), 404, "unknown image id → 404, no oracle");
 
         let convo = Uuid::new_v4();
-        let up = serve_op(
-            st,
-            PeerOp::Upload {
-                convo,
-                name: "a b.txt".into(),
-                content_type: "application/octet-stream".into(),
-                body: Bytes::from_static(b"hello"),
-            },
+        let up_req = build_upload_request(
+            convo,
+            "a b.txt",
+            "application/octet-stream",
+            Some(5),
+            Body::from("hello"),
         )
-        .await;
+        .expect("upload request");
+        let up = serve_request(st, up_req).await;
         assert_eq!(up.status(), 200, "upload accepted");
         let v: Value = serde_json::from_slice(&body(up).await).unwrap();
         let id = Uuid::parse_str(v["id"].as_str().expect("upload reply carries id")).unwrap();
@@ -723,16 +937,15 @@ profiles:
                 ..Default::default()
             }),
         );
-        let up = serve_op(
-            &env.state,
-            PeerOp::Upload {
-                convo: Uuid::new_v4(),
-                name: "big.bin".into(),
-                content_type: "application/octet-stream".into(),
-                body: Bytes::from(vec![0u8; 2 * 1024 * 1024]),
-            },
+        let up_req = build_upload_request(
+            Uuid::new_v4(),
+            "big.bin",
+            "application/octet-stream",
+            None,
+            Body::from(vec![0u8; 2 * 1024 * 1024]),
         )
-        .await;
+        .expect("upload request");
+        let up = serve_request(&env.state, up_req).await;
         assert_eq!(
             up.status(),
             413,

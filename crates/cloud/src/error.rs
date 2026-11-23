@@ -119,6 +119,9 @@ pub enum Error {
     /// Chain change made peer or self not active (§9.6).
     #[error("revoked")]
     Revoked,
+    /// The sender tried to write more bytes than its credit window allows.
+    #[error("credit exhausted")]
+    Credit,
     /// Handshake timer expired (§8.6).
     #[error("timeout")]
     Timeout,

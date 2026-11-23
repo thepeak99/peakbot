@@ -144,8 +144,16 @@ async fn upload_post(directory: &Arc<Directory>, profile: &str, req: Request<Bod
         return not_found().await;
     };
     let content_type = req.headers().get(header::CONTENT_TYPE).cloned();
+    let length = req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
     let body = req.into_body().into_data_stream().boxed();
-    match client.post_upload(&convo, &name, content_type, body).await {
+    match client
+        .post_upload(&convo, &name, content_type, length, body)
+        .await
+    {
         Ok(upstream) => upstream_response(upstream),
         Err(e) => failure_response(e),
     }
@@ -212,6 +220,8 @@ fn upstream_response(upstream: Upstream) -> Response {
 fn failure_response(error: RemoteError) -> Response {
     let status = match &error {
         RemoteError::Timeout { .. } => StatusCode::GATEWAY_TIMEOUT,
+        // The device's own upload limit, not a transport failure.
+        RemoteError::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
         _ => StatusCode::BAD_GATEWAY,
     };
     (
@@ -252,5 +262,19 @@ where
     fn size_hint(&self) -> (usize, Option<usize>) {
         let exact = std::cmp::min(self.left, usize::MAX as u64) as usize;
         (exact, Some(exact))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The device's own upload limit is a 413, not a transport 502.
+    #[test]
+    fn payload_too_large_maps_to_413() {
+        let resp = failure_response(RemoteError::PayloadTooLarge {
+            profile: "dev@laptop".to_string(),
+        });
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

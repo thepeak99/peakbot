@@ -97,6 +97,9 @@ async fn op_reply(stream: &mut CloudStream) -> (u16, String, Vec<u8>) {
             StreamMsg::End => panic!("End before the Head"),
             StreamMsg::Frame(f) => panic!("unexpected frame on an op stream: {f}"),
             StreamMsg::Open(_) => panic!("unexpected Open on an op stream"),
+            StreamMsg::FrameBegin { .. } | StreamMsg::FrameEnd | StreamMsg::Credit { .. } => {
+                panic!("unexpected v2 Attach record on an op stream")
+            }
         }
     }
 }
@@ -139,6 +142,7 @@ async fn upload(
                 convo: convo_bytes,
                 name: name.to_string(),
                 content_type: content_type.to_string(),
+                length: None,
             },
         )
         .await

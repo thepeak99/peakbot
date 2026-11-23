@@ -15,6 +15,8 @@ use perma_crypto::v1;
 use crate::constants;
 use crate::{Error, Result, SessionId};
 
+pub use crate::framing::{CreditLedger, FragmentAssembler, ReassemblyBudget};
+
 // ---------------------------------------------------------------------------
 // Record protection (spec §9.1)
 // ---------------------------------------------------------------------------
@@ -189,9 +191,10 @@ pub struct Inner {
 pub enum StreamMsg {
     /// Open a stream (id > 0, strictly increasing, initiator only).
     Open(Op),
-    /// Existing JSON wire frame (Attach streams only).
+    /// Existing JSON wire frame (Attach streams only). A message up to
+    /// `FRAME_ONESHOT_MAX` rides here; larger ones are fragmented.
     Frame(String),
-    /// File chunk, len ≤ MAX_CHUNK.
+    /// File chunk, len ≤ MAX_CHUNK. On Attach, a fragment piece.
     Chunk(Vec<u8>),
     /// Response head for non-Attach ops.
     Head {
@@ -203,6 +206,13 @@ pub enum StreamMsg {
     End,
     /// Reset the stream with an error code.
     Reset(u16),
+    /// Start one fragmented Attach message: the exact UTF-8 byte length the
+    /// following `Chunk`s will carry.
+    FrameBegin { len: u32 },
+    /// Complete the fragmented Attach message currently in flight.
+    FrameEnd,
+    /// Receiver → sender window update: up to `bytes` more may be sent.
+    Credit { bytes: u32 },
 }
 
 /// The six allowed operations (spec §9.4); nothing else is expressible.
@@ -220,6 +230,10 @@ pub enum Op {
         convo: [u8; 16],
         name: String,
         content_type: String,
+        /// Declared body length (the browser's Content-Length), when known.
+        /// A value over the host cap fast-fails before any body is read; the
+        /// actual byte count is still verified against it at End.
+        length: Option<u64>,
     },
 }
 
@@ -321,11 +335,14 @@ impl Mux {
     ///   strictly greater than every previously opened id.
     /// - S2: at most `MAX_STREAMS` open at once; a further Open answers
     ///   `Reset(TooLarge)` (event, not abort).
-    /// - S3: Attach: `Frame` both ways, `End` per direction, closed when
-    ///   both ended; `Chunk`/`Head` on Attach → `Protocol`.
+    /// - S3: Attach: `Frame`, the v2 `FrameBegin`/`Chunk*`/`FrameEnd`
+    ///   fragment grammar, `Credit`, and `End` per direction; closed when
+    ///   both ended. `Head` → `Protocol`. The mux is direction-agnostic, so
+    ///   the endpoint assemblers own per-direction fragment ordering.
     /// - S4: other ops: initiator `Open, Chunk*, End`; responder
     ///   `Head, Chunk*, End`; `End` is a HALF-close (the stream closes on
-    ///   the second End); out of sequence or `Frame` → `Protocol`.
+    ///   the second End); out of sequence, `Frame`, or a v2 Attach-only
+    ///   record → `Protocol`.
     /// - S5: `Reset` ends a stream both ways; messages for a reset/closed
     ///   id are dropped silently (no event); a message for an id that was
     ///   never opened → `Protocol`.
@@ -391,8 +408,13 @@ impl Mux {
                         Ok(events)
                     }
                     StreamMsg::Chunk(c) => {
-                        if attach || c.len() > constants::MAX_CHUNK {
+                        if c.len() > constants::MAX_CHUNK {
                             return Err(Error::Protocol);
+                        }
+                        if attach {
+                            // v2 Attach fragment piece; ordering lives in the
+                            // endpoint assembler (the mux sees both directions).
+                            return Ok(events);
                         }
                         // Before Head only the request can send; after its
                         // End a Chunk is out of sequence (S4).
@@ -401,6 +423,16 @@ impl Mux {
                         }
                         Ok(events)
                     }
+                    StreamMsg::FrameBegin { .. } | StreamMsg::FrameEnd => {
+                        if !attach {
+                            return Err(Error::Protocol);
+                        }
+                        Ok(events)
+                    }
+                    // Credit is legal on every live stream: live bulk ops
+                    // (Upload/Get bodies, Head/Chunk replies) share the one
+                    // per-direction window with Attach.
+                    StreamMsg::Credit { .. } => Ok(events),
                     StreamMsg::Head { .. } => {
                         if attach || headed {
                             return Err(Error::Protocol);

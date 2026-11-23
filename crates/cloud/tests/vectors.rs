@@ -161,8 +161,8 @@ fn vector_relay_hello_a() {
 
 // -- hs_A_to_B ----------------------------------------------------------------------------------------
 
-const HS_K_IR: &str = "3287349023d61e3ac233acb614b52faa656542d43f01d4eab6b4a41a971d6df1";
-const HS_K_RI: &str = "dd3189265b4d2137e97098653eadc856a828142b84e001e7e92403a650df8187";
+const HS_K_IR: &str = "a1c321bfa69dc2c340c0272d2f2dec91d300ac72390d59c5a2a20d63711dbb6e";
+const HS_K_RI: &str = "4b76607108432e84150996e52473d7e5d8599f1bcd387eb4687605f67ab4b690";
 
 #[test]
 fn vector_hs_a_to_b_transcript() {

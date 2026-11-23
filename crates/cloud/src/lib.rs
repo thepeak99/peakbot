@@ -19,6 +19,7 @@ pub mod constants;
 pub mod domain;
 pub mod error;
 pub mod frames;
+pub mod framing;
 pub mod handshake;
 pub mod letter;
 pub mod link;

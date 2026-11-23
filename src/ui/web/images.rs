@@ -29,16 +29,20 @@ pub(crate) async fn image_handler(Path(id): Path<String>) -> Response {
         Err(_) => return (StatusCode::NOT_FOUND, "not found").into_response(),
     };
 
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, content_type_for(&id)),
-            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
-            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
-        ],
-        bytes,
-    )
-        .into_response()
+    let len = bytes.len();
+    let mut resp = Response::new(bytes.into());
+    *resp.status_mut() = StatusCode::OK;
+    resp.headers_mut()
+        .insert(header::CONTENT_TYPE, content_type_for(&id).parse().unwrap());
+    resp.headers_mut()
+        .insert(header::CONTENT_LENGTH, len.to_string().parse().unwrap());
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        "public, max-age=31536000, immutable".parse().unwrap(),
+    );
+    resp.headers_mut()
+        .insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
+    resp
 }
 
 /// `path_for` already constrained the extension to a closed 5-value set, so

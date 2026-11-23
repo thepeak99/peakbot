@@ -19,7 +19,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use cloud::frames::StreamMsg;
 use futures::stream::BoxStream;
-use futures::{Sink, SinkExt, Stream, StreamExt};
+use futures::{Sink, Stream, StreamExt};
 use reqwest::StatusCode;
 use reqwest::header::{COOKIE, HeaderValue};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -53,6 +53,9 @@ pub(super) mod relay;
 // edition parses — the relay runs in the Local edition too.
 #[cfg(test)]
 mod client_tests;
+
+#[cfg(test)]
+mod cloud_body_tests;
 
 #[cfg(test)]
 mod relay_tests;
@@ -108,7 +111,8 @@ impl Stream for WsStream {
                 Poll::Ready(Some(StreamMsg::Reset(code))) => {
                     Poll::Ready(Some(Err(WsError::Io(io::Error::other(reset_text(code))))))
                 }
-                // Head/Chunk/Open on an attach stream is a protocol bug.
+                // Head/Chunk/Open or a raw fragment record on an Attach
+                // stream is a protocol bug: the actor delivers whole Frames.
                 Poll::Ready(Some(_)) => Poll::Ready(Some(Err(WsError::Io(io::Error::other(
                     "unexpected message on an attach stream",
                 ))))),
@@ -224,11 +228,12 @@ enum UpstreamBody {
     /// The response plus the peer its body errors are classified against.
     Direct(reqwest::Response, Peer),
     /// The Cloud Mode tunnel body (§F.3): `Chunk`s until `End`, `Reset` →
-    /// error. `head` = the `Head` was already read (status/content/length
-    /// ride on the `Upstream`); `None` = `bytes_stream` must read it.
+    /// error. `head` = `None` while the `Head` is still unread; `Some(len)`
+    /// once it has been read (`len` is the exact declared body length, when
+    /// the device supplied one).
     Cloud {
         stream: crate::cloud::stream::CloudStream,
-        head: Option<()>,
+        head: Option<Option<u64>>,
     },
 }
 
@@ -268,7 +273,7 @@ impl Upstream {
             headers,
             body: UpstreamBody::Cloud {
                 stream,
-                head: Some(()),
+                head: Some(length),
             },
         }
     }
@@ -279,7 +284,7 @@ impl Upstream {
                 resp.bytes_stream()
                     .map(move |chunk| chunk.map_err(|e| peer.classify_reqwest(&e))),
             ),
-            UpstreamBody::Cloud { stream, head } => Box::pin(cloud_body(stream, head.is_some())),
+            UpstreamBody::Cloud { stream, head } => Box::pin(cloud_body(stream, head)),
         }
     }
 }
@@ -290,56 +295,139 @@ fn cloud_fault(message: &str) -> RemoteError {
     cloud_down("cloud", message)
 }
 
-/// §F.3: `Head` first (unless `headed`), then `Chunk`s, `End` ends,
-/// `Reset` → Io error; anything out of sequence is a protocol fault.
-fn cloud_body(
-    mut stream: crate::cloud::stream::CloudStream,
+/// §F.3: `Head` first (unless already read), then `Chunk`s paced by credit,
+/// `End` ends. The receiver validates the exact declared length (short or
+/// overlong is an error, never a clean truncated body) and returns credit
+/// for bytes it has actually yielded. Per-record receive timeouts apply;
+/// a steadily progressing transfer is never capped.
+struct CloudBodyState {
     headed: bool,
+    expected: Option<u64>,
+    seen: u64,
+    since_grant: u32,
+    done: bool,
+}
+
+fn cloud_body(
+    stream: crate::cloud::stream::CloudStream,
+    head: Option<Option<u64>>,
 ) -> impl Stream<Item = Result<Bytes, RemoteError>> {
-    let mut head = headed;
-    let mut done = false;
-    futures::stream::poll_fn(move |cx| {
-        if done {
-            return Poll::Ready(None);
+    let state = match head {
+        Some(expected) => CloudBodyState {
+            headed: true,
+            expected,
+            seen: 0,
+            since_grant: 0,
+            done: false,
+        },
+        None => CloudBodyState {
+            headed: false,
+            expected: None,
+            seen: 0,
+            since_grant: 0,
+            done: false,
+        },
+    };
+    futures::stream::unfold((stream, state), |(mut stream, mut st)| async move {
+        if st.done {
+            return None;
         }
         loop {
-            match Pin::new(&mut stream).poll_next(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => {
-                    // The actor ended the stream: clean after a Head, a
-                    // fault before one.
-                    done = true;
-                    return if head {
-                        Poll::Ready(None)
-                    } else {
-                        Poll::Ready(Some(Err(cloud_fault(
-                            "the cloud body ended without a Head",
-                        ))))
-                    };
+            // Return credit for the previous chunk(s) only when the
+            // consumer asks for more: that is consumption, not delivery.
+            if st.since_grant >= cloud::constants::CREDIT_GRANT {
+                let grant = std::mem::take(&mut st.since_grant);
+                if stream
+                    .send_timed(
+                        StreamMsg::Credit { bytes: grant },
+                        Duration::from_secs(cloud::constants::CREDIT_STALL_SECS),
+                    )
+                    .await
+                    .is_err()
+                {
+                    st.done = true;
+                    return Some((
+                        Err(cloud_down(
+                            "cloud",
+                            "the download stalled waiting for credit",
+                        )),
+                        (stream, st),
+                    ));
                 }
-                Poll::Ready(Some(msg)) => match (msg, head) {
-                    (StreamMsg::Head { .. }, false) => head = true,
-                    (StreamMsg::Chunk(c), true) => return Poll::Ready(Some(Ok(Bytes::from(c)))),
-                    (StreamMsg::End, true) => {
-                        done = true;
-                        return Poll::Ready(None);
+            }
+            match stream
+                .next_timed(Duration::from_secs(cloud::constants::RECV_STALL_SECS))
+                .await
+            {
+                Ok(Some(StreamMsg::Head { length, .. })) if !st.headed => {
+                    st.headed = true;
+                    st.expected = length;
+                }
+                Ok(Some(StreamMsg::Chunk(c))) if st.headed => {
+                    let len = c.len() as u64;
+                    if let Some(expected) = st.expected
+                        && st.seen + len > expected
+                    {
+                        st.done = true;
+                        return Some((
+                            Err(cloud_fault(
+                                "the cloud body is longer than its declared length",
+                            )),
+                            (stream, st),
+                        ));
                     }
-                    (StreamMsg::End, false) => {
-                        // End before the Head is a fault, not an end.
-                        done = true;
-                        return Poll::Ready(Some(Err(cloud_fault("End before the Head"))));
+                    st.seen += len;
+                    st.since_grant = st.since_grant.saturating_add(len as u32);
+                    return Some((Ok(Bytes::from(c)), (stream, st)));
+                }
+                Ok(Some(StreamMsg::End)) => {
+                    st.done = true;
+                    if !st.headed {
+                        return Some((Err(cloud_fault("End before the Head")), (stream, st)));
                     }
-                    (StreamMsg::Reset(code), _) => {
-                        done = true;
-                        return Poll::Ready(Some(Err(cloud_down("cloud", &reset_text(code)))));
+                    if let Some(expected) = st.expected
+                        && st.seen != expected
+                    {
+                        return Some((
+                            Err(cloud_fault(
+                                "the cloud body is shorter than its declared length",
+                            )),
+                            (stream, st),
+                        ));
                     }
-                    _ => {
-                        done = true;
-                        return Poll::Ready(Some(Err(cloud_fault(
-                            "unexpected message in a cloud body",
-                        ))));
-                    }
-                },
+                    return None;
+                }
+                Ok(Some(StreamMsg::Reset(code))) => {
+                    st.done = true;
+                    return Some((Err(reset_error(code, "cloud")), (stream, st)));
+                }
+                // The actor consumes Credit; ignore defensively.
+                Ok(Some(StreamMsg::Credit { .. })) => continue,
+                Ok(Some(_)) => {
+                    st.done = true;
+                    return Some((
+                        Err(cloud_fault("unexpected message in a cloud body")),
+                        (stream, st),
+                    ));
+                }
+                Ok(None) => {
+                    st.done = true;
+                    return Some((
+                        Err(cloud_fault(if st.headed {
+                            "the cloud body ended before its End"
+                        } else {
+                            "the cloud body ended without a Head"
+                        })),
+                        (stream, st),
+                    ));
+                }
+                Err(_) => {
+                    st.done = true;
+                    return Some((
+                        Err(cloud_down("cloud", "the download stalled waiting for data")),
+                        (stream, st),
+                    ));
+                }
             }
         }
     })
@@ -426,6 +514,11 @@ pub enum RemoteError {
     NotFound {
         name: String,
     },
+    /// Cloud Mode: the device refused an upload because the file exceeds
+    /// its `max_file_mb` limit. The proxy answers 413 (never a generic 502).
+    PayloadTooLarge {
+        profile: String,
+    },
 }
 
 /// Android 17 drops LAN dials silently without the "Nearby devices" grant; name the fix.
@@ -491,7 +584,24 @@ impl fmt::Display for RemoteError {
             // §F.7 user texts (locked strings land with the green phase).
             Self::Trust(e) => write!(f, "cloud trust failure: {e} — re-check devices"),
             Self::NotFound { name } => write!(f, "no such remote: {name}"),
+            Self::PayloadTooLarge { profile } => write!(
+                f,
+                "{profile}: the file is larger than that device's upload limit"
+            ),
         }
+    }
+}
+
+/// Map a stream reset code to the proxy-facing error: `TOO_LARGE` is the
+/// device's upload limit (HTTP 413); everything else is a normal cloud
+/// failure (HTTP 502).
+fn reset_error(code: u16, name: &str) -> RemoteError {
+    if code == cloud::constants::reset::TOO_LARGE {
+        RemoteError::PayloadTooLarge {
+            profile: name.to_string(),
+        }
+    } else {
+        cloud_down(name, &reset_text(code))
     }
 }
 
@@ -518,6 +628,11 @@ pub fn from_cloud(err: &crate::cloud::CloudError, name: &str) -> RemoteError {
         CloudError::UnknownDevice => RemoteError::NotFound {
             name: name.to_string(),
         },
+        CloudError::Reset(code) if *code == cloud::constants::reset::TOO_LARGE => {
+            RemoteError::PayloadTooLarge {
+                profile: name.to_string(),
+            }
+        }
         CloudError::SelfTarget => cloud_down(name, "that is this device itself"),
         CloudError::Reset(code) => cloud_down(name, &reset_text(*code)),
         CloudError::Io(msg) => cloud_down(name, msg),
@@ -939,6 +1054,7 @@ impl DirectClient {
         convo: &Uuid,
         name: &str,
         content_type: Option<HeaderValue>,
+        length: Option<u64>,
         body: BodyStream,
     ) -> Result<Upstream, RemoteError> {
         let body = reqwest::Body::wrap_stream(body);
@@ -953,6 +1069,9 @@ impl DirectClient {
             .body(body);
         if let Some(content_type) = content_type {
             request = request.header(reqwest::header::CONTENT_TYPE, content_type);
+        }
+        if let Some(len) = length {
+            request = request.header(reqwest::header::CONTENT_LENGTH, len);
         }
         let resp = request
             .send()
@@ -1162,10 +1281,11 @@ impl Client {
         convo: &Uuid,
         name: &str,
         content_type: Option<HeaderValue>,
+        length: Option<u64>,
         body: BodyStream,
     ) -> Result<Upstream, RemoteError> {
         match self {
-            Self::Direct(d) => d.post_upload(convo, name, content_type, body).await,
+            Self::Direct(d) => d.post_upload(convo, name, content_type, length, body).await,
             Self::Cloud {
                 handle,
                 device,
@@ -1182,28 +1302,64 @@ impl Client {
                             convo: *convo.as_bytes(),
                             name: name.to_string(),
                             content_type,
+                            length,
                         },
                     )
                     .await
                     .map_err(|e| from_cloud(&e, &label))?;
-                // The body streams through in ≤ MAX_CHUNK pieces; a closed
-                // tunnel ends the upload.
+                // The body streams through in ≤ MAX_CHUNK pieces, paced by
+                // the device's credit grants; every send is bounded by the
+                // approved credit-stall budget. A closed/refused tunnel ends
+                // the upload with the device's real error (413 for TOO_LARGE).
                 let mut body = body;
+                let send_stall = Duration::from_secs(cloud::constants::CREDIT_STALL_SECS);
                 while let Some(chunk) = body.next().await {
                     let bytes = chunk.map_err(|e| cloud_down(&label, &e.to_string()))?;
                     for piece in bytes.chunks(cloud::constants::MAX_CHUNK) {
-                        if stream.send(StreamMsg::Chunk(piece.to_vec())).await.is_err() {
-                            return Err(cloud_down(&label, "the upload stream closed"));
+                        if let Err(e) = stream
+                            .send_timed(StreamMsg::Chunk(piece.to_vec()), send_stall)
+                            .await
+                        {
+                            return cloud_upload_error(stream, &label, &e).await;
                         }
                     }
                 }
-                if stream.send(StreamMsg::End).await.is_err() {
-                    return Err(cloud_down(&label, "the upload stream closed"));
+                if let Err(e) = stream.send_timed(StreamMsg::End, send_stall).await {
+                    return cloud_upload_error(stream, &label, &e).await;
                 }
                 let (status, ct, len) = cloud_head(&mut stream, &label).await?;
                 Ok(Upstream::from_cloud_headed(stream, status, ct, len))
             }
         }
+    }
+}
+
+/// A refused upload's real reason: a peer `Reset(TOO_LARGE)` is queued on
+/// the receive side after the local sink closes. Read it so the proxy can
+/// answer 413 instead of a generic 502; if the device queued an early
+/// `Head` (e.g. 415 Unacceptable Media Type), return it as `Ok(Upstream)`
+/// so the phone surfaces the device's actual HTTP status.
+async fn cloud_upload_error(
+    mut stream: crate::cloud::stream::CloudStream,
+    label: &str,
+    err: &crate::cloud::CloudError,
+) -> Result<Upstream, RemoteError> {
+    match stream.next_timed(Duration::from_secs(2)).await {
+        Ok(Some(StreamMsg::Head {
+            status,
+            content_type,
+            length,
+        })) => Ok(Upstream::from_cloud_headed(
+            stream,
+            status,
+            Some(content_type),
+            length,
+        )),
+        Ok(Some(StreamMsg::Reset(code))) => Err(reset_error(code, label)),
+        _ => Err(cloud_down(
+            label,
+            &format!("the upload stream closed: {err}"),
+        )),
     }
 }
 
@@ -1227,34 +1383,85 @@ async fn cloud_head(
     stream: &mut crate::cloud::stream::CloudStream,
     name: &str,
 ) -> Result<(u16, Option<String>, Option<u64>), RemoteError> {
-    match stream.next().await {
-        Some(StreamMsg::Head {
+    match stream
+        .next_timed(Duration::from_secs(cloud::constants::RECV_STALL_SECS))
+        .await
+    {
+        Ok(Some(StreamMsg::Head {
             status,
             content_type,
             length,
-        }) => Ok((status, Some(content_type), length)),
-        Some(StreamMsg::Reset(code)) => Err(cloud_down(name, &reset_text(code))),
-        Some(_) | None => Err(cloud_down(name, "a cloud op reply must start with a Head")),
+        })) => Ok((status, Some(content_type), length)),
+        Ok(Some(StreamMsg::Reset(code))) => Err(reset_error(code, name)),
+        Ok(Some(_)) | Ok(None) => Err(cloud_down(name, "a cloud op reply must start with a Head")),
+        Err(_) => Err(cloud_down(name, "the device stalled before answering")),
     }
 }
 
 /// Read a request/response op body to completion: `Head`, `Chunk`s until
-/// `End` (§E.2). Anything out of sequence is a protocol fault.
+/// `End` (§E.2). The receiver grants credit for consumed bytes and rejects
+/// a body whose length differs from the `Head`'s declared length.
 async fn cloud_op_reply(
     stream: &mut crate::cloud::stream::CloudStream,
     name: &str,
 ) -> Result<(u16, Vec<u8>), RemoteError> {
-    let (status, _, _) = cloud_head(stream, name).await?;
+    let (status, _, expected) = cloud_head(stream, name).await?;
     let mut body = Vec::new();
-    while let Some(msg) = stream.next().await {
-        match msg {
-            StreamMsg::Chunk(c) => body.extend(c),
-            StreamMsg::End => return Ok((status, body)),
-            StreamMsg::Reset(code) => return Err(cloud_down(name, &reset_text(code))),
-            _ => return Err(cloud_down(name, "protocol fault in a cloud op body")),
+    let mut since_grant = 0u32;
+    loop {
+        match stream
+            .next_timed(Duration::from_secs(cloud::constants::RECV_STALL_SECS))
+            .await
+        {
+            Ok(Some(StreamMsg::Chunk(c))) => {
+                let len = c.len();
+                if let Some(expected) = expected
+                    && (body.len() + len) as u64 > expected
+                {
+                    return Err(cloud_down(
+                        name,
+                        "the reply body exceeds its declared length",
+                    ));
+                }
+                body.extend(c);
+                since_grant = since_grant.saturating_add(len as u32);
+                if since_grant >= cloud::constants::CREDIT_GRANT {
+                    stream
+                        .send_timed(
+                            StreamMsg::Credit { bytes: since_grant },
+                            Duration::from_secs(cloud::constants::CREDIT_STALL_SECS),
+                        )
+                        .await
+                        .map_err(|_| cloud_down(name, "stalled returning credit"))?;
+                    since_grant = 0;
+                }
+            }
+            Ok(Some(StreamMsg::End)) => {
+                if let Some(expected) = expected
+                    && body.len() as u64 != expected
+                {
+                    return Err(cloud_down(
+                        name,
+                        "the reply body is shorter than its declared length",
+                    ));
+                }
+                return Ok((status, body));
+            }
+            Ok(Some(StreamMsg::Reset(code))) => return Err(reset_error(code, name)),
+            Ok(Some(_)) => {
+                return Err(cloud_down(name, "protocol fault in a cloud op body"));
+            }
+            Ok(None) => {
+                return Err(cloud_down(name, "the cloud op stream ended before its End"));
+            }
+            Err(_) => {
+                return Err(cloud_down(
+                    name,
+                    "the device stalled while sending the reply",
+                ));
+            }
         }
     }
-    Err(cloud_down(name, "the cloud op stream ended before its End"))
 }
 
 impl fmt::Debug for Client {

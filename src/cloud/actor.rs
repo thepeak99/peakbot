@@ -23,7 +23,8 @@ use cloud::{
     codec::{self, FromRelay, ToRelay},
     constants,
     frames::{
-        self, FrameReceiver, FrameSender, Inner, Mux, MuxEvent, Op, RecvOutcome, Role, StreamMsg,
+        self, FrameReceiver, FrameSender, Inner, Mux, MuxEvent, Op, ReassemblyBudget, RecvOutcome,
+        Role, StreamMsg,
     },
     handshake::{self, Close, Data, Hs1, Hs2, Hs3, Initiator, PipeMsg, SessionKeys},
     letter::{self, LetterBody, LetterIn, RecipientState},
@@ -31,7 +32,7 @@ use cloud::{
 use futures::{SinkExt as _, StreamExt as _};
 use perma_crypto::v1;
 use rand_core::{CryptoRng, RngCore};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message as TMsg;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -42,7 +43,7 @@ use super::link::{
     CloudCmd, CloudError, CloudState, CloudStateKind, DeviceInfo, EnrollRequestInfo, FlowError,
     InboundHook, LogoutOutcome, LogoutReason, TrustError,
 };
-use super::session::{Handshaking, Open, Phase, Session, StreamSide};
+use super::session::{AttachState, Handshaking, Open, Phase, Session, StreamSide, wire_cost};
 use super::store::{PublicState, Seed, SeedStore, SessionToken};
 use super::stream::CloudStream;
 
@@ -84,6 +85,9 @@ pub enum ActorOut {
         peer: DeviceId,
         stream: u32,
         msg: StreamMsg,
+        /// Holds one per-stream in-flight slot until the actor sends the
+        /// whole logical message; this is the local producer's backpressure.
+        permit: Option<OwnedSemaphorePermit>,
     },
     Gone {
         peer: DeviceId,
@@ -261,6 +265,59 @@ fn reset_for_reason(reason: u8) -> u16 {
     } else {
         constants::reset::INTERNAL
     }
+}
+
+/// Outcome of routing one inbound Attach record.
+enum RouteEnd {
+    Done,
+    /// Reset only this stream with `code`.
+    Reset(u16),
+    /// Close the whole session with `reason` (record limit only).
+    Close(u8),
+}
+
+/// Outcome of pumping queued Attach records.
+enum PumpEnd {
+    Reset(u16),
+    Close(u8),
+}
+
+/// A record that must not be sealed.
+enum SealErr {
+    /// Encoded inner exceeds `MAX_INNER`.
+    TooLarge,
+    /// The per-direction record counter is exhausted.
+    Closed,
+}
+
+/// The caller→actor queue depth for one stream. An Attach stream
+/// admits one logical message in flight (the forwarder's permit), so a
+/// deeper queue would only hold messages that cannot make progress — two
+/// slots give backpressure without deadlocking `send`/`Gone`. Non-Attach
+/// bulk streams keep the original depth (their forwarder paces each record
+/// against the peer's credit window).
+fn caller_capacity(op: &Op) -> usize {
+    if matches!(*op, Op::Attach) { 2 } else { 32 }
+}
+
+fn attach_state(o: &mut Open, id: u32) -> Option<&mut AttachState> {
+    o.streams.get_mut(&id)?.attach.as_mut()
+}
+
+fn deliver(o: &mut Open, id: u32, msg: StreamMsg) -> bool {
+    o.streams
+        .get_mut(&id)
+        .is_some_and(|side| side.to_caller.try_send(msg).is_ok())
+}
+
+/// Validate the encoded inner before sealing: an application-level
+/// oversize message resets only its stream.
+fn seal_checked(o: &mut Open, inner: &Inner) -> Result<Data, SealErr> {
+    let encoded = frames::encode_inner(inner);
+    if encoded.is_empty() || encoded.len() > constants::MAX_INNER {
+        return Err(SealErr::TooLarge);
+    }
+    o.tx.seal(&encoded).map_err(|_| SealErr::Closed)
 }
 
 fn devices_of(chain: &VerifiedChain) -> Vec<DeviceInfo> {
@@ -1249,8 +1306,10 @@ impl Actor {
                 };
                 match o.mux.feed(&inner) {
                     Ok(events) => {
-                        self.route_inner(ws, from, o, &inner, claim, events).await;
-                        DataOutcome::Handled
+                        match self.route_inner(ws, from, o, &inner, claim, events).await {
+                            None => DataOutcome::Handled,
+                            Some(reason) => DataOutcome::Close(reason),
+                        }
                     }
                     Err(e) => {
                         if let Some((_, out)) = claim {
@@ -1278,6 +1337,7 @@ impl Actor {
     }
 
     /// Route one mux inner + its events to the per-stream channels.
+    /// `Some(reason)` closes the session (record limit only).
     async fn route_inner(
         &mut self,
         ws: &mut Ws,
@@ -1286,17 +1346,39 @@ impl Actor {
         inner: &Inner,
         claim: Option<(Op, oneshot::Sender<Result<CloudStream, CloudError>>)>,
         events: Vec<MuxEvent>,
-    ) {
+    ) -> Option<u8> {
         if let StreamMsg::Open(op) = &inner.msg {
             // Inbound stream (we are the responder side of the mux).
             self.add_stream(o, peer, inner.stream, op.clone(), claim);
-            return;
+            return None;
         }
-        if let Some(side) = o.streams.get_mut(&inner.stream) {
+        let id = inner.stream;
+        if let StreamMsg::Credit { bytes } = &inner.msg {
+            // Credit is a per-direction control record on EVERY live stream
+            // (Attach and non-Attach bulk). The actor consumes it here; the
+            // application never sees it.
+            let end = self.route_credit(ws, peer, o, id, *bytes).await;
+            return match end {
+                RouteEnd::Done => None,
+                RouteEnd::Reset(code) => {
+                    self.reset_stream(ws, o, peer, id, code).await;
+                    None
+                }
+                RouteEnd::Close(reason) => Some(reason),
+            };
+        }
+        let attach = o.streams.get(&id).is_some_and(|s| s.attach.is_some());
+        if attach {
+            match self.route_attach(ws, peer, o, inner).await {
+                RouteEnd::Done => {}
+                RouteEnd::Reset(code) => self.reset_stream(ws, o, peer, id, code).await,
+                RouteEnd::Close(reason) => return Some(reason),
+            }
+        } else if let Some(side) = o.streams.get_mut(&id) {
             if side.to_caller.try_send(inner.msg.clone()).is_err() {
                 // Backpressure (§D.5): reset the stream, never block.
-                self.drop_stream(o, inner.stream);
-                self.send_reset(ws, o, peer, inner.stream, constants::reset::CANCELLED)
+                self.drop_stream(o, id);
+                self.send_reset(ws, o, peer, id, constants::reset::CANCELLED)
                     .await;
             } else if matches!(inner.msg, StreamMsg::End) {
                 // A peer half-close, NOT ours: the caller still owes its
@@ -1318,6 +1400,253 @@ impl Actor {
                 }
             }
         }
+        None
+    }
+
+    /// Attach-side inbound: reassemble fragments, return receive credit,
+    /// and report whether this stream or the session must end.
+    async fn route_attach(
+        &mut self,
+        ws: &mut Ws,
+        peer: DeviceId,
+        o: &mut Open,
+        inner: &Inner,
+    ) -> RouteEnd {
+        let id = inner.stream;
+        // The peer's `End` is a half-close of ITS direction: no data record
+        // may follow. Reset only this stream (§L6); `Credit` still belongs
+        // to our outbound direction and never reaches here.
+        let peer_ended = o.streams.get(&id).is_some_and(|s| s.peer_ended);
+        if peer_ended
+            && matches!(
+                inner.msg,
+                StreamMsg::Frame(_)
+                    | StreamMsg::FrameBegin { .. }
+                    | StreamMsg::Chunk(_)
+                    | StreamMsg::FrameEnd
+            )
+        {
+            return RouteEnd::Reset(constants::reset::PROTOCOL);
+        }
+        match &inner.msg {
+            StreamMsg::Frame(text) => {
+                if attach_state(o, id).is_some_and(|a| a.fragments.is_assembling()) {
+                    return RouteEnd::Reset(constants::reset::PROTOCOL);
+                }
+                if !deliver(o, id, StreamMsg::Frame(text.clone())) {
+                    return RouteEnd::Reset(constants::reset::CANCELLED);
+                }
+                self.note_received(ws, peer, o, id, text.len()).await
+            }
+            StreamMsg::FrameBegin { .. } | StreamMsg::Chunk(_) | StreamMsg::FrameEnd => {
+                let (fed, chunk_len) = match attach_state(o, id) {
+                    Some(a) => {
+                        let chunk_len = match &inner.msg {
+                            StreamMsg::Chunk(c) => c.len(),
+                            _ => 0,
+                        };
+                        let fed = a.fragments.feed(inner.msg.clone());
+                        // Real inbound fragment activity restarts this
+                        // stream's stall clock. `FrameBegin` counts (it
+                        // reserves reassembly budget); a zero-byte chunk
+                        // does not, so empty records cannot hold a
+                        // reservation forever. A completed `FrameEnd`
+                        // leaves nothing to stall.
+                        let activity =
+                            chunk_len > 0 || matches!(inner.msg, StreamMsg::FrameBegin { .. });
+                        if fed.is_ok() && activity && a.fragments.is_assembling() {
+                            a.last_progress = tokio::time::Instant::now();
+                        }
+                        (fed, chunk_len)
+                    }
+                    None => return RouteEnd::Done,
+                };
+                match fed {
+                    Ok(Some(text)) => {
+                        if !deliver(o, id, StreamMsg::Frame(text)) {
+                            return RouteEnd::Reset(constants::reset::CANCELLED);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(cloud::Error::Limit) => {
+                        return RouteEnd::Reset(constants::reset::TOO_LARGE);
+                    }
+                    Err(_) => return RouteEnd::Reset(constants::reset::PROTOCOL),
+                }
+                self.note_received(ws, peer, o, id, chunk_len).await
+            }
+            StreamMsg::End => {
+                if attach_state(o, id).is_some_and(|a| a.fragments.is_assembling()) {
+                    return RouteEnd::Reset(constants::reset::PROTOCOL);
+                }
+                let delivered = o.streams.get_mut(&id).is_some_and(|side| {
+                    let ok = side.to_caller.try_send(StreamMsg::End).is_ok();
+                    if ok {
+                        side.peer_ended = true;
+                    }
+                    ok
+                });
+                if delivered {
+                    RouteEnd::Done
+                } else {
+                    RouteEnd::Reset(constants::reset::CANCELLED)
+                }
+            }
+            // The mux event delivers a Reset to the caller.
+            StreamMsg::Reset(_) => RouteEnd::Done,
+            // Head/Open on Attach are rejected by the mux; defensive.
+            _ => RouteEnd::Reset(constants::reset::PROTOCOL),
+        }
+    }
+
+    /// Apply one inbound `Credit`: Attach grants the fragment sender's
+    /// ledger and re-pumps; non-Attach adds permits to the forwarder's
+    /// window (capped at one window). A zero grant is malformed.
+    async fn route_credit(
+        &mut self,
+        ws: &mut Ws,
+        peer: DeviceId,
+        o: &mut Open,
+        id: u32,
+        bytes: u32,
+    ) -> RouteEnd {
+        if bytes == 0 {
+            return RouteEnd::Reset(constants::reset::PROTOCOL);
+        }
+        let attach = o.streams.get(&id).is_some_and(|s| s.attach.is_some());
+        if attach {
+            let granted = match o.streams.get_mut(&id).and_then(|s| s.attach.as_mut()) {
+                Some(a) => a.send_credit.grant(bytes),
+                None => return RouteEnd::Done,
+            };
+            if granted.is_err() {
+                return RouteEnd::Reset(constants::reset::PROTOCOL);
+            }
+            return self.pump_or_end(ws, peer, o, id).await;
+        }
+        let Some(window) = o.streams.get(&id).and_then(|s| s.credit.as_ref()) else {
+            return RouteEnd::Done;
+        };
+        let available = window
+            .available_permits()
+            .min(constants::CREDIT_MAX as usize) as u32;
+        let add = bytes.min(constants::CREDIT_MAX - available);
+        if add > 0 {
+            window.add_permits(add as usize);
+        }
+        RouteEnd::Done
+    }
+
+    /// Bill consumed inbound bytes and return a `Credit` once the grant
+    /// cadence is reached.
+    async fn note_received(
+        &mut self,
+        ws: &mut Ws,
+        peer: DeviceId,
+        o: &mut Open,
+        id: u32,
+        bytes: usize,
+    ) -> RouteEnd {
+        if bytes == 0 {
+            return RouteEnd::Done;
+        }
+        let bytes = u32::try_from(bytes).unwrap_or(u32::MAX);
+        let grant = match attach_state(o, id) {
+            Some(a) => {
+                a.recv_since_grant = a.recv_since_grant.saturating_add(bytes);
+                if a.recv_since_grant >= constants::CREDIT_GRANT {
+                    Some(std::mem::replace(&mut a.recv_since_grant, 0))
+                } else {
+                    None
+                }
+            }
+            None => return RouteEnd::Done,
+        };
+        let Some(bytes) = grant else {
+            return RouteEnd::Done;
+        };
+        let inner = Inner {
+            stream: id,
+            msg: StreamMsg::Credit { bytes },
+        };
+        if o.mux.feed(&inner).is_err() {
+            return RouteEnd::Reset(constants::reset::PROTOCOL);
+        }
+        match seal_checked(o, &inner) {
+            Ok(d) => {
+                self.send_data(ws, peer, d).await;
+                RouteEnd::Done
+            }
+            Err(SealErr::TooLarge) => RouteEnd::Reset(constants::reset::TOO_LARGE),
+            Err(SealErr::Closed) => RouteEnd::Close(constants::close_reason::LIMIT),
+        }
+    }
+
+    async fn pump_or_end(&self, ws: &mut Ws, peer: DeviceId, o: &mut Open, id: u32) -> RouteEnd {
+        match self.pump_stream(ws, peer, o, id).await {
+            None => RouteEnd::Done,
+            Some(PumpEnd::Reset(code)) => RouteEnd::Reset(code),
+            Some(PumpEnd::Close(reason)) => RouteEnd::Close(reason),
+        }
+    }
+
+    /// Send queued Attach records while the peer's window allows. Never
+    /// blocks on credit: a later `Credit` re-runs this.
+    async fn pump_stream(
+        &self,
+        ws: &mut Ws,
+        peer: DeviceId,
+        o: &mut Open,
+        id: u32,
+    ) -> Option<PumpEnd> {
+        while let Some((record, pop)) = attach_state(o, id).and_then(|a| a.next_record()) {
+            let inner = Inner {
+                stream: id,
+                msg: record,
+            };
+            // The shared mux tracks BOTH directions, so our own sends are
+            // fed too (an illegal one resets that stream locally).
+            let events = match o.mux.feed(&inner) {
+                Ok(ev) => ev,
+                Err(_) => return Some(PumpEnd::Reset(constants::reset::PROTOCOL)),
+            };
+            let sealed = seal_checked(o, &inner);
+            if pop && let Some(a) = attach_state(o, id) {
+                a.pop_sent();
+            }
+            for ev in events {
+                if let MuxEvent::Closed(id) | MuxEvent::Reset(id, _) = ev {
+                    self.drop_stream(o, id);
+                }
+            }
+            match sealed {
+                Ok(d) => self.send_data(ws, peer, d).await,
+                Err(SealErr::TooLarge) => {
+                    return Some(PumpEnd::Reset(constants::reset::TOO_LARGE));
+                }
+                Err(SealErr::Closed) => {
+                    return Some(PumpEnd::Close(constants::close_reason::LIMIT));
+                }
+            }
+            if !o.streams.contains_key(&id) {
+                return None;
+            }
+        }
+        // A dropped caller: once its outbox is on the wire, honour the
+        // owed `End` or cancel the stream.
+        let finalize = o.streams.get(&id).and_then(|side| {
+            let a = side.attach.as_ref()?;
+            (a.caller_gone && a.outbox.is_empty()).then_some(side.sent_end)
+        });
+        if let Some(sent_end) = finalize {
+            if sent_end {
+                self.drop_stream(o, id);
+            } else {
+                self.reset_stream(ws, o, peer, id, constants::reset::CANCELLED)
+                    .await;
+            }
+        }
+        None
     }
 
     /// Create the per-stream channels + forwarder, and hand the
@@ -1330,10 +1659,19 @@ impl Actor {
         op: Op,
         claim: Option<(Op, oneshot::Sender<Result<CloudStream, CloudError>>)>,
     ) {
-        let (caller_tx, actor_rx) = mpsc::channel(32);
+        let (caller_tx, actor_rx) = futures::channel::mpsc::channel(caller_capacity(&op));
         let (actor_tx, caller_rx) = mpsc::channel(32);
         let (stop_tx, stop_rx) = oneshot::channel::<()>();
         let stream = CloudStream::new(caller_tx, caller_rx);
+        let attach = matches!(op, Op::Attach);
+        let attach_state = attach.then(|| AttachState::new(o.reassembly.clone()));
+        let permits = attach.then(|| Arc::new(Semaphore::new(1)));
+        // Every stream is credit-paced; Attach's window lives in
+        // `AttachState` (fragments consume it as they are emitted), while a
+        // non-Attach stream's forwarder acquires its exact byte cost here.
+        let credit =
+            (!attach).then(|| Arc::new(Semaphore::new(constants::CREDIT_INITIAL as usize)));
+        let forward_credit = credit.clone();
         o.streams.insert(
             id,
             StreamSide {
@@ -1341,9 +1679,11 @@ impl Actor {
                 forward_stop: stop_tx,
                 sent_end: false,
                 peer_ended: false,
+                attach: attach_state,
+                credit,
             },
         );
-        self.spawn_forwarder(actor_rx, stop_rx, peer, id);
+        self.spawn_forwarder(actor_rx, stop_rx, peer, id, permits, forward_credit);
         match claim {
             Some((_, out)) => {
                 let _ = out.send(Ok(stream));
@@ -1360,8 +1700,13 @@ impl Actor {
     /// caller dropped its `CloudStream` (`Gone`).
     async fn on_out(&mut self, live: &mut Live, ws: &mut Ws, ev: ActorOut) {
         match ev {
-            ActorOut::Out { peer, stream, msg } => {
-                self.send_out(live, ws, peer, stream, msg).await;
+            ActorOut::Out {
+                peer,
+                stream,
+                msg,
+                permit,
+            } => {
+                self.send_out(live, ws, peer, stream, msg, permit).await;
             }
             ActorOut::Gone { peer, stream } => {
                 let flags = {
@@ -1372,13 +1717,49 @@ impl Actor {
                         Phase::Open(o) => o
                             .streams
                             .get(&stream)
-                            .map(|side| (side.sent_end, side.peer_ended)),
+                            .map(|side| (side.sent_end, side.peer_ended, side.attach.is_some())),
                         _ => None,
                     }
                 };
-                let Some((sent_end, peer_ended)) = flags else {
+                let Some((sent_end, peer_ended, attach)) = flags else {
                     return;
                 };
+                if attach {
+                    // `End` is a HALF-close: a drop after the peer ended owes
+                    // ours. Queue it behind pending fragments; `pump_stream`
+                    // flushes and then retires or cancels the stream.
+                    if peer_ended && !sent_end {
+                        self.send_out(live, ws, peer, stream, StreamMsg::End, None)
+                            .await;
+                    }
+                    let marked = {
+                        let Some(s) = live.sessions.get_mut(&peer) else {
+                            return;
+                        };
+                        let Phase::Open(o) = &mut s.phase else {
+                            return;
+                        };
+                        o.streams.get_mut(&stream).map(|side| {
+                            if let Some(a) = side.attach.as_mut() {
+                                a.caller_gone = true;
+                            }
+                        })
+                    };
+                    if marked.is_none() {
+                        return;
+                    }
+                    let outcome = {
+                        let Some(s) = live.sessions.get_mut(&peer) else {
+                            return;
+                        };
+                        let Phase::Open(o) = &mut s.phase else {
+                            return;
+                        };
+                        self.pump_stream(ws, peer, o, stream).await
+                    };
+                    self.finish_pump(live, ws, peer, stream, outcome).await;
+                    return;
+                }
                 // `End` is a HALF-close (S3/S4). If the peer already ended its
                 // direction, the caller's drop owes OUR `End`; without it the
                 // mux pair never closes and its slot leaks until MAX_STREAMS
@@ -1386,7 +1767,8 @@ impl Actor {
                 // End through the normal path also sends the wire frame and
                 // retires the stream on `MuxEvent::Closed`.
                 if peer_ended && !sent_end {
-                    self.send_out(live, ws, peer, stream, StreamMsg::End).await;
+                    self.send_out(live, ws, peer, stream, StreamMsg::End, None)
+                        .await;
                     return;
                 }
                 let Some(s) = live.sessions.get_mut(&peer) else {
@@ -1405,6 +1787,31 @@ impl Actor {
         }
     }
 
+    /// Apply a pump outcome: an application-level reset ends only that
+    /// stream; the record limit ends the session.
+    async fn finish_pump(
+        &mut self,
+        live: &mut Live,
+        ws: &mut Ws,
+        peer: DeviceId,
+        stream: u32,
+        outcome: Option<PumpEnd>,
+    ) {
+        match outcome {
+            None => {}
+            Some(PumpEnd::Reset(code)) => {
+                let Some(s) = live.sessions.get_mut(&peer) else {
+                    return;
+                };
+                let Phase::Open(o) = &mut s.phase else {
+                    return;
+                };
+                self.reset_stream(ws, o, peer, stream, code).await;
+            }
+            Some(PumpEnd::Close(reason)) => self.close_session(live, ws, peer, reason).await,
+        }
+    }
+
     /// Seal + send one caller-originated message through the shared mux.
     async fn send_out(
         &mut self,
@@ -1413,7 +1820,22 @@ impl Actor {
         peer: DeviceId,
         stream: u32,
         msg: StreamMsg,
+        permit: Option<OwnedSemaphorePermit>,
     ) {
+        let attach = match live.sessions.get(&peer) {
+            Some(s) => match &s.phase {
+                Phase::Open(o) => o
+                    .streams
+                    .get(&stream)
+                    .is_some_and(|side| side.attach.is_some()),
+                _ => return,
+            },
+            None => return,
+        };
+        if attach {
+            self.send_attach(live, ws, peer, stream, msg, permit).await;
+            return;
+        }
         let sent_end = matches!(msg, StreamMsg::End);
         let Some(s) = live.sessions.get_mut(&peer) else {
             return;
@@ -1442,7 +1864,7 @@ impl Actor {
                 return;
             }
         };
-        match o.tx.seal(&frames::encode_inner(&inner)) {
+        match seal_checked(o, &inner) {
             Ok(d) => {
                 if let Some(side) = o.streams.get_mut(&stream).filter(|_| sent_end) {
                     side.sent_end = true;
@@ -1454,7 +1876,11 @@ impl Actor {
                 }
                 self.send_data(ws, peer, d).await;
             }
-            Err(_) => {
+            Err(SealErr::TooLarge) => {
+                self.reset_stream(ws, o, peer, stream, constants::reset::TOO_LARGE)
+                    .await;
+            }
+            Err(SealErr::Closed) => {
                 // The record limit: the session is over (§9.6).
                 self.close_session(live, ws, peer, constants::close_reason::LIMIT)
                     .await;
@@ -1462,9 +1888,77 @@ impl Actor {
         }
     }
 
+    /// Attach outbound: queue (fragmenting large Frames), then send what
+    /// the peer's credit window allows.
+    async fn send_attach(
+        &mut self,
+        live: &mut Live,
+        ws: &mut Ws,
+        peer: DeviceId,
+        stream: u32,
+        msg: StreamMsg,
+        permit: Option<OwnedSemaphorePermit>,
+    ) {
+        if let StreamMsg::Reset(code) = msg {
+            let Some(s) = live.sessions.get_mut(&peer) else {
+                return;
+            };
+            let Phase::Open(o) = &mut s.phase else {
+                return;
+            };
+            if o.streams.contains_key(&stream) {
+                self.reset_stream(ws, o, peer, stream, code).await;
+            }
+            return;
+        }
+        let sent_end = matches!(msg, StreamMsg::End);
+        let rejected = {
+            let Some(s) = live.sessions.get_mut(&peer) else {
+                return;
+            };
+            let Phase::Open(o) = &mut s.phase else {
+                return;
+            };
+            let Some(side) = o.streams.get_mut(&stream) else {
+                return;
+            };
+            let Some(a) = side.attach.as_mut() else {
+                return;
+            };
+            match a.enqueue(msg, permit) {
+                Ok(()) => {
+                    if sent_end {
+                        side.sent_end = true;
+                    }
+                    None
+                }
+                Err(code) => Some(code),
+            }
+        };
+        let outcome = {
+            let Some(s) = live.sessions.get_mut(&peer) else {
+                return;
+            };
+            let Phase::Open(o) = &mut s.phase else {
+                return;
+            };
+            if let Some(code) = rejected {
+                self.reset_stream(ws, o, peer, stream, code).await;
+                return;
+            }
+            self.pump_stream(ws, peer, o, stream).await
+        };
+        self.finish_pump(live, ws, peer, stream, outcome).await;
+    }
+
     fn drop_stream(&self, o: &mut Open, id: u32) {
         if let Some(side) = o.streams.remove(&id) {
             let _ = side.forward_stop.send(());
+            // Wake a forwarder blocked on this stream's credit window so it
+            // notices the stream is gone instead of waiting forever.
+            if let Some(window) = &side.credit {
+                window.close();
+            }
         }
     }
 
@@ -1491,6 +1985,19 @@ impl Actor {
         if let Ok(d) = o.tx.seal(&frames::encode_inner(&reset)) {
             self.send_data(ws, peer, d).await;
         }
+    }
+
+    /// Application-level reset: notify the caller and the peer, then retire
+    /// the stream. The session and every other stream survive.
+    async fn reset_stream(&self, ws: &mut Ws, o: &mut Open, peer: DeviceId, id: u32, code: u16) {
+        if !o.streams.contains_key(&id) {
+            return;
+        }
+        if let Some(side) = o.streams.get(&id) {
+            let _ = side.to_caller.try_send(StreamMsg::Reset(code));
+        }
+        self.send_reset(ws, o, peer, id, code).await;
+        self.drop_stream(o, id);
     }
 
     async fn send_close(&self, ws: &mut Ws, to: DeviceId, sid: SessionId, reason: u8) {
@@ -1578,6 +2085,41 @@ impl Actor {
             .collect();
         for p in expired {
             self.close_session(live, ws, p, constants::close_reason::NORMAL)
+                .await;
+        }
+    }
+
+    /// Reset the Attach streams whose inbound reassembly has made no
+    /// progress for `RECV_STALL_SECS`. Only the stalled stream is reset:
+    /// `reset_stream` drops it, which releases its reassembly reservation
+    /// and its stream slot; the session (and every other stream) survives.
+    /// Driven by `run_live`'s timer arm — no per-stream task.
+    async fn reap_stalled_attach(&mut self, live: &mut Live, ws: &mut Ws) {
+        let now = tokio::time::Instant::now();
+        let budget = Duration::from_secs(constants::RECV_STALL_SECS);
+        let overdue = |a: &AttachState| {
+            a.fragments.is_assembling() && now.saturating_duration_since(a.last_progress) >= budget
+        };
+        let mut stalled: Vec<(DeviceId, u32)> = Vec::new();
+        for s in live.sessions.values() {
+            let Phase::Open(o) = &s.phase else {
+                continue;
+            };
+            stalled.extend(
+                o.streams
+                    .iter()
+                    .filter(|(_, side)| side.attach.as_ref().is_some_and(overdue))
+                    .map(|(id, _)| (s.peer, *id)),
+            );
+        }
+        for (peer, id) in stalled {
+            let Some(s) = live.sessions.get_mut(&peer) else {
+                continue;
+            };
+            let Phase::Open(o) = &mut s.phase else {
+                continue;
+            };
+            self.reset_stream(ws, o, peer, id, constants::reset::CANCELLED)
                 .await;
         }
     }
@@ -1678,10 +2220,19 @@ impl Actor {
         op: Op,
         out: oneshot::Sender<Result<CloudStream, CloudError>>,
     ) {
-        let (caller_tx, actor_rx) = mpsc::channel(32);
+        let (caller_tx, actor_rx) = futures::channel::mpsc::channel(caller_capacity(&op));
         let (actor_tx, caller_rx) = mpsc::channel(32);
         let (stop_tx, stop_rx) = oneshot::channel::<()>();
         let stream = CloudStream::new(caller_tx, caller_rx);
+        let attach = matches!(op, Op::Attach);
+        let attach_state = attach.then(|| AttachState::new(o.reassembly.clone()));
+        let permits = attach.then(|| Arc::new(Semaphore::new(1)));
+        // Every stream is credit-paced; Attach's window lives in
+        // `AttachState` (fragments consume it as they are emitted), while a
+        // non-Attach stream's forwarder acquires its exact byte cost here.
+        let credit =
+            (!attach).then(|| Arc::new(Semaphore::new(constants::CREDIT_INITIAL as usize)));
+        let forward_credit = credit.clone();
         o.streams.insert(
             id,
             StreamSide {
@@ -1689,9 +2240,11 @@ impl Actor {
                 forward_stop: stop_tx,
                 sent_end: false,
                 peer_ended: false,
+                attach: attach_state,
+                credit,
             },
         );
-        self.spawn_forwarder(actor_rx, stop_rx, peer, id);
+        self.spawn_forwarder(actor_rx, stop_rx, peer, id, permits, forward_credit);
         let open = Inner {
             stream: id,
             msg: StreamMsg::Open(op),
@@ -1715,12 +2268,17 @@ impl Actor {
 
     /// The stateless glue between one caller's outbound channel and the
     /// actor's outbox (the actor stays the sole owner of protocol state).
+    /// For non-Attach streams it also spends the peer's byte credit before
+    /// forwarding, so a blocked window pauses this stream (and only this
+    /// stream) instead of resetting or flooding the actor.
     fn spawn_forwarder(
         &self,
-        mut rx: mpsc::Receiver<StreamMsg>,
+        mut rx: futures::channel::mpsc::Receiver<StreamMsg>,
         stop: oneshot::Receiver<()>,
         peer: DeviceId,
         stream: u32,
+        permits: Option<Arc<Semaphore>>,
+        credit: Option<Arc<Semaphore>>,
     ) {
         let out = self.outbox_tx.clone();
         tokio::spawn(async move {
@@ -1728,9 +2286,42 @@ impl Actor {
             loop {
                 tokio::select! {
                     _ = &mut stop => return,
-                    m = rx.recv() => match m {
+                    m = rx.next() => match m {
                         Some(msg) => {
-                            if out.send(ActorOut::Out { peer, stream, msg }).await.is_err() {
+                            // Attach streams admit one logical message at a
+                            // time: the permit is backpressure on this
+                            // stream's producer, so a fast local producer
+                            // waits instead of piling work up in the actor.
+                            let permit = match &permits {
+                                Some(s) => tokio::select! {
+                                    _ = &mut stop => return,
+                                    p = s.clone().acquire_owned() => match p {
+                                        Ok(p) => Some(p),
+                                        Err(_) => return,
+                                    },
+                                },
+                                None => None,
+                            };
+                            // Non-Attach: buy the wire bytes from the peer's
+                            // window. Control records cost zero. A cost over
+                            // one window is malformed (the mux resets it), so
+                            // it is not allowed to block forever here.
+                            if let Some(window) = &credit {
+                                let cost = wire_cost(&msg);
+                                if cost > 0 && cost <= constants::CREDIT_MAX as usize {
+                                    let bought = tokio::select! {
+                                        _ = &mut stop => return,
+                                        p = window.clone().acquire_many_owned(cost as u32) => p.ok(),
+                                    };
+                                    let Some(spent) = bought else {
+                                        return;
+                                    };
+                                    // Bytes are consumed, not returned: the
+                                    // permit represents credit already spent.
+                                    std::mem::forget(spent);
+                                }
+                            }
+                            if out.send(ActorOut::Out { peer, stream, msg, permit }).await.is_err() {
                                 return;
                             }
                         }
@@ -2440,6 +3031,34 @@ async fn run_live(
                 std::future::pending::<()>().await;
             }
         });
+        // The next inbound-Attach stall deadline: an assembly that makes no
+        // fragment progress for RECV_STALL_SECS is reset by this arm, so no
+        // per-stream timer task is needed. `None` when nothing is assembling.
+        let next_stall = live
+            .sessions
+            .values()
+            .filter_map(|s| {
+                let Phase::Open(o) = &s.phase else {
+                    return None;
+                };
+                o.streams
+                    .values()
+                    .filter_map(|side| {
+                        let a = side.attach.as_ref()?;
+                        a.fragments.is_assembling().then(|| {
+                            a.last_progress + Duration::from_secs(constants::RECV_STALL_SECS)
+                        })
+                    })
+                    .min()
+            })
+            .min();
+        let mut stall = Box::pin(async {
+            if let Some(t) = next_stall {
+                tokio::time::sleep_until(t).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        });
         tokio::select! {
             msg = ws_recv(ws) => {
                 match msg {
@@ -2479,6 +3098,9 @@ async fn run_live(
             _ = &mut expiry => {
                 actor.expire_sessions(live, ws).await;
             }
+            _ = &mut stall => {
+                actor.reap_stalled_attach(live, ws).await;
+            }
         }
     }
 }
@@ -2504,6 +3126,7 @@ fn establish_open(sid: SessionId, keys: &SessionKeys, role: Role) -> Open {
         role,
         streams: HashMap::new(),
         next_stream: 1,
+        reassembly: ReassemblyBudget::new(constants::MAX_LOGICAL_MESSAGE),
     }
 }
 

@@ -10,7 +10,9 @@ use crate::config::UploadsConfig;
 use crate::vision::MAX_IMAGE_BYTES;
 use futures::StreamExt;
 use std::path::{Path, PathBuf};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio_util::io::StreamReader;
 use uuid::Uuid;
 
@@ -46,17 +48,115 @@ pub enum AttachmentKind {
 /// never collide with an upload id dir.
 pub const WORK_DIR: &str = "work";
 
+/// A deterministic disk-read failure for the streaming reader. Test-only:
+/// the production build has no fault hooks.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultMode {
+    /// Fail the read once this many bytes have been served.
+    ReadErrorAt(u64),
+}
+
+/// The file reader behind `GET /api/uploads/{convo}/{id}` — a real async
+/// file, so the handler never buffers a whole attachment in memory.
+pub struct UploadReader {
+    file: tokio::fs::File,
+    pos: u64,
+    #[cfg(test)]
+    fault: Option<FaultMode>,
+}
+
+impl AsyncRead for UploadReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        #[cfg(test)]
+        if let Some(FaultMode::ReadErrorAt(at)) = this.fault {
+            if buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            if this.pos >= at {
+                return Poll::Ready(Err(std::io::Error::other("injected upload read failure")));
+            }
+            // Read only up to the failing offset (exact byte position via a
+            // small temporary buffer).
+            let want = (at - this.pos).min(buf.remaining() as u64) as usize;
+            let mut tmp = vec![0u8; want];
+            let mut tmp_buf = ReadBuf::new(&mut tmp);
+            match Pin::new(&mut this.file).poll_read(cx, &mut tmp_buf) {
+                Poll::Ready(Ok(())) => {
+                    let filled = tmp_buf.filled().len();
+                    buf.put_slice(tmp_buf.filled());
+                    this.pos += filled as u64;
+                    return Poll::Ready(Ok(()));
+                }
+                other => return other,
+            }
+        }
+        // Production path (and test path with no fault injected).
+        let before = buf.filled().len();
+        let result = Pin::new(&mut this.file).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = result {
+            this.pos += (buf.filled().len() - before) as u64;
+        }
+        result
+    }
+}
+
+/// Removes a staging directory on every path that does not reach the final
+/// atomic rename — including cancellation (future drop), copy errors,
+/// sniff/metadata failures and rename failures.
+struct StagingGuard {
+    path: Option<PathBuf>,
+}
+
+impl StagingGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for StagingGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
 /// Per-conversation upload store. The root is created lazily on the first
 /// store, so a session that never attaches touches no disk.
 #[derive(Clone)]
 pub struct UploadStore {
     root: PathBuf,
     limits: UploadsConfig,
+    #[cfg(test)]
+    fault: Option<FaultMode>,
 }
 
 impl UploadStore {
     pub fn new(root: PathBuf, limits: UploadsConfig) -> Self {
-        Self { root, limits }
+        Self {
+            root,
+            limits,
+            #[cfg(test)]
+            fault: None,
+        }
+    }
+
+    /// Test-only disk failure injection for the streaming reader.
+    #[cfg(test)]
+    #[doc(hidden)]
+    pub fn with_fault(mut self, mode: FaultMode) -> Self {
+        self.fault = Some(mode);
+        self
     }
 
     /// `<data_local_dir>/peakbot/uploads` — the data dir, not the cache dir,
@@ -91,27 +191,73 @@ impl UploadStore {
         name: &str,
         reader: impl AsyncRead + Unpin,
     ) -> Result<Attachment, AttachError> {
+        self.store_declared(convo, name, reader, None).await
+    }
+
+    /// Stores one file with an optional declared length. The body streams
+    /// into a staging directory; only a complete, valid body is atomically
+    /// renamed to `<convo>/<id>/<name>`. Cancellation/errors leave no final
+    /// attachment (the staging guard removes it on drop).
+    pub async fn store_declared(
+        &self,
+        convo: Uuid,
+        name: &str,
+        reader: impl AsyncRead + Unpin,
+        declared: Option<u64>,
+    ) -> Result<Attachment, AttachError> {
         let name = sanitize_name(name);
         let id = Uuid::new_v4();
-        let id_dir = self.conversation_dir(convo).join(id.to_string());
-        tokio::fs::create_dir_all(&id_dir).await?;
-        let file_path = id_dir.join(&name);
+        let convo_dir = self.conversation_dir(convo);
+        tokio::fs::create_dir_all(&convo_dir).await?;
+        // A dot-prefixed, non-UUID sibling of the final id dir: `find` can
+        // never mistake staging for a published attachment.
+        let staging_dir = convo_dir.join(format!(".{id}.staging"));
+        let final_dir = convo_dir.join(id.to_string());
+        let mut guard = StagingGuard::new(staging_dir.clone());
+        tokio::fs::create_dir_all(&staging_dir).await?;
+
+        let staged_path = staging_dir.join(&name);
         let max_bytes = self.limits.max_file_mb as u64 * 1024 * 1024;
 
-        let mut file = tokio::fs::File::create(&file_path).await?;
+        let mut file = tokio::fs::File::create(&staged_path).await?;
+        // `take(max+1)` is authoritative for a missing OR lying declared
+        // length; the declared value is only an additional exact check.
         let mut reader = reader.take(max_bytes + 1);
         let written = tokio::io::copy(&mut reader, &mut file).await?;
+        file.flush().await?;
+        // Close before rename (Windows refuses to move an open file).
+        drop(file);
+
         if written > max_bytes {
-            // One id dir per file, so removing the dir removes the partial.
-            let _ = tokio::fs::remove_dir_all(&id_dir).await;
             return Err(AttachError::TooLarge {
                 name,
                 size: None,
                 max_mb: self.limits.max_file_mb,
             });
         }
+        if let Some(expected) = declared
+            && written != expected
+        {
+            return Err(AttachError::LengthMismatch { expected, written });
+        }
 
-        Ok(describe(&file_path, convo, id)?)
+        // Metadata + magic sniff BEFORE publishing: an unreadable/malformed
+        // body never becomes visible.
+        let attachment = describe(&staged_path, convo, id)?;
+        tokio::fs::rename(&staging_dir, &final_dir).await?;
+        guard.disarm();
+        Ok(attachment)
+    }
+
+    /// Opens the stored file for streaming downloads. The caller pipes this
+    /// through `ReaderStream`; the bytes are never read into a whole-file Vec.
+    pub async fn open_stream(&self, a: &Attachment) -> std::io::Result<UploadReader> {
+        Ok(UploadReader {
+            file: tokio::fs::File::open(self.path(a)).await?,
+            pos: 0,
+            #[cfg(test)]
+            fault: self.fault,
+        })
     }
 
     /// The single regular file in `root/convo/id`, described. `None` if the
@@ -522,6 +668,10 @@ pub enum AttachError {
         size: Option<u64>,
         max_mb: u32,
     },
+    /// The body did not match its declared Content-Length: a short or lying
+    /// body is rejected rather than published.
+    #[error("upload body length mismatch: got {written} bytes, expected {expected}")]
+    LengthMismatch { expected: u64, written: u64 },
     #[error("too many files: {count} (max {max})")]
     TooMany { count: usize, max: u32 },
     #[error("attachment not found in this conversation — attach the file again")]
@@ -534,4 +684,45 @@ pub enum AttachError {
     InvalidToken(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A disk read failure stops the source at the injected offset: the
+    /// body stream errors instead of silently delivering a truncated
+    /// (clean) response.
+    #[tokio::test]
+    async fn open_stream_with_injected_read_failure_errors_at_the_offset() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = UploadStore::new(dir.path().to_path_buf(), UploadsConfig::default());
+        let convo = Uuid::new_v4();
+        let payload = vec![0x11u8; 4096];
+        let attachment = store
+            .store(convo, "broken.bin", &payload[..])
+            .await
+            .expect("store");
+
+        let faulty = store.with_fault(FaultMode::ReadErrorAt(512));
+        let mut reader = faulty
+            .open_stream(&attachment)
+            .await
+            .expect("open_stream must still open the file");
+        use tokio::io::AsyncReadExt;
+        let mut first = vec![0u8; 512];
+        reader
+            .read_exact(&mut first)
+            .await
+            .expect("the first 512 bytes are readable");
+        let err = reader
+            .read(&mut [0u8; 16])
+            .await
+            .expect_err("the injected failure must surface as an error");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::Other,
+            "an injected disk failure is an I/O error, not a clean EOF"
+        );
+    }
 }
