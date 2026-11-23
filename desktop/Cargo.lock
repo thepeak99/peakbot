@@ -2665,7 +2665,7 @@ dependencies = [
 
 [[package]]
 name = "peakbot-desktop"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "gio",
  "gtk",
@@ -2697,7 +2697,7 @@ dependencies = [
 
 [[package]]
 name = "peakbot-desktop-core"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "base64 0.23.1",
  "directories-next",
