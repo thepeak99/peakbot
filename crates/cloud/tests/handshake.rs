@@ -598,7 +598,7 @@ fn pipe_msg_unknown_version_rejected() {
     )
     .unwrap();
     let mut bytes = cloud::handshake::PipeMsg::Hs1(hs1).encode();
-    bytes[0] = 2; // version 2
+    bytes[0] = cloud::constants::PIPE_VERSION + 1; // unknown version
     assert_eq!(
         cloud::handshake::PipeMsg::parse(&bytes),
         Err(Error::UnknownVersion)
@@ -807,7 +807,7 @@ fn initiator_aborts_when_peer_not_in_own_chain() {
         cloud::handshake::transcript_th1(&cloud::handshake::PipeMsg::Hs1(hs1.clone()).encode());
     let hs2_tbs = {
         let mut m = Vec::new();
-        m.push(1); // pipe version
+        m.push(cloud::constants::PIPE_VERSION); // pipe version
         m.push(2); // Hs2
         m.extend_from_slice(&hs1.sid);
         m.extend_from_slice(&(ct.len() as u32).to_be_bytes());

@@ -141,8 +141,8 @@ impl PipeMsg {
         out
     }
 
-    /// Parse CE pipe bytes. Version byte ≠ 1 → `UnknownVersion`; unknown
-    /// type tag, wrong field lengths, trailing bytes → `Malformed`.
+    /// Parse CE pipe bytes. Version byte ≠ `PIPE_VERSION` → `UnknownVersion`;
+    /// unknown type tag, wrong field lengths, trailing bytes → `Malformed`.
     pub fn parse(raw: &[u8]) -> Result<Self> {
         let mut r = Reader::new(raw);
         if r.u8()? != constants::PIPE_VERSION {

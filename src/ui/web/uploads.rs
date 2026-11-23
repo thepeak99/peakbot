@@ -24,7 +24,7 @@ use axum::{
 use futures::StreamExt;
 use percent_encoding::{AsciiSet, CONTROLS, percent_encode};
 use serde::Deserialize;
-use tokio_util::io::StreamReader;
+use tokio_util::io::{ReaderStream, StreamReader};
 use uuid::Uuid;
 
 /// `POST /api/uploads?convo=<uuid>&name=<urlencoded filename>`.
@@ -79,19 +79,26 @@ async fn upload_handler(
         );
     }
 
-    // Stream straight into the store: `take(max+1)` bounds the copy, and a
-    // mid-stream failure leaves no id dir behind.
+    // Stream straight into the store: `take(max+1)` bounds the copy, the
+    // declared Content-Length is verified exactly, and a mid-stream failure
+    // or cancellation leaves no published attachment.
     let stream = body
         .into_data_stream()
         .map(|result| result.map_err(std::io::Error::other));
     let reader = StreamReader::new(stream);
-    match store.store(query.convo, &name, reader).await {
+    match store
+        .store_declared(query.convo, &name, reader, declared)
+        .await
+    {
         Ok(attachment) => json_response(StatusCode::OK, &attachment),
         Err(e) => match e {
             // `take(max+1)` caught it despite the Content-Length check
             // (absent or lying header).
             AttachError::TooLarge { .. } => {
                 json_error(StatusCode::PAYLOAD_TOO_LARGE, &e.to_string())
+            }
+            AttachError::LengthMismatch { .. } => {
+                json_error(StatusCode::BAD_REQUEST, &e.to_string())
             }
             other => json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -123,15 +130,25 @@ async fn serve_handler(
     let Some(attachment) = store.find(convo, id) else {
         return not_found;
     };
-    let Ok(bytes) = tokio::fs::read(store.path(&attachment)).await else {
+    // Stream the file (64 KiB reads) instead of `tokio::fs::read`: the
+    // tunnel and the browser both get correct memory behaviour, and a
+    // mid-read disk error becomes a body error rather than a clean 200.
+    let Ok(file) = store.open_stream(&attachment).await else {
         // One response for "absent" and "unreadable" — no oracle.
         return not_found;
     };
 
     let (content_type, disposition, sandbox) = serve_class(&attachment.mime);
-    let mut response = (StatusCode::OK, bytes).into_response();
+    let body = Body::from_stream(ReaderStream::with_capacity(file, 64 * 1024));
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::OK;
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&attachment.size.to_string())
+            .expect("a u64 Content-Length is a valid header value"),
+    );
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
@@ -235,12 +252,24 @@ pub fn router(store: UploadStore) -> Router {
 /// build is configured without the `json` feature (the `setup.rs` pattern).
 fn json_response<T: serde::Serialize>(status: StatusCode, value: &T) -> Response {
     match serde_json::to_vec(value) {
-        Ok(bytes) => (
-            status,
-            [(header::CONTENT_TYPE, "application/json")],
-            Body::from(bytes),
-        )
-            .into_response(),
+        Ok(bytes) => {
+            // The tunnel's `Head` carries this as `length`; set it explicitly
+            // (hyper otherwise frames the body at serialization time).
+            let length = HeaderValue::from_str(&bytes.len().to_string())
+                .expect("a usize Content-Length is a valid header value");
+            (
+                status,
+                [
+                    (
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    ),
+                    (header::CONTENT_LENGTH, length),
+                ],
+                Body::from(bytes),
+            )
+                .into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to serialise response: {e}"),

@@ -2,8 +2,9 @@
 
 /// Protocol version 1 (spec §11): exact match, no negotiation.
 pub const PROTOCOL_VERSION: u8 = 1;
-/// Pipe protocol version byte (spec §8.2).
-pub const PIPE_VERSION: u8 = 1;
+/// Pipe protocol version byte (spec §8.2): Transport v2 (fragmentation +
+/// credit). Exact match, no v1 fallback.
+pub const PIPE_VERSION: u8 = 2;
 
 /// Letter TTL (spec §7.5 step 6, §12).
 pub const TTL_LETTER: u64 = 900;
@@ -31,6 +32,26 @@ pub const MAX_CHAIN_BATCH: usize = 256;
 pub const MAX_INNER: usize = 1_048_576;
 /// Max stream chunk (spec §9.4, §12).
 pub const MAX_CHUNK: usize = 65_536;
+/// Largest logical Attach message, in UTF-8 bytes. Also the per-session
+/// aggregate reassembly budget.
+pub const MAX_LOGICAL_MESSAGE: usize = 64 * 1024 * 1024;
+/// A Frame up to this size rides in one `StreamMsg::Frame`; larger messages
+/// use `FrameBegin`/`Chunk*`/`FrameEnd`. Must fit one credit window and
+/// `MAX_INNER` with room for bincode framing.
+pub const FRAME_ONESHOT_MAX: usize = 256 * 1024;
+/// Per-direction Attach receive window, in bytes (initial = max).
+pub const CREDIT_INITIAL: u32 = 512 * 1024;
+pub const CREDIT_MAX: u32 = 512 * 1024;
+/// The receiver returns credit every time this many bytes are consumed.
+pub const CREDIT_GRANT: u32 = 256 * 1024;
+/// Sender stall budget: how long a bulk sender may wait for the peer's
+/// credit before the stream is abandoned. The clock restarts for every
+/// message, so a steadily progressing transfer is never capped.
+pub const CREDIT_STALL_SECS: u64 = 60;
+/// Receiver stall budget: how long a bulk receiver may wait for the next
+/// data record before the stream is abandoned. Idle time between records,
+/// not total transfer duration.
+pub const RECV_STALL_SECS: u64 = 120;
 /// Max concurrently open streams (spec §9.5 S2).
 pub const MAX_STREAMS: u32 = 64;
 /// Per-direction record cap (spec §9.6): sender must not send ctr = 2^32.

@@ -177,6 +177,18 @@ fn inner_roundtrip_all_stream_msg_variants() {
             stream: 4,
             msg: StreamMsg::Reset(3),
         },
+        Inner {
+            stream: 5,
+            msg: StreamMsg::FrameBegin { len: 1024 },
+        },
+        Inner {
+            stream: 5,
+            msg: StreamMsg::FrameEnd,
+        },
+        Inner {
+            stream: 5,
+            msg: StreamMsg::Credit { bytes: 262_144 },
+        },
     ];
     for c in cases {
         let bytes = encode_inner(&c);
@@ -200,6 +212,7 @@ fn inner_roundtrip_all_op_variants() {
             convo: [0xEF; 16],
             name: "a.txt".into(),
             content_type: "text/plain".into(),
+            length: None,
         },
     ];
     for op in ops {
@@ -277,7 +290,10 @@ fn mux_non_increasing_stream_id_aborts() {
 }
 
 #[test]
-fn mux_chunk_on_attach_aborts() {
+fn mux_chunk_on_attach_allowed_for_v2_fragments() {
+    // v2 relaxes v1's blanket rejection: a Chunk on Attach is a fragment
+    // piece. The endpoint assembler enforces Begin/End ordering; the mux
+    // checks the Attach/non-Attach split and MAX_CHUNK only.
     let mut m = Mux::new(Role::Initiator);
     assert!(
         m.feed(&Inner {
@@ -286,12 +302,12 @@ fn mux_chunk_on_attach_aborts() {
         })
         .is_ok()
     );
-    assert_eq!(
+    assert!(
         m.feed(&Inner {
             stream: 1,
             msg: StreamMsg::Chunk(vec![1])
-        }),
-        Err(Error::Protocol)
+        })
+        .is_ok()
     );
 }
 

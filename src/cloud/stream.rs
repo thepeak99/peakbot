@@ -2,14 +2,23 @@
 //! callers (p3-design §D.6): `Stream<Item = StreamMsg>` + `Sink<StreamMsg>`.
 //! Dropping it makes the actor send `Reset(CANCELLED)` (observed through
 //! the outbound channel closing) unless `End` was already exchanged.
-//! `AttachStream` (the spike) wraps it as `Frame(String)` ↔ `TMsg::Text`
-//! for the controller.
+//!
+//! The caller→actor half is a bounded futures channel, so `Sink` applies
+//! real backpressure (awaiting capacity) instead of failing a fast caller.
+//! For Attach streams this is the shared transport adapter's local end: the
+//! actor fragments/reassembles and applies the credit window, so callers
+//! only ever see whole `Frame(String)` messages. Non-Attach bulk streams are
+//! credit-paced one layer lower: the stream's forwarder buys each record's
+//! bytes from the peer window before the actor queues it.
 
 use std::pin::Pin;
 use std::task::Context;
+use std::time::Duration;
 
+use cloud::constants;
 use cloud::frames::StreamMsg;
-use futures::{Sink, Stream};
+use futures::channel::mpsc as fmpsc;
+use futures::{Sink, SinkExt, Stream, StreamExt};
 use tokio::sync::mpsc;
 
 use super::link::CloudError;
@@ -24,13 +33,36 @@ impl std::fmt::Debug for CloudStream {
 }
 
 pub struct CloudStream {
-    tx: mpsc::Sender<StreamMsg>,
+    tx: fmpsc::Sender<StreamMsg>,
     rx: mpsc::Receiver<StreamMsg>,
 }
 
 impl CloudStream {
-    pub fn new(tx: mpsc::Sender<StreamMsg>, rx: mpsc::Receiver<StreamMsg>) -> Self {
+    pub fn new(tx: fmpsc::Sender<StreamMsg>, rx: mpsc::Receiver<StreamMsg>) -> Self {
         Self { tx, rx }
+    }
+
+    /// Receive one record, giving up after `within`. The approved receive
+    /// stall budget is per record — a steadily progressing transfer never
+    /// hits it. The error is an `Io` failure: the caller resets that stream.
+    pub async fn next_timed(&mut self, within: Duration) -> Result<Option<StreamMsg>, CloudError> {
+        match tokio::time::timeout(within, self.next()).await {
+            Ok(next) => Ok(next),
+            Err(_) => Err(CloudError::Io(format!("no data for {}s", within.as_secs()))),
+        }
+    }
+
+    /// Send one record, giving up after `within`. This waits for the
+    /// caller→actor channel to have capacity (the actor's forwarder queue),
+    /// not for peer credit; a stalled consumer is a local failure.
+    pub async fn send_timed(&mut self, msg: StreamMsg, within: Duration) -> Result<(), CloudError> {
+        match tokio::time::timeout(within, Pin::new(&mut *self).send(msg)).await {
+            Ok(sent) => sent,
+            Err(_) => Err(CloudError::Io(format!(
+                "waited {}s for credit",
+                within.as_secs()
+            ))),
+        }
     }
 }
 
@@ -50,30 +82,35 @@ impl Sink<StreamMsg> for CloudStream {
 
     fn poll_ready(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        std::task::Poll::Ready(if self.tx.is_closed() {
-            Err(CloudError::Reset(4))
-        } else {
-            Ok(())
-        })
+        Pin::new(&mut self.get_mut().tx)
+            .poll_ready(cx)
+            .map_err(|_| CloudError::Reset(constants::reset::INTERNAL))
     }
 
     fn start_send(self: Pin<&mut Self>, item: StreamMsg) -> Result<(), Self::Error> {
-        self.tx.try_send(item).map_err(|_| CloudError::Reset(4))
+        Pin::new(&mut self.get_mut().tx)
+            .start_send(item)
+            .map_err(|_| CloudError::Reset(constants::reset::INTERNAL))
     }
 
     fn poll_flush(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        std::task::Poll::Ready(Ok(()))
+        Pin::new(&mut self.get_mut().tx)
+            .poll_flush(cx)
+            .map_err(|_| CloudError::Reset(constants::reset::INTERNAL))
     }
 
     fn poll_close(
         self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
+        // Dropping the sender is what signals `Gone`; an explicit close
+        // must not also send `End` (that is a wire half-close, not a sink
+        // operation).
         std::task::Poll::Ready(Ok(()))
     }
 }
