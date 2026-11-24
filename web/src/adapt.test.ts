@@ -10,6 +10,7 @@ import {
   deriveSubAgentRoster,
   filterMessagesByView,
   flatTree,
+  mergeCatalog,
   messagesByLane,
   parseCallKey,
   todoCounts,
@@ -17,8 +18,9 @@ import {
   todosFromMessages,
   viewLabel,
 } from "./adapt";
-import type { AppState, WireAttachment, WireChatMessage, WireStats } from "./state";
-import type { TodoNode } from "./types";
+import type { AppState, WireAttachment, WireChatMessage, WireProfileInfo, WireStats } from "./state";
+import type { Device } from "./cloud/types";
+import type { CatalogProfile, TodoNode } from "./types";
 
 // Minimal transcript builder: a `todo` tool call carrying the given args JSON.
 // Mirrors what SessionHook.on_tool_call TEEs into the transcript.
@@ -1115,5 +1117,154 @@ describe("adaptCatalog — machine normalisation (W1)", () => {
     const state = { ...base, catalog } as unknown as AppState;
     const adapted = adaptCatalog(state);
     expect(adapted[0].machine).toBeNull();
+  });
+});
+
+// ─── mergeCatalog: the visible catalog for a phone bound to two hosts ─────
+//
+// The confirmed bug: a phone linked to two PCs that both ship profile
+// `default` sees only the host it is attached to. The server's state catalog
+// carries one stub row for the attached `default@<slug>`; the other peers'
+// rows arrive separately over `/api/cloud/devices/{id}/profiles`. `mergeCatalog`
+// combines them for display while keeping the session stub (and its agents) as
+// the authoritative row, and adds a display-only `label` (`profile@Device.name`)
+// so two `default` rows are distinguishable. Route keys (`name`) never change.
+
+describe("mergeCatalog — two hosts, both profile `default`", () => {
+  const DESK = "desk";
+  const PHONE = "phone";
+
+  const DEVICES: Device[] = [
+    { id: "d-desk", slug: DESK, name: "Desktop", platform: "macos", online: true, self: false },
+    { id: "d-phone", slug: PHONE, name: "Pixel 10 Pro", platform: "android", online: true, self: false },
+  ];
+
+  // The attached host's session stub — the server sends this on AppState.
+  // It carries the resolved agents so a picker pick survives the merge.
+  const STUB: CatalogProfile = {
+    name: "default@desk",
+    origin: "remote",
+    overridesGlobal: false,
+    machine: DESK,
+    agents: [{ name: "team", model: "sonnet", subagents: [] }],
+    color: "blue",
+  };
+
+  // What `/api/cloud/devices/{id}/profiles` + toCloudRows now yield for each
+  // peer. The attached host's own row is also present (the endpoint reports
+  // the host's local profiles), so only a name-exact dedupe keeps it single.
+  const cloudRow = (over: Partial<WireProfileInfo> = {}): WireProfileInfo => ({
+    name: "default@desk",
+    origin: "remote",
+    overrides_global: false,
+    agents: [],
+    color: "blue",
+    machine: DESK,
+    ...over,
+  });
+
+  const CLOUD_ROWS: WireProfileInfo[] = [
+    cloudRow(),
+    cloudRow({ name: "default@phone", machine: PHONE, color: "pink" }),
+  ];
+
+  it("lists the session stub first, dedupes its cloud twin, then adds the other host", () => {
+    const merged = mergeCatalog([STUB], CLOUD_ROWS, DEVICES);
+    expect(merged.map((p: CatalogProfile) => p.name)).toEqual(["default@desk", "default@phone"]);
+    expect(merged).toHaveLength(2);
+  });
+
+  it("keeps the session stub's agents, color and origin (agents survive the merge)", () => {
+    const merged = mergeCatalog([STUB], CLOUD_ROWS, DEVICES);
+    expect(merged[0]).toMatchObject({
+      name: "default@desk",
+      origin: "remote",
+      machine: DESK,
+      color: "blue",
+      agents: [{ name: "team", model: "sonnet", subagents: [] }],
+    });
+  });
+
+  it("labels the stub and the other host with their device names", () => {
+    const merged = mergeCatalog([STUB], CLOUD_ROWS, DEVICES);
+    expect(merged[0].label).toBe("default@Desktop");
+    expect(merged[1].label).toBe("default@Pixel 10 Pro");
+    expect(merged[0].label).not.toBe(merged[1].label);
+  });
+
+  it("adds a non-local cloud row as a catalog profile with its own machine", () => {
+    const merged = mergeCatalog([STUB], CLOUD_ROWS, DEVICES);
+    expect(merged[1]).toMatchObject({
+      name: "default@phone",
+      origin: "remote",
+      overridesGlobal: false,
+      machine: PHONE,
+      agents: [],
+      color: "pink",
+    });
+  });
+
+  it("preserves local/session order first, then cloud order", () => {
+    const merged = mergeCatalog([STUB], [CLOUD_ROWS[1], CLOUD_ROWS[0]], DEVICES);
+    expect(merged.map((p: CatalogProfile) => p.name)).toEqual(["default@desk", "default@phone"]);
+  });
+
+  it("leaves a genuinely local row unlabelled and untouched", () => {
+    const local: CatalogProfile = {
+      name: "dev",
+      origin: "global",
+      overridesGlobal: false,
+      machine: null,
+      agents: [{ name: "solo", model: "opus", subagents: [] }],
+      color: "teal",
+    };
+    const merged = mergeCatalog([local], [], DEVICES);
+    expect(merged).toEqual([local]);
+    expect(merged[0].label).toBeUndefined();
+  });
+
+  it("maps the label slug from the last '@' suffix", () => {
+    const row = cloudRow({
+      name: "team@ops@phone",
+      machine: PHONE,
+    });
+    const merged = mergeCatalog([], [row], DEVICES);
+    expect(merged[0].name).toBe("team@ops@phone");
+    expect(merged[0].label).toBe("team@ops@Pixel 10 Pro");
+  });
+
+  it("leaves a cloud row unlabelled when no device matches its slug", () => {
+    const row = cloudRow({ name: "default@ghost", machine: "ghost" });
+    const merged = mergeCatalog([], [row], DEVICES);
+    expect(merged[0].name).toBe("default@ghost");
+    expect(merged[0].machine).toBe("ghost");
+    expect(merged[0].label).toBeUndefined();
+  });
+
+  it("returns [] for empty inputs", () => {
+    expect(mergeCatalog([], [], [])).toEqual([]);
+  });
+
+  it("keeps one row per exact name when every cloud row is already in the session catalog", () => {
+    // The phone's stub carries no resolved agents yet — it is here only to
+    // prove the name-exact dedupe, so the assertion below stays about the
+    // row count, not about which side's agents won.
+    const stubPhone: CatalogProfile = {
+      ...STUB,
+      name: "default@phone",
+      machine: PHONE,
+      agents: [],
+    };
+    const merged = mergeCatalog([STUB, stubPhone], CLOUD_ROWS, DEVICES);
+    expect(merged.map((p: CatalogProfile) => p.name)).toEqual(["default@desk", "default@phone"]);
+    expect(merged[1].agents).toEqual([]);
+  });
+
+  it("never mutates the cloud row's name or the local row", () => {
+    const row = cloudRow({ name: "default@phone", machine: PHONE });
+    const before = { ...row };
+    mergeCatalog([STUB], [row], DEVICES);
+    expect(row).toEqual(before);
+    expect(row.name).toBe("default@phone");
   });
 });

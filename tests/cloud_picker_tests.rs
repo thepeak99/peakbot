@@ -309,10 +309,86 @@ fn cloud_attach_catalog_contains_target_entry() {
     // the target. This is tested as a unit test of cloud_target_info, the
     // function that builds the catalog entry. The two-core integration test
     // is deferred; the unit test covers the server-side contract.
-    let info = peakbot::ui::web::cloud_target_info("dev@computer", "dev");
+    let info = peakbot::ui::web::cloud_target_info("dev@computer");
     assert_eq!(info.name, "dev@computer");
     assert_eq!(info.origin, "remote");
     assert!(!info.overrides_global);
     assert!(info.agents.is_empty());
     assert_eq!(info.machine.as_deref(), Some("computer"));
+}
+
+// ═══ case (d): the catalog row's colour is per HOST, not per target profile ═
+//
+// Confirmed bug: `cloud_target_info` derived the colour from the bare target
+// profile (`default`), so the same profile on two different devices got the
+// SAME colour, and a renamed profile changed a host's colour for no reason.
+// After the fix the colour is `TabColor::derived(slug)` — a host identity.
+//
+// These call the single-argument signature: the colour is `derived` of the
+// slug parsed from `name`'s last `@` suffix.
+
+#[test]
+fn cloud_target_info_color_is_derived_from_the_device_slug() {
+    use peakbot::config::file::TabColor;
+
+    let desk = peakbot::ui::web::cloud_target_info("default@desk");
+    let phone = peakbot::ui::web::cloud_target_info("default@phone");
+
+    assert_eq!(
+        desk.color,
+        TabColor::derived("desk"),
+        "the attached desk target must be coloured from its slug"
+    );
+    assert_eq!(
+        phone.color,
+        TabColor::derived("phone"),
+        "the phone host target must be coloured from its slug"
+    );
+    assert_ne!(
+        desk.color, phone.color,
+        "two hosts with the same profile name must not share a colour"
+    );
+}
+
+#[test]
+fn cloud_target_info_color_is_stable_across_profiles_on_one_host() {
+    use peakbot::config::file::TabColor;
+
+    let alpha = peakbot::ui::web::cloud_target_info("alpha@desk");
+    let beta = peakbot::ui::web::cloud_target_info("beta@desk");
+
+    assert_eq!(
+        alpha.color,
+        TabColor::derived("desk"),
+        "alpha on desk is coloured by the host"
+    );
+    assert_eq!(
+        beta.color,
+        TabColor::derived("desk"),
+        "beta on the same host keeps the host colour"
+    );
+    assert_eq!(
+        alpha.color, beta.color,
+        "a host's colour must not follow the profile name"
+    );
+}
+
+#[test]
+fn cloud_target_info_keeps_name_and_machine_unchanged() {
+    let info = peakbot::ui::web::cloud_target_info("default@phone");
+    assert_eq!(info.name, "default@phone", "route key is untouched");
+    assert_eq!(info.origin, "remote");
+    assert!(!info.overrides_global);
+    assert!(info.agents.is_empty());
+    assert_eq!(info.machine.as_deref(), Some("phone"));
+}
+
+#[test]
+fn cloud_target_info_uses_the_last_at_suffix_as_the_host() {
+    use peakbot::config::file::TabColor;
+
+    // A profile name may itself contain '@'; the slug is the last segment.
+    let info = peakbot::ui::web::cloud_target_info("team@ops@phone");
+    assert_eq!(info.machine.as_deref(), Some("phone"));
+    assert_eq!(info.color, TabColor::derived("phone"));
 }

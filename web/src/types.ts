@@ -179,9 +179,16 @@ export interface CatalogProfile {
   /** Resolved accent (RP8: always set server-side). Optional so old wire
    * snapshots parse; absent = no dot. */
   color?: TabColor;
-  /** The machine this profile runs on: null = this device, else the
-   * remote's normalised origin. Required — normalised by the adapter. */
+  /** The machine this profile runs on: null = this device, else the remote's
+   * normalised origin — or, for a cloud row, the paired device's `slug`
+   * (`toCloudRows`; display names come from the cloud device list). Required —
+   * normalised by the adapter. */
   machine: MachineId;
+  /** Display-only label for a cloud profile bound to a paired device
+   * (`profile@Device name`, see `mergeCatalog`); absent on local, unknown and
+   * classic `scheme://host` rows so those render as `name`. `name` stays the
+   * identity: keys, testids, routing and callbacks always use it, never this. */
+  label?: string;
 }
 
 /** A machine: null = this device, else a remote's normalised origin. */

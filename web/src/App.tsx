@@ -15,6 +15,7 @@ import { UpdateBanner } from "./components/UpdateBanner";
 import { CloudRoot } from "./cloud/CloudRoot";
 import { CLOUD_SETTINGS_EVENT } from "./cloud/openCloud";
 import { useCloudTargets } from "./cloud/targets";
+import { useCloudDevices } from "./cloud/useCloud";
 import { NoMachines } from "./cloud/NoMachines";
 import { BashPanel } from "./components/BashPanel";
 import {
@@ -75,6 +76,7 @@ import {
   filterMessagesByView,
   flatTree,
   laneOf,
+  mergeCatalog,
   messagesByLane,
   scopeStatsToView,
   todoCounts,
@@ -178,7 +180,17 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   // conversation is bound to. `boundAgent` resolves the two — the roster the
   // Agents panel renders. `view` scopes the transcript, todos, files and
   // stats to one lane via the message `source`.
-  const catalog = state ? adaptCatalog(state) : [];
+  const cloudDevices = useCloudDevices();
+  // Every consumer below reads this ONE binding: the session's own rows plus
+  // every online peer's rows, so a phone linked to several cloud hosts sees
+  // them all. `label` is display-only (see mergeCatalog); `name` stays the
+  // route key. The auto-select above deliberately keeps reading
+  // `cloudTargets.rows` — merging would re-pick and loop.
+  const catalog = mergeCatalog(
+    state ? adaptCatalog(state) : [],
+    cloudTargets.status === "ready" ? cloudTargets.rows : [],
+    cloudDevices,
+  );
   const selection = state ? adaptSelection(state) : null;
   const boundAgent = boundAgentOf(catalog, selection);
   // `/r/<L>` prefix for uploads and attachment URLs; derived, never stored.
@@ -698,6 +710,7 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
           leaving={chatListSlide === "leaving"}
           conversations={conversations}
           catalog={catalog}
+          cloudDevices={cloudDevices}
           loaded={chats.loaded}
           unread={chats.unread}
           connected={connected}

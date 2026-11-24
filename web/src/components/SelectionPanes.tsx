@@ -51,7 +51,7 @@ export function ProfilePane({
                 style={{ backgroundColor: `var(--profile-${p.color})` }}
               />
             )}
-            {p.name}
+            {p.label ?? p.name}
             {p.origin === "remote" && (
               <span className="ml-1.5 rounded bg-zinc-800 px-1 text-[10px] font-normal text-zinc-400">
                 remote
@@ -98,7 +98,7 @@ export function AgentPane({
                 : "text-zinc-200"
             }
           >
-            {profile.name}
+            {profile.label ?? profile.name}
           </span>
           <span className="text-[10px] text-zinc-500">remote — agents on the server</span>
         </button>

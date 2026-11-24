@@ -40,10 +40,12 @@ use futures::Stream;
 use serde_json::json;
 
 use crate::cloud::link::device_slugs;
+use crate::cloud::session::ProfileInfo;
 use crate::cloud::{
     CloudError, CloudHandle, CloudState, DeviceInfo, EnrollRequestInfo, FlowError, LogoutReason,
     TrustError,
 };
+use crate::config::file::TabColor;
 
 const KEEPALIVE: Duration = Duration::from_secs(15);
 
@@ -293,6 +295,22 @@ fn request_dto(r: &EnrollRequestInfo) -> RequestDto {
     }
 }
 
+/// `/profiles` rows: the peer's own colour never crosses; instead every row
+/// carries the requesting host's per-host accent. An unknown slug omits
+/// `color` entirely (never `null`).
+pub fn profile_dtos(profiles: &[ProfileInfo], slug: Option<&str>) -> Vec<serde_json::Value> {
+    profiles
+        .iter()
+        .map(|p| {
+            let mut row = json!({ "name": p.name.clone() });
+            if let Some(slug) = slug {
+                row["color"] = json!(TabColor::derived(slug));
+            }
+            row
+        })
+        .collect()
+}
+
 impl CloudStateDto {
     fn from_state(st: &CloudState, own: Option<DeviceId>) -> Self {
         match st {
@@ -463,8 +481,25 @@ async fn logout(State(s): State<CloudApiState>) -> ApiResult {
 async fn profiles(State(s): State<CloudApiState>, Path(id): Path<String>) -> ApiResult {
     let h = handle(&s)?;
     let device = device_id_or_400(&id)?;
+    // Resolve the host slug from the active device list — the same
+    // `device_slugs` dedupe routing uses. The snapshot ends before the
+    // actor round-trip below.
+    let st = h.state().borrow().clone();
+    let slug = match &st {
+        CloudState::Active { devices, .. } => {
+            let slugs = device_slugs(devices);
+            devices
+                .iter()
+                .position(|d| d.id == device)
+                .map(|i| slugs[i].clone())
+        }
+        // Not active: `profiles` below returns the existing error.
+        _ => None,
+    };
     let list = h.profiles(device).await?;
-    Ok(Json(json!({ "profiles": list })))
+    Ok(Json(
+        json!({ "profiles": profile_dtos(&list, slug.as_deref()) }),
+    ))
 }
 
 /// `GET /api/cloud/events` — the full state on connect, then on every

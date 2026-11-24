@@ -255,4 +255,36 @@ describe("toCloudRows", () => {
     expect(rows[0].overrides_global).toBe(false);
     expect(rows[0].agents).toEqual([]);
   });
+
+  // ── Regression: two hosts, both carrying profile `default` ───────────────
+  //
+  // The catalog row must carry the device slug as `machine` (the very value
+  // mergeCatalog uses to look up the human device name). Without it every
+  // cloud row's machine is undefined and two `default` profiles on different
+  // hosts collapse into one indistinguishable entry.
+  it("carries the device slug as machine on every row", () => {
+    const d = device({ slug: "desk", id: "d1" });
+    const rows = toCloudRows([d], { d1: [{ name: "alice" }, { name: "bob" }] });
+    expect(rows.map((r) => r.machine)).toEqual(["desk", "desk"]);
+  });
+
+  it("uses each device's own slug when several peers report the same profile", () => {
+    const desk = device({ slug: "desk", id: "d1", name: "Desktop" });
+    const phone = device({ slug: "phone", id: "d2", name: "Pixel 10 Pro" });
+    const rows = toCloudRows([desk, phone], {
+      d1: [{ name: "default" }],
+      d2: [{ name: "default" }],
+    });
+    expect(rows.map((r) => r.name)).toEqual(["default@desk", "default@phone"]);
+    expect(rows.map((r) => r.machine)).toEqual(["desk", "phone"]);
+  });
+
+  it("preserves the profile name verbatim before appending @slug", () => {
+    // A profile name may itself contain '@'. The route key is exactly
+    // `${profile}@${slug}`; the last '@' is the machine separator.
+    const d = device({ slug: "desk", id: "d1" });
+    const rows = toCloudRows([d], { d1: [{ name: "alice@corp" }] });
+    expect(rows[0].name).toBe("alice@corp@desk");
+    expect(rows[0].machine).toBe("desk");
+  });
 });
