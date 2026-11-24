@@ -96,7 +96,11 @@ export function CloudPane() {
           label: COPY.confirm.signOut.confirm,
           kind: "danger",
           onClick: async () => {
-            await store.act("/api/cloud/logout");
+            try {
+              await store.act("/api/cloud/logout");
+            } finally {
+              setConfirm(null);
+            }
           },
         },
       ]}
@@ -315,7 +319,11 @@ export function CloudPane() {
               label: COPY.confirm.first.confirm,
               kind: "danger",
               onClick: async () => {
-                await store.act("/api/cloud/genesis");
+                try {
+                  await store.act("/api/cloud/genesis");
+                } finally {
+                  setConfirm(null);
+                }
               },
             },
           ]}
@@ -333,7 +341,11 @@ export function CloudPane() {
               label: COPY.confirm.revoke.confirm,
               kind: "danger",
               onClick: async () => {
-                await store.act(`/api/cloud/devices/${confirm.device.id}/revoke`);
+                try {
+                  await store.act(`/api/cloud/devices/${confirm.device.id}/revoke`);
+                } finally {
+                  setConfirm(null);
+                }
               },
             },
           ]}
