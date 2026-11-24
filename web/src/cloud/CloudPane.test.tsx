@@ -85,6 +85,8 @@ const buttons = (el: Element): HTMLButtonElement[] =>
   [...el.querySelectorAll("button")] as HTMLButtonElement[];
 const buttonByText = (el: Element, label: string): HTMLButtonElement | undefined =>
   buttons(el).find((b) => b.textContent?.trim() === label);
+const dialog = (): HTMLElement | null =>
+  container?.querySelector('[role="dialog"], [role="alertdialog"]') ?? null;
 
 describe("no snapshot", () => {
   it("shows the loading line before the first SSE state", async () => {
@@ -366,7 +368,10 @@ describe("error mapping (design §D.5)", () => {
     const confirm = buttonByText(container!, COPY.confirm.revoke.confirm);
     expect(confirm).toBeDefined();
     await act(async () => confirm!.click());
+    // The async error settles; dialog must close on failure too.
+    await flush();
     expect(text(container!)).toContain(COPY.err.last_device);
+    expect(dialog()).toBeNull();
   });
 
   it("an unknown code shows the server `message`", async () => {
@@ -427,6 +432,9 @@ describe("confirms (G.4)", () => {
     expect(confirm).toBeDefined();
     await act(async () => confirm!.click());
     expect(fetchMock.mock.calls.filter(([u]) => String(u).endsWith("/api/cloud/genesis"))).toHaveLength(1);
+    // After the async action settles, the confirm dialog must close.
+    await flush();
+    expect(dialog()).toBeNull();
   });
 
   it("revoke: confirm → exactly one POST /devices/{id}/revoke", async () => {
@@ -448,6 +456,9 @@ describe("confirms (G.4)", () => {
     await act(async () => confirm!.click());
     const fetchMock = vi.mocked(globalThis.fetch);
     expect(fetchMock.mock.calls.filter(([u]) => String(u).includes(`/devices/${id}/revoke`))).toHaveLength(1);
+    // After the async action settles, the confirm dialog must close.
+    await flush();
+    expect(dialog()).toBeNull();
   });
 
   it("sign out: confirm → exactly one POST /api/cloud/logout", async () => {
@@ -468,6 +479,9 @@ describe("confirms (G.4)", () => {
     await act(async () => confirm!.click());
     const fetchMock = vi.mocked(globalThis.fetch);
     expect(fetchMock.mock.calls.filter(([u]) => String(u).endsWith("/api/cloud/logout"))).toHaveLength(1);
+    // After the async action settles, the confirm dialog must close.
+    await flush();
+    expect(dialog()).toBeNull();
   });
 
   it("a confirm Cancel closes with no fetch", async () => {
@@ -484,5 +498,6 @@ describe("confirms (G.4)", () => {
     await act(async () => cancel!.click());
     const fetchMock = vi.mocked(globalThis.fetch);
     expect(fetchMock.mock.calls.filter(([u]) => String(u).includes("/api/cloud/genesis"))).toHaveLength(0);
+    expect(dialog()).toBeNull();
   });
 });

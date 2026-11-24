@@ -136,8 +136,8 @@ export function SafeDialog({ title, children, actions, onLater }: SafeDialogProp
                   }
                   void e.currentTarget;
                 }
-                // `store.act` throws on non-2xx (the store holds the message);
-                // the dialog stays open for the next SSE state.
+                // `store.act` throws on non-2xx; the store holds the message
+                // for the pane to render. Callers own dialog closure.
                 void a.onClick().catch(() => undefined);
               }}
               className={`rounded-md border px-3 py-1.5 text-sm disabled:opacity-50 ${KIND_CLASS[a.kind]}`}
