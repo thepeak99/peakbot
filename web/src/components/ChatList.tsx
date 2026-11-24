@@ -10,6 +10,7 @@ import { useCallback, useMemo, useState, type Ref } from "react";
 import type { ReactNode } from "react";
 import type { ConversationSummary, TabColor, WireMachineStatus } from "../state";
 import type { CatalogProfile, MachineId } from "../types";
+import type { Device } from "../cloud/types";
 import {
   deriveMachines,
   filterByMachine,
@@ -43,11 +44,18 @@ export interface ChatListProps {
   onOpenSettings?: () => void;
   /** The last `conversations_list`'s machine statuses (`agent.machines`). */
   machineStatus: WireMachineStatus[];
+  /** Paired cloud devices (slug → display name): a cloud catalog row's
+   * `machine` is the device slug, so the machine sheet, pill and row tags
+   * render the human name. Empty off cloud. */
+  cloudDevices?: readonly Device[];
   /** The overlay root, for the slide animation (React 19 ref-as-prop). */
   ref?: Ref<HTMLElement>;
   /** Mid-exit: still painted, but inert (no input, focus or AT). */
   leaving?: boolean;
 }
+
+// Stable empty list: a fresh `[]` default would break the `machines` memo.
+const NO_CLOUD_DEVICES: readonly Device[] = [];
 
 export function ChatList({
   conversations,
@@ -60,6 +68,7 @@ export function ChatList({
   onNew,
   onOpenSettings,
   machineStatus,
+  cloudDevices = NO_CLOUD_DEVICES,
   ref,
   leaving,
 }: ChatListProps) {
@@ -74,7 +83,10 @@ export function ChatList({
   const closeMachine = useCallback(() => setMachineOpen(false), []);
   const closePicker = useCallback(() => setPickerOpen(false), []);
 
-  const machines = useMemo(() => deriveMachines(catalog, machineStatus), [catalog, machineStatus]);
+  const machines = useMemo(
+    () => deriveMachines(catalog, machineStatus, cloudDevices),
+    [catalog, machineStatus, cloudDevices],
+  );
   const machineUi = machines.length >= 2;
   const filter = resolveFilter(stored, machines);
   const selectedMachine =
@@ -248,7 +260,7 @@ export function ChatList({
           {chips.map((p) => (
             <Chip
               key={p.name}
-              label={p.name}
+              label={p.label ?? p.name}
               profile={p.name}
               color={p.color}
               pressed={activeProfile === p.name}
@@ -303,7 +315,7 @@ export function ChatList({
                 row={r}
                 now={now}
                 catalog={catalog}
-                machineTag={showTags ? machineName(machineOf(catalog, r.chat.profile ?? null)) : undefined}
+                machineTag={showTags ? machineName(machineOf(catalog, r.chat.profile ?? null), cloudDevices) : undefined}
                 isUnread={unread.has(r.chat.id)}
                 onOpen={onOpen}
               />
@@ -502,7 +514,7 @@ function Row({
           </span>
         </span>
         <span className="flex w-full min-w-0 items-center text-xs text-zinc-500">
-          {chat.profile && <span className="truncate">{chat.profile}</span>}
+          {chat.profile && <span className="truncate">{profile?.label ?? chat.profile}</span>}
           {machineTag !== undefined && (
             <span data-testid="chat-machine-tag" className={`ml-1.5 ${MTAG}`}>
               {machineTag}

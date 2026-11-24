@@ -30,6 +30,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { ChatList } from "./ChatList";
 import { MACHINE_KEY } from "../mobileStorage";
+import type { Device } from "../cloud/types";
 import type { ConversationSummary, WireMachineStatus } from "../state";
 import type { CatalogProfile } from "../types";
 
@@ -99,6 +100,10 @@ interface ListProps {
   onNew(profile: string | null): void;
   onOpenSettings?: () => void;
   machineStatus: WireMachineStatus[];
+  /** Cloud device identities (slug → display name). Added by the
+   *  cloud-host-catalog fix; kept optional so the pre-existing cases may
+   *  omit it. */
+  cloudDevices?: Device[];
 }
 
 const baseProps: ListProps = {
@@ -112,6 +117,9 @@ const baseProps: ListProps = {
   onNew: () => {},
   machineStatus: STATUS_UP,
 };
+
+// The regression under test adds an optional `cloudDevices` prop to ChatList;
+// `ListProps` mirrors the public surface the harness drives.
 
 async function render(over: Partial<ListProps> = {}): Promise<HTMLDivElement> {
   if (container === null) {
@@ -657,5 +665,165 @@ describe("ChatList machines — cloud-only new chat", () => {
       String(onNew.mock.calls[0]?.[0]),
       "the remote profile must be passed through",
     ).toBe("default@sandworm");
+  });
+});
+
+// ─── Regression: two hosts, both profile `default` ────────────────────────
+//
+// A phone linked to two PCs that both ship `default` sees two catalog rows
+// with the SAME profile part but distinct route keys (`default@desk`,
+// `default@phone`). ChatList must:
+//   * render the human labels (`default@Desktop` / `default@Pixel 10 Pro`)
+//     from `CatalogProfile.label` while keeping the route key for
+//     `data-profile`, filtering and callbacks;
+//   * pass `cloudDevices` down to `deriveMachines`/`machineName` so the
+//     machine sheet, pill and row tags show `Desktop` / `Pixel 10 Pro`, not
+//     the raw slugs.
+
+const CLOUD_DEVICES: Device[] = [
+  { id: "d1", name: "Desktop", platform: "macos", online: true, slug: "desk", self: false },
+  { id: "d2", name: "Pixel 10 Pro", platform: "linux", online: true, slug: "phone", self: false },
+];
+
+// `label` is the display-only field mergeCatalog adds; cast keeps the fixture
+// compiling before the optional field lands on CatalogProfile.
+const CLOUD_CATALOG = [
+  {
+    name: "default@desk",
+    origin: "remote",
+    overridesGlobal: false,
+    machine: "desk",
+    agents: [],
+    color: "blue",
+    label: "default@Desktop",
+  },
+  {
+    name: "default@phone",
+    origin: "remote",
+    overridesGlobal: false,
+    machine: "phone",
+    agents: [],
+    color: "pink",
+    label: "default@Pixel 10 Pro",
+  },
+] as unknown as CatalogProfile[];
+
+const CLOUD_CONVOS: ConversationSummary[] = [
+  row("c-desk", "default@desk"),
+  row("c-phone", "default@phone"),
+];
+
+const CLOUD_STATUS: WireMachineStatus[] = [
+  { id: "desk", online: true },
+  { id: "phone", online: true },
+];
+
+function profileChips(el: HTMLElement): HTMLElement[] {
+  return Array.from(
+    el.querySelectorAll<HTMLElement>('button[data-testid="chat-filter"]'),
+  ).filter((c) => (c.getAttribute("data-profile") ?? "") !== "");
+}
+
+describe("ChatList machines — two cloud hosts, both profile `default`", () => {
+  it("renders two distinct profile chips labelled with device names, keys intact", async () => {
+    const el = await render({
+      catalog: CLOUD_CATALOG,
+      cloudDevices: CLOUD_DEVICES,
+      conversations: CLOUD_CONVOS,
+      machineStatus: CLOUD_STATUS,
+    });
+    const chips = profileChips(el);
+    expect(chips.map((c) => c.getAttribute("data-profile"))).toEqual([
+      "default@desk",
+      "default@phone",
+    ]);
+    const labels = chips.map((c) => (c.textContent ?? "").trim());
+    expect(labels).toEqual(["default@Desktop", "default@Pixel 10 Pro"]);
+    expect(new Set(labels).size, "the two chips must be distinguishable").toBe(2);
+  });
+
+  it("shows device names in the machine sheet and pill, not raw slugs", async () => {
+    const el = await render({
+      catalog: CLOUD_CATALOG,
+      cloudDevices: CLOUD_DEVICES,
+      conversations: CLOUD_CONVOS,
+      machineStatus: CLOUD_STATUS,
+    });
+    await openMachineSheet(el);
+    const dlg = machineDialog()!;
+    expect(option(dlg, "desk").textContent).toContain("Desktop");
+    expect(option(dlg, "phone").textContent).toContain("Pixel 10 Pro");
+    // The raw slug must not leak as the display name (word-boundary test:
+    // "Desktop" contains "desk" as a prefix but is not the bare slug).
+    expect(option(dlg, "desk").textContent).not.toMatch(/\bdesk\b/);
+    expect(option(dlg, "phone").textContent).not.toMatch(/\bphone\b/);
+
+    await pressMachine(dlg, "desk");
+    expect(pill(el)!.textContent).toContain("Desktop");
+    expect(pill(el)!.textContent).not.toMatch(/\bdesk\b/);
+  });
+
+  it("tags every row with its device name in All mode", async () => {
+    const el = await render({
+      catalog: CLOUD_CATALOG,
+      cloudDevices: CLOUD_DEVICES,
+      conversations: CLOUD_CONVOS,
+      machineStatus: CLOUD_STATUS,
+    });
+    expect(tag(el, "c-desk")!.textContent).toBe("Desktop");
+    expect(tag(el, "c-phone")!.textContent).toBe("Pixel 10 Pro");
+  });
+
+  it("filters by the route key even though the chip shows a label", async () => {
+    const el = await render({
+      catalog: CLOUD_CATALOG,
+      cloudDevices: CLOUD_DEVICES,
+      conversations: CLOUD_CONVOS,
+      machineStatus: CLOUD_STATUS,
+    });
+    const phoneChip = el.querySelector<HTMLElement>(
+      'button[data-testid="chat-filter"][data-profile="default@phone"]',
+    );
+    expect(phoneChip, "the route-key chip exists").not.toBeNull();
+    await act(async () => {
+      phoneChip!.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    });
+    expect(phoneChip!.getAttribute("aria-pressed")).toBe("true");
+    expect(el.querySelector('[data-testid="chat-row"][data-convo="c-phone"]')).not.toBeNull();
+    expect(el.querySelector('[data-testid="chat-row"][data-convo="c-desk"]')).toBeNull();
+  });
+
+  it("passes the original route key from the FAB and from a row open", async () => {
+    const onNew = vi.fn();
+    const onOpen = vi.fn();
+    const el = await render({
+      catalog: CLOUD_CATALOG,
+      cloudDevices: CLOUD_DEVICES,
+      conversations: CLOUD_CONVOS,
+      machineStatus: CLOUD_STATUS,
+      onNew,
+      onOpen,
+    });
+
+    // FAB on the phone machine starts a chat on its first catalog profile.
+    await openMachineSheet(el);
+    await pressMachine(machineDialog()!, "phone");
+    const fab = el.querySelector<HTMLElement>('button[aria-label="New chat"]')!;
+    await act(async () => {
+      fab.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    });
+    expect(String(onNew.mock.calls[0]?.[0]), "route key, never the label").toBe(
+      "default@phone",
+    );
+
+    // Row open still carries the route-key profile.
+    const opener = el.querySelector<HTMLElement>(
+      '[data-testid="chat-row"][data-convo="c-phone"] [data-testid="chat-open"]',
+    )!;
+    await act(async () => {
+      opener.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    });
+    expect(String(onOpen.mock.calls[0]?.[0])).toBe("c-phone");
+    expect(String(onOpen.mock.calls[0]?.[1])).toBe("default@phone");
   });
 });

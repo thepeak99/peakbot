@@ -34,6 +34,7 @@ export function toCloudRows(
         origin: "remote",
         overrides_global: false,
         agents: [],
+        machine: d.slug,
       };
       if (p.color !== undefined) {
         row.color = p.color as TabColor;

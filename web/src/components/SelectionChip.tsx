@@ -157,6 +157,10 @@ export function SelectionChip({
 
   const boundAgent = boundAgentOf(catalog, selection);
   const selectedProfile = catalog.find((p) => p.name === selection.profile);
+  // Display-only, for the chip face and its title: a cloud row reads
+  // `profile@Device name` (`CatalogProfile.label`). The identity and every
+  // callback keep `selection.profile`.
+  const profileLabel = selectedProfile?.label ?? selection.profile;
 
   // Pinned (--profile): only the pinned profile is listed, captioned `pinned`;
   // agent switching under a pin still works.
@@ -231,8 +235,8 @@ export function SelectionChip({
       }
       onToast?.(
         agent
-          ? `Next conversation: ${browsedProfile.name} › ${agent}`
-          : `Next conversation: ${browsedProfile.name}`,
+          ? `Next conversation: ${browsedProfile.label ?? browsedProfile.name} › ${agent}`
+          : `Next conversation: ${browsedProfile.label ?? browsedProfile.name}`,
       );
     }
     setNav({ pane: "team" });
@@ -368,7 +372,7 @@ export function SelectionChip({
             onClick={() => browse(p.name)}
           >
             {p.origin === "repo" && "📁 "}
-            {p.name}
+            {p.label ?? p.name}
           </SegPill>
         ))}
       </SegGroup>
@@ -382,7 +386,7 @@ export function SelectionChip({
               close();
             }}
           >
-            {browsedProfile.name}
+            {browsedProfile.label ?? browsedProfile.name}
           </SegPill>
         ) : (
           browsedProfile.agents.map((a) => (
@@ -454,7 +458,7 @@ export function SelectionChip({
         {selectedProfile?.origin === "repo" && <span aria-hidden>📁</span>}
         <span
           className={sheet ? "min-w-0 truncate" : "max-w-[9rem] truncate xl:max-w-[16rem]"}
-          title={`${selection.profile} › ${selection.agent} › ${chipModel}`}
+          title={`${profileLabel} › ${selection.agent} › ${chipModel}`}
         >
           {selectedProfile?.color && (
             <span
@@ -464,7 +468,7 @@ export function SelectionChip({
               style={{ backgroundColor: `var(--profile-${selectedProfile.color})` }}
             />
           )}
-          {selection.profile} <span className={sep}>›</span> {selection.agent}{" "}
+          {profileLabel} <span className={sep}>›</span> {selection.agent}{" "}
           <span className={sep}>{sheet ? "·" : "›"}</span>{" "}
           <span
             data-testid="selection-chip-model"

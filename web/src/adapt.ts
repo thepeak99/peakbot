@@ -6,9 +6,11 @@ import type {
   AppState,
   WireBashPanel,
   WireChatMessage,
+  WireProfileInfo,
   WireRole,
   WireTodoStatus,
 } from "./state";
+import type { Device } from "./cloud/types";
 import type {
   BashPanel,
   BgProcess,
@@ -162,12 +164,10 @@ export function adaptSubAgent(s: AppState): SubAgentRun | null {
   return s.sub_agent ?? null;
 }
 
-/** The catalog (profiles → agents → sub-agents) this install declares,
- * mapped from the wire's snake_case to the view's camelCase. An absent
- * field (old snapshot) normalises to `[]`, the safe default; an absent
- * `machine` (old server) normalises to `null` (this device). */
-export function adaptCatalog(s: AppState): CatalogProfile[] {
-  return (s.catalog ?? []).map((p) => ({
+/** One wire profile → the view's camelCase shape. Shared by the AppState
+ * catalog and the peers' rows (`mergeCatalog`), so both adapt identically. */
+function adaptProfile(p: WireProfileInfo): CatalogProfile {
+  return {
     name: p.name,
     origin: p.origin,
     overridesGlobal: p.overrides_global,
@@ -182,7 +182,56 @@ export function adaptCatalog(s: AppState): CatalogProfile[] {
       })),
     })),
     color: p.color,
-  }));
+  };
+}
+
+/** The catalog (profiles → agents → sub-agents) this install declares,
+ * mapped from the wire's snake_case to the view's camelCase. An absent
+ * field (old snapshot) normalises to `[]`, the safe default; an absent
+ * `machine` (old server) normalises to `null` (this device). */
+export function adaptCatalog(s: AppState): CatalogProfile[] {
+  return (s.catalog ?? []).map(adaptProfile);
+}
+
+/** Display-only label for a row bound to a paired cloud device:
+ * `profile@Device name`. Matched on the route key's exact suffix after the
+ * LAST `@` (the machine separator, so a profile name may itself contain `@`).
+ * A row whose suffix names no device — a local one, an unknown peer, a
+ * classic `scheme://host` remote — keeps `name` alone and is returned as-is;
+ * identity fields are never touched. */
+function withDeviceLabel(
+  p: CatalogProfile,
+  devices: readonly Device[],
+): CatalogProfile {
+  const at = p.name.lastIndexOf("@");
+  if (at < 0) return p;
+  const device = devices.find((d) => d.slug === p.name.slice(at + 1));
+  return device ? { ...p, label: `${p.name.slice(0, at + 1)}${device.name}` } : p;
+}
+
+/** The visible catalog for a phone linked to several cloud hosts: the
+ * session's own rows first (in order, authoritative), then the peers' rows
+ * appended and deduped by exact `name`. A duplicate keeps the session row —
+ * its resolved agents and color must survive the merge — and only rows that
+ * name a known device get the display-only `label`. Never mutates its inputs;
+ * `name` stays the route key throughout. */
+export function mergeCatalog(
+  local: readonly CatalogProfile[],
+  cloudRows: readonly WireProfileInfo[],
+  devices: readonly Device[],
+): CatalogProfile[] {
+  const seen = new Set<string>();
+  const merged: CatalogProfile[] = [];
+  for (const p of local) {
+    seen.add(p.name);
+    merged.push(withDeviceLabel(p, devices));
+  }
+  for (const row of cloudRows) {
+    if (seen.has(row.name)) continue;
+    seen.add(row.name);
+    merged.push(withDeviceLabel(adaptProfile(row), devices));
+  }
+  return merged;
 }
 
 /** The (profile, agent) this conversation is bound to, or null when the wire

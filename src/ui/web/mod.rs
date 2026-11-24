@@ -965,15 +965,16 @@ async fn handle_socket(socket: WebSocket, state: WsState) {
 }
 
 /// The catalog row for a `profile@device` cloud target (machine = the bare
-/// device slug, the cloud `MachineId`); the relay fills its agents.
-pub fn cloud_target_info(name: &str, target: &str) -> crate::config::resolve::ProfileInfo {
+/// device slug, the cloud `MachineId`); the relay fills its agents. The
+/// colour is the HOST's, so every profile on one device shares it.
+pub fn cloud_target_info(name: &str) -> crate::config::resolve::ProfileInfo {
     let slug = name.rsplit_once('@').map_or("", |(_, d)| d);
     crate::config::resolve::ProfileInfo {
         name: name.to_string(),
         origin: "remote".to_string(),
         overrides_global: false,
         agents: Vec::new(),
-        color: crate::config::file::TabColor::derived(target),
+        color: crate::config::file::TabColor::derived(slug),
         machine: Some(slug.to_string()),
     }
 }
@@ -1044,7 +1045,7 @@ async fn serve_socket<Si, St, E>(
                         target_agent: None,
                         // One stub row so `relay::rewrite` keeps the target in
                         // the chip's catalog (and fills its agents).
-                        catalog: vec![cloud_target_info(p, target)],
+                        catalog: vec![cloud_target_info(p)],
                     };
                     remote::relay::run(
                         ws_stream,
