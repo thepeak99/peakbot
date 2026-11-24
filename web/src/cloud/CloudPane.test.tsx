@@ -501,3 +501,39 @@ describe("confirms (G.4)", () => {
     expect(dialog()).toBeNull();
   });
 });
+
+// Locked first-device UX (the PM's plan). Written before the copy change:
+// the empty-account view must not imply a privileged "root"/"primary"/"main"
+// device, and the confirm must say the first device gets no extra privileges
+// and that any device can approve or revoke another. The behaviour above
+// (opening sends nothing; confirm sends exactly one POST /genesis) is unchanged.
+describe("first-device UX copy (locked plan)", () => {
+  const ROOT_LANGUAGE =
+    /\broot\s+of\s+trust\b|\broot\s+device\b|\broot\s+that\s+approves\b|\bapproves?\s+all\b|\bprimary\s+device\b|\bmain\s+(?:device|computer)\b/i;
+
+  it("empty account heading reads 'No devices yet'", async () => {
+    const el = await withState(pendingEmpty());
+    expect(text(el)).toContain("No devices yet");
+  });
+
+  it("empty account pane has no root/primary/main-device language", async () => {
+    const el = await withState(pendingEmpty());
+    expect(text(el)).not.toMatch(ROOT_LANGUAGE);
+  });
+
+  it("first-device confirm explains no extra privileges and that any device can approve or revoke", async () => {
+    const el = await withState(pendingEmpty());
+    buttonByText(el, COPY.btn.makeFirst)?.click();
+    await act(async () => {});
+    const d = dialog();
+    expect(d, "first-device confirm is open").not.toBeNull();
+    const body = text(d!);
+    expect(body).toMatch(
+      /\b(?:no|without)\b[^.]{0,40}\b(?:extra|additional|special)\s+privileges?/i,
+    );
+    expect(body).toMatch(/\bany\s+(?:of\s+your\s+)?devices?\b/i);
+    expect(body).toMatch(/\bapprove\b/i);
+    expect(body).toMatch(/\brevoke\b/i);
+    expect(body).not.toMatch(ROOT_LANGUAGE);
+  });
+});

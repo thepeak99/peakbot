@@ -14,7 +14,7 @@ export const COPY = {
   btn: {
     signIn: "Sign in",
     openSignInPage: "Open sign-in page",
-    makeFirst: "Make this the first device",
+    makeFirst: "Add this as the first device",
     tryAgain: "Try again",
     review: "Review",
     revoke: "Revoke",
@@ -28,10 +28,12 @@ export const COPY = {
   signInOpened: "Finish signing in in the new tab.",
   connecting: (n: number) => `Connecting… (attempt ${n})`,
   pendingEmpty: {
-    title: "Set up your first device",
-    body: "No device has been set up on this account yet. This machine will " +
-      "become the root of trust: every future device must be approved by one " +
-      "you already own. Only do this on a machine you control.",
+    title: "No devices yet",
+    body: "No trusted devices on this account yet. Adding this one creates the " +
+      "account's permanent device history, the reference point every later " +
+      "device is checked against. This machine gets no special privileges; " +
+      "afterwards, any device on the account can approve or revoke any other. " +
+      "Only do this on a machine you control.",
   },
   pending: {
     requesting: "Requesting approval…",
@@ -72,12 +74,14 @@ export const COPY = {
   // D.3 confirm dialogs
   confirm: {
     first: {
-      title: "Make this the first device?",
+      title: "Add this as the first device?",
       body:
-        "Trust starts here. This machine becomes the root that approves all " +
-        "your other devices. If someone else has already signed in to this " +
-        "account, do not continue.",
-      confirm: "Make first device",
+        "This makes this machine the first entry in the account's permanent " +
+        "device history, the reference point every later device is checked " +
+        "against. It gets no extra privileges; afterwards, any device on the " +
+        "account can approve or revoke any other. If someone else has already " +
+        "signed in, do not continue.",
+      confirm: "Add as first device",
     },
     revoke: {
       title: (name: string) => `Revoke '${name}'?`,
@@ -98,7 +102,8 @@ export const COPY = {
   // D.4 trust banner (per §A.4)
   banner: {
     genesis_mismatch:
-      "Cloud trust error: this account's root device changed. Cloud is stopped.",
+      "Cloud trust error: this device's saved device history doesn't match " +
+      "your account's. Cloud is stopped.",
     fork:
       "Cloud trust error: conflicting device histories detected. Cloud is stopped.",
     revoked: "This device was revoked by another of your devices.",

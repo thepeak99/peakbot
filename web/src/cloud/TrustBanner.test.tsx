@@ -102,6 +102,20 @@ describe("visibility", () => {
   });
 });
 
+describe("genesis_mismatch copy (locked plan)", () => {
+  it("describes saved device history, not a root device change", async () => {
+    const el = await withState(trust("genesis_mismatch"));
+    const alert = el.querySelector('[role="alert"]');
+    expect(alert, "alert for genesis_mismatch").not.toBeNull();
+    const message = alert?.textContent ?? "";
+    expect(message).toMatch(/\bdevice\s+history\b/i);
+    expect(message).toMatch(
+      /mismatch|does\s*n[o']?t\s+match|does\s+not\s+match|no\s+longer\s+match|differ/i,
+    );
+    expect(message).not.toMatch(/\broot\b/i);
+  });
+});
+
 describe("safety", () => {
   it("has NO close/dismiss button", async () => {
     const el = await withState(trust("fork"));
