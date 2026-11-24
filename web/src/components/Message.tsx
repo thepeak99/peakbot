@@ -190,6 +190,21 @@ const MARKDOWN_COMPONENTS = { img: CachedImage } as const;
 
 const PHONE_MARKDOWN_COMPONENTS = { img: CachedImage, pre: CodeBlock } as const;
 
+// Centralized chat markdown renderer. Encapsulates the plugin list and
+// selects the correct components map (phone vs desktop) to keep the
+// rendering pipeline consistent across call sites.
+function ChatMarkdown({ phone = false, content }: { phone?: boolean; content: string }) {
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm, remarkBreaks]}
+      rehypePlugins={[rehypeHighlight]}
+      components={phone ? PHONE_MARKDOWN_COMPONENTS : MARKDOWN_COMPONENTS}
+    >
+      {content}
+    </ReactMarkdown>
+  );
+}
+
 const COPY_ICON = (
   <svg aria-hidden width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
     <rect x="9" y="9" width="11" height="11" rx="2" />
@@ -275,7 +290,11 @@ function ToolRow({ message }: { message: ChatMessage }) {
           data-testid="tool-ext"
           className="mt-1.5 whitespace-pre-wrap break-words rounded-[10px] border border-zinc-800 bg-zinc-950 px-3 py-2.5 font-mono text-[11.5px] leading-[1.5] text-zinc-300"
         >
-          {message.content}
+          {isMarkdown(message.role) ? (
+            <ChatMarkdown phone content={message.content} />
+          ) : (
+            message.content
+          )}
         </div>
       )}
       <MessageTime at={message.at} end={false} />
@@ -328,13 +347,7 @@ function PhoneMessage({ message }: { message: ChatMessage }) {
       )}
       {message.content.trim() !== "" && (
         <div className={`markdown-body md-phone max-w-[96%] break-words ${prose}`}>
-          <ReactMarkdown
-            remarkPlugins={[remarkGfm, remarkBreaks]}
-            rehypePlugins={[rehypeHighlight]}
-            components={PHONE_MARKDOWN_COMPONENTS}
-          >
-            {message.content}
-          </ReactMarkdown>
+          <ChatMarkdown phone content={message.content} />
         </div>
       )}
       <MessageTime at={message.at} end={role === "system"} />
@@ -379,13 +392,7 @@ function MessageView({ message, phone = false }: { message: ChatMessage; phone?:
       {message.attachments && <Attachments attachments={message.attachments} />}
       {isMarkdown(message.role) ? (
         <div className="markdown-body text-sm leading-relaxed text-zinc-200">
-          <ReactMarkdown
-            remarkPlugins={[remarkGfm, remarkBreaks]}
-            rehypePlugins={[rehypeHighlight]}
-            components={MARKDOWN_COMPONENTS}
-          >
-            {message.content}
-          </ReactMarkdown>
+          <ChatMarkdown content={message.content} />
         </div>
       ) : (
         <div
