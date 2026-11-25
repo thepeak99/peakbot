@@ -1491,6 +1491,59 @@ async fn pause_reaches_the_remote_verbatim() {
     forward_frame_verbatim(json!({ "type": "pause" })).await;
 }
 
+/// The attach cursor is forwarded so the remote can prove the cached prefix
+/// and switch this socket to suffix frames.
+#[tokio::test]
+async fn attach_forwards_the_since_cursor_to_the_remote() {
+    let _guard = env_guard();
+    let env = ready_env().await;
+    let mut ws = ws_connect(env.local).await;
+    ws_send(
+        &mut ws,
+        &json!({
+            "type": "attach",
+            "convo": null,
+            "profile": L,
+            "since": { "n": 2, "timestamp": "t2", "epoch": 7 }
+        }),
+    )
+    .await;
+    wait_handshake(&mut ws).await;
+
+    let attach: Value = env
+        .ws_frames()
+        .iter()
+        .filter_map(|f| serde_json::from_str::<Value>(f).ok())
+        .find(|v| v["type"] == "attach")
+        .expect("the relay sent an attach");
+    assert_eq!(
+        attach["since"],
+        json!({ "n": 2, "timestamp": "t2", "epoch": 7 }),
+        "the cursor rides the synthesized attach"
+    );
+}
+
+/// The additive anchor move is forwarded raw; the remote validates it.
+#[tokio::test]
+async fn sync_anchor_reaches_the_remote_verbatim() {
+    let _guard = env_guard();
+    forward_frame_verbatim(json!({
+        "type": "sync_anchor",
+        "since": { "n": 12, "timestamp": "t12", "epoch": 7 }
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn rebase_alias_reaches_the_remote_verbatim() {
+    let _guard = env_guard();
+    forward_frame_verbatim(json!({
+        "type": "rebase",
+        "since": { "n": 12, "timestamp": "t12", "epoch": 7 }
+    }))
+    .await;
+}
+
 #[tokio::test]
 async fn resume_reaches_the_remote_verbatim() {
     let _guard = env_guard();

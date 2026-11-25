@@ -16,7 +16,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{Client, Directory, RemoteName};
+use super::{CONVERSATION_LIST_LIMIT, Client, Directory, RemoteName};
 use crate::ui::web::KILL_RUNNING_MSG;
 use crate::ui::web::conversations::local_rows;
 use crate::ui::web::registry::{KillOutcome, SessionRegistry};
@@ -47,9 +47,13 @@ impl Listing {
     }
 }
 
-/// One summary fetch: (display name, rows, offline) in a join_all.
-pub(crate) type FetchFuture =
-    Pin<Box<dyn Future<Output = (String, Vec<ConversationSummaryWire>, bool)> + Send>>;
+/// One summary fetch: (display name, rows, offline, stable_id) in a
+/// join_all. The stable_id (`None` for direct, `cloud://<DeviceId>` for
+/// cloud) rides back separately from rows because rows may be empty on
+/// failure while the status still reports the offline machine.
+pub(crate) type FetchFuture = Pin<
+    Box<dyn Future<Output = (String, Vec<ConversationSummaryWire>, bool, Option<String>)> + Send>,
+>;
 
 /// Local rows + every reachable remote's rows, merged by `updated_at`
 /// desc, plus one status per distinct origin in BTreeMap order (the SPA
@@ -60,7 +64,8 @@ pub(crate) async fn merged_listing(
     directory: &Arc<Directory>,
     registry: &SessionRegistry,
 ) -> Listing {
-    let mut items = local_rows(registry);
+    let mut items = local_rows(registry, None);
+    items.truncate(CONVERSATION_LIST_LIMIT);
 
     // §5.11: a fresh global-config parse on every request; a broken file
     // means no remote rows and no known machines.
@@ -109,17 +114,21 @@ pub(crate) async fn merged_listing(
                     .ok()
                     .flatten();
                 let online = fetched.is_some();
-                let rows = fetched
+                let mut rows: Vec<ConversationSummaryWire> = fetched
                     .into_iter()
                     .flatten()
                     .filter_map(|mut row| {
                         targets.get(row.profile.as_deref()?).map(|local_name| {
                             row.profile = Some(local_name.clone());
+                            row.machine = Some(origin.clone());
                             row
                         })
                     })
                     .collect();
-                (origin, rows, online)
+                // An old remote ignores `?limit`; keep the newest rows only.
+                rows.sort_by_key(|row| std::cmp::Reverse(parse_updated_at(&row.updated_at)));
+                rows.truncate(CONVERSATION_LIST_LIMIT);
+                (origin, rows, online, None)
             }
         }));
     }
@@ -141,6 +150,8 @@ pub(crate) async fn merged_listing(
                 }
                 let handle = handle.clone();
                 let device = device.id;
+                let machine = format!("cloud://{}", hex(&device));
+                let slug_for_status = slug.clone();
                 fetches.push(Box::pin(async move {
                     // `list()` ignores the profile field; the rows carry
                     // their own local profiles, which get re-tagged.
@@ -154,25 +165,32 @@ pub(crate) async fn merged_listing(
                         .ok()
                         .and_then(Result::ok);
                     let online = fetched.is_some();
-                    let rows = fetched
+                    let mut rows: Vec<ConversationSummaryWire> = fetched
                         .into_iter()
                         .flatten()
                         .filter_map(|mut row| {
                             row.profile.take().map(|p| {
                                 row.profile = Some(format!("{p}@{slug}"));
+                                row.machine = Some(machine.clone());
                                 row
                             })
                         })
                         .collect();
-                    (slug, rows, online)
+                    rows.sort_by_key(|row| std::cmp::Reverse(parse_updated_at(&row.updated_at)));
+                    rows.truncate(CONVERSATION_LIST_LIMIT);
+                    (slug_for_status, rows, online, Some(machine))
                 }));
             }
         }
     }
 
     let mut machines = Vec::new();
-    for (id, rows, online) in futures::future::join_all(fetches).await {
-        machines.push(MachineStatusWire { id, online });
+    for (id, rows, online, stable_id) in futures::future::join_all(fetches).await {
+        machines.push(MachineStatusWire {
+            id,
+            online,
+            stable_id,
+        });
         items.extend(rows);
     }
     items.sort_by_key(|row| std::cmp::Reverse(parse_updated_at(&row.updated_at)));
@@ -234,6 +252,11 @@ pub(crate) async fn answer_kill(
         (error, merged_listing(directory, registry).await)
     };
     Some((listing, error))
+}
+
+/// `[u8; 32]` → 64 lowercase hex — the stable `cloud://` identity suffix.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// RFC 3339 → instant for the merge sort; an unparseable stamp sorts first.

@@ -1,5 +1,5 @@
 // Mobile "Chats home" glue (design §3.4): two screens over the one shared
-// socket, the list poll, the unread fold, last-chat persistence and the
+// socket, list refreshes, the unread fold, last-chat persistence and the
 // refused-resume fallback. Returns `null` outside the Tauri mobile shell.
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -23,9 +23,6 @@ export interface MobileChatsApi {
   showChats(): void;
 }
 
-/** How often the bound list is refreshed while the socket is up. */
-const POLL_MS = 4000;
-
 export function useMobileChats(
   agent: AgentConnection,
   onNotice: (message: string) => void,
@@ -48,6 +45,12 @@ export function useMobileChats(
     agentRef.current = agent;
   });
 
+  // The refresh triggers read the visible screen live; only Chats refreshes.
+  const screenRef = useRef<Screen>(screen);
+  useEffect(() => {
+    screenRef.current = screen;
+  });
+
   // One refresh per entry into the list, whether by "‹ Chats" or by OS Back.
   useEffect(() => {
     if (enabled && screen === "chats") agentRef.current.send({ type: "request_conversations" });
@@ -60,17 +63,39 @@ export function useMobileChats(
     saveLastChat(window.localStorage, { convo: agent.convo, profile: profileFromUrl() });
   }, [enabled, agent.convo]);
 
-  // The connect edge refreshes once, then the list stays current on a timer;
-  // a hidden page skips its tick (read live, never cached).
+  // A connect/reconnect edge refreshes the list only while it is on screen.
+  const wasConnected = useRef(agent.connected);
   useEffect(() => {
-    if (!enabled || !agent.connected) return;
-    agentRef.current.send({ type: "request_conversations" });
-    const id = window.setInterval(() => {
-      if (document.hidden) return;
+    if (!enabled) return;
+    const edge = agent.connected && !wasConnected.current;
+    wasConnected.current = agent.connected;
+    if (edge && screenRef.current === "chats") {
       agentRef.current.send({ type: "request_conversations" });
-    }, POLL_MS);
-    return () => window.clearInterval(id);
+    }
   }, [enabled, agent.connected]);
+
+  // A visible list refreshes when the app returns to the foreground.
+  useEffect(() => {
+    if (!enabled) return;
+    const onVisible = () => {
+      if (document.hidden || screenRef.current !== "chats") return;
+      agentRef.current.send({ type: "request_conversations" });
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [enabled]);
+
+  // A visible list refreshes when the attached turn ends.
+  const wasRunning = useRef(agent.state?.is_running ?? false);
+  useEffect(() => {
+    if (!enabled) return;
+    const running = agent.state?.is_running ?? false;
+    const ended = wasRunning.current && !running;
+    wasRunning.current = running;
+    if (ended && screenRef.current === "chats") {
+      agentRef.current.send({ type: "request_conversations" });
+    }
+  }, [enabled, agent.state]);
 
   // Each fresh conversations array is folded against the chat on screen; the
   // mount-time array only sets the baseline and leaves `loaded` false.

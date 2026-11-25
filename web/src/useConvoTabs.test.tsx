@@ -214,6 +214,12 @@ type Views = {
 
 const views = (): Views => (api as { views: Views }).views;
 
+/** How many `request_conversations` frames the hook sent, from `agent.send`. */
+const listRequests = (agent: StubAgent): number =>
+  agent.send.mock.calls.filter(
+    (c) => (c[0] as { type?: string } | undefined)?.type === "request_conversations",
+  ).length;
+
 // ─── browser (initial null) ──────────────────────────────────────────────
 
 describe("useConvoTabs — browser (initial null)", () => {
@@ -512,9 +518,16 @@ describe("useConvoTabs — background status (running → unread)", () => {
 });
 
 // ─── polling ─────────────────────────────────────────────────────────────
+// Shared-cache stage 1: the 4s setInterval polling is gone. The hook never
+// sends request_conversations on a timer. Refreshes are triggered by:
+//   - list surface opens (ConversationsPicker opens)
+//   - foreground or socket reconnect WHILE list visible
+//   - manual refresh where supported
+//   - attached turn ends WHILE list visible
+// Opening/switching/resuming/reattaching a conversation cause ZERO list requests.
 
-describe("useConvoTabs — status polling", () => {
-  it("polls request_conversations every 4s when connected with more than one tab", async () => {
+describe("useConvoTabs — no interval polling", () => {
+  it("does not send request_conversations on any timer, even with multiple tabs", async () => {
     useIntervalFakes();
     const agent = makeAgent({
       connected: true,
@@ -525,15 +538,14 @@ describe("useConvoTabs — status polling", () => {
     await renderHook(agent, initial);
     agent.send.mockClear();
 
+    // Advance far enough that the old 4s interval would have fired three times.
     await act(async () => {
-      vi.advanceTimersByTime(4000);
+      vi.advanceTimersByTime(12_000);
     });
-    expect(agent.send).toHaveBeenCalledWith({ type: "request_conversations" });
-
-    await act(async () => {
-      vi.advanceTimersByTime(4000);
-    });
-    expect(agent.send).toHaveBeenCalledTimes(2);
+    expect(
+      agent.send,
+      "the hook never polls on an interval",
+    ).not.toHaveBeenCalledWith({ type: "request_conversations" });
   });
 
   it("does not poll with a single tab", async () => {
@@ -545,7 +557,7 @@ describe("useConvoTabs — status polling", () => {
     agent.send.mockClear();
 
     await act(async () => {
-      vi.advanceTimersByTime(12_000); // three intervals
+      vi.advanceTimersByTime(12_000);
     });
     expect(agent.send).not.toHaveBeenCalledWith({ type: "request_conversations" });
   });
@@ -565,6 +577,243 @@ describe("useConvoTabs — status polling", () => {
       vi.advanceTimersByTime(12_000);
     });
     expect(agent.send).not.toHaveBeenCalledWith({ type: "request_conversations" });
+  });
+});
+
+// ─── user ops cause ZERO list requests ───────────────────────────────────
+// The shared refresh path replaces setInterval polling. Opening, switching,
+// resuming or reattaching a conversation never triggers a list refresh — only
+// the specific triggers (list surface opens, foreground/reconnect WHILE list
+// visible, manual refresh, attached turn end WHILE list visible) do.
+
+describe("useConvoTabs — user ops cause zero list requests", () => {
+  it("activate() sends no request_conversations", async () => {
+    const agent = makeAgent({ convo: "a" });
+    const initial = state([tab("a", "A"), tab("b", "B")], 0);
+    await renderHook(agent, initial);
+    agent.send.mockClear();
+
+    await act(async () => {
+      (api as { activate(i: number): void }).activate(1);
+    });
+
+    expect(
+      agent.send,
+      "activating a tab must not list",
+    ).not.toHaveBeenCalledWith({ type: "request_conversations" });
+  });
+
+  it("close() sends no request_conversations", async () => {
+    const agent = makeAgent({ convo: "a" });
+    const initial = state([tab("a", "A"), tab("b", "B"), tab("c", "C")], 0);
+    await renderHook(agent, initial);
+    agent.send.mockClear();
+
+    await act(async () => {
+      (api as { close(i: number): void }).close(0);
+    });
+
+    expect(
+      agent.send,
+      "closing a tab must not list",
+    ).not.toHaveBeenCalledWith({ type: "request_conversations" });
+  });
+
+  it("newTab() sends no request_conversations", async () => {
+    const agent = makeAgent({ convo: "a" });
+    const initial = state([tab("a", "A")], 0);
+    await renderHook(agent, initial);
+    agent.send.mockClear();
+
+    await act(async () => {
+      (api as { newTab(): void }).newTab();
+    });
+
+    expect(
+      agent.send,
+      "creating a new tab must not list",
+    ).not.toHaveBeenCalledWith({ type: "request_conversations" });
+  });
+});
+
+// ─── shared event-driven list refresh (the locked plan) ──────────────────
+// The 4s interval was removed; the list is refreshed by a SMALL set of
+// events (design §4/§5, mirrored from useMobileChats.ts, the locked plan):
+//
+//   1. socket reconnect (connected false→true edge)
+//   2. app returns to the foreground (visibilitychange → visible)
+//   3. the attached conversation's turn ends (state.is_running true→false)
+//
+// The mobile hook gates these on `screen === "chats"`. The desktop has no
+// single "list screen" — the tab bar + conversation surface are always up —
+// so the existing polling gate ("connected AND >1 tab") is the surface
+// condition here: the desktop surface is treated as live/visible when MORE
+// THAN ONE tab is open. (A single tab is the plain one-conversation view the
+// desktop shares with the browser; it does not carry the list surface.)
+// User ops (activate / close / newTab) stay ZERO; no timers are introduced.
+
+describe("useConvoTabs — shared event-driven list refresh", () => {
+  // Two open tabs = the desktop list surface is live (see the block comment).
+  const multi = state([tab("a", "A"), tab("b", "B")], 0);
+
+  /** Make document look foregrounded for the visibility listener. */
+  function foreground(): void {
+    Object.defineProperty(document, "hidden", { value: false, configurable: true });
+    Object.defineProperty(document, "visibilityState", {
+      value: "visible",
+      configurable: true,
+    });
+  }
+
+  async function visibilityChange(): Promise<void> {
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+  }
+
+  it("requests the list once when the socket reconnects while multi-tab", async () => {
+    const agent = makeAgent({ connected: true, convo: "a" });
+    await renderHook(agent, multi);
+
+    // A reconnect is a false→true edge on `connected`.
+    agent.connected = false;
+    await rerender(agent, multi);
+    agent.send.mockClear();
+
+    agent.connected = true;
+    await rerender(agent, multi);
+
+    expect(
+      listRequests(agent),
+      "a socket reconnect while the tab surface is live must refresh the list once",
+    ).toBe(1);
+  });
+
+  it("requests the list once when the app returns to the foreground while multi-tab", async () => {
+    const agent = makeAgent({ connected: true, convo: "a" });
+    await renderHook(agent, multi);
+    agent.send.mockClear();
+
+    foreground();
+    await visibilityChange();
+
+    expect(
+      listRequests(agent),
+      "returning to the foreground while the tab surface is live must refresh once",
+    ).toBe(1);
+  });
+
+  it("requests the list once when the attached turn ends while multi-tab", async () => {
+    const agent = makeAgent({
+      connected: true,
+      convo: "a",
+      state: { is_running: true },
+    });
+    await renderHook(agent, multi);
+    agent.send.mockClear();
+
+    // The attached conversation's turn ends.
+    agent.state = { is_running: false };
+    await rerender(agent, multi);
+
+    expect(
+      listRequests(agent),
+      "the attached turn ending while the tab surface is live must refresh once",
+    ).toBe(1);
+  });
+
+  it("a reconnect with a single tab requests nothing", async () => {
+    const agent = makeAgent({ connected: true, convo: "a" });
+    await renderHook(agent, state([tab("a", "A")], 0));
+
+    agent.connected = false;
+    await rerender(agent, state([tab("a", "A")], 0));
+    agent.send.mockClear();
+
+    agent.connected = true;
+    await rerender(agent, state([tab("a", "A")], 0));
+
+    expect(
+      listRequests(agent),
+      "a single tab is not the list surface: reconnect must not list",
+    ).toBe(0);
+  });
+
+  it("returning to the foreground with a single tab requests nothing", async () => {
+    const agent = makeAgent({ connected: true, convo: "a" });
+    await renderHook(agent, state([tab("a", "A")], 0));
+    agent.send.mockClear();
+
+    foreground();
+    await visibilityChange();
+
+    expect(
+      listRequests(agent),
+      "a single tab is not the list surface: foreground must not list",
+    ).toBe(0);
+  });
+
+  it("a turn end with a single tab requests nothing", async () => {
+    const agent = makeAgent({
+      connected: true,
+      convo: "a",
+      state: { is_running: true },
+    });
+    await renderHook(agent, state([tab("a", "A")], 0));
+    agent.send.mockClear();
+
+    agent.state = { is_running: false };
+    await rerender(agent, state([tab("a", "A")], 0));
+
+    expect(
+      listRequests(agent),
+      "a single tab is not the list surface: turn end must not list",
+    ).toBe(0);
+  });
+
+  it("foreground + reconnect + turn end together is one request per event", async () => {
+    const agent = makeAgent({
+      connected: true,
+      convo: "a",
+      state: { is_running: true },
+    });
+    await renderHook(agent, multi);
+    agent.send.mockClear();
+
+    foreground();
+    await visibilityChange();
+    expect(listRequests(agent), "foreground fires once").toBe(1);
+
+    agent.connected = false;
+    await rerender(agent, multi);
+    agent.connected = true;
+    await rerender(agent, multi);
+    expect(listRequests(agent), "reconnect adds exactly one").toBe(2);
+
+    agent.state = { is_running: false };
+    await rerender(agent, multi);
+    expect(listRequests(agent), "turn end adds exactly one").toBe(3);
+  });
+
+  it("tab ops still send zero list requests even with the triggers wired", async () => {
+    const agent = makeAgent({ connected: true, convo: "a" });
+    await renderHook(agent, multi);
+    agent.send.mockClear();
+
+    await act(async () => {
+      (api as { activate(i: number): void }).activate(1);
+    });
+    await act(async () => {
+      (api as { newTab(): void }).newTab();
+    });
+    await act(async () => {
+      (api as { close(i: number): void }).close(0);
+    });
+
+    expect(
+      listRequests(agent),
+      "activate/new/close must never request the list",
+    ).toBe(0);
   });
 });
 

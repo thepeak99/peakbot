@@ -633,6 +633,20 @@ impl StateManager {
         messages.insert(insert_at, ChatMessage::summary(plan.summary.clone()));
         // `plan.boundary` is meaningless from here on — do not use it.
 
+        // A compaction rewrites the whole wire sequence, so every cursor built
+        // from the old base must be rejected. Persisted with the messages by
+        // `run_compaction`'s `persist_current` immediately after this returns.
+        let epoch = {
+            let mut guard = self.current_conversation.lock().unwrap();
+            guard.as_mut().map(|conv| {
+                conv.bump_history_epoch();
+                conv.history_epoch
+            })
+        };
+        if let Some(epoch) = epoch {
+            state.history_epoch = epoch;
+        }
+
         self.notify_update(&state);
         // Lock order: state → stats. Drop state guard before acquiring stats.
         drop(state);
@@ -1024,7 +1038,20 @@ impl StateManager {
     /// Clear all chat messages
     pub fn clear_chat(&self) {
         let mut state = self.state.write().unwrap();
+        // Clearing is a wholesale removal: break lineage so a cursor for the
+        // pre-clear transcript cannot validate against the empty one. This is
+        // in-memory only; every caller resets onto a fresh conversation
+        // (`/new`, `/model`, `/cd`, delete), and persisting here would wipe
+        // the old conversation's on-disk history.
+        let epoch = {
+            let mut guard = self.current_conversation.lock().unwrap();
+            guard.as_mut().map(|conv| {
+                conv.bump_history_epoch();
+                conv.history_epoch
+            })
+        };
         state.chat.clear();
+        state.history_epoch = epoch.unwrap_or(0);
         self.notify_update(&state);
     }
 
@@ -1618,7 +1645,7 @@ impl StateManager {
     /// `?convo=` URL binding depends on it. Derived truth, refreshed at every
     /// identity change (create / load). `None` when no conversation is set.
     fn mirror_conversation_to_state(&self) {
-        let meta = self.current_conversation.lock().unwrap().as_ref().map(|c| {
+        let current = self.current_conversation.lock().unwrap().as_ref().map(|c| {
             let mut cs = crate::ui::app_state::ConversationState::new(
                 c.id.to_string(),
                 c.title.clone().unwrap_or_else(|| c.name.clone()),
@@ -1626,10 +1653,12 @@ impl StateManager {
             );
             cs.message_count = c.messages.len();
             cs.updated_at = c.updated_at.with_timezone(&chrono::Local);
-            cs
+            (cs, c.history_epoch)
         });
+        let (meta, history_epoch) = current.map(|(m, e)| (Some(m), e)).unwrap_or((None, 0));
         let mut state = self.state.write().unwrap();
         state.conversation = meta;
+        state.history_epoch = history_epoch;
         self.notify_update(&state);
     }
 
@@ -1936,83 +1965,7 @@ impl StateManager {
     fn sync_from_conversation(&self) {
         let conv_guard = self.current_conversation.lock().unwrap();
         if let Some(ref conv) = *conv_guard {
-            use crate::conversation::Message as ConvMsg;
-
-            let messages: Vec<ChatMessage> = conv
-                .messages
-                .iter()
-                .map(|msg| match msg {
-                    ConvMsg::User {
-                        content,
-                        attachments,
-                        compacted,
-                        source,
-                        timestamp,
-                    } => {
-                        let mut m = ChatMessage::user(content.clone());
-                        m.attachments = attachments.clone();
-                        m.compacted = *compacted;
-                        m.source = source.clone();
-                        m.timestamp = timestamp.with_timezone(&chrono::Local);
-                        m
-                    }
-                    ConvMsg::Assistant {
-                        content,
-                        compacted,
-                        source,
-                        thinking,
-                        timestamp,
-                        response_id,
-                    } => {
-                        let mut m = ChatMessage::agent(content.clone());
-                        m.compacted = *compacted;
-                        m.source = source.clone();
-                        m.thinking = thinking.clone();
-                        m.timestamp = timestamp.with_timezone(&chrono::Local);
-                        m.response_id = *response_id;
-                        m
-                    }
-                    ConvMsg::ToolCall {
-                        tool_name,
-                        arguments,
-                        call_id,
-                        compacted,
-                        source,
-                        thinking,
-                        timestamp,
-                        response_id,
-                    } => {
-                        let mut m = ChatMessage::tool_call(tool_name, arguments, call_id.clone());
-                        m.compacted = *compacted;
-                        m.source = source.clone();
-                        m.thinking = thinking.clone();
-                        m.timestamp = timestamp.with_timezone(&chrono::Local);
-                        m.response_id = *response_id;
-                        m
-                    }
-                    ConvMsg::ToolResult {
-                        tool_name,
-                        arguments,
-                        result,
-                        call_id,
-                        compacted,
-                        source,
-                        timestamp,
-                    } => {
-                        let mut m =
-                            ChatMessage::tool_result(tool_name, arguments, result, call_id.clone());
-                        m.compacted = *compacted;
-                        m.source = source.clone();
-                        m.timestamp = timestamp.with_timezone(&chrono::Local);
-                        m
-                    }
-                    ConvMsg::Summary { content, timestamp } => {
-                        let mut m = ChatMessage::summary(content.clone());
-                        m.timestamp = timestamp.with_timezone(&chrono::Local);
-                        m
-                    }
-                })
-                .collect();
+            let messages = crate::ui::app_state::chat_messages_from_conversation(conv);
 
             // Resume response ids ABOVE everything the loaded transcript
             // already used. Restarting from the in-memory counter would let a
@@ -3717,6 +3670,8 @@ impl Default for StateManager {
     }
 }
 
+#[cfg(test)]
+mod lineage_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

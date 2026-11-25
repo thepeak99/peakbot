@@ -16,6 +16,7 @@ import { CloudRoot } from "./cloud/CloudRoot";
 import { CLOUD_SETTINGS_EVENT } from "./cloud/openCloud";
 import { useCloudTargets } from "./cloud/targets";
 import { useCloudDevices } from "./cloud/useCloud";
+import { useCacheRetention } from "./useCacheRetention";
 import { NoMachines } from "./cloud/NoMachines";
 import { BashPanel } from "./components/BashPanel";
 import {
@@ -181,6 +182,10 @@ export function App({ initialTabs = null }: { initialTabs?: TabsState | null }) 
   // Agents panel renders. `view` scopes the transcript, todos, files and
   // stats to one lane via the message `source`.
   const cloudDevices = useCloudDevices();
+  // Shared conversation cache retention: subscribe to the cloud roster and
+  // purge only on explicit removal / self logout / self revoke. Never on a
+  // transient state. Direct-remote origins are purged explicitly, not here.
+  useCacheRetention();
   // Every consumer below reads this ONE binding: the session's own rows plus
   // every online peer's rows, so a phone linked to several cloud hosts sees
   // them all. `label` is display-only (see mergeCatalog); `name` stays the

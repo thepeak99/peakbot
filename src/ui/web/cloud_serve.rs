@@ -24,6 +24,7 @@ use futures::{Sink, SinkExt, Stream, StreamExt};
 use tower::ServiceExt;
 use uuid::Uuid;
 
+use super::remote::CONVERSATION_LIST_LIMIT;
 use super::{DeviceId, Principal, WsState, conversations, images, serve_socket, uploads};
 use crate::cloud::stream::CloudStream;
 
@@ -477,7 +478,10 @@ async fn serve_request(state: &WsState, req: Request<Body>) -> Response {
 
 fn build_request(op: PeerOp) -> Option<Request<Body>> {
     let (method, uri) = match op {
-        PeerOp::List => (Method::GET, "/api/conversations".to_string()),
+        PeerOp::List => (
+            Method::GET,
+            format!("/api/conversations?limit={CONVERSATION_LIST_LIMIT}"),
+        ),
         PeerOp::Kill { id } => (Method::POST, format!("/api/conversations/{id}/kill")),
         PeerOp::GetImage { id } => (Method::GET, format!("/images/{}", enc(&id))),
         PeerOp::GetUpload { convo, id } => (Method::GET, format!("/api/uploads/{convo}/{id}")),
@@ -923,6 +927,22 @@ profiles:
         let got = serve_op(st, PeerOp::GetUpload { convo, id }).await;
         assert_eq!(got.status(), 200);
         assert_eq!(&body(got).await[..], b"hello", "bytes come back identical");
+    }
+
+    /// Shared-cache stage 1: the Cloud `List` op still asks the local router
+    /// for `GET /api/conversations`, now with `?limit=100`. The wire Op
+    /// (bincode) is unchanged — only the HTTP construction grows the query, so
+    /// old and new peers interoperate.
+    #[test]
+    fn cloud_list_op_requests_conversations_with_limit_100() {
+        let req = build_request(PeerOp::List).expect("the List request builds");
+        assert_eq!(req.method(), Method::GET);
+        assert_eq!(req.uri().path(), "/api/conversations");
+        assert_eq!(
+            req.uri().query(),
+            Some("limit=100"),
+            "Cloud List must cap at 100 like the direct client"
+        );
     }
 
     /// An upload over `general.uploads.max_file_mb` gets the router's

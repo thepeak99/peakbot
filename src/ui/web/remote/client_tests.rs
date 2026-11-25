@@ -385,7 +385,7 @@ fn last_cookie_on(rec: &Recorder, path: &str) -> Option<String> {
     rec.hits()
         .iter()
         .rev()
-        .find(|h| h.uri == path)
+        .find(|h| h.uri.split('?').next() == Some(path))
         .and_then(|h| hit_cookie(h).map(str::to_string))
 }
 
@@ -585,7 +585,7 @@ async fn remote_token_travels_as_peakbot_token_cookie_on_every_request() {
         let hits = rec.hits();
         let hit = hits
             .iter()
-            .find(|h| h.uri == path)
+            .find(|h| h.uri.split('?').next() == Some(path.as_str()))
             .unwrap_or_else(|| panic!("the remote saw {path}"));
         assert_eq!(
             hit_cookie(hit),
@@ -743,7 +743,9 @@ async fn loopback_plain_uses_plain_http_and_ws() {
     drop(client.dial().await.expect("plain ws dial"));
 
     assert!(
-        rec.hits().iter().any(|h| h.uri == "/api/conversations"),
+        rec.hits()
+            .iter()
+            .any(|h| h.uri.split('?').next() == Some("/api/conversations")),
         "the plain remote saw the list call"
     );
 }
@@ -855,7 +857,7 @@ async fn remote_401_is_eauth_with_no_retry() {
     assert_eq!(
         rec.hits()
             .iter()
-            .filter(|h| h.uri == "/api/conversations")
+            .filter(|h| h.uri.split('?').next() == Some("/api/conversations"))
             .count(),
         1,
         "no retry storm: exactly one list request"
@@ -898,7 +900,7 @@ async fn list_is_get_api_conversations_and_parses_the_t4_shape() {
     let hits = rec.hits();
     let hit = hits
         .iter()
-        .find(|h| h.uri == "/api/conversations")
+        .find(|h| h.uri.split('?').next() == Some("/api/conversations"))
         .expect("the remote saw GET /api/conversations");
     assert_eq!(hit.method, "GET", "list is a GET");
 
@@ -906,6 +908,38 @@ async fn list_is_get_api_conversations_and_parses_the_t4_shape() {
         serde_json::to_value(&items).expect("serialize the parsed items"),
         expected_items(),
         "the T4 response shape round-trips, incl. the #[serde(default)] profile"
+    );
+}
+
+// Shared-cache stage 1: Client::list passes ?limit=100 so the remote doesn't
+// send back an unbounded list. The limit parameter is a client-side defensive
+// cap; the remote applies it AFTER sorting. Old remotes that ignore the query
+// param continue to work (they just return everything).
+#[tokio::test]
+async fn list_request_includes_limit_100_query_param() {
+    let ca = mint_ca();
+    let rec = Recorder::new();
+    let url = start_tls_server(
+        &ca,
+        &["127.0.0.1"],
+        FakeRemote::new(REMOTE_TOKEN, &ca),
+        rec.clone(),
+    )
+    .await;
+    let p = profile(&url, &ca.fingerprint, REMOTE_TOKEN);
+    let client = Client::new(&p, short_opts()).await.expect("build");
+
+    client.list().await.expect("list");
+
+    let hits = rec.hits();
+    let hit = hits
+        .iter()
+        .find(|h| h.uri.starts_with("/api/conversations"))
+        .expect("the remote saw the list request");
+    assert!(
+        hit.uri.contains("limit=100"),
+        "list request must include limit=100, got: {}",
+        hit.uri
     );
 }
 
