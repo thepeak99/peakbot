@@ -459,8 +459,8 @@ fn wire_roundtrip_credit() {
 
 // ── §7: version constants ───────────────────────────────────────────────────
 
-/// PIPE_VERSION must be 2 for Transport v2.
+/// PIPE_VERSION must be 3 for the symmetric-session pipe (pipe v3).
 #[test]
-fn pipe_version_is_2() {
-    assert_eq!(cloud::constants::PIPE_VERSION, 2);
+fn pipe_version_is_3() {
+    assert_eq!(cloud::constants::PIPE_VERSION, 3);
 }

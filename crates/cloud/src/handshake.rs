@@ -208,6 +208,27 @@ impl PipeMsg {
     }
 }
 
+/// Best-effort session id from a FOREIGN-version Hs1 prefix
+/// (`u8(version ≠ PIPE_VERSION) ‖ u8(1) ‖ fix[16](sid)`).
+///
+/// Pipe v3 uses this to answer a peer still speaking an older pipe with
+/// `Close{sid}` even though [`PipeMsg::parse`] rejects its version. The
+/// current version is the parser's job and yields `None` here; every short,
+/// non-Hs1, or malformed shape also yields `None`. Total: never panics.
+pub fn first_session_id(raw: &[u8]) -> Option<SessionId> {
+    if raw.first().copied()? == constants::PIPE_VERSION {
+        return None;
+    }
+    if raw.get(1).copied()? != 1 {
+        return None;
+    }
+    // 1 version + 1 type + 16-byte sid.
+    let sid_bytes = raw.get(2..18)?;
+    let mut sid = [0u8; 16];
+    sid.copy_from_slice(sid_bytes);
+    Some(sid)
+}
+
 // ---------------------------------------------------------------------------
 // Transcript (spec §8.3)
 // ---------------------------------------------------------------------------

@@ -52,6 +52,14 @@ pub fn session_expired(established_at: u64, now: u64) -> bool {
     established_at.saturating_add(constants::SESSION_LIFETIME) <= now
 }
 
+/// True once a pending handshake created at `created` is past
+/// `HANDSHAKE_TIMEOUT` (30 s, spec §8.6), with the boundary inclusive as in
+/// [`session_expired`]. Saturating subtraction keeps clock skew
+/// (`now < created`) a non-expired, non-panicking case.
+pub fn handshake_expired(created: u64, now: u64) -> bool {
+    now.saturating_sub(created) >= constants::HANDSHAKE_TIMEOUT
+}
+
 // ---------------------------------------------------------------------------
 // Sender / receiver (spec §9.2)
 // ---------------------------------------------------------------------------
@@ -189,7 +197,8 @@ pub struct Inner {
 /// Stream messages (spec §9.4).
 #[derive(Debug, Clone, PartialEq, Eq, bincode::Encode, bincode::Decode)]
 pub enum StreamMsg {
-    /// Open a stream (id > 0, strictly increasing, initiator only).
+    /// Open a stream (id > 0, strictly increasing within the opener's
+    /// namespace; either role may open).
     Open(Op),
     /// Existing JSON wire frame (Attach streams only). A message up to
     /// `FRAME_ONESHOT_MAX` rides here; larger ones are fragmented.
@@ -274,6 +283,34 @@ pub enum Role {
     Responder,
 }
 
+/// First stream id minted by `role` (pipe v3, spec §9.5): the initiator
+/// opens from 1 upward, the responder from 2^31 upward. The two ranges are
+/// disjoint, so each side owns a namespace and both may open streams on
+/// the same session.
+pub const fn first_stream_id(role: Role) -> u32 {
+    match role {
+        Role::Initiator => 1,
+        Role::Responder => 1 << 31,
+    }
+}
+
+/// The namespace an id belongs to: ids below the responder base are the
+/// initiator's, the rest are the responder's.
+fn stream_namespace(id: u32) -> Role {
+    if id >= first_stream_id(Role::Responder) {
+        Role::Responder
+    } else {
+        Role::Initiator
+    }
+}
+
+fn namespace_index(role: Role) -> usize {
+    match role {
+        Role::Initiator => 0,
+        Role::Responder => 1,
+    }
+}
+
 /// What a fed message caused the peer to observe / answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MuxEvent {
@@ -291,16 +328,17 @@ pub enum MuxEvent {
 /// `End` is a HALF-close (S3/S4): each direction ends on its own and the
 /// stream closes when both have. The mux is fed messages of both
 /// directions without a direction tag, so direction is inferred: on a
-/// non-Attach stream everything before `Head` is the initiator's, hence a
-/// first `End` before `Head` is the request's End.
+/// non-Attach stream everything before `Head` belongs to the opening
+/// side, hence a first `End` before `Head` is the request's End. This
+/// works identically for streams opened by either role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamState {
     Live {
         attach: bool,
         /// Head seen on this (non-Attach) stream; at most one (S4).
         headed: bool,
-        /// The request direction (initiator) has ended; known only when
-        /// the End arrived before `Head`.
+        /// The request direction (the opening side) has ended; known only
+        /// when the End arrived before `Head`.
         req_ended: bool,
         /// Number of `End`s seen so far (0 or 1; the second closes).
         ends: u8,
@@ -310,39 +348,47 @@ enum StreamState {
 }
 
 /// The stream table for one session side (spec §9.5, S1–S5).
+///
+/// Pipe v3 is duplex: both roles open streams, each in its own namespace
+/// (`first_stream_id`). Because one mux sees its own locally fed messages
+/// and the peer's inbound ones, Opens in either namespace are accepted and
+/// ordering is enforced per namespace.
 #[derive(Debug, Default)]
 pub struct Mux {
-    role: Role,
     streams: BTreeMap<u32, StreamState>,
-    /// Highest stream id ever opened (S1: strictly increasing).
-    max_opened: u32,
-    /// Streams not yet closed/reset (S2 cap).
+    /// Highest stream id ever opened in each namespace (S1: strictly
+    /// increasing within a namespace; the namespaces are independent).
+    max_opened: [u32; 2],
+    /// Streams not yet closed/reset across both namespaces (S2 cap).
     open_count: usize,
 }
 
 impl Mux {
     /// New mux for a session side.
-    pub fn new(role: Role) -> Self {
-        Self {
-            role,
-            ..Self::default()
-        }
+    ///
+    /// The `role` parameter is retained for source compatibility only: the
+    /// mux does not classify Opens by a stored role. The actor mints ids
+    /// from `first_stream_id(role)`, and the namespace is derived from each
+    /// Open's id, so both roles are accepted in both namespaces.
+    pub fn new(_role: Role) -> Self {
+        Self::default()
     }
 
     /// Feed one inner message; returns the events it caused. Enforces:
-    /// - S1: id 0 reserved; only the initiator sends `Open` (an Open on
-    ///   the responder side is a `Protocol` abort); each Open uses an id
-    ///   strictly greater than every previously opened id.
-    /// - S2: at most `MAX_STREAMS` open at once; a further Open answers
-    ///   `Reset(TooLarge)` (event, not abort).
+    /// - S1: id 0 reserved; either role may `Open`, but each Open must use
+    ///   an id strictly greater than every previously opened id in ITS
+    ///   namespace (initiator ids from [`first_stream_id`]`(Initiator)`,
+    ///   responder ids from [`first_stream_id`]`(Responder)`). The two
+    ///   namespaces are ordered independently.
+    /// - S2: at most `MAX_STREAMS` open at once across both namespaces; a
+    ///   further Open answers `Reset(TooLarge)` (event, not abort).
     /// - S3: Attach: `Frame`, the v2 `FrameBegin`/`Chunk*`/`FrameEnd`
     ///   fragment grammar, `Credit`, and `End` per direction; closed when
     ///   both ended. `Head` → `Protocol`. The mux is direction-agnostic, so
     ///   the endpoint assemblers own per-direction fragment ordering.
-    /// - S4: other ops: initiator `Open, Chunk*, End`; responder
-    ///   `Head, Chunk*, End`; `End` is a HALF-close (the stream closes on
-    ///   the second End); out of sequence, `Frame`, or a v2 Attach-only
-    ///   record → `Protocol`.
+    /// - S4: other ops: opener `Open, Chunk*, End`; peer `Head, Chunk*,
+    ///   End`; `End` is a HALF-close (the stream closes on the second End);
+    ///   out of sequence, `Frame`, or a v2 Attach-only record → `Protocol`.
     /// - S5: `Reset` ends a stream both ways; messages for a reset/closed
     ///   id are dropped silently (no event); a message for an id that was
     ///   never opened → `Protocol`.
@@ -357,11 +403,11 @@ impl Mux {
             if self.streams.contains_key(&id) {
                 return Err(Error::Protocol);
             }
-            // S1: only the initiator sends Open.
-            if self.role == Role::Responder {
-                return Err(Error::Protocol);
-            }
-            if id <= self.max_opened {
+            // S1: an id must be strictly increasing within its own
+            // namespace. Both roles open, so no role check applies here;
+            // the locally fed and inbound messages share this table.
+            let ns = namespace_index(stream_namespace(id));
+            if id <= self.max_opened[ns] {
                 return Err(Error::Protocol);
             }
             if self.open_count >= constants::MAX_STREAMS as usize {
@@ -377,7 +423,7 @@ impl Mux {
                     ends: 0,
                 },
             );
-            self.max_opened = id;
+            self.max_opened[ns] = id;
             self.open_count += 1;
             return Ok(events);
         }

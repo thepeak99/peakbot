@@ -10,7 +10,7 @@ use cloud::{
     DeviceId, SessionId, constants,
     frames::{
         CreditLedger, FragmentAssembler, FrameReceiver, FrameSender, Mux, Op, ReassemblyBudget,
-        Role, StreamMsg,
+        StreamMsg,
     },
     handshake::{Initiator, Responder},
 };
@@ -25,12 +25,8 @@ pub struct Session {
     pub peer: DeviceId,
     pub phase: Phase,
     /// `open()` calls queued while this peer's handshake is in flight;
-    /// flushed (or failed) when the phase resolves.
+    /// flushed in arrival order (or failed) when the phase resolves.
     pub queued: Vec<(Op, oneshot::Sender<Result<CloudStream, CloudError>>)>,
-    /// Tie-break / responder-side `open()`: a responder cannot send
-    /// `Open` itself (mux S1), so this open binds to the first stream the
-    /// winning initiator opens.
-    pub claim: Option<(Op, oneshot::Sender<Result<CloudStream, CloudError>>)>,
     pub established_at: u64,
 }
 
@@ -63,11 +59,10 @@ pub struct Open {
     pub tx: FrameSender,
     pub rx: FrameReceiver,
     pub mux: Mux,
-    pub role: Role,
     /// Live stream id → the actor→caller side (bounded 32; a full
     /// receiver resets the stream, §D.5 backpressure).
     pub streams: HashMap<u32, StreamSide>,
-    /// Next stream id for THIS side's opens (strictly increasing, S1).
+    /// Next stream id in THIS side's namespace (strictly increasing, S1).
     pub next_stream: u32,
     /// Aggregate in-flight fragment bytes across all Attach streams.
     pub reassembly: ReassemblyBudget,

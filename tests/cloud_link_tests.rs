@@ -785,31 +785,70 @@ async fn simultaneous_handshake_tie_breaks_to_one_session() {
         .expect("join B")
         .expect("B's open succeeds (tie-break)");
 
-    // Exactly ONE established session: data flows both ways through the
-    // same pair. (The lower-DeviceId initiator wins; the other responds.)
-    let mut a = stream_a;
-    let mut b = stream_b;
-    a.send(StreamMsg::Frame("a→b".into()))
+    // Exactly ONE established session, but pipe v3 lets BOTH roles originate
+    // a stream in their own namespace. The lower-DeviceId initiator still
+    // wins the handshake; the loser's queued open now flushes in its own
+    // namespace instead of binding to the winner's first stream.
+    let mut a_out = stream_a;
+    let mut b_out = stream_b;
+    let (dev_b, op_b, mut b_in) = tokio::time::timeout(TIMEOUT, rx_b_hook.recv())
+        .await
+        .expect("B's inbound hook fired for A's namespace")
+        .expect("hook payload");
+    assert_eq!((dev_b, op_b), (id_a(), Op::Attach));
+    let (dev_a, op_a, mut a_in) = tokio::time::timeout(TIMEOUT, rx_a_hook.recv())
+        .await
+        .expect("A's inbound hook fired for B's namespace")
+        .expect("hook payload");
+    assert_eq!((dev_a, op_a), (id_b(), Op::Attach));
+
+    // Initiator namespace (A→B) round-trips on its own stream.
+    a_out
+        .send(StreamMsg::Frame("a→b".into()))
         .await
         .expect("a sends");
-    b.send(StreamMsg::Frame("b→a".into()))
+    let m = tokio::time::timeout(TIMEOUT, b_in.next())
         .await
-        .expect("b sends");
-    let m1 = tokio::time::timeout(TIMEOUT, a.next())
+        .expect("b inbound reads")
+        .expect("frame");
+    assert_eq!(m, StreamMsg::Frame("a→b".into()));
+    b_in.send(StreamMsg::Frame("b→a".into()))
+        .await
+        .expect("b inbound sends");
+    let m = tokio::time::timeout(TIMEOUT, a_out.next())
         .await
         .expect("a reads")
         .expect("frame");
-    let m2 = tokio::time::timeout(TIMEOUT, b.next())
+    assert_eq!(m, StreamMsg::Frame("b→a".into()));
+
+    // Responder namespace (B→A) round-trips independently on the same session.
+    b_out
+        .send(StreamMsg::Frame("b→a reverse".into()))
+        .await
+        .expect("b sends");
+    let m = tokio::time::timeout(TIMEOUT, a_in.next())
+        .await
+        .expect("a inbound reads")
+        .expect("frame");
+    assert_eq!(m, StreamMsg::Frame("b→a reverse".into()));
+    a_in.send(StreamMsg::Frame("a→b reverse".into()))
+        .await
+        .expect("a inbound sends");
+    let m = tokio::time::timeout(TIMEOUT, b_out.next())
         .await
         .expect("b reads")
         .expect("frame");
-    assert_eq!(m1, StreamMsg::Frame("b→a".into()));
-    assert_eq!(m2, StreamMsg::Frame("a→b".into()));
+    assert_eq!(m, StreamMsg::Frame("a→b reverse".into()));
 
-    // No spurious inbound hooks fired (the loser of the tie-break became a
-    // responder, not a fresh inbound session).
-    assert!(rx_a_hook.try_recv().is_err(), "A got no extra inbound hook");
-    assert!(rx_b_hook.try_recv().is_err(), "B got no extra inbound hook");
+    // One stream per role namespace, no duplicates.
+    assert!(
+        rx_a_hook.try_recv().is_err(),
+        "A got exactly one inbound stream from B"
+    );
+    assert!(
+        rx_b_hook.try_recv().is_err(),
+        "B got exactly one inbound stream from A"
+    );
 }
 
 // ── A: the phone / controller-only link refuses inbound Hs1 ────────────────
@@ -872,4 +911,124 @@ async fn a_link_without_an_inbound_hook_refuses_hs1() {
 #[allow(dead_code)]
 fn _info(d: &DeviceInfo) -> &cloud::DeviceId {
     &d.id
+}
+
+// ── B: a foreign-version Hs1 is answered with Close{UNKNOWN_VERSION} fast ──
+
+/// A peer still speaking an older pipe (v2) sends a well-formed Hs1 shape
+/// whose version byte is 2. The actor cannot parse it (`UnknownVersion`),
+/// but it must answer the sender's session id with
+/// `Close{reason: UNKNOWN_VERSION}` *immediately* so the old peer fails
+/// fast instead of waiting out the 30 s handshake timer.
+///
+/// The relay does not decrypt the pipe layer; `Hs1`/`Close` are plaintext
+/// there (only `Data` is sealed). The FakeRelay `pipes()` seam records
+/// every forwarded `ToRelay::Pipe`, so we observe the actor's outbound
+/// Close without a second live socket. No sleep for expiry: the bound is
+/// a few seconds, and the actor's path is synchronous (no timer).
+#[tokio::test]
+async fn foreign_version_hs1_gets_close_unknown_version_fast() {
+    use cloud::SessionId;
+    use cloud::handshake::{Initiator, PipeMsg};
+
+    // Bounded: the answer must arrive well under the 30 s handshake timer.
+    const ANSWER_BOUND: Duration = Duration::from_secs(5);
+
+    let fake = FakeRelay::spawn().await;
+    let dir_a = tempfile::tempdir().expect("tmp a");
+
+    // A is a live, Active genesis device with a relay socket.
+    let (handle_a, _store_a) = spawn_device(1, "Laptop", &fake, dir_a.path().to_path_buf(), None);
+    let h = handle_a.clone();
+    let fk = fake.clone();
+    h.login(move |url| {
+        tokio::spawn(async move { drive_login(&fk, url).await });
+    })
+    .await
+    .expect("login A");
+    let mut rx_a = handle_a.state();
+    let _ = wait_state(rx_a.clone(), |s| matches!(s, CloudState::Pending { .. })).await;
+    handle_a.genesis().await.expect("genesis A");
+    let _ = is_active(&mut rx_a).await;
+
+    // Add B to the chain so the peer is a real active device (not a
+    // fabricated sender).
+    let e0 = fake.entries().first().expect("genesis entry").clone();
+    let h0 = cloud::chain::entry_hash(&e0);
+    fake.append_entry(devices::add_entry(1, 1, h0, &card_b()));
+    let _ = wait_state(
+        rx_a.clone(),
+        |s| matches!(s, CloudState::Active { devices, .. } if devices.len() == 2),
+    )
+    .await;
+
+    // Build a real Hs1 (pipe v3) then age its version byte to 2 — exactly
+    // what a not-yet-upgraded peer sends.
+    let e1 = fake.entries().get(1).expect("add B entry").clone();
+    let chain = cloud::chain::extend(None, &[e0, e1], None).expect("verified chain");
+    let (_i, hs1) = Initiator::start(
+        &chain,
+        id_a(),
+        id_b(),
+        devices::keypair(1).private(),
+        &mut devices::rng(0xA1),
+    )
+    .expect("initiator starts");
+    let sid = hs1.sid;
+    let mut foreign = PipeMsg::Hs1(hs1).encode();
+    assert_eq!(foreign[0], cloud::constants::PIPE_VERSION, "sanity: v3");
+    foreign[0] = 2; // the old peer
+    assert_eq!(foreign[1], 1, "sanity: Hs1 type tag");
+
+    // Inject as if B sent it to A.
+    fake.inject_pipe(id_b(), id_a(), foreign);
+
+    // Poll the relay's forwarded-pipe record until A answers B with a
+    // Close frame. Bounded, no fixed sleep.
+    let deadline = tokio::time::Instant::now() + ANSWER_BOUND;
+    loop {
+        // Grab the raw Close bytes A→B. The type tag (byte 1 == 5) is
+        // version-independent, so this finds the Close regardless of the
+        // encoding version — that is the whole point of the assertions below.
+        let close_raw = fake.pipes().into_iter().find_map(|(from, to, bytes)| {
+            if from != id_a() || to != id_b() {
+                return None;
+            }
+            if bytes.len() >= 19 && bytes[1] == 5 {
+                Some(bytes)
+            } else {
+                None
+            }
+        });
+        if let Some(bytes) = close_raw {
+            // A real v2 peer cannot read a v3-encoded response: the reply
+            // MUST carry the *sender's* (foreign) version byte, exactly 2.
+            assert_eq!(
+                bytes[0], 2,
+                "the Close to a foreign v2 peer must be encoded at v2, not v3"
+            );
+            // Close layout is version-independent apart from the leading
+            // version byte: [version][tag=5][sid(16)][reason].
+            let c_sid: SessionId = bytes[2..18]
+                .try_into()
+                .expect("Close carries a 16-byte sid");
+            let reason = bytes[18];
+            assert_eq!(c_sid, sid, "the Close must name the sender's sid");
+            assert_eq!(
+                reason,
+                cloud::constants::close_reason::UNKNOWN_VERSION,
+                "a foreign-version Hs1 must be answered with UNKNOWN_VERSION"
+            );
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no Close{{UNKNOWN_VERSION}} within {ANSWER_BOUND:?}; pipes seen: {:?}",
+            fake.pipes()
+                .iter()
+                .map(|(f, t, _)| (f, t))
+                .collect::<Vec<_>>()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }

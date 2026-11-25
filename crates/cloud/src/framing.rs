@@ -1,5 +1,6 @@
-//! Transport v2 application framing (PIPE_VERSION 2): one fragmented logical
-//! Attach message per direction, plus the per-direction credit window.
+//! Pipe v3 application framing (semantics unchanged from transport v2): one
+//! fragmented logical Attach message per direction, plus the per-direction
+//! credit window.
 //!
 //! Pure, no I/O. The actor owns one [`FragmentAssembler`] and one
 //! [`CreditLedger`] per Attach stream; this module only encodes the rules.
