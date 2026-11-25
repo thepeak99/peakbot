@@ -63,6 +63,12 @@ struct Inner {
     /// Decoded ToRelay messages, in order (the "no Hello on chain Err"
     /// and "ChainFetch before Hello" assertions read this).
     msgs: std::sync::Mutex<Vec<String>>,
+    /// Every forwarded `ToRelay::Pipe` as `(from, to, raw bytes)`, in
+    /// wire order. The bytes are the pipe-layer `PipeMsg` plaintext (the
+    /// relay does not decrypt: Data is sealed inside, but Hs*/Close are
+    /// not). Lets a test observe the actor's outbound control messages
+    /// without a second live socket.
+    pipes: std::sync::Mutex<Vec<(DeviceId, DeviceId, Vec<u8>)>>,
     /// When set, `/ws` upgrades block until released (deterministic
     /// `Connecting` state).
     ws_gate: AtomicBool,
@@ -169,6 +175,7 @@ impl FakeRelay {
             conns: Default::default(),
             connects: Default::default(),
             msgs: Default::default(),
+            pipes: Default::default(),
             ws_gate: AtomicBool::new(false),
             ws_gate_released: tokio::sync::Notify::new(),
             drops: tokio::sync::watch::channel(0).0,
@@ -212,6 +219,21 @@ impl FakeRelay {
     /// The decoded ToRelay log (order = wire order).
     pub fn msgs(&self) -> Vec<String> {
         self.inner.msgs.lock().expect("msgs").clone()
+    }
+
+    /// Every forwarded pipe as `(from, to, raw PipeMsg bytes)`, in wire
+    /// order. Note: `Data` payloads are sealed, but `Hs1`/`Close` control
+    /// messages are plaintext at this layer.
+    pub fn pipes(&self) -> Vec<(DeviceId, DeviceId, Vec<u8>)> {
+        self.inner.pipes.lock().expect("pipes").clone()
+    }
+
+    /// Deliver a pipe message to `to` as if it came from `from`, without a
+    /// socket for `from` (the "a peer speaks an older pipe version" seam).
+    pub fn inject_pipe(&self, from: DeviceId, to: DeviceId, bytes: Vec<u8>) {
+        let _ = self
+            .inner
+            .send(&to, cloud::codec::FromRelay::Pipe { from, bytes });
     }
 
     /// Gate `/ws` upgrades (the socket is accepted but never answers):
@@ -808,6 +830,15 @@ async fn dispatch(
                 });
                 return;
             };
+            // Record before routing: even an undeliverable pipe carries a
+            // control message a test may need to observe (e.g. a
+            // foreign-version `Close{UNKNOWN_VERSION}` to a peer that is
+            // not connected).
+            inner
+                .pipes
+                .lock()
+                .expect("pipes")
+                .push((from, to, bytes.clone()));
             let chain = inner.verified().expect("pipe needs a chain");
             if to == from || !chain.active.contains_key(&to) {
                 let _ = out_tx.send(FromRelay::Error {

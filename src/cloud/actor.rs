@@ -24,7 +24,7 @@ use cloud::{
     constants,
     frames::{
         self, FrameReceiver, FrameSender, Inner, Mux, MuxEvent, Op, ReassemblyBudget, RecvOutcome,
-        Role, StreamMsg,
+        Role, StreamMsg, first_stream_id,
     },
     handshake::{self, Close, Data, Hs1, Hs2, Hs3, Initiator, PipeMsg, SessionKeys},
     letter::{self, LetterBody, LetterIn, RecipientState},
@@ -225,9 +225,6 @@ impl Live {
                 }
             }
             for (_, out) in s.queued.drain(..) {
-                let _ = out.send(Err(CloudError::Offline));
-            }
-            if let Some((_, out)) = s.claim.take() {
                 let _ = out.send(Err(CloudError::Offline));
             }
         }
@@ -940,8 +937,27 @@ impl Actor {
     ) {
         let pm = match PipeMsg::parse(&bytes) {
             Ok(p) => p,
-            Err(_) => {
-                tracing::warn!(peer = ?from, "undecodable pipe message");
+            Err(e) => {
+                // A peer still speaking an older pipe sends a valid Hs1
+                // shape with a foreign version byte. Answer its sid so it
+                // fails fast instead of waiting for the handshake timer.
+                // `UnknownVersion` means the parser already read the leading
+                // version byte, so it is present here.
+                if e == cloud::Error::UnknownVersion
+                    && let Some(sid) = handshake::first_session_id(&bytes)
+                    && let Some(&version) = bytes.first()
+                {
+                    self.send_close_at_version(
+                        ws,
+                        from,
+                        version,
+                        sid,
+                        constants::close_reason::UNKNOWN_VERSION,
+                    )
+                    .await;
+                } else {
+                    tracing::warn!(peer = ?from, "undecodable pipe message");
+                }
                 return;
             }
         };
@@ -1003,7 +1019,7 @@ impl Actor {
                 .await;
         }
         // We lose (or no session): become the responder, carrying our
-        // queued opens over (they are re-bound once the session opens).
+        // queued opens over (they are flushed once the session opens).
         let queued = live
             .sessions
             .remove(&from)
@@ -1097,7 +1113,6 @@ impl Actor {
             peer: from,
             phase: Phase::Handshaking(Handshaking::Responder(resp)),
             queued: Vec::new(),
-            claim: None,
             established_at: now_secs(),
         };
         s.queued = queued;
@@ -1204,9 +1219,7 @@ impl Actor {
             s.established_at = established;
             q
         };
-        for (op, out) in queued {
-            self.flush_open(live, ws, from, op, out).await;
-        }
+        self.flush_queued(live, ws, from, queued).await;
         publish_live(state, self, live);
     }
 
@@ -1260,21 +1273,18 @@ impl Actor {
             }
         };
         let open = establish_open(sid, &keys, Role::Responder);
-        let mut s = Session {
-            peer: from,
-            phase: Phase::Open(open),
-            queued: Vec::new(),
-            claim: None,
-            established_at: established,
-        };
-        // A responder cannot send `Open` itself (mux S1): the first local
-        // open binds to the first stream the initiator opens (G.7).
-        let mut queued = queued.into_iter();
-        s.claim = queued.next();
-        for (_, out) in queued {
-            let _ = out.send(Err(CloudError::Reset(constants::reset::PROTOCOL)));
-        }
-        live.sessions.insert(from, s);
+        live.sessions.insert(
+            from,
+            Session {
+                peer: from,
+                phase: Phase::Open(open),
+                queued: Vec::new(),
+                established_at: established,
+            },
+        );
+        // Both roles may open in their own mux namespace (pipe v3), so the
+        // responder flushes its queued opens exactly like the initiator.
+        self.flush_queued(live, ws, from, queued).await;
         publish_live(state, self, live);
     }
 
@@ -1297,41 +1307,28 @@ impl Actor {
         };
         match o.rx.open(d) {
             Ok(RecvOutcome::Dropped) => DataOutcome::Handled,
-            Ok(RecvOutcome::Inner(inner)) => {
-                let claim = if matches!(&inner.msg, StreamMsg::Open(op) if s.claim.as_ref().is_some_and(|(c, _)| c == op))
-                {
-                    s.claim.take()
-                } else {
-                    None
-                };
-                match o.mux.feed(&inner) {
-                    Ok(events) => {
-                        match self.route_inner(ws, from, o, &inner, claim, events).await {
-                            None => DataOutcome::Handled,
-                            Some(reason) => DataOutcome::Close(reason),
+            Ok(RecvOutcome::Inner(inner)) => match o.mux.feed(&inner) {
+                Ok(events) => match self.route_inner(ws, from, o, &inner, events).await {
+                    None => DataOutcome::Handled,
+                    Some(reason) => DataOutcome::Close(reason),
+                },
+                Err(e) => {
+                    let known = !matches!(inner.msg, StreamMsg::Open(_))
+                        && o.streams.contains_key(&inner.stream);
+                    if known {
+                        if let Some(side) = o.streams.get(&inner.stream) {
+                            let _ = side
+                                .to_caller
+                                .try_send(StreamMsg::Reset(constants::reset::PROTOCOL));
                         }
+                        self.drop_stream(o, inner.stream);
+                        self.send_reset(ws, o, from, inner.stream, constants::reset::PROTOCOL)
+                            .await;
+                        return DataOutcome::Handled;
                     }
-                    Err(e) => {
-                        if let Some((_, out)) = claim {
-                            let _ = out.send(Err(CloudError::Reset(constants::reset::PROTOCOL)));
-                        }
-                        let known = !matches!(inner.msg, StreamMsg::Open(_))
-                            && o.streams.contains_key(&inner.stream);
-                        if known {
-                            if let Some(side) = o.streams.get(&inner.stream) {
-                                let _ = side
-                                    .to_caller
-                                    .try_send(StreamMsg::Reset(constants::reset::PROTOCOL));
-                            }
-                            self.drop_stream(o, inner.stream);
-                            self.send_reset(ws, o, from, inner.stream, constants::reset::PROTOCOL)
-                                .await;
-                            return DataOutcome::Handled;
-                        }
-                        DataOutcome::Close(reason_for_cloud_err(e))
-                    }
+                    DataOutcome::Close(reason_for_cloud_err(e))
                 }
-            }
+            },
             Err(e) => DataOutcome::Close(reason_for_cloud_err(e)),
         }
     }
@@ -1344,12 +1341,17 @@ impl Actor {
         peer: DeviceId,
         o: &mut Open,
         inner: &Inner,
-        claim: Option<(Op, oneshot::Sender<Result<CloudStream, CloudError>>)>,
         events: Vec<MuxEvent>,
     ) -> Option<u8> {
         if let StreamMsg::Open(op) = &inner.msg {
-            // Inbound stream (we are the responder side of the mux).
-            self.add_stream(o, peer, inner.stream, op.clone(), claim);
+            // Inbound stream: both roles may open in their own namespace.
+            if !self.add_stream(o, peer, inner.stream, op.clone()) {
+                // No inbound hook (controller-only / Local edition) on a
+                // session this side initiated: refuse explicitly so the
+                // peer's request fails fast instead of waiting forever.
+                self.send_reset(ws, o, peer, inner.stream, constants::reset::UNSUPPORTED)
+                    .await;
+            }
             return None;
         }
         let id = inner.stream;
@@ -1649,16 +1651,11 @@ impl Actor {
         None
     }
 
-    /// Create the per-stream channels + forwarder, and hand the
-    /// `CloudStream` to the claim (tie-break) or the inbound hook.
-    fn add_stream(
-        &self,
-        o: &mut Open,
-        peer: DeviceId,
-        id: u32,
-        op: Op,
-        claim: Option<(Op, oneshot::Sender<Result<CloudStream, CloudError>>)>,
-    ) {
+    /// Create the per-stream channels + forwarder and hand the
+    /// `CloudStream` to the inbound hook. Returns `false` when this peer
+    /// has no hook (controller-only / Local edition); the caller must then
+    /// explicitly reset the stream.
+    fn add_stream(&self, o: &mut Open, peer: DeviceId, id: u32, op: Op) -> bool {
         let (caller_tx, actor_rx) = futures::channel::mpsc::channel(caller_capacity(&op));
         let (actor_tx, caller_rx) = mpsc::channel(32);
         let (stop_tx, stop_rx) = oneshot::channel::<()>();
@@ -1684,15 +1681,15 @@ impl Actor {
             },
         );
         self.spawn_forwarder(actor_rx, stop_rx, peer, id, permits, forward_credit);
-        match claim {
-            Some((_, out)) => {
-                let _ = out.send(Ok(stream));
+        match &self.inbound {
+            Some(hook) => {
+                hook(peer, op, stream);
+                true
             }
-            None => match &self.inbound {
-                Some(hook) => hook(peer, op, stream),
-                // No hook ⇒ no session should exist; drop defensively.
-                None => self.drop_stream(o, id),
-            },
+            None => {
+                self.drop_stream(o, id);
+                false
+            }
         }
     }
 
@@ -2005,6 +2002,26 @@ impl Actor {
             .await;
     }
 
+    /// `Close` addressed to a peer that spoke a foreign pipe version.
+    ///
+    /// Close has the same layout in v2 and v3 — `[version][tag=5][sid(16)]
+    /// [reason]` — so we echo the peer's own version byte. Replying at our
+    /// `PIPE_VERSION` would be rejected by its parser and the peer would sit
+    /// out the handshake timer instead of failing fast.
+    async fn send_close_at_version(
+        &self,
+        ws: &mut Ws,
+        to: DeviceId,
+        version: u8,
+        sid: SessionId,
+        reason: u8,
+    ) {
+        let mut bytes = PipeMsg::Close(Close { sid, reason }).encode();
+        // `encode` always writes the leading version byte.
+        bytes[0] = version;
+        let _ = send_to_relay(ws, &ToRelay::Pipe { to, bytes }).await;
+    }
+
     /// A `Close` for one of our sessions (§D.5: fail what is queued).
     async fn on_close(&mut self, live: &mut Live, ws: &mut Ws, sid: SessionId) {
         for (peer, s) in &live.sessions {
@@ -2048,44 +2065,55 @@ impl Actor {
                 }
             }
         }
-        if let Some((_, out)) = s.claim {
-            let _ = out.send(Err(CloudError::Reset(reset_code)));
+    }
+
+    /// Resolve a session whose peer socket is already gone (`Unreachable`):
+    /// fail queued opens and reset every live stream locally — there is no
+    /// wire `Close` to send — so no caller is left waiting on a stale
+    /// session. The next request re-handshakes from scratch.
+    fn fail_session_local(&self, live: &mut Live, peer: DeviceId) {
+        let Some(s) = live.sessions.remove(&peer) else {
+            return;
+        };
+        let Session { phase, queued, .. } = s;
+        if let Phase::Open(o) = phase {
+            for side in o.streams.into_values() {
+                let _ = side
+                    .to_caller
+                    .try_send(StreamMsg::Reset(constants::reset::INTERNAL));
+                let _ = side.forward_stop.send(());
+            }
+        }
+        for (_, out) in queued {
+            let _ = out.send(Err(CloudError::Offline));
         }
     }
 
     /// `Unreachable{to}`: the peer has no live socket (§D.5).
     fn on_unreachable(&mut self, live: &mut Live, to: DeviceId) {
-        let handshaking = live
-            .sessions
-            .get(&to)
-            .is_some_and(|s| matches!(s.phase, Phase::Handshaking(_)));
-        if handshaking {
-            if let Some(s) = live.sessions.remove(&to) {
-                for (_, out) in s.queued {
-                    let _ = out.send(Err(CloudError::Offline));
-                }
-            }
-            return;
-        }
-        if let Some(s) = live.sessions.get_mut(&to) {
-            for (_, out) in s.queued.drain(..) {
-                let _ = out.send(Err(CloudError::Offline));
-            }
-        }
+        self.fail_session_local(live, to);
     }
 
-    /// Expired sessions (§D.5: `session_expired` ⇒ close `NORMAL`).
+    /// Expired sessions: an established one at `SESSION_LIFETIME` closes
+    /// `NORMAL` (§D.5); one still handshaking at `HANDSHAKE_TIMEOUT` closes
+    /// `TIMEOUT` and resolves its queued opens.
     async fn expire_sessions(&mut self, live: &mut Live, ws: &mut Ws) {
         let now = now_secs();
-        let expired: Vec<DeviceId> = live
+        let expired: Vec<(DeviceId, u8)> = live
             .sessions
             .values()
-            .filter(|s| frames::session_expired(s.established_at, now))
-            .map(|s| s.peer)
+            .filter_map(|s| match &s.phase {
+                Phase::Open(_) if frames::session_expired(s.established_at, now) => {
+                    Some((s.peer, constants::close_reason::NORMAL))
+                }
+                Phase::Handshaking(_) if frames::handshake_expired(s.established_at, now) => {
+                    Some((s.peer, constants::close_reason::TIMEOUT))
+                }
+                _ => None,
+            })
             .collect();
-        for p in expired {
-            self.close_session(live, ws, p, constants::close_reason::NORMAL)
-                .await;
+        for (p, reason) in expired {
+            self.close_session(live, ws, p, reason).await;
         }
     }
 
@@ -2152,7 +2180,6 @@ impl Actor {
                             peer: device,
                             phase: Phase::Handshaking(Handshaking::Initiator(init)),
                             queued: Vec::new(),
-                            claim: None,
                             established_at: now_secs(),
                         };
                         s.queued.push((op, out));
@@ -2170,6 +2197,22 @@ impl Actor {
                     self.flush_open(live, ws, device, op, out).await;
                 }
             },
+        }
+    }
+
+    /// Flush every open queued during a handshake, in arrival order. Both
+    /// roles may originate streams (each in its own mux namespace), so there
+    /// is no one-request cap here. Called only after the session is already
+    /// installed as `Open`, so the borrow ends before any await.
+    async fn flush_queued(
+        &mut self,
+        live: &mut Live,
+        ws: &mut Ws,
+        peer: DeviceId,
+        queued: Vec<(Op, oneshot::Sender<Result<CloudStream, CloudError>>)>,
+    ) {
+        for (op, out) in queued {
+            self.flush_open(live, ws, peer, op, out).await;
         }
     }
 
@@ -2192,12 +2235,6 @@ impl Actor {
                 let _ = out.send(Err(CloudError::Reset(constants::reset::INTERNAL)));
                 return;
             };
-            // Only the session initiator may send `Open` (mux S1): a responder-side
-            // open on a live session is unsupported until the peer re-keys (E-D4).
-            if o.role == Role::Responder {
-                let _ = out.send(Err(CloudError::Reset(constants::reset::UNSUPPORTED)));
-                return;
-            }
             let id = o.next_stream;
             o.next_stream = o.next_stream.saturating_add(1);
             id
@@ -3020,7 +3057,12 @@ async fn run_live(
         let next_expiry = live
             .sessions
             .values()
-            .map(|s| s.established_at.saturating_add(constants::SESSION_LIFETIME))
+            .map(|s| match &s.phase {
+                Phase::Handshaking(_) => s
+                    .established_at
+                    .saturating_add(constants::HANDSHAKE_TIMEOUT),
+                Phase::Open(_) => s.established_at.saturating_add(constants::SESSION_LIFETIME),
+            })
             .min();
         let mut expiry = Box::pin(async {
             if let Some(t) = next_expiry {
@@ -3120,12 +3162,11 @@ fn establish_open(sid: SessionId, keys: &SessionKeys, role: Role) -> Open {
         sid,
         tx,
         rx,
-        // The crate mux rejects an inbound Open on a Responder-role mux (S1), so
-        // both sides track every sent+received message with one Initiator mux.
-        mux: Mux::new(Role::Initiator),
-        role,
+        // Our role picks the id range we mint (`first_stream_id`); the mux
+        // classifies Opens by the id's namespace, not by a stored role.
+        mux: Mux::new(role),
         streams: HashMap::new(),
-        next_stream: 1,
+        next_stream: first_stream_id(role),
         reassembly: ReassemblyBudget::new(constants::MAX_LOGICAL_MESSAGE),
     }
 }

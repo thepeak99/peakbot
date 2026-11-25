@@ -161,8 +161,17 @@ fn vector_relay_hello_a() {
 
 // -- hs_A_to_B ----------------------------------------------------------------------------------------
 
-const HS_K_IR: &str = "a1c321bfa69dc2c340c0272d2f2dec91d300ac72390d59c5a2a20d63711dbb6e";
-const HS_K_RI: &str = "4b76607108432e84150996e52473d7e5d8599f1bcd387eb4687605f67ab4b690";
+// Pipe v3 goldens. `PIPE_VERSION` is byte 0 of Hs1, and `th1 = H("pbc1 hs
+// th1"; hs1)` covers the complete Hs1 pipe_msg (spec §8.2/§8.3), so the
+// 2→3 bump cascades th1 → th2 → th3 (the HKDF salt) and moves both
+// directional keys by design. Verified independently (SHA3-256 transcript +
+// RFC 5869 HKDF-SHA3-256 recomputation): only the version byte and its
+// transcript dependants changed — the KEM shared secret and the key
+// schedule itself are untouched. The previous v2 goldens were
+// k_IR a1c321bf…, k_RI 4b766071…; the same code pinning PIPE_VERSION to 2
+// still reproduces them exactly.
+const HS_K_IR: &str = "6d9863af5eda8916849c0fadb0da7278b3651fa848f1347e3a065987446fc5fa";
+const HS_K_RI: &str = "6d74bbf090e718269a6566c03def8a2babd3e2c48c5fd9edd51370ab4f6baa19";
 
 #[test]
 fn vector_hs_a_to_b_transcript() {

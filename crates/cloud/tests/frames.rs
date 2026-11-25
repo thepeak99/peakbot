@@ -13,6 +13,12 @@ use cloud::handshake::Data;
 const SID: [u8; 16] = [0x09; 16];
 const K_IR: [u8; 32] = [0x01; 32];
 
+/// Pipe v3 symmetric stream-id namespaces: the initiator opens from 1
+/// upward, the responder opens from 2^31 upward. The bases are disjoint
+/// and each side's ids are monotonic within its own namespace.
+const INITIATOR_BASE: u32 = 1;
+const RESPONDER_BASE: u32 = 1 << 31;
+
 fn inner_attach_open() -> Inner {
     Inner {
         stream: 1,
@@ -136,6 +142,42 @@ fn session_expired_checked_arithmetic_no_panic() {
     assert!(frames::session_expired(0, u64::MAX));
 }
 
+/// Pipe v3 pending-handshake expiry: 30 s from creation, inclusive at the
+/// boundary (matching `session_expired`'s convention). Expected home is the
+/// handshake timer helper (`cloud::frames::handshake_expired` alongside
+/// `session_expired`); this is COMPILE-RED until the helper is added.
+#[test]
+fn handshake_expires_at_30s_boundary_inclusive() {
+    let created = 1_800_000_000u64;
+    assert!(
+        !frames::handshake_expired(created, created),
+        "a just-created handshake is live"
+    );
+    assert!(
+        !frames::handshake_expired(created, created + 29),
+        "29 s is still inside the 30 s window"
+    );
+    assert!(
+        frames::handshake_expired(created, created + 30),
+        "30 s is the inclusive expiry boundary"
+    );
+    assert!(frames::handshake_expired(created, created + 31));
+}
+
+#[test]
+fn handshake_expired_checked_arithmetic_no_panic() {
+    // now < created (clock skew) must be a non-panic "not expired"; the
+    // saturating addition must also handle created near u64::MAX.
+    let res = std::panic::catch_unwind(|| frames::handshake_expired(u64::MAX, 0));
+    assert!(res.is_ok(), "handshake_expired must not panic on skew");
+    assert!(!res.expect("no panic"), "now < created is not expired");
+    let res = std::panic::catch_unwind(|| frames::handshake_expired(0, u64::MAX));
+    assert!(res.is_ok());
+    assert!(res.expect("no panic"), "any later time is expired");
+    assert!(!frames::handshake_expired(u64::MAX - 10, u64::MAX));
+    assert!(frames::handshake_expired(u64::MAX - 30, u64::MAX));
+}
+
 // -- inner bincode (spec §9.4): every StreamMsg and Op variant ----------------------------
 
 #[test]
@@ -237,28 +279,56 @@ fn decode_inner_over_max_inner_rejected() {
 
 // -- stream rules (spec §9.5) ------------------------------------------------------------------
 
+/// Pipe v3: the responder side also opens streams, so a Responder-role mux
+/// must accept the peer's `Open` in the initiator namespace (base 1).
 #[test]
-fn mux_open_from_responder_aborts() {
+fn mux_responder_accepts_peer_open_in_initiator_namespace() {
     let mut r = Mux::new(Role::Responder);
-    assert_eq!(
+    assert!(
         r.feed(&Inner {
-            stream: 1,
+            stream: INITIATOR_BASE,
             msg: StreamMsg::Open(Op::Attach)
-        }),
-        Err(Error::Protocol)
+        })
+        .is_ok(),
+        "a responder mux must accept the initiator's Open (id {INITIATOR_BASE})"
+    );
+}
+
+/// An Initiator-role mux must accept the peer responder's `Open` in the
+/// responder namespace (base 2^31).
+#[test]
+fn mux_initiator_accepts_peer_open_in_responder_namespace() {
+    let mut i = Mux::new(Role::Initiator);
+    assert!(
+        i.feed(&Inner {
+            stream: RESPONDER_BASE,
+            msg: StreamMsg::Open(Op::Attach)
+        })
+        .is_ok(),
+        "an initiator mux must accept the responder's Open (id {RESPONDER_BASE})"
     );
 }
 
 #[test]
-fn mux_stream_id_zero_reserved() {
-    let mut m = Mux::new(Role::Responder);
-    assert_eq!(
-        m.feed(&Inner {
-            stream: 0,
-            msg: StreamMsg::Open(Op::Attach)
-        }),
-        Err(Error::Protocol)
-    );
+fn mux_stream_id_zero_reserved_for_both_roles() {
+    for role in [Role::Responder, Role::Initiator] {
+        let mut m = Mux::new(role);
+        assert_eq!(
+            m.feed(&Inner {
+                stream: 0,
+                msg: StreamMsg::Open(Op::Attach)
+            }),
+            Err(Error::Protocol),
+            "id 0 is reserved for both roles ({role:?})"
+        );
+    }
+}
+
+#[test]
+fn mux_namespaces_are_disjoint() {
+    assert_ne!(INITIATOR_BASE, RESPONDER_BASE);
+    assert_eq!(INITIATOR_BASE, 1);
+    assert_eq!(RESPONDER_BASE, 1 << 31);
 }
 
 #[test]
@@ -286,6 +356,129 @@ fn mux_non_increasing_stream_id_aborts() {
         }),
         Err(Error::Protocol),
         "a smaller id is non-increasing"
+    );
+}
+
+/// Namespaces are tracked independently: a later peer open in the other
+/// namespace must not be mistaken for a non-increasing id.
+#[test]
+fn mux_tracks_stream_namespaces_independently() {
+    // Initiator side: peer (responder) ids start high; own ids start at 1.
+    // The high peer id arrives first and must not raise the bar for our
+    // own namespace.
+    let mut i = Mux::new(Role::Initiator);
+    assert!(
+        i.feed(&Inner {
+            stream: RESPONDER_BASE,
+            msg: StreamMsg::Open(Op::Attach)
+        })
+        .is_ok(),
+        "peer responder open"
+    );
+    assert!(
+        i.feed(&Inner {
+            stream: INITIATOR_BASE,
+            msg: StreamMsg::Open(Op::Attach)
+        })
+        .is_ok(),
+        "our own open in the initiator namespace is independent of the peer's"
+    );
+    assert!(
+        i.feed(&Inner {
+            stream: INITIATOR_BASE + 1,
+            msg: StreamMsg::Open(Op::Attach)
+        })
+        .is_ok(),
+        "own namespace stays monotonic"
+    );
+    assert!(
+        i.feed(&Inner {
+            stream: RESPONDER_BASE + 1,
+            msg: StreamMsg::Open(Op::Attach)
+        })
+        .is_ok(),
+        "peer namespace stays monotonic"
+    );
+
+    // Responder side: the peer's low initiator id arrives first and must
+    // not raise the bar for our 2^31 namespace.
+    let mut r = Mux::new(Role::Responder);
+    assert!(
+        r.feed(&Inner {
+            stream: INITIATOR_BASE,
+            msg: StreamMsg::Open(Op::Attach)
+        })
+        .is_ok(),
+        "peer initiator open"
+    );
+    assert!(
+        r.feed(&Inner {
+            stream: RESPONDER_BASE,
+            msg: StreamMsg::Open(Op::Attach)
+        })
+        .is_ok(),
+        "our own open in the responder namespace is independent of the peer's"
+    );
+    assert!(
+        r.feed(&Inner {
+            stream: INITIATOR_BASE + 1,
+            msg: StreamMsg::Open(Op::Attach)
+        })
+        .is_ok()
+    );
+    assert!(
+        r.feed(&Inner {
+            stream: RESPONDER_BASE + 1,
+            msg: StreamMsg::Open(Op::Attach)
+        })
+        .is_ok()
+    );
+}
+
+#[test]
+fn mux_responder_namespace_non_increasing_aborts() {
+    let mut i = Mux::new(Role::Initiator);
+    assert!(
+        i.feed(&Inner {
+            stream: RESPONDER_BASE + 1,
+            msg: StreamMsg::Open(Op::Attach)
+        })
+        .is_ok()
+    );
+    assert_eq!(
+        i.feed(&Inner {
+            stream: RESPONDER_BASE,
+            msg: StreamMsg::Open(Op::Attach)
+        }),
+        Err(Error::Protocol),
+        "a smaller responder-namespace id is non-increasing"
+    );
+}
+
+#[test]
+fn mux_responder_own_namespace_monotonic() {
+    let mut r = Mux::new(Role::Responder);
+    assert!(
+        r.feed(&Inner {
+            stream: RESPONDER_BASE,
+            msg: StreamMsg::Open(Op::Attach)
+        })
+        .is_ok()
+    );
+    assert!(
+        r.feed(&Inner {
+            stream: RESPONDER_BASE + 1,
+            msg: StreamMsg::Open(Op::Attach)
+        })
+        .is_ok()
+    );
+    assert_eq!(
+        r.feed(&Inner {
+            stream: RESPONDER_BASE + 1,
+            msg: StreamMsg::Open(Op::Attach)
+        }),
+        Err(Error::Protocol),
+        "re-using a responder-namespace id aborts"
     );
 }
 
@@ -373,11 +566,23 @@ fn mux_chunk_over_max_chunk_aborts() {
 }
 
 #[test]
-fn mux_message_for_never_opened_id_aborts() {
-    let mut m = Mux::new(Role::Responder);
+fn mux_message_for_never_opened_id_aborts_in_both_roles() {
+    for role in [Role::Responder, Role::Initiator] {
+        let mut m = Mux::new(role);
+        assert_eq!(
+            m.feed(&Inner {
+                stream: 7,
+                msg: StreamMsg::Frame("{}".into())
+            }),
+            Err(Error::Protocol),
+            "an unopened id is Protocol for {role:?}"
+        );
+    }
+    // The responder namespace is just as unknown when nobody opened it.
+    let mut i = Mux::new(Role::Initiator);
     assert_eq!(
-        m.feed(&Inner {
-            stream: 7,
+        i.feed(&Inner {
+            stream: RESPONDER_BASE,
             msg: StreamMsg::Frame("{}".into())
         }),
         Err(Error::Protocol)
@@ -419,22 +624,117 @@ fn mux_end_both_sides_closes_stream() {
     // Attach: each side ends its direction; the stream closes when both
     // have sent End (S3). The initiator's mux observes its own Open and
     // both Ends (its own, then the peer's) → Closed on the second.
-    // (Verified from the initiator side: the responder mux rejects Open
-    // per S1, so it cannot track the stream from the Open alone.)
     let mut i = Mux::new(Role::Initiator);
     let open = Inner {
-        stream: 1,
+        stream: INITIATOR_BASE,
         msg: StreamMsg::Open(Op::Attach),
     };
     assert!(i.feed(&open).is_ok());
     let end = Inner {
-        stream: 1,
+        stream: INITIATOR_BASE,
         msg: StreamMsg::End,
     };
     assert!(i.feed(&end).is_ok(), "own End: one direction, no close");
     // The peer's End arrives: both directions ended → Closed.
     let events = i.feed(&end).expect("peer end");
-    assert!(events.contains(&MuxEvent::Closed(1)));
+    assert!(events.contains(&MuxEvent::Closed(INITIATOR_BASE)));
+}
+
+/// A paired initiator/responder mux exchange: each side opens one Attach
+/// stream in its OWN namespace, both streams carry data in both
+/// directions, and each stream closes once both sides have sent End.
+#[test]
+fn paired_muxes_roundtrip_and_close_both_directions() {
+    let mut i = Mux::new(Role::Initiator);
+    let mut r = Mux::new(Role::Responder);
+
+    let i_open = Inner {
+        stream: INITIATOR_BASE,
+        msg: StreamMsg::Open(Op::Attach),
+    };
+    let r_open = Inner {
+        stream: RESPONDER_BASE,
+        msg: StreamMsg::Open(Op::Attach),
+    };
+    // Each mux sees its own Open and the peer's Open.
+    assert!(i.feed(&i_open).is_ok(), "initiator tracks its own Open");
+    assert!(r.feed(&i_open).is_ok(), "responder accepts initiator Open");
+    assert!(r.feed(&r_open).is_ok(), "responder tracks its own Open");
+    assert!(i.feed(&r_open).is_ok(), "initiator accepts responder Open");
+
+    // Data in both directions is routed by its own stream id.
+    let i_frame = Inner {
+        stream: INITIATOR_BASE,
+        msg: StreamMsg::Frame("initiator→responder".into()),
+    };
+    let r_frame = Inner {
+        stream: RESPONDER_BASE,
+        msg: StreamMsg::Frame("responder→initiator".into()),
+    };
+    assert!(i.feed(&i_frame).is_ok(), "initiator sends on its stream");
+    assert!(r.feed(&i_frame).is_ok(), "responder receives on it");
+    assert!(r.feed(&r_frame).is_ok(), "responder sends on its stream");
+    assert!(i.feed(&r_frame).is_ok(), "initiator receives on it");
+
+    // Close the initiator-opened stream: each mux sees both Ends.
+    let i_end = Inner {
+        stream: INITIATOR_BASE,
+        msg: StreamMsg::End,
+    };
+    let r_end = Inner {
+        stream: INITIATOR_BASE,
+        msg: StreamMsg::End,
+    };
+    assert!(
+        !i.feed(&i_end)
+            .expect("initiator own End")
+            .contains(&MuxEvent::Closed(INITIATOR_BASE))
+    );
+    assert!(
+        !r.feed(&i_end)
+            .expect("responder peer End")
+            .contains(&MuxEvent::Closed(INITIATOR_BASE))
+    );
+    assert!(
+        i.feed(&r_end)
+            .expect("initiator peer End")
+            .contains(&MuxEvent::Closed(INITIATOR_BASE))
+    );
+    assert!(
+        r.feed(&r_end)
+            .expect("responder own End")
+            .contains(&MuxEvent::Closed(INITIATOR_BASE))
+    );
+
+    // Close the responder-opened stream the other way around.
+    let r_end = Inner {
+        stream: RESPONDER_BASE,
+        msg: StreamMsg::End,
+    };
+    let i_end = Inner {
+        stream: RESPONDER_BASE,
+        msg: StreamMsg::End,
+    };
+    assert!(
+        !r.feed(&r_end)
+            .expect("responder own End")
+            .contains(&MuxEvent::Closed(RESPONDER_BASE))
+    );
+    assert!(
+        !i.feed(&r_end)
+            .expect("initiator peer End")
+            .contains(&MuxEvent::Closed(RESPONDER_BASE))
+    );
+    assert!(
+        r.feed(&i_end)
+            .expect("responder peer End")
+            .contains(&MuxEvent::Closed(RESPONDER_BASE))
+    );
+    assert!(
+        i.feed(&i_end)
+            .expect("initiator own End")
+            .contains(&MuxEvent::Closed(RESPONDER_BASE))
+    );
 }
 
 #[test]

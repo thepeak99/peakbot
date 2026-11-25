@@ -111,7 +111,30 @@ impl Core {
         seed: u8,
         tmp: tempfile::TempDir,
         yaml: String,
+        relay: &TestRelay,
+    ) -> Core {
+        Self::start_inner(name, seed, tmp, yaml, relay, true).await
+    }
+
+    /// The Local edition (the phone): the same web core, but booted WITHOUT
+    /// an inbound hook so it can never serve a peer's inbound stream
+    /// (edition table §A). Outbound obligations — login, profiles, Attach
+    /// to a host — work normally.
+    async fn start_controller(name: &str, seed: u8, relay: &TestRelay) -> Core {
+        init_shared_roots();
+        let tmp = tempfile::tempdir().expect("core dir");
+        let yaml = yaml_for(&tmp.path().join("convos"), Some(&relay.url()));
+        Self::start_inner(name, seed, tmp, yaml, relay, false).await
+    }
+
+    /// `serves_inbound = false` boots the controller-only phone.
+    async fn start_inner(
+        name: &str,
+        seed: u8,
+        tmp: tempfile::TempDir,
+        yaml: String,
         _relay: &TestRelay,
+        serves_inbound: bool,
     ) -> Core {
         let deps = boot::session_deps_in(
             parse(&yaml),
@@ -132,6 +155,13 @@ impl Core {
             boot_cwd: tmp.path().to_path_buf(),
         };
         let ui = boot::web_boot(web, WebSession::Ready(deps)).expect("web_boot");
+        // §A: only a host serves inbound. The phone passes `None`, exactly
+        // as `boot::boot_cloud` does for the Local edition.
+        let inbound = if serves_inbound {
+            ui.cloud_inbound()
+        } else {
+            None
+        };
         let store = Arc::new(MemSeedStore::new());
         store.store_seed(&Seed::new([seed; 64])).expect("seed");
         let handle = boot::boot_cloud(
@@ -139,7 +169,7 @@ impl Core {
             tmp.path().join("cloud"),
             name,
             store,
-            ui.cloud_inbound(),
+            inbound,
         )
         .expect("general.cloud is set ⇒ the CloudLink is spawned");
         let dir = Arc::new(Directory::new().with_cloud(Some(handle.clone())));
@@ -817,4 +847,197 @@ async fn cloud_session_reclaims_finished_non_attach_streams() {
         }
     }
     assert!(ready, "attach reached the computer after MAX_STREAMS ops");
+}
+
+// ═══ case 10: three-device profiles — both directions work via HTTP ════
+
+/// Enroll three real cores into one account: PC1 is the genesis host, PC2
+/// and the phone join afterwards (PC1 approves each). The phone is the
+/// Local edition — booted without an inbound hook, like `boot_cloud` does
+/// for `#[cfg(not(feature = "host"))]`.
+async fn enroll_three(relay: &TestRelay) -> (Core, Core, Core) {
+    let pc1 = Core::start("pc1", 1, relay).await;
+    let pc2 = Core::start("pc2", 2, relay).await;
+    let phone = Core::start_controller("phone", 3, relay).await;
+
+    pc1.login(relay).await;
+    pc1.state_where("pc1 pending", |s| s["state"] == "pending")
+        .await;
+    let (st, b) = pc1.post("/api/cloud/genesis", json!({})).await;
+    assert_eq!(st, 200, "genesis: {b}");
+    pc1.state_where("pc1 active", |s| s["state"] == "active")
+        .await;
+
+    for (what, c, expected) in [("pc2", &pc2, 2usize), ("phone", &phone, 3usize)] {
+        c.login(relay).await;
+        let s = pc1
+            .state_where(&format!("pc1 sees {what} request"), |s| {
+                s["requests"].as_array().is_some_and(|r| !r.is_empty())
+            })
+            .await;
+        let letter = s["requests"][0]["letter_id"].clone();
+        let (st, b) = pc1
+            .post("/api/cloud/enroll/approve", json!({ "letter_id": letter }))
+            .await;
+        assert_eq!(st, 200, "approve {what}: {b}");
+        // Both the approving genesis host and the newly enrolled core must
+        // observe the growing device list (the not-yet-logged-in third
+        // core cannot).
+        for e in [&pc1, c] {
+            e.state_where(
+                &format!("every enrolled core sees {expected} devices"),
+                |s| {
+                    s["state"] == "active"
+                        && s["devices"].as_array().is_some_and(|d| d.len() == expected)
+                },
+            )
+            .await;
+        }
+    }
+    (pc1, pc2, phone)
+}
+
+/// Two PCs (genesis host + enrolled host) and a controller-only phone.
+/// Phone→PC1 and phone→PC2 profiles succeed. PC1→PC2 profiles succeed.
+/// Crucially, PC2→PC1 profiles ALSO succeed — the original asymmetry bug
+/// that made the second direction of an established session fail.
+#[tokio::test]
+async fn three_device_profiles_work_both_directions() {
+    let relay = TestRelay::spawn().await;
+    let (pc1, pc2, phone) = enroll_three(&relay).await;
+
+    // Phone → PC1 profiles (warm-up; phone is always the initiator here).
+    let (st, p1_from_phone) = phone
+        .get(&format!("/api/cloud/devices/{}/profiles", pc1.id_hex()))
+        .await;
+    assert_eq!(st, 200, "phone→pc1 profiles: {p1_from_phone}");
+    assert_local_profiles(&p1_from_phone, "phone→pc1");
+
+    // Phone → PC2 profiles (different host, same direction).
+    let (st, p2_from_phone) = phone
+        .get(&format!("/api/cloud/devices/{}/profiles", pc2.id_hex()))
+        .await;
+    assert_eq!(st, 200, "phone→pc2 profiles: {p2_from_phone}");
+    assert_local_profiles(&p2_from_phone, "phone→pc2");
+
+    // PC1 → PC2 profiles: PC1 has been an initiator before, this is its
+    // first request to PC2. PC2 has been a responder to the phone's requests.
+    let (st, p2_from_pc1) = pc1
+        .get(&format!("/api/cloud/devices/{}/profiles", pc2.id_hex()))
+        .await;
+    assert_eq!(st, 200, "pc1→pc2 profiles: {p2_from_pc1}");
+    assert_local_profiles(&p2_from_pc1, "pc1→pc2");
+
+    // THE REGRESSION: PC2 → PC1 profiles. PC2 was only ever a responder
+    // (to the phone and to PC1). Before pipe v3, the responder-side open
+    // failed with Reset(UNSUPPORTED). It must work now.
+    let (st, p1_from_pc2) = pc2
+        .get(&format!("/api/cloud/devices/{}/profiles", pc1.id_hex()))
+        .await;
+    assert_eq!(
+        st, 200,
+        "pc2→pc1 profiles (the original asymmetry): {p1_from_pc2}"
+    );
+    assert_local_profiles(&p1_from_pc2, "pc2→pc1");
+}
+
+/// The profiles handler answers `{"profiles": [ProfileDto, …]}` — a bare
+/// array of the host's LOCAL profiles. Every fixture PC has `dev` and
+/// `alt`, plus a `remote: home-dev` that must never cross the tunnel.
+fn assert_local_profiles(body: &Value, what: &str) {
+    let rows = body["profiles"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{what}: `profiles` must be an array: {body}"));
+    let names: Vec<&str> = rows
+        .iter()
+        .map(|r| r["name"].as_str().unwrap_or(""))
+        .collect();
+    assert!(
+        names.contains(&"dev") && names.contains(&"alt"),
+        "{what}: expected the fixture's local profiles [dev, alt], got {names:?}"
+    );
+    assert!(
+        !names.contains(&"home-dev"),
+        "{what}: a remote profile must never be listed, got {names:?}"
+    );
+    assert!(
+        !names.is_empty(),
+        "{what}: the host contributes profile rows, got {body}"
+    );
+}
+
+// ═══ case 11: the controller-only phone stays outbound-only ══════════════
+
+/// The phone is the Local edition (`inbound = None`, edition table §A):
+///
+/// * a PC's `/api/cloud/devices/{phone}/profiles` must fail FAST (bounded,
+///   nowhere near the 30 s handshake timer) and never return rows;
+/// * the phone's own outbound request to a host still works — both the
+///   Profiles op and a real conversation Attach;
+/// * the device list on every core shows all three, with the phone's own
+///   row carrying its name and platform.
+#[tokio::test]
+async fn controller_only_phone_is_outbound_only_over_http() {
+    let relay = TestRelay::spawn().await;
+    let (pc1, pc2, phone) = enroll_three(&relay).await;
+
+    // ── a PC cannot reach the phone's Profiles ────────────────────────────
+    // The acceptance bound: the refusal is initiated by the phone
+    // immediately, so 2 s is only a hang detector.
+    let t0 = Instant::now();
+    let (st, body) = pc2
+        .get(&format!("/api/cloud/devices/{}/profiles", phone.id_hex()))
+        .await;
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "pc2→phone profiles must fail within 2 s (was {elapsed:?})"
+    );
+    assert_ne!(st, 200, "pc2→phone profiles must not succeed: {body}");
+    assert!(
+        body["profiles"].as_array().is_none(),
+        "pc2→phone profiles must never return target rows: {body}"
+    );
+
+    // ── the phone's outbound Profiles still works ────────────────────────
+    let (st, p) = phone
+        .get(&format!("/api/cloud/devices/{}/profiles", pc1.id_hex()))
+        .await;
+    assert_eq!(st, 200, "phone→pc1 profiles still works: {p}");
+    assert_local_profiles(&p, "phone→pc1 (controller)");
+
+    // ── the phone's outbound Attach still works ──────────────────────────
+    // A real controller tab: the phone opens the stream, PC1 serves it.
+    let (mut tab, convo) = attach(&phone, "dev@pc1").await;
+    turn(&mut tab, "hello pc1 from the phone").await;
+    assert!(!convo.is_empty(), "the controller opened a conversation");
+
+    // ── the device list shows all three, with a correct self row ─────────
+    let (st, state) = phone.get("/api/cloud/state").await;
+    assert_eq!(st, 200, "phone state: {state}");
+    let devices = state["devices"]
+        .as_array()
+        .unwrap_or_else(|| panic!("phone device list: {state}"));
+    assert_eq!(devices.len(), 3, "all three devices visible: {state}");
+    let self_id = phone.id_hex();
+    let me = devices
+        .iter()
+        .find(|d| d["id"] == self_id.as_str())
+        .unwrap_or_else(|| panic!("the phone must find itself in {state}"));
+    assert_eq!(me["name"], "phone", "self row names the phone");
+    // `platform` is the card platform byte rendered as a string. In one
+    // build every core shares the edition's value (`boot_cloud` picks it
+    // by feature), so assert it is present and consistent — the phone's
+    // own platform must equal what the PCs report.
+    let platform = me["platform"]
+        .as_str()
+        .unwrap_or_else(|| panic!("self row carries a platform: {me}"));
+    assert!(!platform.is_empty(), "self platform is populated: {me}");
+    for d in devices {
+        assert_eq!(
+            d["platform"].as_str(),
+            Some(platform),
+            "every device reports the edition's platform ({d})"
+        );
+    }
 }

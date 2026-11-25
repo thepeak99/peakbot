@@ -841,3 +841,86 @@ fn initiator_aborts_when_peer_not_in_own_chain() {
         "processing Hs2 from a revoked r must fail"
     );
 }
+
+// -- pipe v3: best-effort session id from a foreign-version Hs1 ------------------
+
+/// Pipe v3 needs to answer a peer still speaking pipe v2 with `Close{sid}`
+/// even though `PipeMsg::parse` rejects its version. The planned helper is
+/// `cloud::handshake::first_session_id(raw) -> Option<SessionId>`: it only
+/// mines the Hs1 prefix (type 1 + sid) from a FOREIGN version byte; the
+/// current version is handled by the normal parser, and every other shape
+/// is `None`. COMPILE-RED until the helper is added.
+#[test]
+fn first_session_id_extracts_from_foreign_version_hs1() {
+    // Pipe v3 ships as PIPE_VERSION 3; v2 is the version it must bridge.
+    const FOREIGN_VERSION: u8 = 2;
+    let c = chain();
+    let a = card_a();
+    let b = card_b();
+    let (_i, hs1) = Initiator::start(
+        &c,
+        a.device_id(),
+        b.device_id(),
+        keypair(1).private(),
+        &mut rng(0xA1),
+    )
+    .expect("initiator starts");
+    let mut foreign = cloud::handshake::PipeMsg::Hs1(hs1.clone()).encode();
+    foreign[0] = FOREIGN_VERSION;
+    assert_eq!(
+        cloud::handshake::first_session_id(&foreign),
+        Some(hs1.sid),
+        "a foreign-version Hs1 must still yield its session id"
+    );
+}
+
+#[test]
+fn first_session_id_ignores_current_version_hs1() {
+    let c = chain();
+    let a = card_a();
+    let b = card_b();
+    let (_i, hs1) = Initiator::start(
+        &c,
+        a.device_id(),
+        b.device_id(),
+        keypair(1).private(),
+        &mut rng(0xA1),
+    )
+    .expect("initiator starts");
+    let current = cloud::handshake::PipeMsg::Hs1(hs1).encode();
+    assert_eq!(
+        cloud::handshake::first_session_id(&current),
+        None,
+        "the current-version parser owns this message; no foreign fallback"
+    );
+}
+
+#[test]
+fn first_session_id_none_for_short_or_non_hs1_shapes() {
+    const FOREIGN_VERSION: u8 = 2;
+    for len in 0..18usize {
+        let mut raw = vec![0u8; len];
+        if len > 0 {
+            raw[0] = FOREIGN_VERSION;
+        }
+        if len > 1 {
+            raw[1] = 1; // Hs1 type, but too short for a 16-byte sid
+        }
+        assert_eq!(
+            cloud::handshake::first_session_id(&raw),
+            None,
+            "short shape of {len} bytes must not yield a session id"
+        );
+    }
+    // Long enough, foreign version, but not an Hs1 message type.
+    let mut raw = vec![0u8; 64];
+    raw[0] = FOREIGN_VERSION;
+    for ty in [0u8, 2, 3, 4, 5, 255] {
+        raw[1] = ty;
+        assert_eq!(
+            cloud::handshake::first_session_id(&raw),
+            None,
+            "foreign-version type {ty} is not an Hs1"
+        );
+    }
+}

@@ -2,9 +2,10 @@
 
 /// Protocol version 1 (spec §11): exact match, no negotiation.
 pub const PROTOCOL_VERSION: u8 = 1;
-/// Pipe protocol version byte (spec §8.2): Transport v2 (fragmentation +
-/// credit). Exact match, no v1 fallback.
-pub const PIPE_VERSION: u8 = 2;
+/// Pipe protocol version byte (spec §8.2): pipe v3 adds role-namespaced
+/// bidirectional streams (each side opens in its own namespace) on top of
+/// transport v2 fragmentation + credit. Exact match, no fallback.
+pub const PIPE_VERSION: u8 = 3;
 
 /// Letter TTL (spec §7.5 step 6, §12).
 pub const TTL_LETTER: u64 = 900;
