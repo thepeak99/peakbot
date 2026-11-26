@@ -1024,6 +1024,12 @@ pub(crate) fn build_bound_agent(
         &ctx.bound.profile,
         &ctx.mcp_handles,
     ));
+    // Inject the profile's VectorStore into StateManager for turn-start
+    // reconciliation. A no-op for profiles without vector or the Local
+    // edition. Every rebuild (boot, /model, /new, /cd, /load) updates the
+    // store, so the turn loop always sees the current one.
+    #[cfg(feature = "host")]
+    sm.set_vector(tool_env.vector.clone());
     let agent = ctx.bound.agent();
     let delegate = delegate_enabled(agent).then(|| {
         Arc::new(SubAgentDeps {
@@ -2868,6 +2874,30 @@ impl AgentRunner {
         agent: &Arc<DynAgent>,
         config: &Config,
     ) -> crate::notify::TurnOutcome {
+        // Turn-start reconciliation: for a repo-anchored doc store, ensure the
+        // store is fresh before the first agent call (before any doc tool can
+        // fire). The per-path lock (vector_lock) serializes reconcile against
+        // tool calls; a try-lock avoids blocking the turn if a doc tool call is in
+        // flight. Errors are logged, never fatal — the next turn will retry.
+        // The tool call path (index_file / search) is the correctness backstop.
+        #[cfg(feature = "host")]
+        if let Some(sm) = state_manager
+            && let Some(store) = sm.vector_store()
+        {
+            let db_path = store.db_path_for(&sm.session_cwd());
+            // Nonblocking try-lock: if a doc tool call is in flight, skip the
+            // turn-start reconcile (the tool call will reconcile on its own
+            // path). The guard is held only across this one call.
+            if let Ok(_guard) = vector::vector_lock(&db_path).try_lock()
+                && let Err(e) = store.ensure_fresh_at_turn_start(&db_path).await
+            {
+                tracing::warn!(
+                    target: "peakbot",
+                    error = %e,
+                    "turn-start reconciliation failed; will retry on next turn"
+                );
+            }
+        }
         let mut retry_count = 0;
         let mut nudged = false;
         // One-shot override for the post-compaction iteration. The compact
@@ -3864,6 +3894,9 @@ mod mcp_client {
 
 pub use mcp_client::*;
 
+#[cfg(all(test, feature = "host", feature = "mock"))]
+#[path = "vector_turn_tests.rs"]
+mod vector_turn_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5184,6 +5217,73 @@ profiles:
             todo_tool: None,
             profile_pin: None,
         }
+    }
+
+    /// Production wiring: the profile's `ToolEnv.vector` must reach the
+    /// `StateManager` on **build and rebuild**, which is what makes the
+    /// turn-start reconcile see a store at all. The turn-loop suites inject the
+    /// store directly, so this is the one narrow test covering the handoff.
+    #[cfg(feature = "host")]
+    #[tokio::test]
+    async fn build_bound_agent_hands_toolenv_vector_to_the_state_manager() {
+        use crate::config::resolve::{ParseCtx, Source};
+
+        let global = |vector: &str| {
+            format!(
+                "providers:\n  - name: openrouter\n    type: openrouter\n    api_key: sk-test\n    models:\n      - {{ name: anthropic/claude-3.7-sonnet, alias: sonnet }}\ngeneral:\n  context:\n    enabled: false\nprofiles:\n  dev:\n{vector}    agents:\n      team:\n        model: sonnet\n"
+            )
+        };
+        let parse = |vector: &str| {
+            Config::parse(
+                Source {
+                    path: std::path::Path::new("/global/config.yaml"),
+                    text: &global(vector),
+                },
+                None,
+                &ParseCtx { known_skills: &[] },
+            )
+            .expect("fixture config must parse")
+        };
+        let ctx_for = |config: Config| RebuildContext {
+            bound: config.catalog.default_bound().expect("the fixture profile"),
+            config: Arc::new(config),
+            mcp_handles: Arc::new(Vec::new()),
+            shell_kind: None,
+            skills: SkillRegistry::default(),
+            todo_tool: None,
+            profile_pin: None,
+        };
+        let model = {
+            // The registry carries the provider config (api key) the fixture
+            // declared; `create_provider` needs it.
+            let ctx = ctx_for(parse(""));
+            ctx.bound.agent().main.model.clone()
+        };
+
+        // The profile config carries a vector_db.
+        let db_path = tempfile::tempdir().unwrap().path().join("vectors.db");
+        let with_vector = parse(&format!(
+            "    vector_db:\n      db_path: {}\n      embeddings:\n        base_url: https://e.example/v1\n        model: bge\n        dimensions: 8\n",
+            db_path.display()
+        ));
+        let sm = StateManager::new_arc();
+        build_bound_agent(&model, &ctx_for(with_vector), &sm).expect("agent builds");
+        let store = sm
+            .vector_store()
+            .expect("ToolEnv.vector must reach the StateManager on build");
+        assert_eq!(
+            store.db_path_for(std::path::Path::new("")).as_path(),
+            db_path,
+            "the injected store is the profile's"
+        );
+
+        // A rebuild on a profile without vector_db clears it again.
+        let without_vector = parse("");
+        build_bound_agent(&model, &ctx_for(without_vector), &sm).expect("agent rebuilds");
+        assert!(
+            sm.vector_store().is_none(),
+            "a rebuild must replace the stale store, not keep it"
+        );
     }
 
     /// Switching `/model` from an Anthropic model to a non-Anthropic one must

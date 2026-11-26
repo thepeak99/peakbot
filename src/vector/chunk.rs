@@ -6,10 +6,10 @@
 //! graduate to config then, not before.
 
 /// Target chunk size in characters.
-const CHUNK_SIZE: usize = 1000;
+pub(crate) const CHUNK_SIZE: usize = 1000;
 /// Overlap between consecutive chunks, in characters. Preserves context that
 /// would otherwise be severed at a chunk boundary.
-const CHUNK_OVERLAP: usize = 200;
+pub(crate) const CHUNK_OVERLAP: usize = 200;
 
 /// Split `text` into overlapping chunks of `CHUNK_SIZE` chars with
 /// `CHUNK_OVERLAP` chars of overlap between neighbours.

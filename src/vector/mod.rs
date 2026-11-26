@@ -21,14 +21,17 @@
 
 mod chunk;
 mod embeddings;
+pub mod merge_driver;
 mod parse;
+mod reconcile;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use ruvector_core::types::{DbOptions, DistanceMetric, HnswConfig, SearchQuery, VectorEntry};
 use ruvector_core::vector_db::VectorDB;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::OnceCell;
@@ -56,18 +59,417 @@ pub enum VectorStoreError {
     Embeddings(#[from] EmbeddingsError),
     #[error(transparent)]
     Parse(#[from] ParseError),
+    #[error("reconciliation failed: {0}")]
+    Reconcile(#[from] reconcile::ReconcileError),
     #[error("failed to read {path}: {source}")]
     Io {
         path: String,
         #[source]
         source: std::io::Error,
     },
+    #[error(
+        "source {path} is outside the repository root that owns this vector DB — index files inside the repo, or keep the DB outside the repo to use absolute local IDs"
+    )]
+    OutsideRoot { path: String },
+    #[error("vector DB {path} fingerprint mismatch: stored {stored}, requested {requested}")]
+    FingerprintMismatch {
+        path: String,
+        stored: String,
+        requested: String,
+    },
+    #[error("invalid vector DB metadata: {0}")]
+    InvalidMetadata(String),
+    #[error(
+        "vector DB metadata schema {found} is newer than this build supports (max {supported}); upgrade PeakBot or use a compatible store"
+    )]
+    MetadataNewer { found: u32, supported: u32 },
+    #[error(
+        "vector DB {path} anchor mismatch: {detail}; refusing to write or reconcile so source IDs cannot mix"
+    )]
+    AnchorMismatch { path: String, detail: String },
+    #[error(
+        "vector DB {path} predates the current v2 format (no `peakbot.vector` metadata); run a migration before indexing — search remains available"
+    )]
+    MigrationRequired { path: String },
 }
 
 /// Reserved metadata keys owned by the store. User-supplied metadata that
 /// collides with any of these is dropped at the boundary so it can never
 /// shadow the fields search relies on.
 const RESERVED_METADATA_KEYS: [&str; 4] = ["source", "chunk_index", "text", "sha256"];
+
+/// ruvector config key holding the universal v2 record. Presence marks a
+/// store as managed; absence means a legacy v1 store (read-only compatibility)
+/// or an empty store that is adopted on its first write.
+const VECTOR_METADATA_KEY: &str = "peakbot.vector";
+/// Universal v2 metadata schema version.
+const VECTOR_SCHEMA: u32 = 2;
+/// Distance metric name recorded in the fingerprint (matches `DbOptions`).
+const VECTOR_METRIC: &str = "cosine";
+
+/// Which anchoring contract a store's source IDs and roots follow. A store
+/// inside a git repo uses repo-relative IDs (clone-portable); a store outside
+/// any repo uses absolute local IDs. Persisted so a relocated store is still
+/// structurally readable, while writes can refuse a boundary crossing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum AnchorKind {
+    Repo,
+    Local,
+}
+
+/// The anchor derived from the DB's *current* location. This is the only
+/// source of truth for resolving recorded paths; metadata never persists an
+/// absolute repo path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StoreAnchor {
+    Repo(PathBuf),
+    Local,
+}
+
+impl StoreAnchor {
+    pub(crate) fn derive(db_path: &Path) -> Self {
+        match anchored_root_of(db_path) {
+            Some(root) => Self::Repo(root),
+            None => Self::Local,
+        }
+    }
+
+    fn kind(&self) -> AnchorKind {
+        match self {
+            Self::Repo(_) => AnchorKind::Repo,
+            Self::Local => AnchorKind::Local,
+        }
+    }
+
+    pub(crate) fn is_repo(&self) -> bool {
+        matches!(self, Self::Repo(_))
+    }
+}
+
+/// The immutable identity of a store: everything whose change would make
+/// existing vectors meaningless. Deliberately excludes `base_url`, `api_key`
+/// and the anchor — the same model served from a different endpoint, or the
+/// same embedding space in a different checkout, is still the same space.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct EmbeddingFingerprint {
+    schema: u32,
+    model: String,
+    dimensions: usize,
+    metric: String,
+    chunk_chars: usize,
+    chunk_overlap: usize,
+}
+
+/// One doc_index root recorded in the manifest. Each call to `doc_index`
+/// carries its own recursive flag and metadata; the same root upserts without
+/// duplicates.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct ManifestRoot {
+    /// The root as a repo-relative POSIX path (`""` is the repo root itself)
+    /// for a repo-anchored store, or an absolute local path for a local store.
+    /// Repo roots are never creator-absolute: each clone resolves them against
+    /// the root derived from its own DB location, so the store is portable.
+    root: String,
+    /// Was the root indexed recursively?
+    recursive: bool,
+    /// The user-supplied metadata for this root (author, book, year, …).
+    #[serde(default)]
+    metadata: BTreeMap<String, serde_json::Value>,
+}
+
+/// The mutable bookkeeping for a store: the collection of doc_index roots and
+/// the global sorted source set. `roots` is kept sorted by root path for
+/// deterministic serialization.
+///
+/// Deliberately carries **no** absolute repo path: the repo root is always
+/// derived locally from the current DB path (`anchored_root_of`), which is what
+/// makes a committed DB usable from a clone at a different absolute path.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct VectorManifest {
+    /// The collection of doc_index roots recorded for this store, sorted by
+    /// root path for deterministic serialization.
+    #[serde(default)]
+    roots: Vec<ManifestRoot>,
+    /// Global sorted list of all indexed source ids (not root-scoped).
+    #[serde(default)]
+    sources: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct VectorMetadata {
+    schema: u32,
+    anchor: AnchorKind,
+    fingerprint: EmbeddingFingerprint,
+    manifest: VectorManifest,
+}
+
+/// How an `index_file` call relates to the v2 contract.
+enum DbWrite {
+    /// Create the v2 record (fingerprint before the first row).
+    Fresh,
+    /// An existing managed store: validate + extend the manifest.
+    Existing(VectorMetadata),
+}
+
+/// Read and structurally validate the v2 record. A missing record is `None`
+/// (legacy or empty); a newer schema is a distinct error so callers never
+/// mistake it for legacy. Path shape is validated against the **persisted**
+/// anchor kind, not the derived location: that keeps a relocated store
+/// readable while [`check_anchor_metadata`] guards writes.
+fn load_metadata(db: &VectorDB) -> Result<Option<VectorMetadata>, VectorStoreError> {
+    let Some(json) = db.load_config_value(VECTOR_METADATA_KEY)? else {
+        return Ok(None);
+    };
+    let value: serde_json::Value = serde_json::from_str(&json)
+        .map_err(|e| VectorStoreError::InvalidMetadata(format!("not valid JSON: {e}")))?;
+    let schema = value
+        .get("schema")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| VectorStoreError::InvalidMetadata("missing integer `schema`".into()))?
+        as u32;
+    if schema > VECTOR_SCHEMA {
+        return Err(VectorStoreError::MetadataNewer {
+            found: schema,
+            supported: VECTOR_SCHEMA,
+        });
+    }
+    if schema != VECTOR_SCHEMA {
+        return Err(VectorStoreError::InvalidMetadata(format!(
+            "unsupported schema {schema}"
+        )));
+    }
+    let meta: VectorMetadata = serde_json::from_value(value)
+        .map_err(|e| VectorStoreError::InvalidMetadata(e.to_string()))?;
+    if meta.fingerprint.schema != VECTOR_SCHEMA {
+        return Err(VectorStoreError::InvalidMetadata(format!(
+            "fingerprint schema {} does not match schema {VECTOR_SCHEMA}",
+            meta.fingerprint.schema
+        )));
+    }
+    // Validate every recorded path on read: the manifest travels through git,
+    // so a tampered/hand-edited record must never steer a file or git read
+    // outside the local repo (or at an absolute location from another clone).
+    validate_metadata_paths(&meta)?;
+    Ok(Some(meta))
+}
+
+/// Reject a manifest path that is not a plain repo-relative POSIX path.
+///
+/// `""` means the repo root itself. Anything absolute, Windows-prefixed,
+/// containing `.`/`..`, or using backslashes is refused before any disk access.
+fn validate_repo_relative(path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Ok(());
+    }
+    if path.contains('\\') {
+        return Err(format!("{path:?} is not a POSIX path"));
+    }
+    if Path::new(path).is_absolute() {
+        return Err(format!("{path:?} is absolute"));
+    }
+    for component in Path::new(path).components() {
+        match component {
+            std::path::Component::Normal(_) => {}
+            std::path::Component::CurDir => {
+                return Err(format!("{path:?} contains a '.' component"));
+            }
+            std::path::Component::ParentDir => {
+                return Err(format!("{path:?} contains a '..' component"));
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(format!("{path:?} contains a root/prefix component"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reject an absolute local path that is not already normalized: local source
+/// IDs are full paths, so `.`/`..` components would make groups ambiguous.
+fn validate_local_absolute(path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Err("is empty".to_string());
+    }
+    if !Path::new(path).is_absolute() {
+        return Err(format!("{path:?} is not absolute"));
+    }
+    for component in Path::new(path).components() {
+        match component {
+            std::path::Component::Normal(_)
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {}
+            std::path::Component::CurDir => {
+                return Err(format!("{path:?} contains a '.' component"));
+            }
+            std::path::Component::ParentDir => {
+                return Err(format!("{path:?} contains a '..' component"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_metadata_paths(meta: &VectorMetadata) -> Result<(), VectorStoreError> {
+    let invalid = |what: &str, e: String| VectorStoreError::InvalidMetadata(format!("{what}: {e}"));
+    let check = |path: &str| match meta.anchor {
+        AnchorKind::Repo => validate_repo_relative(path),
+        AnchorKind::Local => validate_local_absolute(path),
+    };
+    for root in &meta.manifest.roots {
+        check(&root.root).map_err(|e| invalid("invalid manifest root", e))?;
+    }
+    for source in &meta.manifest.sources {
+        check(source).map_err(|e| invalid("invalid manifest source", e))?;
+    }
+    Ok(())
+}
+
+/// Ensure a store's persisted anchor kind matches the anchor derived from its
+/// current location. A mismatch is a relocation across the repo boundary:
+/// reads may still use the existing rows, but a write/reconcile must refuse so
+/// relative and absolute source IDs never mix.
+pub(crate) fn check_anchor_metadata(
+    db_path: &Path,
+    meta: &VectorMetadata,
+    anchor: &StoreAnchor,
+) -> Result<(), VectorStoreError> {
+    if meta.anchor == anchor.kind() {
+        return Ok(());
+    }
+    let detail = match (meta.anchor, anchor) {
+        (AnchorKind::Repo, StoreAnchor::Local) => {
+            "metadata records repository-relative source IDs but the DB is outside any git repository"
+        }
+        (AnchorKind::Local, StoreAnchor::Repo(_)) => {
+            "metadata records absolute local source IDs but the DB is inside a git repository"
+        }
+        // `check_anchor_metadata` only runs when the kinds differ.
+        _ => unreachable!("anchor kind compared equal above"),
+    };
+    Err(VectorStoreError::AnchorMismatch {
+        path: db_path.display().to_string(),
+        detail: detail.to_string(),
+    })
+}
+
+/// Resolve a validated repo-relative manifest path against the locally derived
+/// repo root. The result is lexically contained; callers canonicalize existing
+/// paths before reading so a symlink cannot escape either.
+pub(crate) fn resolve_repo_relative(anchor: &Path, rel: &str) -> Result<PathBuf, String> {
+    validate_repo_relative(rel)?;
+    let joined = if rel.is_empty() {
+        anchor.to_path_buf()
+    } else {
+        anchor.join(rel)
+    };
+    let normalized = normalize_lexical(&joined);
+    if !normalized.starts_with(anchor) {
+        return Err(format!("{rel:?} resolves outside the repository root"));
+    }
+    Ok(normalized)
+}
+
+fn save_metadata(db: &VectorDB, meta: &VectorMetadata) -> Result<(), VectorStoreError> {
+    let json = serde_json::to_string(meta)
+        .map_err(|e| VectorStoreError::InvalidMetadata(e.to_string()))?;
+    db.save_config_value(VECTOR_METADATA_KEY, &json)?;
+    Ok(())
+}
+
+/// Derive the repo root for a DB from its location: find the nearest `.git`
+/// ancestor of the DB path (treating the DB path as a file whose parent
+/// directory is the starting point). Returns `None` if the DB lives outside any
+/// repo. Works even when the DB file itself does not yet exist, because it
+/// searches from the nearest existing ancestor of the DB's parent.
+///
+/// This is the **only** source of the repo root: manifests never persist an
+/// absolute path, so each clone resolves its own.
+pub(crate) fn anchored_root_of(db_path: &Path) -> Option<PathBuf> {
+    // The DB path is a file; start searching from its parent directory.
+    let parent = db_path.parent()?;
+    // Find the nearest existing ancestor (the parent may not exist yet).
+    let mut cur = parent;
+    while !cur.exists() {
+        cur = cur.parent()?;
+    }
+    let canonical = std::fs::canonicalize(cur).ok()?;
+    // Search from that ancestor up for a `.git` entry.
+    let mut search = canonical.as_path();
+    loop {
+        if search.join(".git").exists() {
+            return Some(search.to_path_buf());
+        }
+        search = search.parent()?;
+    }
+}
+
+/// Git-aware file discovery for a repo-anchored store: resolve the repo anchor
+/// from the **local** DB path and hand it to [`reconcile::discover_files`].
+/// Returns `None` when the DB is outside a repo (callers fall back to the plain
+/// local walk, which deliberately does not read `.gitignore`).
+pub(crate) fn git_discover_files(
+    db_path: &DbPath,
+    root: &Path,
+    recursive: bool,
+) -> Option<Vec<PathBuf>> {
+    let anchor = anchored_root_of(db_path.as_path())?;
+    reconcile::discover_files(&anchor, root, recursive, db_path.as_path()).ok()
+}
+
+/// Drop the cached redb handle for `db_path` from the process-wide registry.
+/// Used before reopening a DB that was replaced on disk (git checkout/pull or
+/// another process writing a new inode), so subsequent reads/writes go through
+/// the on-disk file rather than a stale inode. Other live `Arc` clones keep the
+/// old handle alive; this only evicts the registry's reference.
+pub(crate) fn close_db_handle(db_path: &DbPath) {
+    let mut dbs = DB_HANDLES.lock().expect("vector db map lock poisoned");
+    dbs.remove(db_path);
+}
+
+/// The source id of `path` relative to a known anchored repo root. Errors with
+/// `OutsideRoot` when the path lies outside the anchored root.
+pub(crate) fn relative_source(
+    path: &Path,
+    anchored_root: &Path,
+) -> Result<String, VectorStoreError> {
+    let canonical = std::fs::canonicalize(path).map_err(|source| VectorStoreError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let rel = canonical
+        .strip_prefix(anchored_root)
+        .map_err(|_| VectorStoreError::OutsideRoot {
+            path: path.display().to_string(),
+        })?;
+    let source = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
+    Ok(source)
+}
+
+/// The source id of `path` for a local (outside-git) store: the canonical
+/// absolute path with POSIX separators. Local IDs are not portable by design;
+/// they identify rows on this machine only.
+pub(crate) fn absolute_source(path: &Path) -> Result<String, VectorStoreError> {
+    let canonical = std::fs::canonicalize(path).map_err(|source| VectorStoreError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    // Normalize to POSIX separators; the leading root stays a single `/`.
+    Ok(canonical.to_string_lossy().replace('\\', "/"))
+}
+
+/// Key `path` by the anchor's contract: repo-relative for a repo-anchored
+/// store, absolute for a local store.
+pub(crate) fn source_id(anchor: &StoreAnchor, path: &Path) -> Result<String, VectorStoreError> {
+    match anchor {
+        StoreAnchor::Repo(root) => relative_source(path, root),
+        StoreAnchor::Local => absolute_source(path),
+    }
+}
 
 /// One indexed chunk hit returned from a search.
 pub struct Hit {
@@ -112,7 +514,7 @@ impl DbPath {
     }
 }
 
-/// Shared vector store. Cheap to clone (everything is `Arc`-backed). The redb
+/// Universal vector store. Cheap to clone (everything is `Arc`-backed). The redb
 /// file is created lazily on the first write — see the module-level
 /// "Lazy materialization" note.
 #[derive(Clone)]
@@ -130,6 +532,19 @@ type DbHandle = Arc<OnceCell<Arc<VectorDB>>>;
 /// path into one handle. Handles are never closed (process lifetime).
 static DB_HANDLES: LazyLock<Mutex<HashMap<DbPath, DbHandle>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Per-DB async locks serializing reconcile against search/index. A reconcile
+/// rewrites rows and swaps the on-disk inode; a concurrent reader/writer must
+/// not observe or race that. Keyed by resolved path so independent DBs stay
+/// independent. The outer std `Mutex` guards only the map lookup.
+static DB_LOCKS: LazyLock<Mutex<HashMap<DbPath, Arc<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Return the async lock for `db_path`, creating it on first request.
+pub(crate) fn vector_lock(db_path: &DbPath) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = DB_LOCKS.lock().expect("vector lock map poisoned");
+    Arc::clone(locks.entry(db_path.clone()).or_default())
+}
 
 struct StoreInner {
     /// The resolved spec. `db_path_for` turns `spec.db_path` into the
@@ -153,6 +568,20 @@ impl VectorStore {
         })
     }
 
+    /// Turn-start reconciliation seam. Resolves a repo-anchored store's
+    /// freshness at the start of every turn (before any doc tool call). A no-op
+    /// for a local (outside-git) store; for a repo store, detects and replays
+    /// the manifest if a pending marker, missing local state, HEAD change, or
+    /// DB stamp change is found. The caller passes the resolved `DbPath` for
+    /// the session cwd. Errors are logged but never fail the turn — the next
+    /// turn will retry.
+    pub async fn ensure_fresh_at_turn_start(
+        &self,
+        db_path: &DbPath,
+    ) -> Result<(), reconcile::ReconcileError> {
+        reconcile::ensure_fresh(self, db_path.as_path()).await
+    }
+
     /// Test accessor over the process-wide `DB_HANDLES` registry: the
     /// handle for this store's spec resolved against `session_cwd`,
     /// materializing the redb file on first access (the same lazy-open rule
@@ -166,16 +595,16 @@ impl VectorStore {
         self.db(&self.db_path_for(session_cwd)).await
     }
 
-    /// The DB handle for `db_path`, creating the redb file (and parent dir) on
-    /// first call. This is the **only** path that materializes a store — call
-    /// it solely when about to write.
+    /// Open the DB handle for `db_path`, creating the redb file (and parent
+    /// dir) on first call. This is the **only** path that materializes a store
+    /// — call it solely when about to write.
     ///
     /// ⚠ On reopen of an existing path, ruvector rebuilds the index from disk
     /// using the STORED dimensions/metric — the `DbOptions` here only take
     /// effect when creating a fresh DB. A model whose output dimension differs
     /// from an existing DB surfaces as a clear error on insert, never as silent
     /// corruption.
-    async fn db(&self, db_path: &DbPath) -> Result<Arc<VectorDB>, VectorStoreError> {
+    pub(crate) async fn db(&self, db_path: &DbPath) -> Result<Arc<VectorDB>, VectorStoreError> {
         // Take the cell out of the registry and drop the guard *before*
         // awaiting: a std `MutexGuard` must never span an await point.
         // Opening then happens under the per-path `OnceCell`, so the map
@@ -203,7 +632,7 @@ impl VectorStore {
     /// here so they never create anything: a directory that was never indexed
     /// has no DB, and asking about it must not conjure one. Async because
     /// opening is blocking I/O, same as [`VectorStore::db`].
-    async fn db_if_exists(
+    pub(crate) async fn db_if_exists(
         &self,
         db_path: &DbPath,
     ) -> Result<Option<Arc<VectorDB>>, VectorStoreError> {
@@ -239,6 +668,10 @@ impl VectorStore {
     ///
     /// `doc_index` aggregates these outcomes across a directory walk into an
     /// [`IndexReport`].
+    ///
+    /// Writes are serialized against reconcile/search via the per-path async
+    /// lock. A repo-anchored store is brought fresh before the write; a local
+    /// store has no git/state work at all.
     pub async fn index_file(
         &self,
         db_path: &DbPath,
@@ -251,7 +684,53 @@ impl VectorStore {
             )));
         }
 
-        let source = path.display().to_string();
+        let lock = vector_lock(db_path);
+        let _guard = lock.lock().await;
+
+        let anchor = StoreAnchor::derive(db_path.as_path());
+        if anchor.is_repo() {
+            // Repo stores must be fresh before any write (pending/HEAD/stamp).
+            reconcile::ensure_fresh(self, db_path.as_path())
+                .await
+                .map_err(VectorStoreError::from)?;
+        }
+
+        let outcome = self.index_file_inner(db_path, path, user_metadata).await?;
+
+        // Record state after a successful index so ensure_fresh knows the
+        // current HEAD and DB stamp match what is on disk. Local stores keep no
+        // reconcile state.
+        if anchor.is_repo() {
+            self.record_state_after_index(db_path).await?;
+        }
+
+        Ok(outcome)
+    }
+
+    /// Write the reconcile state (HEAD + DB stamp) after a successful write.
+    ///
+    /// The state stamp must describe the DB **as it is on disk now**: metadata
+    /// written after the state would leave a stale stamp and trigger a needless
+    /// full replay on the next search.
+    async fn record_state_after_index(&self, db_path: &DbPath) -> Result<(), VectorStoreError> {
+        let db = self.db(db_path).await?;
+        if load_metadata(&db)?.is_none() {
+            return Ok(());
+        }
+        reconcile::record_state(db_path.as_path()).map_err(VectorStoreError::from)
+    }
+
+    /// Internal indexing path called after the freshness check.
+    async fn index_file_inner(
+        &self,
+        db_path: &DbPath,
+        path: &Path,
+        user_metadata: &HashMap<String, serde_json::Value>,
+    ) -> Result<IndexOutcome, VectorStoreError> {
+        // Repo stores key chunks by a repo-relative source id; local stores use
+        // the absolute path.
+        let (write, source) = self.write_plan_for(db_path, path).await?;
+
         let text = parse::extract_text(path)?;
 
         // Strip reserved keys once, here at the boundary; the interior trusts
@@ -305,9 +784,38 @@ impl VectorStore {
         // The first write materializes the store. ruvector's VectorDB is sync;
         // run the insert off the async runtime so the agent loop isn't starved.
         let db = self.db(db_path).await?;
-        tokio::task::spawn_blocking(move || db.insert_batch(&entries))
+
+        // A fresh store records its identity BEFORE the first row, so a
+        // partially written DB can never be read under the wrong identity.
+        if let DbWrite::Fresh = &write {
+            let anchor = StoreAnchor::derive(db_path.as_path());
+            let metadata = VectorMetadata {
+                schema: VECTOR_SCHEMA,
+                anchor: anchor.kind(),
+                fingerprint: self.fingerprint(),
+                manifest: VectorManifest {
+                    roots: Vec::new(),
+                    sources: vec![source.clone()],
+                },
+            };
+            save_metadata(&db, &metadata)?;
+        }
+
+        let db_for_insert = Arc::clone(&db);
+        tokio::task::spawn_blocking(move || db_for_insert.insert_batch(&entries))
             .await
             .expect("vector insert task panicked")?;
+
+        // Keep the manifest's source set complete. `sort` makes the union
+        // deterministic regardless of index order or clone.
+        if let DbWrite::Existing(metadata) = &write
+            && !metadata.manifest.sources.iter().any(|s| s == &source)
+        {
+            let mut updated = metadata.clone();
+            updated.manifest.sources.push(source.clone());
+            updated.manifest.sources.sort();
+            save_metadata(&db, &updated)?;
+        }
 
         // If the file shrank, chunks 0..n were overwritten in place but any
         // higher-indexed rows from the previous version are now orphans. Reap
@@ -323,20 +831,195 @@ impl VectorStore {
         })
     }
 
+    /// Record a doc_index root in the manifest, upserting by root ID so the
+    /// same root does not duplicate. The caller (DocIndexTool) passes the
+    /// actual requested root + recursive flag + metadata; this method is the
+    /// bookkeeping seam between the tool layer and the store. A store that has
+    /// not been materialized yet is a no-op.
+    ///
+    /// Runs under the same per-DB async lock as `index_file`/`search`, so a
+    /// concurrent reconcile can never overwrite the root list with a stale
+    /// snapshot. Reconcile state is refreshed **after** the metadata save, so
+    /// its DB stamp describes the file that is actually on disk.
+    pub async fn record_root(
+        &self,
+        db_path: &DbPath,
+        root: PathBuf,
+        recursive: bool,
+        metadata: &HashMap<String, serde_json::Value>,
+    ) -> Result<(), VectorStoreError> {
+        let lock = vector_lock(db_path);
+        let _guard = lock.lock().await;
+
+        let Some(db) = self.db_if_exists(db_path).await? else {
+            // Nothing was indexed (e.g. a walk with only unsupported files), so
+            // there is no manifest to extend — and asking must not create one.
+            return Ok(());
+        };
+        let Some(mut meta) = load_metadata(&db)? else {
+            return Ok(());
+        };
+        let anchor = StoreAnchor::derive(db_path.as_path());
+        check_anchor_metadata(db_path.as_path(), &meta, &anchor)?;
+        let root_id = source_id(&anchor, &root)?;
+        // Upsert: find existing entry with the same root path, or append.
+        let root_entry = ManifestRoot {
+            root: root_id,
+            recursive,
+            metadata: sanitize_metadata(metadata).into_iter().collect(),
+        };
+        let mut roots = meta.manifest.roots.clone();
+        if let Some(existing) = roots.iter_mut().find(|r| r.root == root_entry.root) {
+            *existing = root_entry;
+        } else {
+            roots.push(root_entry);
+        }
+        // Deterministic order: sorted by root path.
+        roots.sort_by(|a, b| a.root.cmp(&b.root));
+        meta.manifest.roots = roots;
+        save_metadata(&db, &meta)?;
+        // Refresh the stamp *after* the metadata save (see doc comment).
+        if anchor.is_repo() {
+            reconcile::record_state(db_path.as_path()).map_err(VectorStoreError::from)?;
+        }
+        Ok(())
+    }
+
+    /// Decide how this write relates to the v2 contract and return the source
+    /// id to key chunks by.
+    ///
+    /// The on-disk file is classified first (see [`reconcile::classify_db`]) so
+    /// a magic-valid but damaged or foreign file is never opened for writing or
+    /// mistaken for a fresh store.
+    async fn write_plan_for(
+        &self,
+        db_path: &DbPath,
+        path: &Path,
+    ) -> Result<(DbWrite, String), VectorStoreError> {
+        let anchor = StoreAnchor::derive(db_path.as_path());
+        match reconcile::classify_db(db_path.as_path()).await {
+            // No file yet, or a valid store that carries no rows and no v2
+            // record: adopt the v2 contract on this write.
+            reconcile::DbKind::Missing | reconcile::DbKind::Fresh => {
+                Ok((DbWrite::Fresh, source_id(&anchor, path)?))
+            }
+            // A populated v1 DB is read-only compatibility; never silently
+            // migrated or extended.
+            reconcile::DbKind::Legacy => Err(VectorStoreError::MigrationRequired {
+                path: db_path.display().to_string(),
+            }),
+            reconcile::DbKind::Newer { found } => Err(VectorStoreError::MetadataNewer {
+                found,
+                supported: VECTOR_SCHEMA,
+            }),
+            // The file is not a readable store (or not ours). Leave its bytes
+            // untouched and fail rather than repair it in place.
+            reconcile::DbKind::Damaged => Err(VectorStoreError::InvalidMetadata(format!(
+                "vector DB {} is damaged; refusing to write to it",
+                db_path.display()
+            ))),
+            reconcile::DbKind::Managed => {
+                let Some(db) = self.db_if_exists(db_path).await? else {
+                    // Replaced/deleted between classification and open.
+                    return Ok((DbWrite::Fresh, source_id(&anchor, path)?));
+                };
+                let Some(metadata) = load_metadata(&db)? else {
+                    return Ok((DbWrite::Fresh, source_id(&anchor, path)?));
+                };
+                check_anchor_metadata(db_path.as_path(), &metadata, &anchor)?;
+                self.check_fingerprint(db_path, &metadata.fingerprint)?;
+                let source = source_id(&anchor, path)?;
+                Ok((DbWrite::Existing(metadata), source))
+            }
+        }
+    }
+
+    fn fingerprint(&self) -> EmbeddingFingerprint {
+        EmbeddingFingerprint {
+            schema: VECTOR_SCHEMA,
+            model: self.inner.spec.embeddings.model.clone(),
+            dimensions: self.inner.spec.embeddings.dimensions,
+            metric: VECTOR_METRIC.to_string(),
+            chunk_chars: chunk::CHUNK_SIZE,
+            chunk_overlap: chunk::CHUNK_OVERLAP,
+        }
+    }
+
+    /// Reject a store whose identity differs from this spec. Called before any
+    /// write and on every read of a managed store, so a mismatch can never
+    /// corrupt rows.
+    fn check_fingerprint(
+        &self,
+        db_path: &DbPath,
+        stored: &EmbeddingFingerprint,
+    ) -> Result<(), VectorStoreError> {
+        let requested = self.fingerprint();
+        if &requested != stored {
+            return Err(VectorStoreError::FingerprintMismatch {
+                path: db_path.display().to_string(),
+                stored: format!("{stored:?}"),
+                requested: format!("{requested:?}"),
+            });
+        }
+        Ok(())
+    }
+
     /// Embed `query` and return the top `k` most similar chunks. If nothing has
     /// been indexed at `db_path` there is no DB file — return no hits without
     /// touching the network or disk.
+    ///
+    /// Repo-anchored stores are serialized against reconcile: the per-path async
+    /// lock is held from freshness check through the actual search, so a
+    /// concurrent reconcile can never race a reader into serving stale/partial
+    /// rows. Local stores do no freshness/git work.
     pub async fn search(
         &self,
         db_path: &DbPath,
         query: &str,
         k: usize,
     ) -> Result<Vec<Hit>, VectorStoreError> {
-        // Bail before embedding: no DB file means no hits, and asking must not
-        // cost a network round-trip (nor create the file).
+        // Bail before embedding/opening: no DB file means no hits, and asking
+        // must not create one.
+        if !db_path.as_path().exists() {
+            return Ok(Vec::new());
+        }
+
+        let lock = vector_lock(db_path);
+        let _guard = lock.lock().await;
+
+        let anchor = StoreAnchor::derive(db_path.as_path());
+        if anchor.is_repo() {
+            // Freshness first: it classifies the on-disk file (and sets the
+            // pending repair marker on corruption) *before* any handle is
+            // opened, so a raw open error can never bypass the safety contract.
+            // Reconcile may also have swapped the on-disk inode.
+            reconcile::ensure_fresh(self, db_path.as_path())
+                .await
+                .map_err(VectorStoreError::from)?;
+        }
+        self.search_fresh(db_path, query, k).await
+    }
+
+    /// The actual read: fingerprint check + query embed + HNSW search. Called
+    /// with the per-path lock held.
+    async fn search_fresh(
+        &self,
+        db_path: &DbPath,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<Hit>, VectorStoreError> {
         let Some(db) = self.db_if_exists(db_path).await? else {
             return Ok(Vec::new());
         };
+
+        // A managed store must match this spec's identity — a mismatch (e.g. a
+        // different model) errors without touching rows. A legacy store (no
+        // record) is readable, read-only compatibility. Anchor shape is
+        // deliberately *not* re-checked here: a relocated store may still serve
+        // its existing rows; writes enforce the boundary.
+        if let Some(metadata) = load_metadata(&db)? {
+            self.check_fingerprint(db_path, &metadata.fingerprint)?;
+        }
 
         let vector = {
             let mut v = self.inner.embeddings.embed(&[query.to_string()]).await?;
@@ -374,7 +1057,7 @@ impl VectorStore {
     /// The content hash stored for a file's chunk 0, if the file was indexed
     /// before. Returns `None` if the file is not in the store — including the
     /// case where no DB exists at `db_path` yet, which must not create it.
-    async fn stored_hash(
+    pub(crate) async fn stored_hash(
         &self,
         db_path: &DbPath,
         source: &str,
@@ -398,7 +1081,7 @@ impl VectorStore {
     /// run, so a miss means we've passed the end. Used after a re-index to
     /// reap orphans left when a file shrinks to fewer chunks (or to zero). A
     /// no-op when there is no DB at `db_path` (nothing to delete).
-    async fn delete_chunks_from(
+    pub(crate) async fn delete_chunks_from(
         &self,
         db_path: &DbPath,
         source: &str,
@@ -476,7 +1159,7 @@ fn chunk_id(source: &str, index: usize) -> String {
 /// Folding metadata in means changing only an author/book/year — same text —
 /// still re-indexes instead of being skipped as unchanged. Keys are sorted so
 /// the hash is independent of `HashMap` iteration order.
-fn content_hash(text: &str, metadata: &HashMap<String, serde_json::Value>) -> String {
+pub(crate) fn content_hash(text: &str, metadata: &HashMap<String, serde_json::Value>) -> String {
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
     let mut keys: Vec<&String> = metadata.keys().collect();
@@ -492,7 +1175,7 @@ fn content_hash(text: &str, metadata: &HashMap<String, serde_json::Value>) -> St
 
 /// Drop reserved keys from caller-supplied metadata so it can never shadow the
 /// system fields. Applied once at the index boundary.
-fn sanitize_metadata(
+pub(crate) fn sanitize_metadata(
     md: &HashMap<String, serde_json::Value>,
 ) -> HashMap<String, serde_json::Value> {
     md.iter()
@@ -1194,7 +1877,7 @@ mod t2_tests {
     #[tokio::test]
     async fn two_stores_same_fixed_path_share_handle() {
         let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("shared.db");
+        let db = dir.path().join("v.db");
 
         let a = VectorStore::open(&fixed_spec(db.clone())).unwrap();
         let b = VectorStore::open(&fixed_spec(db.clone())).unwrap();

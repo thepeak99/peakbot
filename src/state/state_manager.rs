@@ -119,6 +119,19 @@ pub struct StateManager {
     /// only override seam (tests inject a tempdir).
     uploads: crate::attachments::UploadStore,
 
+    // ── Vector store (vectors-merge) ─────────────────────────────────────────
+    /// The active profile's vector store, handed to the session at build
+    /// from `ToolEnv.vector` so the turn loop can reconcile it at the *start*
+    /// of every turn (before any doc tool call). `None` ⇒ no doc store for
+    /// this session (Local edition, or a profile without `vector:`), and the
+    /// turn-start reconcile is a no-op.
+    ///
+    /// `with_vector` is the injection seam (mirrors `with_uploads`): tests
+    /// inject a hermetic store so they can drive the *real* turn loop and
+    /// observe reconciliation without booting a profile.
+    #[cfg(feature = "host")]
+    vector: RwLock<Option<crate::vector::VectorStore>>,
+
     // ── Background processes (`bash_bg` tool) ────────────────────────────────
     /// Long-running PTY-attached processes spawned by the `bash_bg` tool.
     /// Lock is held only synchronously — never across `.await`. See
@@ -263,6 +276,8 @@ impl StateManager {
                 crate::attachments::UploadStore::default_root(),
                 crate::config::UploadsConfig::default(),
             ),
+            #[cfg(feature = "host")]
+            vector: RwLock::new(None),
             bg: Arc::new(Mutex::new(BgRegistry::new())),
             bg_notify_tx: RwLock::new(None),
             bash_stdin_tx: RwLock::new(None),
@@ -321,6 +336,36 @@ impl StateManager {
         &self.uploads
     }
 
+    /// Inject the active profile's vector store (builder, mirrors
+    /// [`Self::with_uploads`]). Production wires this from `ToolEnv.vector`
+    /// at session build; tests inject a hermetic store so the *real* turn loop
+    /// can be driven against a tempdir DB without booting a profile.
+    #[cfg(feature = "host")]
+    #[doc(hidden)]
+    pub fn with_vector(mut self, store: crate::vector::VectorStore) -> Self {
+        self.vector = RwLock::new(Some(store));
+        self
+    }
+
+    /// The session's vector store, if any. The turn loop reads this at
+    /// the start of every turn to reconcile it before dispatching the prompt;
+    /// `None` means the session has no doc store and there is nothing to
+    /// reconcile.
+    #[cfg(feature = "host")]
+    #[doc(hidden)]
+    pub fn vector_store(&self) -> Option<crate::vector::VectorStore> {
+        self.vector.read().expect("vector lock poisoned").clone()
+    }
+
+    /// Update the session's vector store (in-place setter). Called by
+    /// the production rebuild paths after a fresh ToolEnv is built — so the
+    /// turn loop sees the current store (not a stale one from boot).
+    #[cfg(feature = "host")]
+    #[doc(hidden)]
+    pub fn set_vector(&self, store: Option<crate::vector::VectorStore>) {
+        let mut guard = self.vector.write().expect("vector lock poisoned");
+        *guard = store;
+    }
     /// The current conversation's upload folder, `<uploads_root>/<convo>`:
     /// the root the Local edition's file tools are confined to. `None` when
     /// no conversation is current.

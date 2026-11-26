@@ -38,6 +38,11 @@ enum Command {
         #[command(subcommand)]
         action: ServiceAction,
     },
+    /// Manage the vector DB (for the git merge driver).
+    Vectors {
+        #[command(subcommand)]
+        action: VectorsAction,
+    },
 }
 
 /// Sub-verbs of `peakbot service …`. `Install` carries its own `--bind` /
@@ -64,6 +69,24 @@ enum ServiceAction {
     Uninstall,
     /// Print what is registered, where it points, and whether it is running.
     Status,
+}
+
+/// Sub-verbs of `peakbot vectors …`. `merge-driver` is invoked directly by git
+/// with its standard `%O %A %B %P` placeholders and must dispatch before any
+/// config load (the binary's §E.12 subcommand path).
+#[derive(Debug, Clone, Subcommand)]
+enum VectorsAction {
+    /// Git merge driver for the vector DB.
+    MergeDriver {
+        #[arg(value_name = "O")]
+        original: String,
+        #[arg(value_name = "A")]
+        current: String,
+        #[arg(value_name = "B")]
+        theirs: String,
+        #[arg(value_name = "P")]
+        working: String,
+    },
 }
 
 #[derive(Parser)]
@@ -414,12 +437,24 @@ fn set_web_token(doc: &mut serde_yaml::Value, token: &str) -> Option<()> {
 
 /// Dispatch a subcommand. Returns `Ok(())` after printing the result;
 /// errors are propagated as `Err` so the caller can exit non-zero.
-fn run_subcommand(cmd: Command, cli: &Cli) -> Result<()> {
+async fn run_subcommand(cmd: Command, cli: &Cli) -> Result<()> {
     match cmd {
         Command::Install => {
             let outcome = install_binary().map_err(|e| anyhow::anyhow!("install failed: {e}"))?;
             print_install_result(&outcome);
         }
+        Command::Vectors { action } => match action {
+            VectorsAction::MergeDriver {
+                original,
+                current,
+                theirs,
+                working,
+            } => {
+                peakbot::vector::merge_driver::run([&original, &current, &theirs, &working])
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+        },
         Command::Service { action } => match action {
             ServiceAction::Install {
                 bind,
@@ -494,7 +529,7 @@ async fn main() -> Result<()> {
     // the service verb is what gets re-run after every self-update. Any
     // "no config" gate that ran before this branch would be a bug.
     if let Some(cmd) = cli.command.clone() {
-        return run_subcommand(cmd, &cli);
+        return run_subcommand(cmd, &cli).await;
     }
 
     if mode == Mode::Stdio {

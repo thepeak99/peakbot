@@ -45,3 +45,16 @@ desktop/src-tauri/linux/fonts/
 # The locked Windows desktop plan: absorbed into desktop/DESIGN.md
 # (amendment (windows-portable)); the full document stays on disk only.
 desktop/WINDOWS-PLAN.md
+
+# Vector DB runtime state for git merge (merge driver + reconcile) — generated
+# at merge/index time, never tracked:
+#   * `.peakbot/<name>.peakbot/` holds the reconcile state (`pending`, ...);
+#   * `<name>.merge-<pid>-<nanos>-<seq>.tmp` is the merge-driver temp
+#     sibling that `peakbot vectors merge-driver` creates before its atomic
+#     rename (may survive a crash mid-merge).
+.peakbot/vectors.db.peakbot/
+*.merge-[0-9]*.tmp
+
+# docs: only the shipped vector-db page is tracked; the broader `*.md`
+# rule keeps every other doc local.
+!docs/vector-db.md
