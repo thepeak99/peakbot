@@ -629,7 +629,7 @@ profiles:
 - **Subagent `prompt`** is required, non-blank; a subagent `persona` is an error (the prompt is its whole persona).
 - **NameFilters** (`tools:`, `mcps:`, `skills:`, `ui.tabs:`): `only:` XOR `disabled:`; unknown tool/MCP/tab names are errors, unknown **skill** names a warning (the skill set depends on the cwd).
 - **`delegate` is not filterable** — naming it in `tools:` gets a dedicated error.
-- **`vector_db`**: presence = on (there is no `enabled:` key); the same resolved `db_path` with different embeddings in two profiles is an error.
+- **`vector_db`**: presence = on (there is no `enabled:` key); the same resolved `db_path` with different embeddings in two profiles is an error. The store's contract is derived from the DB file's location: inside a git repo → repo-relative IDs, gitignore-aware discovery, and pending/HEAD/stamp reconcile (only files inside that repo indexable); outside any repo → same v2 record with absolute local IDs, plain discovery, and no git/state. See `docs/vector-db.md`.
 
 ### Selection
 

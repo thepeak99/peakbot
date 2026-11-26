@@ -23,7 +23,7 @@ pub enum DocSearchError {
     Store(#[from] VectorStoreError),
 }
 
-/// Semantic search tool over the shared vector store. `session_cwd` is the base
+/// Semantic search tool over the profile's vector store. `session_cwd` is the base
 /// for resolving the vector DB path; the default empty path leaves the DB
 /// anchored at the process cwd (tests).
 #[derive(Clone)]

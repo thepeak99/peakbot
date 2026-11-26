@@ -33,7 +33,7 @@ pub enum DocIndexError {
     Store(#[from] VectorStoreError),
 }
 
-/// Indexing tool over the shared vector store. `session_cwd` is the base for
+/// Indexing tool over the profile's vector store. `session_cwd` is the base for
 /// relative path resolution; the default empty path leaves relatives anchored
 /// at the process cwd (tests).
 #[derive(Clone)]
@@ -53,6 +53,22 @@ impl DocIndexTool {
     pub fn with_session_cwd(mut self, session_cwd: PathBuf) -> Self {
         self.session_cwd = session_cwd;
         self
+    }
+
+    /// Collect candidate files for this call. A repo-anchored store uses the
+    /// git-aware helper (`.gitignore` respected, repo anchor derived from the
+    /// local DB path); a local store uses the plain walk, which deliberately
+    /// does not read `.gitignore`.
+    fn collect_files(
+        &self,
+        root: &Path,
+        recursive: bool,
+        db_path: &crate::vector::DbPath,
+    ) -> Vec<PathBuf> {
+        if let Some(files) = crate::vector::git_discover_files(db_path, root, recursive) {
+            return files;
+        }
+        collect_files(root, recursive)
     }
 }
 
@@ -103,7 +119,7 @@ impl Tool for DocIndexTool {
         // belongs to this session's cwd.
         let db_path = self.store.db_path_for(&self.session_cwd);
         let recursive = args.recursive.unwrap_or(false);
-        let files = collect_files(&root, recursive);
+        let files = self.collect_files(&root, recursive, &db_path);
 
         let mut report = IndexReport::default();
         for file in files {
@@ -129,6 +145,13 @@ impl Tool for DocIndexTool {
                 }
             }
         }
+
+        // Record the requested root (with its recursive flag and metadata) in
+        // the v2 manifest so multiple roots persist independently. Repo stores
+        // record a relative root, local stores an absolute one.
+        self.store
+            .record_root(&db_path, root.clone(), recursive, &args.metadata)
+            .await?;
 
         Ok(format!(
             "Indexed {} file(s), updated {}, skipped {} (unchanged), {} unsupported. \

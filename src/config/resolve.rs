@@ -681,7 +681,7 @@ impl Config {
             .filter_map(local_entry)
             .map(|p| p.as_ref())
             .collect();
-        check_shared_vector_dbs(&locals, &mut global_sink, &mut repo_sink);
+        check_vector_db_clashes(&locals, &mut global_sink, &mut repo_sink);
         resolver.general(&mut global_sink, &file.general);
 
         let errors: Vec<ConfigError> = global_sink
@@ -966,33 +966,37 @@ fn check_mcps(servers: &[McpServerConfig], sink: &mut Sink) {
     }
 }
 
-/// V2: one DB file needs one embedding model. Reported on the later profile,
-/// in the file that declares it.
-fn check_shared_vector_dbs(profiles: &[&ResolvedProfile], global: &mut Sink, repo: &mut Sink) {
+/// V2: one DB file needs one embedding model. Profiles that point at the same
+/// store must agree on the embedding identity; everything else about the store
+/// is derived from its location at use time.
+fn check_vector_db_clashes(profiles: &[&ResolvedProfile], global: &mut Sink, repo: &mut Sink) {
     for (i, profile) in profiles.iter().enumerate() {
         let Some(spec) = &profile.vector else {
             continue;
         };
-        let clash = profiles[..i].iter().find(|earlier| {
-            earlier
-                .vector
-                .as_ref()
-                .is_some_and(|e| e.db_path == spec.db_path && e.embeddings != spec.embeddings)
-        });
-        if let Some(earlier) = clash {
-            let sink = match profile.origin {
-                Origin::Global => &mut *global,
-                Origin::Repo { .. } => &mut *repo,
-            };
-            sink.push(
-                vec![key("profiles"), key(&profile.name), key("vector_db")],
-                format!(
-                    "db_path '{}' is also used by profile '{}' with different embeddings — one DB file needs one embedding model",
-                    spec.db_path.path().display(),
-                    earlier.name
-                ),
-            );
+        let clash = profiles[..i]
+            .iter()
+            .filter_map(|earlier| earlier.vector.as_ref().map(|e| (earlier, e)))
+            .find(|(_, e)| e.db_path == spec.db_path);
+        let Some((earlier, other)) = clash else {
+            continue;
+        };
+        if other.embeddings == spec.embeddings {
+            continue;
         }
+        let error = format!(
+            "db_path '{}' is also used by profile '{}' with different embeddings — one DB file needs one embedding model",
+            spec.db_path.path().display(),
+            earlier.name
+        );
+        let sink = match profile.origin {
+            Origin::Global => &mut *global,
+            Origin::Repo { .. } => &mut *repo,
+        };
+        sink.push(
+            vec![key("profiles"), key(&profile.name), key("vector_db")],
+            error,
+        );
     }
 }
 
