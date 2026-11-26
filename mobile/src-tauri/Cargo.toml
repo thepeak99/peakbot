@@ -2,7 +2,7 @@
 # workspace: one Cargo.lock, `--locked` everywhere.
 [package]
 name = "peakbot-mobile"
-version = "0.29.0"
+version = "0.30.0"
 edition = "2024"
 publish = false
 
