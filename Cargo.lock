@@ -5235,7 +5235,7 @@ dependencies = [
 
 [[package]]
 name = "peakbot"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5331,7 +5331,7 @@ dependencies = [
 
 [[package]]
 name = "peakbot-mobile"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "android-native-keyring-store",
  "anyhow",
