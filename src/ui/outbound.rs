@@ -43,14 +43,17 @@ pub(crate) struct Disconnected;
 #[derive(Clone)]
 pub(crate) struct OutboundTx {
     ctrl: mpsc::Sender<OutboundMessage>,
-    state: watch::Sender<Option<Arc<AppState>>>,
+    /// `(snapshot, messages_from)` — `Some(n)` is a delta frame whose message
+    /// array is the authoritative suffix from `n`. The slot replaces
+    /// wholesale; both variants are absolute, so the newest always wins.
+    state: watch::Sender<Option<(Arc<AppState>, Option<usize>)>>,
 }
 
 /// Consumer handle. Moved into the writer task; deliberately **not** `Clone` —
 /// exactly one task may own the sink.
 pub(crate) struct OutboundRx {
     ctrl: mpsc::Receiver<OutboundMessage>,
-    state: watch::Receiver<Option<Arc<AppState>>>,
+    state: watch::Receiver<Option<(Arc<AppState>, Option<usize>)>>,
     ctrl_done: bool,
     state_done: bool,
 }
@@ -101,9 +104,29 @@ impl OutboundTx {
     /// written. Never blocks, never grows. `Err(Disconnected)` means the
     /// consumer dropped — producers stop and tear down.
     pub(crate) fn publish_state(&self, state: Arc<AppState>) -> Result<(), Disconnected> {
+        self.publish_state_at(state, None)
+    }
+
+    /// Publish a delta snapshot: `state.chat.messages` is only the
+    /// authoritative suffix from prefix length `messages_from`.
+    pub(crate) fn publish_state_delta(
+        &self,
+        state: Arc<AppState>,
+        messages_from: usize,
+    ) -> Result<(), Disconnected> {
+        self.publish_state_at(state, Some(messages_from))
+    }
+
+    fn publish_state_at(
+        &self,
+        state: Arc<AppState>,
+        messages_from: Option<usize>,
+    ) -> Result<(), Disconnected> {
         // `send` on a closed watch returns Err; the watch has no other
         // failure mode. The send here also wakes the receiver.
-        self.state.send(Some(state)).map_err(|_| Disconnected)
+        self.state
+            .send(Some((state, messages_from)))
+            .map_err(|_| Disconnected)
     }
 }
 
@@ -130,8 +153,8 @@ impl OutboundRx {
                         // borrow_and_update marks the version seen, then we
                         // clone the Arc. No await between them, so the body
                         // is atomic w.r.t. cancellation.
-                        if let Some(s) = self.state.borrow_and_update().clone() {
-                            return Some(OutboundMessage::State { state: s });
+                        if let Some((s, messages_from)) = self.state.borrow_and_update().clone() {
+                            return Some(OutboundMessage::State { state: s, messages_from });
                         }
                         // Slot holds None (the initial value before any
                         // publish). Loop and wait for a real change.

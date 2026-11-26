@@ -201,6 +201,12 @@ html.light .markdown-body a {
   padding: 0;
   font-size: 0.82rem;
 }
+.markdown-body .code-block {
+  margin: 0.5rem 0;
+}
+.markdown-body .code-block > pre {
+  margin: 0;
+}
 .markdown-body blockquote {
   border-left: 3px solid rgb(63 63 70);
   padding-left: 0.75rem;
@@ -226,7 +232,6 @@ html.light .markdown-body a {
   color: inherit;
 }
 .md-phone .code-block {
-  margin: 0.5rem 0;
   background: #0d1117;
   border: 1px solid #27272a;
   border-radius: 12px;
@@ -250,7 +255,6 @@ html.light .md-phone .code-block {
   color: inherit;
 }
 .md-phone .code-block pre {
-  margin: 0;
   background: transparent;
   border-radius: 0;
   padding: 10px 12px;

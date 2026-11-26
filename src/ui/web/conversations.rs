@@ -9,11 +9,12 @@ use crate::ui::wire::{ConversationSummaryWire, summaries_to_wire};
 use axum::{
     Router,
     body::Body,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use serde::Deserialize;
 use uuid::Uuid;
 
 pub(crate) fn router(state: WsState) -> Router {
@@ -23,9 +24,16 @@ pub(crate) fn router(state: WsState) -> Router {
         .with_state(state)
 }
 
-async fn list(State(state): State<WsState>) -> Response {
+/// `?limit=N` bounds the reply; absent keeps the legacy unlimited response.
+/// Axum's `Query` makes a malformed value a 400 and `limit=0` an empty list.
+#[derive(Deserialize)]
+struct ListQuery {
+    limit: Option<usize>,
+}
+
+async fn list(State(state): State<WsState>, Query(query): Query<ListQuery>) -> Response {
     match state.registry {
-        Some(registry) => items_response(&registry, None),
+        Some(registry) => items_response(&registry, None, query.limit),
         None => super::ws_setup_guard().await,
     }
 }
@@ -40,12 +48,16 @@ async fn kill(State(state): State<WsState>, Path(convo): Path<String>) -> Respon
     // Same outcome mapping as the `kill_session` WS frame: only a refused
     // running kill is an error; `NotLive` is a plain list.
     let refused = registry.kill(id) == KillOutcome::Running;
-    items_response(&registry, refused.then_some(KILL_RUNNING_MSG))
+    items_response(&registry, refused.then_some(KILL_RUNNING_MSG), None)
 }
 
 /// `{"items":[…]}` (+ `error`), built AFTER any kill so the rows reflect it.
-fn items_response(registry: &SessionRegistry, error: Option<&str>) -> Response {
-    let mut body = serde_json::json!({ "items": local_rows(registry) });
+fn items_response(
+    registry: &SessionRegistry,
+    error: Option<&str>,
+    limit: Option<usize>,
+) -> Response {
+    let mut body = serde_json::json!({ "items": local_rows(registry, limit) });
     if let Some(e) = error {
         body["error"] = e.into();
     }
@@ -59,9 +71,16 @@ fn items_response(registry: &SessionRegistry, error: Option<&str>) -> Response {
 
 /// This server's saved conversations, newest first, with the registry's
 /// live flags. Needs no session, so relay sockets can use it too.
-pub(crate) fn local_rows(registry: &SessionRegistry) -> Vec<ConversationSummaryWire> {
+pub(crate) fn local_rows(
+    registry: &SessionRegistry,
+    limit: Option<usize>,
+) -> Vec<ConversationSummaryWire> {
     let mut rows = registry.list_conversations();
     // Storage order is unspecified (the in-memory store is a HashMap).
     rows.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
+    // The bound applies to the sorted list, so a limit keeps the newest rows.
+    if let Some(limit) = limit {
+        rows.truncate(limit);
+    }
     summaries_to_wire(rows, &registry.active_ids(), &registry.running_ids())
 }

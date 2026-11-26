@@ -31,6 +31,7 @@ use std::fmt;
 /// owned — which is why `ProfileInfo.origin` is a `String`, not
 /// `&'static str` (a borrow would pin the derive to `'de: 'static`).
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
 pub struct AppState {
     /// Chat messages
     pub chat: ChatState,
@@ -49,6 +50,11 @@ pub struct AppState {
 
     /// Current conversation info
     pub conversation: Option<ConversationState>,
+
+    /// Durable lineage token of the current conversation (mirror of
+    /// `Conversation::history_epoch`). Delta cursors validate against it.
+    #[serde(default)]
+    pub history_epoch: u64,
 
     /// UI preferences
     pub preferences: UiPreferences,
@@ -229,13 +235,14 @@ impl Serialize for AppState {
         // stored copy can never drift from the pin. `run_started_at` stays
         // off the wire (`Instant` is not `Serialize`). Keep this list in
         // sync with the struct above.
-        let mut ser = serializer.serialize_struct("AppState", 27)?;
+        let mut ser = serializer.serialize_struct("AppState", 28)?;
         ser.serialize_field("chat", &self.chat)?;
         ser.serialize_field("todo", &self.todo)?;
         ser.serialize_field("input", &self.input)?;
         ser.serialize_field("stats", &self.stats)?;
         ser.serialize_field("context", &self.context)?;
         ser.serialize_field("conversation", &self.conversation)?;
+        ser.serialize_field("history_epoch", &self.history_epoch)?;
         ser.serialize_field("preferences", &self.preferences)?;
         ser.serialize_field("is_running", &self.is_running)?;
         ser.serialize_field("command_running", &self.command_running)?;
@@ -1125,6 +1132,91 @@ impl<'de> serde::Deserialize<'de> for MessageSource {
             Shape::Tagged(Tagged::SubAgent { role }) => Ok(MessageSource::SubAgent { role }),
         }
     }
+}
+
+/// Project a persisted conversation onto the UI `ChatMessage` rows.
+///
+/// Load and the delta slice helper both need this exact projection: cursors
+/// carry the *wire* timestamp, so validating against the persisted UTC
+/// timestamp instead would byte-mismatch on every non-UTC server.
+pub(crate) fn chat_messages_from_conversation(
+    conv: &crate::conversation::Conversation,
+) -> Vec<ChatMessage> {
+    use crate::conversation::Message as ConvMsg;
+
+    conv.messages
+        .iter()
+        .map(|msg| match msg {
+            ConvMsg::User {
+                content,
+                attachments,
+                compacted,
+                source,
+                timestamp,
+            } => {
+                let mut m = ChatMessage::user(content.clone());
+                m.attachments = attachments.clone();
+                m.compacted = *compacted;
+                m.source = source.clone();
+                m.timestamp = timestamp.with_timezone(&chrono::Local);
+                m
+            }
+            ConvMsg::Assistant {
+                content,
+                compacted,
+                source,
+                thinking,
+                timestamp,
+                response_id,
+            } => {
+                let mut m = ChatMessage::agent(content.clone());
+                m.compacted = *compacted;
+                m.source = source.clone();
+                m.thinking = thinking.clone();
+                m.timestamp = timestamp.with_timezone(&chrono::Local);
+                m.response_id = *response_id;
+                m
+            }
+            ConvMsg::ToolCall {
+                tool_name,
+                arguments,
+                call_id,
+                compacted,
+                source,
+                thinking,
+                timestamp,
+                response_id,
+            } => {
+                let mut m = ChatMessage::tool_call(tool_name, arguments, call_id.clone());
+                m.compacted = *compacted;
+                m.source = source.clone();
+                m.thinking = thinking.clone();
+                m.timestamp = timestamp.with_timezone(&chrono::Local);
+                m.response_id = *response_id;
+                m
+            }
+            ConvMsg::ToolResult {
+                tool_name,
+                arguments,
+                result,
+                call_id,
+                compacted,
+                source,
+                timestamp,
+            } => {
+                let mut m = ChatMessage::tool_result(tool_name, arguments, result, call_id.clone());
+                m.compacted = *compacted;
+                m.source = source.clone();
+                m.timestamp = timestamp.with_timezone(&chrono::Local);
+                m
+            }
+            ConvMsg::Summary { content, timestamp } => {
+                let mut m = ChatMessage::summary(content.clone());
+                m.timestamp = timestamp.with_timezone(&chrono::Local);
+                m
+            }
+        })
+        .collect()
 }
 
 impl MessageSource {

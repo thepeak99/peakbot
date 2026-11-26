@@ -261,7 +261,9 @@ fn dispatch_stdin_line(
         }
         // Sticky-session frames are web-only (no registry over stdio) —
         // accept and ignore so the shared enum stays exhaustive.
-        Ok(InboundMessage::Attach { .. }) | Ok(InboundMessage::KillSession { .. }) => true,
+        Ok(InboundMessage::Attach { .. })
+        | Ok(InboundMessage::KillSession { .. })
+        | Ok(InboundMessage::SyncAnchor { .. }) => true,
         Ok(InboundMessage::Shutdown) => {
             // `/exit` sets `exit_requested`, which unwinds the state loop
             // and lets `main` tear down cleanly.
@@ -338,6 +340,7 @@ mod tests {
         let sm = StateManager::new_arc();
         let value = serde_json::to_value(&super::OutboundMessage::State {
             state: std::sync::Arc::new(sm.get_state()),
+            messages_from: None,
         })
         .expect("serialises");
         assert_eq!(
@@ -349,6 +352,7 @@ mod tests {
         sm.request_stop(); // first press: graceful
         let value = serde_json::to_value(&super::OutboundMessage::State {
             state: std::sync::Arc::new(sm.get_state()),
+            messages_from: None,
         })
         .expect("serialises");
         assert_eq!(

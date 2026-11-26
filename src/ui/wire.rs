@@ -42,12 +42,25 @@
 use crate::StateManager;
 use crate::config::ModelRegistry;
 use crate::ui::app_state::AppState;
+use crate::ui::delta::AttachCursor;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
 /// Wire protocol version, sent in `ready`. Bump it on any incompatible wire change.
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Lenient cursor decoder: a malformed `since` must never fail the frame that
+/// carries it. `None` means "no usable cursor" (fall back to a full send).
+fn deserialize_cursor<'de, D>(deserializer: D) -> Result<Option<AttachCursor>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value
+        .as_ref()
+        .and_then(crate::ui::delta::parse_cursor_value))
+}
 
 /// Inbound message types from the client.
 #[derive(Debug, Deserialize)]
@@ -67,6 +80,10 @@ pub(crate) enum InboundMessage {
         /// Set only by a relay; forbids chaining remote profiles.
         #[serde(default)]
         relayed: bool,
+        /// Cached-prefix cursor. Absent/malformed ⇒ the server sends full
+        /// frames; a malformed value never fails the attach.
+        #[serde(default, deserialize_with = "deserialize_cursor")]
+        since: Option<AttachCursor>,
     },
     /// `text` may be a slash command (`/new`, `/load <id>`, …) — peakbot
     /// classifies it internally.
@@ -128,6 +145,14 @@ pub(crate) enum InboundMessage {
         profile: Option<String>,
     },
     Shutdown,
+    /// Move this socket's delta base (the client's periodic rebase). `rebase`
+    /// is accepted as an alias. Validation matches `attach`; a malformed or
+    /// invalid cursor falls back to full frames for the rest of the socket.
+    #[serde(alias = "rebase")]
+    SyncAnchor {
+        #[serde(default, deserialize_with = "deserialize_cursor")]
+        since: Option<AttachCursor>,
+    },
 }
 
 /// One `models_available` entry — the subset of `ResolvedModel` a model
@@ -257,16 +282,25 @@ pub(crate) struct ConversationSummaryWire {
     /// profile-less conversations ⇒ `None`.
     #[serde(default)]
     pub(crate) profile: Option<String>,
+    /// The stable origin of this row: `None` for local, the remote URL for
+    /// direct connections, `cloud://<DeviceId>` for cloud connections. Used
+    /// by the SPA's shared conversation cache for per-origin snapshotting
+    /// and retention. Omitted when `None` (old server / local).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) machine: Option<String>,
 }
 
 /// One remote server's reachability in a `conversations_list` (mobile
-/// redesign). `id` is the origin `ProfileInfo.machine` carries; `online` =
-/// its list answered within `LIST_TIMEOUT` (a dial error, a 401, a bad
-/// answer or the timeout all mean offline).
+/// redesign). `id` is the display identifier: origin URL for direct remotes,
+/// device slug for cloud peers. `stable_id` (optional) is the cache key
+/// that never changes — the origin URL for direct, `cloud://<DeviceId>` for
+/// cloud — used by the SPA's shared conversation cache for retention.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct MachineStatusWire {
     pub(crate) id: String,
     pub(crate) online: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) stable_id: Option<String>,
 }
 
 /// Outbound message envelopes to the client. Owning (no lifetime) so any
@@ -296,7 +330,17 @@ pub(crate) enum OutboundMessage {
     /// Behind an `Arc` so the coalescing slot and the writer can pass the
     /// snapshot around without deep-copying ~8 MiB; serialises identically
     /// to the previous `Box` (no frontend change).
-    State { state: Arc<AppState> },
+    ///
+    /// `messages_from: Some(n)` marks a delta frame: `state.chat.messages`
+    /// holds only the authoritative suffix starting at index `n`. `n` is the
+    /// length of the prefix the client must already have; every such frame is
+    /// absolute against its socket anchor, so coalescing is safe. Omitted on
+    /// full frames (old clients and non-delta sockets see the old shape).
+    State {
+        state: Arc<AppState>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        messages_from: Option<usize>,
+    },
     /// Reply to `request_conversations` and `kill_session`; empty when no
     /// storage is configured. `error` is set iff a kill was refused.
     /// `machines` lists the remote servers (this device is implicit) —
@@ -378,6 +422,7 @@ pub(crate) fn summaries_to_wire(
             message_count: s.message_count,
             model: s.model,
             profile: s.profile.clone(),
+            machine: None,
         })
         .collect()
 }
@@ -632,6 +677,7 @@ mod tests {
             // issue #373: the background-tab spinner flag (additive).
             running: false,
             profile: None,
+            machine: None,
         };
         let json = serde_json::to_string(&wire).unwrap();
         assert!(json.contains(r#""active":true"#), "json = {json}");
@@ -656,6 +702,7 @@ mod tests {
             active: true,
             running: true,
             profile: None,
+            machine: None,
         };
         let json = serde_json::to_string(&wire).unwrap();
         assert!(json.contains(r#""running":true"#), "json = {json}");
@@ -777,10 +824,12 @@ mod tests {
                 MachineStatusWire {
                     id: "https://10.0.0.5:7823".to_string(),
                     online: false,
+                    stable_id: None,
                 },
                 MachineStatusWire {
                     id: "https://home-server.local:7823".to_string(),
                     online: true,
+                    stable_id: None,
                 },
             ],
             error: None,
@@ -844,6 +893,7 @@ mod tests {
             &vec![MachineStatusWire {
                 id: "https://h:7823".to_string(),
                 online: true,
+                stable_id: None,
             }]
         );
         assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
@@ -861,6 +911,7 @@ mod tests {
         // fields. Drift here means the frontend breaks.
         let m = OutboundMessage::State {
             state: Arc::new(AppState::new()),
+            messages_from: None,
         };
         let json = serde_json::to_string(&m).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1240,6 +1291,7 @@ mod tests {
             active: false,
             running: false,
             profile: profile.map(str::to_string),
+            machine: None,
         }
     }
 
@@ -1393,6 +1445,7 @@ mod tests {
                 profile,
                 agent,
                 relayed,
+                ..
             } => {
                 assert!(convo.is_none(), "a fresh attach carries convo:null");
                 assert_eq!(profile.as_deref(), Some("home-dev"));
@@ -1500,5 +1553,570 @@ mod tests {
             OutboundMessage::Ready { v } => assert_eq!(v, 7, "v must round-trip"),
             other => panic!("expected Ready, got {other:?}"),
         }
+    }
+
+    // ─── delta sync: cursor parsing, suffix frames, rebase (Stage 3) ────────
+    //
+    // Written against the interface the revised cache/delta design specifies,
+    // not an existing implementation. Compile-RED until `src/ui/delta.rs`
+    // lands and `Attach { since }`, `SyncAnchor`, and `State { messages_from }`
+    // are added to the wire variants.
+
+    use crate::state::state_manager::StateManager;
+    use crate::ui::delta::{
+        AttachCursor, REBASE_EVERY, should_rebase, slice_from_conversation,
+        validate_cursor_for_conversation,
+    };
+    // `Conversation`, `Arc`, and `AppState` are already in scope via `super::*`
+    // / the module-level `use crate::conversation::Conversation;` above.
+
+    fn test_conv_with_messages(count: usize) -> Conversation {
+        let mut conv = Conversation::new(
+            "test".to_string(),
+            "openrouter".to_string(),
+            "anthropic/claude-3.7-sonnet".to_string(),
+            "/tmp".to_string(),
+        );
+        for i in 0..count {
+            conv.add_user_message(format!("msg {i}"));
+        }
+        conv
+    }
+
+    fn raw_ts_for_conversation(conv: &Conversation, index: usize) -> String {
+        let messages = crate::ui::app_state::chat_messages_from_conversation(conv);
+        let json = serde_json::to_value(&messages[index]).expect("serde chat message");
+        json["timestamp"]
+            .as_str()
+            .expect("timestamp is a string in JSON")
+            .to_string()
+    }
+
+    #[test]
+    fn attach_parses_valid_since_cursor() {
+        let json = r#"{"type":"attach","convo":"c","since":{"n":2,"timestamp":"2026-01-01T00:00:00Z","epoch":7}}"#;
+        let m: InboundMessage = serde_json::from_str(json).expect("parses valid cursor");
+        match m {
+            InboundMessage::Attach { since, .. } => {
+                let c = since.expect("since present for valid cursor");
+                assert_eq!(c.n, 2);
+                assert_eq!(c.timestamp, "2026-01-01T00:00:00Z");
+                assert_eq!(c.epoch, 7);
+            }
+            other => panic!("expected Attach, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_without_since_field_is_none() {
+        let m: InboundMessage =
+            serde_json::from_str(r#"{"type":"attach","convo":"c"}"#).expect("parses");
+        match m {
+            InboundMessage::Attach { since, .. } => assert!(since.is_none()),
+            other => panic!("expected Attach, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_with_null_since_is_none() {
+        let m: InboundMessage =
+            serde_json::from_str(r#"{"type":"attach","convo":"c","since":null}"#).expect("parses");
+        match m {
+            InboundMessage::Attach { since, .. } => assert!(since.is_none()),
+            other => panic!("expected Attach, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_since_does_not_fail_the_attach_frame() {
+        let cases = [
+            r#"{"type":"attach","convo":"c","since":{"n":0}}"#,
+            r#"{"type":"attach","convo":"c","since":{"n":"nope","timestamp":"x","epoch":1}}"#,
+            r#"{"type":"attach","convo":"c","since":{"n":1.5,"timestamp":"x","epoch":1}}"#,
+            r#"{"type":"attach","convo":"c","since":{"timestamp":"x","epoch":1}}"#, // bare timestamp
+            r#"{"type":"attach","convo":"c","since":"string"}"#,
+            r#"{"type":"attach","convo":"c","since":{"n":1,"timestamp":"x","epoch":"oops"}}"#,
+            r#"{"type":"attach","convo":"c","since":{"n":-1,"timestamp":"x","epoch":1}}"#,
+            // Beyond 2^53-1 a JS client cannot round-trip the epoch exactly.
+            r#"{"type":"attach","convo":"c","since":{"n":1,"timestamp":"x","epoch":9007199254740992}}"#,
+        ];
+        for json in cases {
+            let m: InboundMessage = serde_json::from_str(json).unwrap_or_else(|e| {
+                panic!("malformed cursor must not fail the attach frame: {e} ({json})")
+            });
+            match m {
+                InboundMessage::Attach { since, .. } => {
+                    assert!(
+                        since.is_none(),
+                        "malformed cursor {json} should yield since=None"
+                    );
+                }
+                other => panic!("expected Attach, got {other:?} ({json})"),
+            }
+        }
+    }
+
+    #[test]
+    fn sync_anchor_parses_with_valid_cursor() {
+        let m: InboundMessage = serde_json::from_str(
+            r#"{"type":"sync_anchor","since":{"n":12,"timestamp":"t","epoch":7}}"#,
+        )
+        .expect("parses");
+        match m {
+            InboundMessage::SyncAnchor { since: Some(c) } => {
+                assert_eq!(c.n, 12);
+                assert_eq!(c.epoch, 7);
+            }
+            other => panic!("expected SyncAnchor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rebase_alias_parses_as_sync_anchor() {
+        let m: InboundMessage =
+            serde_json::from_str(r#"{"type":"rebase","since":{"n":12,"timestamp":"t","epoch":7}}"#)
+                .expect("parses");
+        match m {
+            InboundMessage::SyncAnchor { since: Some(c) } => {
+                assert_eq!(c.n, 12);
+            }
+            other => panic!("expected SyncAnchor for rebase alias, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_sync_anchor_is_lenient_and_does_not_fail_parse() {
+        let cases = [
+            r#"{"type":"sync_anchor"}"#,
+            r#"{"type":"rebase"}"#,
+            r#"{"type":"sync_anchor","since":{"n":0}}"#,
+            r#"{"type":"rebase","since":"not-an-object"}"#,
+        ];
+        for json in cases {
+            let m: InboundMessage = serde_json::from_str(json)
+                .unwrap_or_else(|e| panic!("malformed rebase must not fail parse: {e} ({json})"));
+            match m {
+                InboundMessage::SyncAnchor { since: None } => {} // lenient
+                other => panic!("expected lenient SyncAnchor, got {other:?} ({json})"),
+            }
+        }
+    }
+
+    #[test]
+    fn suffix_state_frame_carries_messages_from() {
+        let state = Arc::new(AppState::new());
+        let m = OutboundMessage::State {
+            state,
+            messages_from: Some(3),
+        };
+        let v = serde_json::to_value(&m).expect("serializes");
+        assert_eq!(v["messages_from"], 3);
+        assert_eq!(v["type"], "state");
+    }
+
+    #[test]
+    fn full_state_frame_omits_messages_from() {
+        let state = Arc::new(AppState::new());
+        let m = OutboundMessage::State {
+            state,
+            messages_from: None,
+        };
+        let json = serde_json::to_string(&m).expect("serializes");
+        assert!(
+            !json.contains("messages_from"),
+            "full frame must not carry messages_from: {json}"
+        );
+    }
+
+    #[test]
+    fn state_frame_without_messages_from_field_deserializes_as_none() {
+        let m: OutboundMessage =
+            serde_json::from_str(r#"{"type":"state","state":{}}"#).expect("parses");
+        match m {
+            OutboundMessage::State { messages_from, .. } => {
+                assert!(
+                    messages_from.is_none(),
+                    "missing field must deserialize as None"
+                );
+            }
+            other => panic!("expected State, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delta_stage_does_not_bump_protocol_version() {
+        assert_eq!(
+            PROTOCOL_VERSION, 1,
+            "Stage 3 must not bump PROTOCOL_VERSION"
+        );
+    }
+
+    // ─── cursor validation against authoritative messages ────────────────────
+
+    #[test]
+    fn validate_accepts_exact_prefix_end() {
+        let conv = test_conv_with_messages(3);
+        let raw = raw_ts_for_conversation(&conv, 2);
+        let cursor = AttachCursor {
+            n: 3,
+            timestamp: raw,
+            epoch: conv.history_epoch,
+        };
+        assert!(
+            validate_cursor_for_conversation(&cursor, &conv).is_some(),
+            "valid cursor must be accepted"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_n_zero() {
+        let conv = test_conv_with_messages(3);
+        let raw = raw_ts_for_conversation(&conv, 0);
+        let cursor = AttachCursor {
+            n: 0,
+            timestamp: raw,
+            epoch: conv.history_epoch,
+        };
+        assert!(validate_cursor_for_conversation(&cursor, &conv).is_none());
+    }
+
+    #[test]
+    fn validate_rejects_n_greater_than_len() {
+        let conv = test_conv_with_messages(3);
+        let raw = raw_ts_for_conversation(&conv, 2);
+        let cursor = AttachCursor {
+            n: 4,
+            timestamp: raw,
+            epoch: conv.history_epoch,
+        };
+        assert!(validate_cursor_for_conversation(&cursor, &conv).is_none());
+    }
+
+    #[test]
+    fn validate_rejects_epoch_mismatch() {
+        let conv = test_conv_with_messages(3);
+        let raw = raw_ts_for_conversation(&conv, 2);
+        let cursor = AttachCursor {
+            n: 3,
+            timestamp: raw,
+            epoch: conv.history_epoch + 1,
+        };
+        assert!(validate_cursor_for_conversation(&cursor, &conv).is_none());
+    }
+
+    #[test]
+    fn validate_rejects_timestamp_mismatch_byte_exact() {
+        let conv = test_conv_with_messages(3);
+        let raw = raw_ts_for_conversation(&conv, 2);
+        let wrong = format!("{raw}0"); // alter one character
+        let cursor = AttachCursor {
+            n: 3,
+            timestamp: wrong,
+            epoch: conv.history_epoch,
+        };
+        assert!(validate_cursor_for_conversation(&cursor, &conv).is_none());
+    }
+
+    #[test]
+    fn same_timestamp_two_messages_disambiguated_by_n() {
+        let conv = test_conv_with_messages(2);
+        // Force both messages to share the same raw timestamp via JSON.
+        let ts = raw_ts_for_conversation(&conv, 0);
+        let json = serde_json::to_value(&conv).unwrap();
+        let mut obj = json.as_object().expect("obj").clone();
+        obj["messages"][1]["timestamp"] = serde_json::Value::String(ts.clone());
+        let same_ts_json = serde_json::to_string(&obj).unwrap();
+        let same_conv: Conversation = serde_json::from_str(&same_ts_json).unwrap();
+
+        let c1 = AttachCursor {
+            n: 1,
+            timestamp: ts.clone(),
+            epoch: same_conv.history_epoch,
+        };
+        let c2 = AttachCursor {
+            n: 2,
+            timestamp: ts.clone(),
+            epoch: same_conv.history_epoch,
+        };
+        assert!(
+            validate_cursor_for_conversation(&c1, &same_conv).is_some(),
+            "n=1 must be valid"
+        );
+        assert!(
+            validate_cursor_for_conversation(&c2, &same_conv).is_some(),
+            "n=2 must be valid"
+        );
+
+        let c0 = AttachCursor { n: 0, ..c1.clone() };
+        let c3 = AttachCursor { n: 3, ..c1 };
+        assert!(
+            validate_cursor_for_conversation(&c0, &same_conv).is_none(),
+            "n=0 invalid"
+        );
+        assert!(
+            validate_cursor_for_conversation(&c3, &same_conv).is_none(),
+            "n=3 invalid"
+        );
+    }
+
+    #[test]
+    fn slice_from_returns_authoritative_tail() {
+        let conv = test_conv_with_messages(4);
+        let suffix = slice_from_conversation(&conv, 2);
+        assert_eq!(suffix.len(), 2);
+        assert_eq!(suffix[0].content, "msg 2");
+        assert_eq!(suffix[1].content, "msg 3");
+    }
+
+    #[test]
+    fn slice_at_end_yields_empty_tail() {
+        let conv = test_conv_with_messages(3);
+        let suffix = slice_from_conversation(&conv, 3);
+        assert!(suffix.is_empty());
+    }
+
+    #[test]
+    fn slice_at_beyond_len_yields_empty() {
+        let conv = test_conv_with_messages(3);
+        let suffix = slice_from_conversation(&conv, 5);
+        assert!(suffix.is_empty());
+    }
+
+    // ─── rebase cadence ──────────────────────────────────────────────────────
+
+    #[test]
+    fn rebase_every_constant_is_10() {
+        assert_eq!(REBASE_EVERY, 10);
+    }
+
+    #[test]
+    fn should_rebase_fires_at_multiples_of_every() {
+        assert!(!should_rebase(9, 10));
+        assert!(should_rebase(10, 10));
+        assert!(!should_rebase(11, 10));
+        assert!(should_rebase(20, 10));
+        assert!(!should_rebase(0, 10));
+    }
+
+    #[test]
+    fn should_rebase_is_injectable_for_tests() {
+        assert!(!should_rebase(2, 3));
+        assert!(should_rebase(3, 3));
+        assert!(!should_rebase(4, 3));
+    }
+
+    // ─── durable lineage (history_epoch) ─────────────────────────────────────
+
+    #[test]
+    fn new_conversation_gets_fresh_nonzero_epoch() {
+        let c = Conversation::new("a".into(), "p".into(), "m".into(), "/tmp".into());
+        assert_ne!(
+            c.history_epoch, 0,
+            "fresh conversation must have a non-zero epoch"
+        );
+    }
+
+    #[test]
+    fn new_conversation_epoch_survives_json_number_precision() {
+        let c = Conversation::new("a".into(), "p".into(), "m".into(), "/tmp".into());
+        assert!(
+            c.history_epoch < (1u64 << 53),
+            "the epoch crosses the wire as a JS number; a full u64 would be rounded"
+        );
+    }
+
+    #[test]
+    fn two_new_conversations_have_different_epochs() {
+        let a = Conversation::new("a".into(), "p".into(), "m".into(), "/tmp".into());
+        let b = Conversation::new("b".into(), "p".into(), "m".into(), "/tmp".into());
+        assert_ne!(
+            a.history_epoch, b.history_epoch,
+            "distinct conversations must have distinct epochs"
+        );
+    }
+
+    #[test]
+    fn legacy_conversation_without_history_epoch_loads_as_zero() {
+        let c = Conversation::new("x".into(), "p".into(), "m".into(), "/tmp".into());
+        // Serialize, remove the epoch field, and deserialize
+        let mut v = serde_json::to_value(&c).expect("serialize");
+        v.as_object_mut().expect("obj").remove("history_epoch");
+        let back: Conversation = serde_json::from_value(v).expect("deserializes legacy JSON");
+        assert_eq!(
+            back.history_epoch, 0,
+            "legacy conversation without the field must load as epoch 0"
+        );
+    }
+
+    #[test]
+    fn save_and_load_preserves_history_epoch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::storage::FileStorage::new(tmp.path().join("storage")).unwrap();
+        let mut c = Conversation::new("e".into(), "p".into(), "m".into(), "/tmp".into());
+        c.add_user_message("hi".into());
+        let epoch = c.history_epoch;
+        store.save(&c).expect("save");
+        let loaded = store.load(c.id).expect("load");
+        assert_eq!(
+            loaded.history_epoch, epoch,
+            "save/load must preserve history_epoch"
+        );
+    }
+
+    #[test]
+    fn cold_restart_permits_delta_attach() {
+        // Save a conversation, drop the session, "cold restart" (new FileStorage),
+        // load the same conversation, and prove a cursor built pre-restart is
+        // still valid against the loaded copy.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::storage::FileStorage::new(tmp.path().join("storage")).unwrap();
+        let mut c = Conversation::new("cold".into(), "p".into(), "m".into(), "/tmp".into());
+        c.add_user_message("first".into());
+        c.add_user_message("second".into());
+        c.add_user_message("third".into());
+        let pre_restart_epoch = c.history_epoch;
+        let pre_restart_raw = raw_ts_for_conversation(&c, 2);
+        let convo_id = c.id;
+        store.save(&c).expect("save");
+
+        // "Cold restart" — drop the original store and conversation
+        drop(c);
+        drop(store);
+
+        let store2 = crate::storage::FileStorage::new(tmp.path().join("storage")).unwrap();
+        let loaded = store2.load(convo_id).expect("load after restart");
+        assert_eq!(
+            loaded.history_epoch, pre_restart_epoch,
+            "epoch must survive cold restart"
+        );
+
+        let post_restart_raw = raw_ts_for_conversation(&loaded, 2);
+        assert_eq!(
+            post_restart_raw, pre_restart_raw,
+            "raw timestamp must survive cold restart"
+        );
+
+        let cursor = AttachCursor {
+            n: 3,
+            timestamp: pre_restart_raw,
+            epoch: pre_restart_epoch,
+        };
+        assert!(
+            validate_cursor_for_conversation(&cursor, &loaded).is_some(),
+            "a cursor built before restart must validate against the loaded conversation"
+        );
+    }
+
+    #[test]
+    fn app_state_exposes_current_epoch() {
+        let sm = StateManager::new_arc();
+        sm.create_conversation("title".into(), "p".into(), "m".into(), "/tmp".into());
+        let state = sm.get_state();
+        assert_ne!(
+            state.history_epoch, 0,
+            "AppState must expose the current conversation's epoch"
+        );
+    }
+
+    #[test]
+    fn append_does_not_change_history_epoch() {
+        let sm = StateManager::new_arc();
+        sm.create_conversation("title".into(), "p".into(), "m".into(), "/tmp".into());
+        let epoch_before = sm.get_current_conversation().unwrap().history_epoch;
+        sm.add_user_message("hello".into());
+        sm.add_assistant_message("hi there".into());
+        let epoch_after = sm.get_current_conversation().unwrap().history_epoch;
+        assert_eq!(
+            epoch_before, epoch_after,
+            "normal append must not change history_epoch"
+        );
+    }
+
+    #[test]
+    fn set_running_does_not_change_history_epoch() {
+        let sm = StateManager::new_arc();
+        sm.create_conversation("title".into(), "p".into(), "m".into(), "/tmp".into());
+        let epoch_before = sm.get_current_conversation().unwrap().history_epoch;
+        sm.set_running(true);
+        sm.set_running(false);
+        let epoch_after = sm.get_current_conversation().unwrap().history_epoch;
+        assert_eq!(
+            epoch_before, epoch_after,
+            "set_running must not change history_epoch"
+        );
+    }
+
+    #[test]
+    fn set_status_does_not_change_history_epoch() {
+        let sm = StateManager::new_arc();
+        sm.create_conversation("title".into(), "p".into(), "m".into(), "/tmp".into());
+        let epoch_before = sm.get_current_conversation().unwrap().history_epoch;
+        sm.set_status(Some("working".to_string()));
+        sm.set_status(None);
+        let epoch_after = sm.get_current_conversation().unwrap().history_epoch;
+        assert_eq!(
+            epoch_before, epoch_after,
+            "set_status must not change history_epoch"
+        );
+    }
+
+    #[test]
+    fn rename_does_not_change_history_epoch() {
+        let mut c = Conversation::new("title".into(), "p".into(), "m".into(), "/tmp".into());
+        let epoch_before = c.history_epoch;
+        c.rename("new title".into());
+        assert_eq!(
+            c.history_epoch, epoch_before,
+            "rename must not change history_epoch"
+        );
+    }
+
+    #[test]
+    fn set_title_does_not_change_history_epoch() {
+        let mut c = Conversation::new("title".into(), "p".into(), "m".into(), "/tmp".into());
+        let epoch_before = c.history_epoch;
+        c.set_provisional_title("prov".into());
+        c.set_definitive_title("final".into());
+        assert_eq!(
+            c.history_epoch, epoch_before,
+            "title updates must not change history_epoch"
+        );
+    }
+
+    #[test]
+    fn clear_chat_changes_history_epoch() {
+        let sm = StateManager::new_arc();
+        sm.create_conversation("title".into(), "p".into(), "m".into(), "/tmp".into());
+        sm.add_user_message("a".into());
+        let epoch_before = sm.get_current_conversation().unwrap().history_epoch;
+        sm.clear_chat();
+        let epoch_after = sm.get_current_conversation().unwrap().history_epoch;
+        assert_ne!(
+            epoch_before, epoch_after,
+            "clear_chat must change history_epoch"
+        );
+    }
+
+    #[test]
+    fn load_conversation_updates_app_state_epoch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::storage::FileStorage::new(tmp.path().join("storage")).unwrap();
+        let c = Conversation::new("load-test".into(), "p".into(), "m".into(), "/tmp".into());
+        store.save(&c).expect("save");
+        let storage: std::sync::Arc<dyn crate::storage::ConversationStorage> =
+            std::sync::Arc::new(store);
+        let sm = StateManager::new_arc_with_storage(storage);
+        sm.create_conversation("other".into(), "p".into(), "m".into(), "/tmp".into());
+        let other_epoch = sm.get_current_conversation().unwrap().history_epoch;
+        sm.load_conversation(c.id).expect("load");
+        let state = sm.get_state();
+        assert_eq!(
+            state.history_epoch, c.history_epoch,
+            "AppState must expose loaded conversation's epoch"
+        );
+        assert_ne!(
+            state.history_epoch, other_epoch,
+            "epoch must change after loading a different conversation"
+        );
     }
 }

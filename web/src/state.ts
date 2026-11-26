@@ -178,7 +178,11 @@ export interface AppState {
   todo: WireTodo;
   stats: WireStats;
   context: WireContext;
+  /** Current conversation info */
   conversation: WireConversationMeta | null;
+  /** Durable lineage token of the current conversation; absent on old
+   * servers/snapshots (no delta cursor can be formed). */
+  history_epoch?: number;
   is_running: boolean;
   /** A slash command (the Command arm, and the SwitchModel/ChangeCwd/Select
    * arms that also set_running) is executing — WITHOUT a user turn in
@@ -283,6 +287,9 @@ export interface WireProfileInfo {
 export interface WireMachineStatus {
   id: string;
   online: boolean;
+  /** Stable cache key: origin URL for direct, `cloud://<DeviceId>` for
+   * cloud. `id` is display-only (origin or device slug). */
+  stable_id?: string;
 }
 
 /** The (profile, agent) a conversation is bound to (src/config/resolve.rs
@@ -296,6 +303,16 @@ export interface WireSelection {
 }
 
 // ── Protocol envelopes (src/ui/wire.rs) ───────────────────────────────
+
+/** Prefix cursor for delta sync (src/ui/wire.rs `AttachCursor`). */
+export interface Anchor {
+  /** Prefix length (>= 1). */
+  n: number;
+  /** Exact raw wire timestamp of message `n - 1` (never Date.parse'd). */
+  timestamp: string;
+  /** Durable conversation lineage token. */
+  epoch: number;
+}
 
 export interface ModelInfo {
   alias: string;
@@ -316,6 +333,10 @@ export interface ConversationSummary {
   /** The config profile this conversation is bound to (design T1, §6.1).
    * `null`/absent = a legacy profile-less conversation. */
   profile?: string | null;
+  /** The stable origin of this row: `null` for local, the remote URL for
+   * direct connections, `cloud://<DeviceId>` for cloud. Used by the shared
+   * conversation cache for per-origin snapshotting and retention. */
+  machine?: string | null;
 }
 
 // One entry in a `dir_listing` reply (src/ui/wire.rs DirEntryWire).
@@ -348,7 +369,13 @@ export type OutboundMessage =
   | { type: "ready"; v?: number }
   | { type: "attached"; convo: string }
   | { type: "models_available"; active: string; models: ModelInfo[] }
-  | { type: "state"; state: AppState }
+  | {
+      type: "state";
+      state: AppState;
+      /** Suffix frame: `state.chat.messages` holds only rows from this
+       * prefix length. Absent = full frame (old server / no anchor). */
+      messages_from?: number;
+    }
   | {
       type: "conversations_list";
       items: ConversationSummary[];
@@ -376,9 +403,12 @@ export type InboundMessage =
       convo: string | null;
       profile?: string;
       agent?: string;
+      /** Cached-prefix cursor; absent/malformed = full attach. */
+      since?: Anchor;
       /** Set only by a server-side relay; the SPA never sends it. */
       relayed?: boolean;
     }
+  | { type: "sync_anchor"; since: Anchor }
   | { type: "send_message"; text: string; attachments?: string[] }
   | { type: "stop" }
   /** Request the running (pausable) sub-agent pause at its next checkpoint.

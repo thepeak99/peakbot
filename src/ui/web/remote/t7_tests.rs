@@ -183,6 +183,44 @@ async fn merged_list_is_ordered_newest_first_across_local_and_remote_rows() {
     );
 }
 
+// Shared-cache stage 1: the merged listing caps each origin defensively at 100
+// rows. An OLD remote that ignores ?limit=100 (this fake matches path only and
+// always returns what it was given) must not blow up the local list: the client
+// keeps at most 100 rows per origin and the newest survive.
+#[tokio::test]
+async fn merged_list_caps_each_origin_at_100_rows_defensively() {
+    let a = FakeRemote::start(T_REMOTE).await;
+    let env = LocalEnv::start(&[(L, &a.url, T_REMOTE, "dev")], None).await;
+
+    // 105 rows on the remote, distinct RFC3339 timestamps (ascending), so an
+    // order-sensitive cap keeps the newest 100.
+    let rows: Vec<Value> = (1..=105)
+        .map(|n| {
+            let stamp = format!("2026-01-01T00:{:02}:{:02}Z", n / 60, n % 60);
+            row(&uid(n), &format!("remote {n}"), &stamp, Some("dev"))
+        })
+        .collect();
+    a.set_rows(rows);
+
+    let mut ws = connect_local(&env).await;
+    let list = request_list(&mut ws).await;
+
+    let remote_rows = list["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter(|r| r["profile"] == L)
+        .count();
+    assert_eq!(
+        remote_rows, 100,
+        "at most 100 rows per origin are kept, got {remote_rows}: {list}"
+    );
+    assert!(
+        list.get("error").is_none(),
+        "the cap never surfaces as an error: {list}"
+    );
+}
+
 // §5.6: "keep rows whose profile P has a local remote profile L with (S, P) …
 // drop rows with no match (incl. profile-less legacy rows)".
 #[tokio::test]
@@ -1096,4 +1134,93 @@ async fn kill_reply_carries_machines_on_a_local_socket() {
 #[tokio::test]
 async fn kill_reply_carries_machines_on_a_relay_socket() {
     kill_reply_carries_machines(Kind::Relay).await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Machine tagging on rows (shared cache stage 2 contract)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Local conversations get no machine tag (implicit = this device).
+#[tokio::test]
+async fn local_rows_in_merged_listing_have_null_machine() {
+    let env = LocalEnv::start(&[], None).await;
+    env.seed(None, "local one", Some("dev"), "2026-01-02T12:00:00Z");
+    let mut ws = connect_local(&env).await;
+    let list = request_list(&mut ws).await;
+    for item in list["items"].as_array().expect("items") {
+        // Local row: machine is absent or null.
+        assert!(
+            item.get("machine").is_none() || item["machine"].is_null(),
+            "local row has no machine: {item}"
+        );
+    }
+}
+
+/// Direct-remote rows get the remote's origin string as the machine tag
+/// (the cache's per-origin identity for direct connections).
+#[tokio::test]
+async fn direct_remote_rows_in_merged_listing_are_tagged_with_origin() {
+    let a = FakeRemote::start(T_REMOTE).await;
+    let env = LocalEnv::start(&[(L, &a.url, T_REMOTE, "dev")], None).await;
+    let remote_id = uid(99);
+    a.set_rows(vec![row(
+        &remote_id,
+        "on A",
+        "2026-01-05T12:00:00Z",
+        Some("dev"),
+    )]);
+    let mut ws = connect_local(&env).await;
+    let list = request_list(&mut ws).await;
+    let row = find(&list, &remote_id).expect("remote row is listed");
+    assert_eq!(row["machine"], a.url, "remote row is tagged with origin");
+}
+
+/// Two profiles on one remote server share the same machine tag.
+#[tokio::test]
+async fn two_profiles_on_one_remote_share_one_machine_tag() {
+    let a = FakeRemote::start(T_REMOTE).await;
+    let env = LocalEnv::start(
+        &[(L, &a.url, T_REMOTE, "dev"), (L2, &a.url, T_REMOTE, "web")],
+        None,
+    )
+    .await;
+    let id1 = uid(11);
+    let id2 = uid(22);
+    a.set_rows(vec![
+        row(&id1, "on A dev", "2026-01-05T12:00:00Z", Some("dev")),
+        row(&id2, "on A web", "2026-01-04T12:00:00Z", Some("web")),
+    ]);
+    let mut ws = connect_local(&env).await;
+    let list = request_list(&mut ws).await;
+    let row1 = find(&list, &id1).expect("row1 listed");
+    let row2 = find(&list, &id2).expect("row2 listed");
+    assert_eq!(row1["machine"], a.url);
+    assert_eq!(row2["machine"], a.url);
+}
+
+/// Machine tag is stable across list requests (same origin, same value).
+#[tokio::test]
+async fn machine_tag_is_stable_across_list_requests() {
+    let a = FakeRemote::start(T_REMOTE).await;
+    let env = LocalEnv::start(&[(L, &a.url, T_REMOTE, "dev")], None).await;
+    let remote_id = uid(33);
+    a.set_rows(vec![row(
+        &remote_id,
+        "on A",
+        "2026-01-05T12:00:00Z",
+        Some("dev"),
+    )]);
+    let mut ws = connect_local(&env).await;
+
+    let list1 = request_list(&mut ws).await;
+    let row1 = find(&list1, &remote_id).expect("row listed");
+    let machine1 = row1["machine"]
+        .as_str()
+        .expect("a remote row carries a string machine tag");
+    assert_eq!(machine1, a.url, "tagged with the origin");
+
+    let list2 = request_list(&mut ws).await;
+    let row2 = find(&list2, &remote_id).expect("row listed");
+    let machine2 = row2["machine"].as_str().expect("machine tag");
+    assert_eq!(machine1, machine2, "machine tag stable across requests");
 }

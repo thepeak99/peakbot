@@ -59,6 +59,7 @@ use crate::session::SessionDeps;
 use crate::ui::AppState;
 use crate::ui::Ui;
 use crate::ui::app_state::MessageRole;
+use crate::ui::delta::{AttachCursor, slice_from_messages, validate_cursor};
 use crate::ui::outbound::{OutboundRx, OutboundTx, outbound_channel};
 use crate::ui::ui_trait::builtin_commands;
 #[cfg(feature = "host")]
@@ -81,7 +82,7 @@ use futures::{Sink, SinkExt, StreamExt};
 use registry::SessionRegistry;
 use rust_embed::RustEmbed;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::time::MissedTickBehavior;
@@ -906,6 +907,92 @@ fn project_state_for_client(mut state: AppState) -> AppState {
     state
 }
 
+/// Per-socket delta base. `base` is set only by an attach/rebase whose cursor
+/// validated against the authoritative projected history. `full` latches when
+/// lineage breaks (epoch change, prefix gone, invalid cursor): the rest of the
+/// socket then sends full frames, never a suffix the client cannot attach.
+#[derive(Clone, Default)]
+pub(crate) struct SocketDelta {
+    inner: Arc<Mutex<DeltaAnchor>>,
+}
+
+#[derive(Default)]
+struct DeltaAnchor {
+    base: Option<AttachCursor>,
+    full: bool,
+}
+
+impl SocketDelta {
+    /// Attach-time construction. A valid cursor is the client's proof that it
+    /// holds the prefix and understands `messages_from`; anything else sends
+    /// full frames for this socket.
+    fn at_attach(since: Option<AttachCursor>, sm: &StateManager) -> Self {
+        match since {
+            Some(cursor) if validated_prefix(&cursor, sm).is_some() => Self {
+                inner: Arc::new(Mutex::new(DeltaAnchor {
+                    base: Some(cursor),
+                    full: false,
+                })),
+            },
+            Some(_) => Self::full_forever(),
+            None => Self::default(),
+        }
+    }
+
+    fn full_forever() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(DeltaAnchor {
+                base: None,
+                full: true,
+            })),
+        }
+    }
+
+    /// The prefix length this frame is relative to, or `None` for a full
+    /// frame. Breaks lineage permanently if the anchored prefix no longer
+    /// exists in the snapshot (compaction, clear, replacement).
+    fn suffix_base(&self, state: &AppState) -> Option<usize> {
+        let mut anchor = self.inner.lock().unwrap();
+        if anchor.full {
+            return None;
+        }
+        let base = anchor.base.as_ref()?;
+        if state.history_epoch != base.epoch || base.n > state.chat.messages.len() {
+            anchor.base = None;
+            anchor.full = true;
+            return None;
+        }
+        Some(base.n)
+    }
+
+    /// Move the base after the client applied enough rows. The same cursor
+    /// contract as attach; failure falls back to full for the rest of the
+    /// socket (the client's cached prefix can no longer be trusted).
+    fn rebase(&self, since: Option<AttachCursor>, sm: &StateManager) {
+        let valid = since
+            .as_ref()
+            .and_then(|cursor| validated_prefix(cursor, sm));
+        let mut anchor = self.inner.lock().unwrap();
+        if anchor.full {
+            return;
+        }
+        match (since, valid) {
+            (Some(cursor), Some(_)) => anchor.base = Some(cursor),
+            _ => {
+                anchor.base = None;
+                anchor.full = true;
+            }
+        }
+    }
+}
+
+/// Validate against the live projected rows without cloning the transcript.
+fn validated_prefix(cursor: &AttachCursor, sm: &StateManager) -> Option<usize> {
+    let state = sm.state_arc();
+    let guard = state.read().unwrap();
+    validate_cursor(cursor, &guard.chat.messages, guard.history_epoch)
+}
+
 /// Pump `StateManager` snapshots into the connection's coalescing slot
 /// until any leg of the connection dies. The `writer` arm is what turns
 /// "the writer noticed the peer is dead" into "the socket detaches from
@@ -917,6 +1004,7 @@ pub(crate) async fn forward_state(
     sm: &StateManager,
     reader: &mut tokio::task::JoinHandle<()>,
     writer: &mut tokio::task::JoinHandle<()>,
+    delta: &SocketDelta,
 ) -> ForwardExit {
     // One memo per connection (not per message): its resolve cache survives
     // across snapshots, and each snapshot is already a clone.
@@ -932,12 +1020,24 @@ pub(crate) async fn forward_state(
     loop {
         tokio::select! {
             maybe_state = state_rx.recv() => {
-                let Some(app_state) = maybe_state else { return ForwardExit::StateEnded };
+                let Some(mut app_state) = maybe_state else { return ForwardExit::StateEnded };
                 let exit = app_state.exit_requested;
+                // Delta frames carry current metadata + only the suffix, so the
+                // cached prefix is never re-sent (including during a running
+                // turn). Slice first: the client already holds the projected
+                // prefix, so image projection only needs the new rows.
+                let messages_from = delta.suffix_base(&app_state);
+                if let Some(n) = messages_from {
+                    app_state.chat.messages = slice_from_messages(&app_state.chat.messages, n);
+                }
                 // Rewrite the already-cloned snapshot (not the shared state): /images/ links
                 // must never leak to disk, and stdio's separate publish path has no server.
                 let app_state = project_state_for_client(images.rewrite(app_state, &sm.session_cwd()));
-                if out.publish_state(Arc::new(app_state)).is_err() {
+                let published = match messages_from {
+                    Some(n) => out.publish_state_delta(Arc::new(app_state), n),
+                    None => out.publish_state(Arc::new(app_state)),
+                };
+                if published.is_err() {
                     return ForwardExit::WriterGone;
                 }
                 if exit { return ForwardExit::StateEnded }
@@ -1004,18 +1104,20 @@ async fn serve_socket<Si, St, E>(
     // non-attach first frame attaches fresh and is then processed normally so
     // nothing is silently dropped. A socket that closes before any frame just
     // unwinds (writer drops on scope exit).
-    let (convo, profile, agent, relayed, leftover) = match read_first_frame(&mut ws_stream).await {
-        Some(text) => match serde_json::from_str::<InboundMessage>(&text) {
-            Ok(InboundMessage::Attach {
-                convo,
-                profile,
-                agent,
-                relayed,
-            }) => (convo, profile, agent, relayed, None),
-            _ => (None, None, None, false, Some(text)),
-        },
-        None => return,
-    };
+    let (convo, profile, agent, relayed, since, leftover) =
+        match read_first_frame(&mut ws_stream).await {
+            Some(text) => match serde_json::from_str::<InboundMessage>(&text) {
+                Ok(InboundMessage::Attach {
+                    convo,
+                    profile,
+                    agent,
+                    relayed,
+                    since,
+                }) => (convo, profile, agent, relayed, since, None),
+                _ => (None, None, None, false, None, Some(text)),
+            },
+            None => return,
+        };
     // §E.1: the server decides — a cloud peer is always a relay, whatever
     // the frame claims (the client flag stays a hint for the token path).
     let relayed = relayed || matches!(principal, Principal::CloudPeer(_));
@@ -1057,6 +1159,7 @@ async fn serve_socket<Si, St, E>(
                         view,
                         convo,
                         agent,
+                        since,
                     )
                     .await;
                 }
@@ -1158,6 +1261,7 @@ async fn serve_socket<Si, St, E>(
             view,
             convo,
             agent,
+            since,
         )
         .await;
         return;
@@ -1183,6 +1287,10 @@ async fn serve_socket<Si, St, E>(
     let convo_id = registered
         .live_convo()
         .unwrap_or(registered.session.conversation_id);
+    // The cursor is validated only after the session is bound (a resume/load
+    // must be in place first). A valid cursor enables suffix frames on this
+    // socket; absence or failure keeps the full-frame path.
+    let delta = SocketDelta::at_attach(since, &registered.session.state_manager);
 
     // Attach-time profile selection ("ensure"). Refused before any handshake
     // frame so the client sees only the error; detach so the minted session
@@ -1220,6 +1328,7 @@ async fn serve_socket<Si, St, E>(
     let registry_for_reader = registry.clone();
     let directory_for_reader = state.directory.clone();
     let reader_tx = out_tx.clone();
+    let delta_for_reader = delta.clone();
 
     // Process a non-attach handshake frame before the reader loop starts.
     if let Some(frame) = leftover.filter(|f| !refused_for(principal, f, &out_tx)) {
@@ -1244,6 +1353,14 @@ async fn serve_socket<Si, St, E>(
             };
             let trimmed = text.trim();
             if trimmed.is_empty() || refused_for(principal, trimmed, &reader_tx) {
+                continue;
+            }
+            // The anchor move is per-socket state, not a UiAction: handle it
+            // here so the reader never queues it behind an agent turn.
+            if let Ok(InboundMessage::SyncAnchor { since }) =
+                serde_json::from_str::<InboundMessage>(trimmed)
+            {
+                delta_for_reader.rebase(since, &sm_for_reader);
                 continue;
             }
             if !dispatch_inbound(
@@ -1272,6 +1389,7 @@ async fn serve_socket<Si, St, E>(
         &registered.session.state_manager,
         &mut reader_task,
         &mut writer_task,
+        &delta,
     )
     .await;
 
@@ -1482,6 +1600,8 @@ fn dispatch_inbound(
         }
         // Re-attach mid-stream is a client bug; ignore rather than reset.
         Ok(InboundMessage::Attach { .. }) => true,
+        // Handled by the socket reader (it mutates per-socket anchor state).
+        Ok(InboundMessage::SyncAnchor { .. }) => true,
         Ok(InboundMessage::Shutdown) => {
             let _ = action_sender.send(UiAction::SendMessage {
                 text: "/exit".to_string(),
@@ -1628,6 +1748,7 @@ mod tests {
         let sm = StateManager::new_arc();
         let value = serde_json::to_value(&OutboundMessage::State {
             state: std::sync::Arc::new(sm.get_state()),
+            messages_from: None,
         })
         .expect("serialises");
         assert_eq!(
@@ -1640,6 +1761,7 @@ mod tests {
         sm.request_stop(); // first press: graceful
         let value = serde_json::to_value(&OutboundMessage::State {
             state: std::sync::Arc::new(sm.get_state()),
+            messages_from: None,
         })
         .expect("serialises");
         assert_eq!(
@@ -2738,7 +2860,7 @@ mod tests {
                 OutboundMessage::Attached { .. } => ordered_kinds.push("attached"),
                 OutboundMessage::Ready { .. } => ordered_kinds.push("ready"),
                 OutboundMessage::ModelsAvailable { .. } => ordered_kinds.push("models_available"),
-                OutboundMessage::State { state } => {
+                OutboundMessage::State { state, .. } => {
                     state_message_lens.push(state.chat.messages.len());
                 }
                 other => panic!("unexpected variant in GatedSink: {other:?}"),
@@ -2794,7 +2916,14 @@ mod tests {
         let sm = StateManager::new();
         let exit = tokio::time::timeout(
             Duration::from_secs(1),
-            forward_state(&mut state_rx, &out, &sm, &mut reader, &mut writer),
+            forward_state(
+                &mut state_rx,
+                &out,
+                &sm,
+                &mut reader,
+                &mut writer,
+                &SocketDelta::default(),
+            ),
         )
         .await
         .expect("forwarder must exit promptly when the writer task has already returned");
@@ -2825,7 +2954,14 @@ mod tests {
         let sm = StateManager::new();
         let exit = tokio::time::timeout(
             Duration::from_secs(1),
-            forward_state(&mut state_rx, &out, &sm, &mut reader, &mut writer),
+            forward_state(
+                &mut state_rx,
+                &out,
+                &sm,
+                &mut reader,
+                &mut writer,
+                &SocketDelta::default(),
+            ),
         )
         .await
         .expect("forwarder must exit promptly when the reader task has already returned");
@@ -2880,7 +3016,14 @@ mod tests {
 
         let exit = tokio::time::timeout(
             Duration::from_secs(2),
-            forward_state(&mut state_rx, &out, &sm, &mut reader, &mut writer),
+            forward_state(
+                &mut state_rx,
+                &out,
+                &sm,
+                &mut reader,
+                &mut writer,
+                &SocketDelta::default(),
+            ),
         )
         .await
         .expect("forwarder must exit after one published frame");
@@ -2894,7 +3037,7 @@ mod tests {
             .expect("published frame must arrive")
             .expect("published frame present");
         let wire = match frame {
-            OutboundMessage::State { state } => state,
+            OutboundMessage::State { state, .. } => state,
             other => panic!("expected a State frame, got {other:?}"),
         };
         let wire_content = wire
@@ -3049,6 +3192,171 @@ mod tests {
         assert_eq!(texts, 0, "idle writer must not emit text frames");
     }
 
+    // ─── delta suffix frames on the shared forwarder ─────────────────────
+
+    fn cursor_at(sm: &StateManager, n: usize) -> AttachCursor {
+        let state = sm.get_state();
+        let timestamp = serde_json::to_value(state.chat.messages[n - 1].timestamp)
+            .expect("timestamp serialises")
+            .as_str()
+            .expect("timestamp is a string")
+            .to_string();
+        AttachCursor {
+            n,
+            timestamp,
+            epoch: state.history_epoch,
+        }
+    }
+
+    async fn forward_one(sm: &StateManager, delta: &SocketDelta) -> OutboundMessage {
+        let (state_tx, mut state_rx) = mpsc::channel::<AppState>(1);
+        let mut reader = tokio::spawn(async { futures::future::pending::<()>().await });
+        let mut writer = tokio::spawn(async { futures::future::pending::<()>().await });
+        let (out, mut rx) = outbound_channel();
+        let mut detached = sm.get_state();
+        detached.exit_requested = true;
+        state_tx.send(detached).await.expect("send state");
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            forward_state(&mut state_rx, &out, sm, &mut reader, &mut writer, delta),
+        )
+        .await
+        .expect("forwarder must finish");
+        rx.next().await.expect("one state frame")
+    }
+
+    fn suffix_parts(frame: OutboundMessage) -> (AppState, Option<usize>) {
+        match frame {
+            OutboundMessage::State {
+                state,
+                messages_from,
+            } => (Arc::unwrap_or_clone(state), messages_from),
+            other => panic!("expected State, got {other:?}"),
+        }
+    }
+
+    fn seeded_sm() -> Arc<StateManager> {
+        let sm = StateManager::new_arc();
+        sm.create_conversation("d".into(), "p".into(), "m".into(), "/tmp".into());
+        for i in 1..=4 {
+            sm.add_user_message(format!("m{i}"));
+        }
+        sm
+    }
+
+    #[tokio::test]
+    async fn forward_state_emits_suffix_from_a_validated_anchor() {
+        let sm = seeded_sm();
+        let epoch = sm.get_state().history_epoch;
+        let delta = SocketDelta::at_attach(Some(cursor_at(&sm, 3)), &sm);
+        let (state, messages_from) = suffix_parts(forward_one(&sm, &delta).await);
+        assert_eq!(
+            messages_from,
+            Some(3),
+            "a valid anchor must produce a suffix frame"
+        );
+        assert_eq!(
+            state.chat.messages.len(),
+            1,
+            "only the authoritative tail is sent"
+        );
+        assert_eq!(state.chat.messages[0].content, "m4");
+        assert_eq!(state.history_epoch, epoch, "metadata stays current");
+    }
+
+    #[tokio::test]
+    async fn forward_state_keeps_the_suffix_while_a_turn_is_running() {
+        let sm = seeded_sm();
+        let delta = SocketDelta::at_attach(Some(cursor_at(&sm, 3)), &sm);
+        sm.set_running(true);
+        let (state, messages_from) = suffix_parts(forward_one(&sm, &delta).await);
+        assert_eq!(
+            messages_from,
+            Some(3),
+            "a running turn must not force the cached prefix back onto the wire"
+        );
+        assert!(state.is_running, "runtime metadata is current");
+        assert_eq!(state.chat.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn forward_state_suffix_may_be_empty() {
+        let sm = seeded_sm();
+        let delta = SocketDelta::at_attach(Some(cursor_at(&sm, 4)), &sm);
+        let (state, messages_from) = suffix_parts(forward_one(&sm, &delta).await);
+        assert_eq!(messages_from, Some(4), "an at-the-end anchor is valid");
+        assert!(
+            state.chat.messages.is_empty(),
+            "the tail is empty, not absent"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_state_sends_full_for_the_rest_after_a_lineage_break() {
+        let sm = seeded_sm();
+        let delta = SocketDelta::at_attach(Some(cursor_at(&sm, 3)), &sm);
+        sm.clear_chat();
+        sm.add_user_message("fresh".into());
+        let (state, messages_from) = suffix_parts(forward_one(&sm, &delta).await);
+        assert_eq!(
+            messages_from, None,
+            "an epoch/prefix break must latch full for the rest of the socket"
+        );
+        assert_eq!(
+            state.chat.messages.len(),
+            1,
+            "the full rewritten history is sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebase_moves_the_socket_base_for_later_frames() {
+        let sm = seeded_sm();
+        let delta = SocketDelta::at_attach(Some(cursor_at(&sm, 2)), &sm);
+        delta.rebase(Some(cursor_at(&sm, 4)), &sm);
+        let (state, messages_from) = suffix_parts(forward_one(&sm, &delta).await);
+        assert_eq!(
+            messages_from,
+            Some(4),
+            "the new base is used by later frames"
+        );
+        assert!(state.chat.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_rebase_latches_full() {
+        let sm = seeded_sm();
+        let delta = SocketDelta::at_attach(Some(cursor_at(&sm, 2)), &sm);
+        let mut bad = cursor_at(&sm, 4);
+        bad.epoch = bad.epoch.wrapping_add(1);
+        delta.rebase(Some(bad), &sm);
+        let (state, messages_from) = suffix_parts(forward_one(&sm, &delta).await);
+        assert_eq!(
+            messages_from, None,
+            "an invalid rebase must fall back to full"
+        );
+        assert_eq!(state.chat.messages.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn attach_without_a_cursor_stays_full() {
+        let sm = seeded_sm();
+        let (state, messages_from) = suffix_parts(forward_one(&sm, &SocketDelta::default()).await);
+        assert_eq!(messages_from, None);
+        assert_eq!(state.chat.messages.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn attach_with_an_invalid_cursor_stays_full() {
+        let sm = seeded_sm();
+        let mut bad = cursor_at(&sm, 3);
+        bad.timestamp.push('0');
+        let delta = SocketDelta::at_attach(Some(bad), &sm);
+        let (state, messages_from) = suffix_parts(forward_one(&sm, &delta).await);
+        assert_eq!(messages_from, None);
+        assert_eq!(state.chat.messages.len(), 4);
+    }
+
     /// T2 (emitter): `forward_state` — not `writer_loop` — paces the 20 s
     /// text beats: the first one full interval after attach, then one per
     /// interval, in order and nothing else. A relayed socket never runs
@@ -3062,13 +3370,15 @@ mod tests {
             tokio::spawn(async { futures::future::pending::<()>().await });
         let (out, mut rx): (OutboundTx, OutboundRx) = outbound_channel();
         let sm = StateManager::new();
+        let delta = SocketDelta::default();
 
         let mut fwd = std::pin::pin!(forward_state(
             &mut state_rx,
             &out,
             &sm,
             &mut reader,
-            &mut writer
+            &mut writer,
+            &delta
         ));
 
         // Drive the forwarder for `secs` of paused time in 1 s steps; it must
@@ -3130,7 +3440,14 @@ mod tests {
 
         let exit = tokio::time::timeout(
             Duration::from_secs(120),
-            forward_state(&mut state_rx, &out, &sm, &mut reader, &mut writer),
+            forward_state(
+                &mut state_rx,
+                &out,
+                &sm,
+                &mut reader,
+                &mut writer,
+                &SocketDelta::default(),
+            ),
         )
         .await
         .expect("a failing heartbeat send must end the forwarder");
@@ -3381,7 +3698,14 @@ mod tests {
 
         let exit = tokio::time::timeout(
             Duration::from_secs(2),
-            forward_state(&mut state_rx, &out, &sm, &mut reader, &mut writer),
+            forward_state(
+                &mut state_rx,
+                &out,
+                &sm,
+                &mut reader,
+                &mut writer,
+                &SocketDelta::default(),
+            ),
         )
         .await
         .expect("forwarder must exit after one published frame");
@@ -3396,11 +3720,12 @@ mod tests {
             .expect("published frame must arrive")
             .expect("published frame present");
         let wire = match frame {
-            OutboundMessage::State { state } => state,
+            OutboundMessage::State { state, .. } => state,
             other => panic!("expected a State frame, got {other:?}"),
         };
         let json = serde_json::to_string(&OutboundMessage::State {
             state: wire.clone(),
+            messages_from: None,
         })
         .expect("serialise the state frame");
 

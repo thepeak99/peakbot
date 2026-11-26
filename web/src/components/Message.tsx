@@ -16,6 +16,7 @@ import { Lightbox } from "./Lightbox";
 import { MTAG } from "./phoneUi";
 import { firstLine } from "../transcriptRows";
 import { formatClock, formatFull, localeClock } from "../dates";
+import { CopyButton } from "./CopyButton";
 
 // Per-role visual treatment. Mirrors the TUI's role glyphs/colours so the
 // web transcript reads the same way (src/ui/app_state.rs MessageRole +
@@ -181,14 +182,20 @@ function CachedImage({ src, alt }: ComponentProps<"img"> & { node?: unknown }) {
   );
 }
 
-// Module scope: stable identity across renders — an inline literal would be
-// a fresh reference every render and defeat memoization.
-const MARKDOWN_COMPONENTS = { img: CachedImage } as const;
-
 // ─── Phone (< lg) faces: mock `.u` / `.a` / `.tool` / `.code` (fix-plan 3.3–3.6) ───
 // Kept apart from the desktop card so `phone` false renders exactly the old DOM.
 
-const PHONE_MARKDOWN_COMPONENTS = { img: CachedImage, pre: CodeBlock } as const;
+// Per-platform pre renderer adapters. Each creates a stable module-scope
+// function that calls CodeBlock with the correct `phone` presentation prop.
+function PhoneCodeBlock(props: ComponentProps<"pre"> & ExtraProps) {
+  return <CodeBlock {...props} phone />;
+}
+function DesktopCodeBlock(props: ComponentProps<"pre"> & ExtraProps) {
+  return <CodeBlock {...props} phone={false} />;
+}
+
+const PHONE_MARKDOWN_COMPONENTS = { img: CachedImage, pre: PhoneCodeBlock } as const;
+const MARKDOWN_COMPONENTS = { img: CachedImage, pre: DesktopCodeBlock } as const;
 
 // Centralized chat markdown renderer. Encapsulates the plugin list and
 // selects the correct components map (phone vs desktop) to keep the
@@ -205,48 +212,79 @@ function ChatMarkdown({ phone = false, content }: { phone?: boolean; content: st
   );
 }
 
-const COPY_ICON = (
-  <svg aria-hidden width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-    <rect x="9" y="9" width="11" height="11" rx="2" />
-    <path d="M5 15V6a2 2 0 0 1 2-2h9" />
-  </svg>
-);
-const CHECK_ICON = (
-  <svg aria-hidden width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-    <path d="M5 12l5 5 9-10" />
-  </svg>
-);
-
-// Fence wrapper: language header + Copy button around the highlighted <pre>.
-// Styled by the `.md-phone .code-*` rules in index.css.
-function CodeBlock({ node, children, ...rest }: ComponentProps<"pre"> & ExtraProps) {
+// Fence wrapper: per-instance Copy button. Phone adds a `.code-hdr` language
+// label; desktop gets a quiet right-aligned button row with no language label.
+// Each instance owns its own <pre> ref for reading rendered text at click time.
+function CodeBlock({
+  node,
+  children,
+  phone,
+  ...rest
+}: ComponentProps<"pre"> & ExtraProps & { phone?: boolean }) {
   const ref = useRef<HTMLPreElement>(null);
-  const [copied, setCopied] = useState(false);
-  const codeClass = node?.children[0]?.type === "element" ? node.children[0].properties.className : undefined;
+  const codeClass =
+    node?.children[0]?.type === "element"
+      ? node.children[0].properties.className
+      : undefined;
   const lang =
-    (Array.isArray(codeClass) ? codeClass.map(String).find((c) => c.startsWith("language-")) : undefined)?.slice(9) ?? "code";
-  const copy = () => {
-    // Swallow clipboard errors (insecure context / denied), like FilesPanel.
-    navigator.clipboard
-      ?.writeText(ref.current?.textContent ?? "")
-      ?.then(() => {
-        setCopied(true);
-        setTimeout(() => setCopied(false), 1500);
-      })
-      .catch(() => {});
-  };
+    (Array.isArray(codeClass)
+      ? codeClass.map(String).find((c) => c.startsWith("language-"))
+      : undefined)?.slice(9) ?? "code";
+
+  if (phone) {
+    // Phone presentation: `.code-hdr` language label + Copy code button.
+    return (
+      <div className="code-block">
+        <div className="code-hdr">
+          <span>{lang}</span>
+          <CopyButton
+            getText={() => ref.current?.textContent ?? ""}
+            label="Copy code"
+            className="text-zinc-500 hover:text-zinc-300"
+          />
+        </div>
+        <pre ref={ref} {...rest}>
+          {children}
+        </pre>
+      </div>
+    );
+  }
+
+  // Desktop presentation: `.code-block` wrapper with quiet right-aligned Copy
+  // code button above the code. No language label, no overlay on code.
   return (
     <div className="code-block">
-      <div className="code-hdr">
-        <span>{lang}</span>
-        <button type="button" aria-label="Copy code" onClick={copy}>
-          {copied ? CHECK_ICON : COPY_ICON}
-        </button>
+      <div className="flex justify-end pb-1">
+        <CopyButton
+          getText={() => ref.current?.textContent ?? ""}
+          label="Copy code"
+          className="text-zinc-500 hover:text-zinc-300"
+        />
       </div>
       <pre ref={ref} {...rest}>
         {children}
       </pre>
     </div>
+  );
+}
+
+// ─── Phone time button ───────────────────────────────────────────────────────
+// Tap toggles HH:MM <-> the full date; local state, so a row scrolled out of
+// the virtualizer overscan resets to the short form. Alignment is owned here
+// (self-start/self-end + mt-1) so the call site only passes `end`.
+function MessageTime({ at, end }: { at: number; end: boolean }) {
+  const [full, setFull] = useState(false);
+  return (
+    <button
+      type="button"
+      aria-expanded={full}
+      onClick={() => setFull((f) => !f)}
+      className={`mt-1 rounded-[5px] px-1 text-[10px] tabular-nums text-zinc-500 hover:text-zinc-300 ${
+        end ? "self-end" : "self-start"
+      }`}
+    >
+      {full ? formatFull(at) : formatClock(at)}
+    </button>
   );
 }
 
@@ -269,6 +307,11 @@ function ToolRow({ message }: { message: ChatMessage }) {
         <span className="shrink-0 font-mono text-[12.5px] text-zinc-300">
           {message.toolName ?? (call ? "tool" : "result")}
         </span>
+        {message.subAgentRole && (
+          <span data-testid="tool-agent-role" className={`${MTAG} max-w-[45%] truncate`}>
+            🧩 {message.subAgentRole}
+          </span>
+        )}
         <span className="min-w-0 flex-1 truncate">{firstLine(message.content)}</span>
         <svg
           aria-hidden
@@ -299,22 +342,6 @@ function ToolRow({ message }: { message: ChatMessage }) {
       )}
       <MessageTime at={message.at} end={false} />
     </div>
-  );
-}
-
-// Tap toggles HH:MM <-> the full date; local state, so a row scrolled out of
-// the virtualizer overscan resets to the short form.
-function MessageTime({ at, end }: { at: number; end: boolean }) {
-  const [full, setFull] = useState(false);
-  return (
-    <button
-      type="button"
-      aria-expanded={full}
-      onClick={() => setFull((f) => !f)}
-      className={`mt-1 rounded-[5px] px-1 text-[10px] tabular-nums text-zinc-500 hover:text-zinc-300 ${end ? "self-end" : "self-start"}`}
-    >
-      {full ? formatFull(at) : formatClock(at)}
-    </button>
   );
 }
 
@@ -384,7 +411,7 @@ function MessageView({ message, phone = false }: { message: ChatMessage; phone?:
             🧩 {message.subAgentRole}
           </span>
         )}
-        <span className="ml-auto tabular-nums text-zinc-600">{localeClock(message.at)}</span>
+        <span className="tabular-nums text-zinc-600">{localeClock(message.at)}</span>
       </div>
       {message.thinking && message.thinking.length > 0 && (
         <ThinkingBlocks blocks={message.thinking} />
