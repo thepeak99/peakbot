@@ -232,6 +232,12 @@ describe("Message — phone (phone: true)", () => {
       });
       expect(writeText, "copying writes the code text").toHaveBeenCalledTimes(1);
       expect(writeText).toHaveBeenCalledWith("let x = 42;\n");
+
+      // No whole-message copy button on the phone either.
+      expect(
+        el.querySelector('button[aria-label="Copy message"]'),
+        "zero whole-message copy buttons on the phone",
+      ).toBeNull();
     } finally {
       await unmount();
     }
@@ -246,6 +252,69 @@ describe("Message — phone (phone: true)", () => {
     try {
       expect(el.querySelector(".hljs-addition"), "added lines are marked").not.toBeNull();
       expect(el.querySelector(".hljs-deletion"), "removed lines are marked").not.toBeNull();
+    } finally {
+      await unmount();
+    }
+  });
+
+  it("user message: zero 'Copy message' buttons", async () => {
+    const { el, unmount } = await renderPhone(
+      msg({ role: "user", content: "hi there" }),
+    );
+    try {
+      expect(
+        el.querySelectorAll('button[aria-label="Copy message"]'),
+        "user rows have no whole-message copy",
+      ).toHaveLength(0);
+    } finally {
+      await unmount();
+    }
+  });
+
+  it("collapsed toolCall: zero 'Copy message' buttons", async () => {
+    const { el, unmount } = await renderPhone(
+      msg({ role: "toolCall", toolName: "file_read", content: "Read /etc/hosts" }),
+    );
+    try {
+      expect(
+        el.querySelectorAll('button[aria-label="Copy message"]'),
+        "collapsed toolCall rows have no whole-message copy",
+      ).toHaveLength(0);
+    } finally {
+      await unmount();
+    }
+  });
+
+  it("collapsed toolResult: zero 'Copy message' buttons", async () => {
+    const { el, unmount } = await renderPhone(
+      msg({ role: "toolResult", toolName: "bash", content: "ok" }),
+    );
+    try {
+      expect(
+        el.querySelectorAll('button[aria-label="Copy message"]'),
+        "collapsed toolResult rows have no whole-message copy",
+      ).toHaveLength(0);
+    } finally {
+      await unmount();
+    }
+  });
+
+  it("expanded toolResult with fenced code: one 'Copy code', zero 'Copy message'", async () => {
+    const content = "```bash\necho hello\n```";
+    const { el, unmount } = await renderPhone(
+      msg({ role: "toolResult", toolName: "bash", content }),
+    );
+    try {
+      await expandToolRow(el);
+
+      expect(
+        el.querySelectorAll('button[aria-label="Copy code"]'),
+        "exactly one Copy code button for the fenced result",
+      ).toHaveLength(1);
+      expect(
+        el.querySelectorAll('button[aria-label="Copy message"]'),
+        "zero whole-message copy buttons",
+      ).toHaveLength(0);
     } finally {
       await unmount();
     }
@@ -309,56 +378,21 @@ describe("Message — phone timestamps (design §7.1)", () => {
     }
   });
 
-  // Updated for the PhoneMeta row: alignment moved OFF MessageTime and onto a
-  // dedicated `data-testid="phone-meta"` row so the optional Copy message
-  // button can sit beside the clock without either one owning the edge.
-  it("user time row is self-end; agent time row is self-start — the phone-meta row owns alignment", async () => {
+  it("user time is self-end; agent time is self-start", async () => {
     const { el, unmount } = await renderPhone(phoneMsg({ role: "user", content: "hi" }));
     try {
-      const userMeta = el.querySelector<HTMLElement>('[data-testid="phone-meta"]');
-      expect(userMeta, "the PhoneMeta row renders under a user message").not.toBeNull();
-      expect(userMeta!.classList.contains("self-end"), "user meta row is self-end").toBe(true);
-
-      const userTime = userMeta!.querySelector<HTMLButtonElement>("button.tabular-nums");
-      expect(userTime, "MessageTime lives inside the PhoneMeta row").not.toBeNull();
-      expect(
-        userTime!.classList.contains("self-end") ||
-          userTime!.classList.contains("self-start"),
-        "alignment is owned by the row, not duplicated on the time button",
-      ).toBe(false);
+      const userTime = el.querySelector("button.tabular-nums");
+      expect(userTime!.classList.contains("self-end")).toBe(true);
     } finally {
       await unmount();
     }
 
     const { el: el2, unmount: unmount2 } = await renderPhone(phoneMsg({ content: "answer" }));
     try {
-      const agentMeta = el2.querySelector<HTMLElement>('[data-testid="phone-meta"]');
-      expect(agentMeta, "the PhoneMeta row renders under an agent message").not.toBeNull();
-      expect(agentMeta!.classList.contains("self-start"), "agent meta row is self-start").toBe(true);
-
-      const agentTime = agentMeta!.querySelector<HTMLButtonElement>("button.tabular-nums");
-      expect(agentTime, "MessageTime lives inside the PhoneMeta row").not.toBeNull();
-      expect(
-        agentTime!.classList.contains("self-end") ||
-          agentTime!.classList.contains("self-start"),
-        "alignment is owned by the row, not duplicated on the time button",
-      ).toBe(false);
+      const agentTime = el2.querySelector("button.tabular-nums");
+      expect(agentTime!.classList.contains("self-start")).toBe(true);
     } finally {
       await unmount2();
-    }
-  });
-
-  it("a tool row's phone-meta row is self-start and hosts the time button", async () => {
-    const { el, unmount } = await renderPhone(
-      phoneMsg({ role: "toolResult", toolName: "bash", content: "ok" }),
-    );
-    try {
-      const meta = el.querySelector<HTMLElement>('[data-testid="phone-meta"]');
-      expect(meta, "the tool row gets a PhoneMeta row").not.toBeNull();
-      expect(meta!.classList.contains("self-start"), "tool meta row is self-start").toBe(true);
-      expect(meta!.querySelector("button.tabular-nums"), "the time lives in the row").not.toBeNull();
-    } finally {
-      await unmount();
     }
   });
 
@@ -399,10 +433,7 @@ describe("Message — phone timestamps (design §7.1)", () => {
       const children = [...parent.children];
       const detailsIdx = children.indexOf(details!);
       const proseIdx = children.indexOf(prose!);
-      // The tappable time now lives inside the `data-testid="phone-meta"` row
-      // (see the PhoneMeta contract), so its direct sibling is that row; the
-      // document order under test is unchanged: details → prose → time.
-      const timeIdx = children.indexOf(time!.parentElement!);
+      const timeIdx = children.indexOf(time!);
       expect(detailsIdx).toBeLessThan(proseIdx);
       expect(proseIdx).toBeLessThan(timeIdx);
     } finally {
@@ -599,24 +630,12 @@ describe("Message — phone tool-row image rendering", () => {
   });
 });
 
-// ─── Phone message copy (shared CopyButton) ───────────────────────────────
+// ─── Mobile tool attribution ──────────────────────────────────────────────
 //
-// Contract: exactly one icon-only `aria-label="Copy message"` button per
-// NONEMPTY message body — user bubbles, agent/system/summary prose, and
-// toolCall/toolResult rows (even while the row is collapsed). The button
-// copies `message.content` RAW (markdown source included), read at click
-// time. Whitespace-only content gets no copy button. The existing fence
-// `Copy code` button is separate and must not be duplicated.
-//
-// `writeText` is installed by the file-level beforeEach above.
-
-function copyMessageButtons(el: HTMLElement): HTMLButtonElement[] {
-  return Array.from(el.querySelectorAll<HTMLButtonElement>('button[aria-label="Copy message"]'));
-}
-
-function copyCodeButtons(el: HTMLElement): HTMLButtonElement[] {
-  return Array.from(el.querySelectorAll<HTMLButtonElement>('button[aria-label="Copy code"]'));
-}
+// ToolRow shows `🧩 <subAgentRole>` exactly once inside its collapsed toggle
+// button (both toolCall and toolResult), tagged data-testid="tool-agent-role".
+// No chip when subAgentRole is absent. Focus filtering is not involved here:
+// rows are rendered directly with focus mode off.
 
 /** The collapsed tool row's toggle. Selected by aria-expanded + a chevron svg
  * so the MessageTime button (also aria-expanded) is never picked up. */
@@ -627,180 +646,6 @@ function toolRowButton(el: HTMLElement): HTMLButtonElement | null {
     ) ?? null
   );
 }
-
-async function clickCopy(btn: HTMLButtonElement): Promise<void> {
-  await act(async () => {
-    btn.click();
-  });
-}
-
-describe("Message — phone copy message", () => {
-  it("agent prose: exactly one 'Copy message' button writes the raw markdown source", async () => {
-    const content = "**bold** and *em*\n\n```js\nlet a = 1;\n```";
-    const { el, unmount } = await renderPhone(msg({ content }));
-    try {
-      const copies = copyMessageButtons(el);
-      expect(copies, "one Copy message button for the agent prose").toHaveLength(1);
-
-      await clickCopy(copies[0]);
-      expect(writeText).toHaveBeenCalledTimes(1);
-      expect(writeText, "raw markdown, not the rendered text").toHaveBeenCalledWith(content);
-      expect(writeText).not.toHaveBeenCalledWith("bold and em");
-    } finally {
-      await unmount();
-    }
-  });
-
-  it("user message: exactly one 'Copy message' button writes the raw user text", async () => {
-    const content = "  keep my **markdown** and   spaces  ";
-    const { el, unmount } = await renderPhone(msg({ role: "user", content }));
-    try {
-      const copies = copyMessageButtons(el);
-      expect(copies, "one Copy message button for the user bubble").toHaveLength(1);
-
-      await clickCopy(copies[0]);
-      expect(writeText).toHaveBeenCalledWith(content);
-    } finally {
-      await unmount();
-    }
-  });
-
-  it("system + summary prose: one 'Copy message' button each, writing the raw banner text", async () => {
-    for (const role of ["system", "summary"] as const) {
-      const content = `a ${role} banner\nwith a second line`;
-      const { el, unmount } = await renderPhone(msg({ role, content }));
-      try {
-        const copies = copyMessageButtons(el);
-        expect(copies, `one Copy message button for role=${role}`).toHaveLength(1);
-        await clickCopy(copies[0]);
-        expect(writeText, `raw text for role=${role}`).toHaveBeenCalledWith(content);
-      } finally {
-        await unmount();
-        writeText.mockClear();
-      }
-    }
-  });
-
-  it("collapsed toolCall: one 'Copy message' button writes the FULL content, not the first line", async () => {
-    const content = "Read /etc/hosts\nsecond line of the output";
-    const { el, unmount } = await renderPhone(
-      msg({ role: "toolCall", toolName: "file_read", content }),
-    );
-    try {
-      expect(
-        el.querySelector('[data-testid="tool-ext"]'),
-        "the row stays collapsed for this contract",
-      ).toBeNull();
-      const copies = copyMessageButtons(el);
-      expect(copies, "one Copy message button on the collapsed toolCall row").toHaveLength(1);
-
-      await clickCopy(copies[0]);
-      expect(writeText, "copy is not limited to the collapsed first line").toHaveBeenCalledWith(
-        content,
-      );
-    } finally {
-      await unmount();
-    }
-  });
-
-  it("collapsed toolResult: one 'Copy message' button writes the FULL result", async () => {
-    const content = "total 48\n-rw-r--r-- 1 exe exe 100 Jan 1 00:00 note.md";
-    const { el, unmount } = await renderPhone(
-      msg({ role: "toolResult", toolName: "bash", content }),
-    );
-    try {
-      expect(el.querySelector('[data-testid="tool-ext"]')).toBeNull();
-      const copies = copyMessageButtons(el);
-      expect(copies, "one Copy message button on the collapsed toolResult row").toHaveLength(1);
-
-      await clickCopy(copies[0]);
-      expect(writeText).toHaveBeenCalledWith(content);
-    } finally {
-      await unmount();
-    }
-  });
-
-  it("whitespace-only content gets NO 'Copy message' button (user, agent, toolCall, toolResult)", async () => {
-    const blank = "   \n\t  ";
-    for (const role of ["user", "agent", "toolCall", "toolResult"] as const) {
-      const { el, unmount } = await renderPhone(msg({ role, content: blank }));
-      try {
-        expect(copyMessageButtons(el), `no Copy message button for role=${role}`).toHaveLength(0);
-      } finally {
-        await unmount();
-      }
-    }
-  });
-
-  it("a fenced message has one 'Copy message' and one 'Copy code', with distinct payloads", async () => {
-    const content = "intro text\n\n```rust\nlet x = 42;\n```";
-    const { el, unmount } = await renderPhone(msg({ content }));
-    try {
-      const messageCopies = copyMessageButtons(el);
-      const codeCopies = copyCodeButtons(el);
-      expect(messageCopies, "one Copy message button").toHaveLength(1);
-      expect(codeCopies, "the existing Copy code button is not duplicated").toHaveLength(1);
-      expect(
-        messageCopies[0],
-        "the two affordances are distinct buttons",
-      ).not.toBe(codeCopies[0]);
-
-      await clickCopy(codeCopies[0]);
-      expect(writeText, "Copy code writes the rendered pre text").toHaveBeenCalledWith(
-        "let x = 42;\n",
-      );
-
-      writeText.mockClear();
-      await clickCopy(messageCopies[0]);
-      expect(writeText, "Copy message writes the full raw markdown source").toHaveBeenCalledWith(
-        content,
-      );
-    } finally {
-      await unmount();
-    }
-  });
-
-  it("the phone-meta row hosts the Copy message button beside the time", async () => {
-    const { el, unmount } = await renderPhone(
-      msg({ role: "user", content: "hi there" }),
-    );
-    try {
-      const meta = el.querySelector<HTMLElement>('[data-testid="phone-meta"]');
-      expect(meta, "the PhoneMeta row renders").not.toBeNull();
-      expect(
-        meta!.querySelector('button[aria-label="Copy message"]'),
-        "Copy message sits in the PhoneMeta row",
-      ).not.toBeNull();
-      expect(
-        meta!.querySelector("button.tabular-nums"),
-        "the time button shares the row",
-      ).not.toBeNull();
-    } finally {
-      await unmount();
-    }
-
-    const { el: el2, unmount: unmount2 } = await renderPhone(
-      msg({ role: "toolResult", toolName: "bash", content: "ok" }),
-    );
-    try {
-      const meta = el2.querySelector<HTMLElement>('[data-testid="phone-meta"]');
-      expect(meta, "the tool row also uses the PhoneMeta row").not.toBeNull();
-      expect(
-        meta!.querySelector('button[aria-label="Copy message"]'),
-        "the collapsed tool row's copy lives in the PhoneMeta row",
-      ).not.toBeNull();
-    } finally {
-      await unmount2();
-    }
-  });
-});
-
-// ─── Mobile tool attribution ──────────────────────────────────────────────
-//
-// ToolRow shows `🧩 <subAgentRole>` exactly once inside its collapsed toggle
-// button (both toolCall and toolResult), tagged data-testid="tool-agent-role".
-// No chip when subAgentRole is absent. Focus filtering is not involved here:
-// rows are rendered directly with focus mode off.
 
 function roleChips(el: HTMLElement): HTMLElement[] {
   return Array.from(el.querySelectorAll<HTMLElement>('[data-testid="tool-agent-role"]'));

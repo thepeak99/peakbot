@@ -1,5 +1,7 @@
-// Contract for the shared `components/CopyButton.tsx` (phone/desktop message
-// copy + any future copy affordance).
+// Contract for the shared `components/CopyButton.tsx` — the code-block copy
+// affordance used by the desktop `CodeBlock` wrapper and the phone `CodeBlock`
+// header. Scope is fenced code blocks only; whole-message copy is out of
+// scope.
 //
 // RED before implementation: `./CopyButton` does not exist yet, so this file
 // fails at import — the right reason (feature absent). Every assertion below
@@ -11,7 +13,8 @@
 // - icon-only <button type="button">, idle aria-label={label}, success
 //   aria-label="Copied" for 1500 ms then back to {label};
 // - getText() is read at CLICK time (never at render), and its exact string
-//   (markdown, unicode, leading whitespace) reaches clipboard.writeText;
+//   (code, unicode, leading whitespace, trailing newline) reaches
+//   clipboard.writeText;
 // - a missing clipboard or a rejected write leaves the button in the idle
 //   state (no throw, no false success);
 // - repeated clicks restart the 1500 ms window; unmount clears it.
@@ -93,11 +96,11 @@ afterEach(async () => {
 
 describe("CopyButton — rendering", () => {
   it("is an icon-only type=button with aria-label={label} and no visible text", async () => {
-    const el = await render({ getText: () => "x", label: "Copy message" });
+    const el = await render({ getText: () => "x", label: "Copy code" });
     const btn = button(el);
 
     expect(btn.getAttribute("type"), "an explicit type=button keeps it out of forms").toBe("button");
-    expect(btn.getAttribute("aria-label")).toBe("Copy message");
+    expect(btn.getAttribute("aria-label")).toBe("Copy code");
     expect(btn.querySelector("svg"), "the button is icon-only (an svg icon)").not.toBeNull();
     expect(btn.textContent ?? "", "no visible label text").toBe("");
   });
@@ -105,7 +108,7 @@ describe("CopyButton — rendering", () => {
   it("forwards className to the button", async () => {
     const el = await render({
       getText: () => "x",
-      label: "Copy message",
+      label: "Copy code",
       className: "tap-copy",
     });
     expect(button(el).classList.contains("tap-copy")).toBe(true);
@@ -116,7 +119,7 @@ describe("CopyButton — click-time text", () => {
   it("reads getText() at click time, once per click, not at render", async () => {
     let n = 0;
     const getText = vi.fn(() => `value-${++n}`);
-    const el = await render({ getText, label: "Copy message" });
+    const el = await render({ getText, label: "Copy code" });
     const btn = button(el);
 
     expect(getText, "getText must not run during render").not.toHaveBeenCalled();
@@ -132,7 +135,7 @@ describe("CopyButton — click-time text", () => {
 
   it("writes the exact raw string: markdown, unicode and edge whitespace survive unchanged", async () => {
     const raw = "  ✨ héllo wörld\n```js\nconst π = 3.14;\n```\n\t";
-    const el = await render({ getText: () => raw, label: "Copy message" });
+    const el = await render({ getText: () => raw, label: "Copy code" });
     await click(button(el));
 
     expect(writeText).toHaveBeenCalledTimes(1);
@@ -140,7 +143,7 @@ describe("CopyButton — click-time text", () => {
   });
 
   it("writes an empty string when getText() is empty (no trimming, no crash)", async () => {
-    const el = await render({ getText: () => "", label: "Copy message" });
+    const el = await render({ getText: () => "", label: "Copy code" });
     await click(button(el));
 
     expect(writeText).toHaveBeenCalledTimes(1);
@@ -151,10 +154,10 @@ describe("CopyButton — click-time text", () => {
 describe("CopyButton — success state", () => {
   it("swaps the aria-label to 'Copied' for exactly 1500ms, then reverts to {label}", async () => {
     vi.useFakeTimers();
-    const el = await render({ getText: () => "payload", label: "Copy message" });
+    const el = await render({ getText: () => "payload", label: "Copy code" });
     const btn = button(el);
 
-    expect(btn.getAttribute("aria-label"), "idle label").toBe("Copy message");
+    expect(btn.getAttribute("aria-label"), "idle label").toBe("Copy code");
 
     await click(btn);
     expect(btn.getAttribute("aria-label")).toBe("Copied");
@@ -168,12 +171,12 @@ describe("CopyButton — success state", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(1);
     });
-    expect(btn.getAttribute("aria-label"), "reverted at 1500ms").toBe("Copy message");
+    expect(btn.getAttribute("aria-label"), "reverted at 1500ms").toBe("Copy code");
   });
 
   it("restarts the 1500ms window on repeated clicks instead of letting the first timer fire", async () => {
     vi.useFakeTimers();
-    const el = await render({ getText: () => "payload", label: "Copy message" });
+    const el = await render({ getText: () => "payload", label: "Copy code" });
     const btn = button(el);
 
     await click(btn); // t = 0, timer #1 at 1500
@@ -199,14 +202,14 @@ describe("CopyButton — success state", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(500); // t = 2500
     });
-    expect(btn.getAttribute("aria-label")).toBe("Copy message");
+    expect(btn.getAttribute("aria-label")).toBe("Copy code");
   });
 });
 
 describe("CopyButton — clipboard failure", () => {
   it("stays in the idle state when writeText rejects (no false success)", async () => {
     writeText.mockImplementation(() => Promise.reject(new Error("denied")));
-    const el = await render({ getText: () => "payload", label: "Copy message" });
+    const el = await render({ getText: () => "payload", label: "Copy code" });
     const btn = button(el);
 
     await click(btn);
@@ -215,7 +218,7 @@ describe("CopyButton — clipboard failure", () => {
     expect(
       btn.getAttribute("aria-label"),
       "a rejected write must not claim 'Copied'",
-    ).toBe("Copy message");
+    ).toBe("Copy code");
   });
 
   it("does not throw and shows no success when navigator.clipboard is missing", async () => {
@@ -224,7 +227,7 @@ describe("CopyButton — clipboard failure", () => {
       value: undefined,
       configurable: true,
     });
-    const el = await render({ getText: () => "payload", label: "Copy message" });
+    const el = await render({ getText: () => "payload", label: "Copy code" });
     const btn = button(el);
 
     // jsdom routes listener errors to window.onerror; vitest fails the test on
@@ -234,7 +237,7 @@ describe("CopyButton — clipboard failure", () => {
       await vi.advanceTimersByTimeAsync(1500);
     });
 
-    expect(btn.getAttribute("aria-label")).toBe("Copy message");
+    expect(btn.getAttribute("aria-label")).toBe("Copy code");
   });
 
   it("does not throw when clipboard exists but writeText is not a function", async () => {
@@ -242,19 +245,19 @@ describe("CopyButton — clipboard failure", () => {
       value: { writeText: undefined },
       configurable: true,
     });
-    const el = await render({ getText: () => "payload", label: "Copy message" });
+    const el = await render({ getText: () => "payload", label: "Copy code" });
     const btn = button(el);
 
     btn.click();
 
-    expect(btn.getAttribute("aria-label")).toBe("Copy message");
+    expect(btn.getAttribute("aria-label")).toBe("Copy code");
   });
 });
 
 describe("CopyButton — cleanup", () => {
   it("clears the pending success timer on unmount", async () => {
     vi.useFakeTimers();
-    const el = await render({ getText: () => "payload", label: "Copy message" });
+    const el = await render({ getText: () => "payload", label: "Copy code" });
     const btn = button(el);
 
     await click(btn);

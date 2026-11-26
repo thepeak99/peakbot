@@ -2,8 +2,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import { act, createElement } from "react";
 import { createRoot } from "react-dom/client";
 import { Message, sameMessage } from "./Message";
-import { localeClock } from "../dates";
-import type { AttachmentView, ChatMessage } from "../types";
+import type { AttachmentView, ChatMessage, MessageRole } from "../types";
 
 // A canonical full message. Every test below mutates exactly one field off this
 // base so each "differs in exactly one field" case is auditable.
@@ -597,37 +596,22 @@ describe("attachment rendering (T13)", () => {
   });
 });
 
-// ─── Desktop message copy + role attribution ──────────────────────────────
+// ─── Desktop code-block copy (shared CopyButton) ──────────────────────────
 //
-// Contract: every nonempty desktop card carries exactly one icon-only
-// `aria-label="Copy message"` button, inside the existing right-hand
-// card-header meta cluster and ordered BEFORE the clock. It copies
-// `message.content` raw (markdown source included). Whitespace-only content
-// gets no button. Desktop code fences keep their current pre-only rendering,
-// so there is no `Copy code` button here (that stays a phone affordance).
-// Role attribution must stay single: one role label, one 🧩 lane chip.
+// Contract: every fenced code block on desktop carries exactly one icon-only
+// `aria-label="Copy code"` button, reading the rendered <pre> text at click
+// time. No whole-message copy button exists anywhere on the card — fenced
+// content gets only the code-block affordance. Existing highlighting and
+// language classes are untouched.
 
-const DESK_AT = 1732000000000;
-
-function copyMessageButtons(el: HTMLElement): HTMLButtonElement[] {
-  return Array.from(el.querySelectorAll<HTMLButtonElement>('button[aria-label="Copy message"]'));
-}
-
+/** Count code-copy buttons. */
 function copyCodeButtons(el: HTMLElement): HTMLButtonElement[] {
   return Array.from(el.querySelectorAll<HTMLButtonElement>('button[aria-label="Copy code"]'));
 }
 
-/** The card-header clock (a plain span, unlike the phone's tappable button). */
-function clockSpan(el: HTMLElement): HTMLElement | null {
-  return (
-    Array.from(el.querySelectorAll<HTMLElement>("span")).find(
-      (s) => s.textContent === localeClock(DESK_AT),
-    ) ?? null
-  );
-}
-
-function occurrences(text: string, needle: string): number {
-  return text.split(needle).length - 1;
+/** Count whole-message copy buttons (expected to be zero). */
+function copyMessageButtons(el: HTMLElement): HTMLButtonElement[] {
+  return Array.from(el.querySelectorAll<HTMLButtonElement>('button[aria-label="Copy message"]'));
 }
 
 async function clickCopy(btn: HTMLButtonElement): Promise<void> {
@@ -636,111 +620,113 @@ async function clickCopy(btn: HTMLButtonElement): Promise<void> {
   });
 }
 
-describe("Message — desktop copy message", () => {
-  it("agent card: one copy button in the meta cluster, before the clock, writing raw markdown", async () => {
-    const content = "## heading\n\n**bold** and `code`";
+describe("Message — desktop code-block copy", () => {
+  it("two fenced blocks produce exactly two Copy code buttons; each copies its own text", async () => {
+    const content = "```rust\nlet x = 42;\n```\n\n```js\nconst y = 10;\n```";
     const { el, unmount } = await renderMessage({ ...full(), content });
     try {
-      const copies = copyMessageButtons(el);
-      expect(copies, "exactly one Copy message button").toHaveLength(1);
+      const buttons = copyCodeButtons(el);
+      expect(buttons, "exactly two Copy code buttons").toHaveLength(2);
 
-      const clock = clockSpan(el);
-      expect(clock, "the card-header clock renders").not.toBeNull();
-      const cluster = clock!.parentElement!;
-      expect(copies[0].parentElement, "the copy button lives in the clock's cluster").toBe(cluster);
+      await clickCopy(buttons[0]);
+      expect(writeText, "first button copies the rust block").toHaveBeenCalledWith("let x = 42;\n");
 
-      const members = [...cluster.children];
-      expect(
-        members.indexOf(copies[0]),
-        "the copy button comes before the clock in the meta cluster",
-      ).toBeLessThan(members.indexOf(clock!));
-
-      await clickCopy(copies[0]);
-      expect(writeText, "raw markdown source, not rendered text").toHaveBeenCalledWith(content);
-      expect(writeText).not.toHaveBeenCalledWith("bold and code");
+      writeText.mockClear();
+      await clickCopy(buttons[1]);
+      expect(writeText, "second button copies the js block").toHaveBeenCalledWith("const y = 10;\n");
     } finally {
       await unmount();
     }
   });
 
-  it("user card: one copy button writing the raw user text", async () => {
-    const content = "  hi **there**  ";
-    const { el, unmount } = await renderMessage({ ...full(), role: "user", content });
+  it("desktop wrapper .code-block exists, phone .code-hdr does not, no language label in copied text", async () => {
+    const content = "```python\nprint('hi')\n```";
+    const { el, unmount } = await renderMessage({ ...full(), content });
     try {
-      const copies = copyMessageButtons(el);
-      expect(copies, "exactly one Copy message button").toHaveLength(1);
-      await clickCopy(copies[0]);
-      expect(writeText).toHaveBeenCalledWith(content);
+      expect(el.querySelector(".code-block"), "desktop code-block wrapper").not.toBeNull();
+      expect(el.querySelector(".code-hdr"), "phone code-hdr must not appear on desktop").toBeNull();
+
+      const button = copyCodeButtons(el)[0];
+      expect(button, "the Copy code button exists").not.toBeNull();
+      await clickCopy(button);
+
+      const written = writeText.mock.calls[0][0];
+      expect(written).toContain("print('hi')");
+      expect(written, "no language label leaked into the copied text").not.toContain("python");
     } finally {
       await unmount();
     }
   });
 
-  it("system + summary cards: one copy button each writing the raw banner text", async () => {
-    for (const role of ["system", "summary"] as const) {
-      const content = `${role} banner\nsecond line`;
-      const { el, unmount } = await renderMessage({ ...full(), role, content });
-      try {
-        const copies = copyMessageButtons(el);
-        expect(copies, `exactly one Copy message button for role=${role}`).toHaveLength(1);
-        await clickCopy(copies[0]);
-        expect(writeText, `raw text for role=${role}`).toHaveBeenCalledWith(content);
-      } finally {
-        await unmount();
-        writeText.mockClear();
-      }
+  it("existing pre code language/highlight classes remain", async () => {
+    const content = "```go\npackage main\n```";
+    const { el, unmount } = await renderMessage({ ...full(), content });
+    try {
+      const code = el.querySelector("pre code");
+      expect(code, "the highlighted <code> element").not.toBeNull();
+      const classes = code!.className;
+      expect(classes).toContain("language-go");
+      expect(classes).toContain("hljs");
+    } finally {
+      await unmount();
     }
   });
 
-  it("toolCall and toolResult cards: one copy button each writing the full content", async () => {
-    for (const role of ["toolCall", "toolResult"] as const) {
-      const content = "first line\nsecond line with more detail";
+  it("an unlabeled fence gets one Copy code and copies its plain text", async () => {
+    const content = "```\nplain text line\n```";
+    const { el, unmount } = await renderMessage({ ...full(), content });
+    try {
+      const buttons = copyCodeButtons(el);
+      expect(buttons, "exactly one Copy code button").toHaveLength(1);
+
+      await clickCopy(buttons[0]);
+      expect(writeText).toHaveBeenCalledWith("plain text line\n");
+    } finally {
+      await unmount();
+    }
+  });
+
+  it("a fenced toolResult gets one Copy code and zero Copy message", async () => {
+    const content = "```bash\ncommand output\n```";
+    const { el, unmount } = await renderMessage({
+      ...full(),
+      role: "toolResult",
+      toolName: "bash",
+      content,
+    });
+    try {
+      expect(copyCodeButtons(el), "one Copy code button").toHaveLength(1);
+      expect(copyMessageButtons(el), "zero Copy message buttons").toHaveLength(0);
+    } finally {
+      await unmount();
+    }
+  });
+
+  it("no Copy message buttons for any role", async () => {
+    const roles: Array<{ role: MessageRole; content: string }> = [
+      { role: "user", content: "hi" },
+      { role: "agent", content: "answer" },
+      { role: "system", content: "banner" },
+      { role: "summary", content: "compacted" },
+      { role: "toolCall", content: "do work" },
+      { role: "toolResult", content: "result" },
+    ];
+
+    for (const { role, content } of roles) {
       const { el, unmount } = await renderMessage({
         ...full(),
         role,
-        toolName: "bash",
         content,
+        toolName: role === "toolCall" || role === "toolResult" ? "test" : undefined,
       });
       try {
-        const copies = copyMessageButtons(el);
-        expect(copies, `exactly one Copy message button for role=${role}`).toHaveLength(1);
-        await clickCopy(copies[0]);
-        expect(writeText, `full content for role=${role}`).toHaveBeenCalledWith(content);
-      } finally {
-        await unmount();
-        writeText.mockClear();
-      }
-    }
-  });
-
-  it("whitespace-only content gets NO copy button (user and agent)", async () => {
-    for (const role of ["user", "agent"] as const) {
-      const { el, unmount } = await renderMessage({
-        ...full(),
-        role,
-        content: "   \n\t  ",
-      });
-      try {
-        expect(copyMessageButtons(el), `no Copy message button for role=${role}`).toHaveLength(0);
+        expect(
+          copyMessageButtons(el),
+          `no Copy message button for role=${role}`,
+        ).toHaveLength(0);
       } finally {
         await unmount();
       }
-    }
-  });
-
-  it("a fenced message keeps desktop pre-only rendering: one Copy message, no Copy code", async () => {
-    const content = "```rust\nlet x = 42;\n```";
-    const { el, unmount } = await renderMessage({ ...full(), content });
-    try {
-      expect(copyCodeButtons(el), "desktop fences have no Copy code button").toHaveLength(0);
-      const copies = copyMessageButtons(el);
-      expect(copies, "one Copy message button").toHaveLength(1);
-      expect(el.querySelector("pre"), "the fence still renders as a plain <pre>").not.toBeNull();
-
-      await clickCopy(copies[0]);
-      expect(writeText).toHaveBeenCalledWith(content);
-    } finally {
-      await unmount();
     }
   });
 });
@@ -754,8 +740,8 @@ describe("Message — desktop role attribution stays single", () => {
     });
     try {
       const text = el.textContent ?? "";
-      expect(occurrences(text, "Shifu"), "the role label renders once").toBe(1);
-      expect(occurrences(text, "🧩 researcher"), "the lane chip renders once").toBe(1);
+      expect((text.split("Shifu").length - 1), "the role label renders once").toBe(1);
+      expect((text.split("🧩 researcher").length - 1), "the lane chip renders once").toBe(1);
     } finally {
       await unmount();
     }
@@ -773,8 +759,8 @@ describe("Message — desktop role attribution stays single", () => {
       });
       try {
         const text = el.textContent ?? "";
-        expect(occurrences(text, label), `one '${label}' label`).toBe(1);
-        expect(occurrences(text, "🧩 researcher"), `one lane chip for role=${role}`).toBe(1);
+        expect((text.split(label).length - 1), `one '${label}' label`).toBe(1);
+        expect((text.split("🧩 researcher").length - 1), `one lane chip for role=${role}`).toBe(1);
       } finally {
         await unmount();
       }

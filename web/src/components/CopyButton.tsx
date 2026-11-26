@@ -1,11 +1,11 @@
-// Shared icon-only copy button used by desktop and phone message copy.
+// Shared icon-only copy button used for code blocks (phone and desktop).
 // Contract (locked by CopyButton.test.tsx):
 // - button type="button", icon-only, idle aria-label={label}
 // - success aria-label="Copied" for exactly 1500ms then back to {label}
 // - getText() evaluated once per click, NOT at render
 // - navigator.clipboard.writeText used; missing API or rejected write = no throw, no success
 // - repeated clicks restart the 1500ms window; unmount clears any pending timer
-import { memo, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 // Lifted from Message.tsx's existing CodeBlock icons; kept module-private here.
 const COPY_ICON = (
@@ -47,7 +47,7 @@ export interface CopyButtonProps {
   className?: string;
 }
 
-function CopyButtonInner({ getText, label, className }: CopyButtonProps) {
+export function CopyButton({ getText, label, className }: CopyButtonProps) {
   const [copied, setCopied] = useState(false);
   const timer = useRef<number | null>(null);
 
@@ -89,5 +89,3 @@ function CopyButtonInner({ getText, label, className }: CopyButtonProps) {
     </button>
   );
 }
-
-export const CopyButton = memo(CopyButtonInner);
