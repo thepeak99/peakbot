@@ -56,13 +56,23 @@ export function ChatHeader(props: ChatHeaderProps): JSX.Element {
         Chats
       </button>
 
-      <div className="flex min-w-0 flex-1 flex-col items-center justify-center gap-[3px]">
-        <h1
-          data-testid="chat-title"
-          className="w-full truncate text-center text-[15px] font-semibold tracking-[-0.01em] text-zinc-100"
-        >
-          {title}
-        </h1>
+      <div
+        className="flex min-w-0 flex-1 flex-col items-center justify-center gap-[3px]"
+        data-testid="chat-title-row"
+      >
+        <div className="flex w-full items-center gap-1.5">
+          <img
+            src="/logo_shifu.png"
+            alt=""
+            className="h-5 w-5 shrink-0"
+          />
+          <h1
+            data-testid="chat-title"
+            className="w-full truncate text-center text-[15px] font-semibold tracking-[-0.01em] text-zinc-100"
+          >
+            {title}
+          </h1>
+        </div>
         <div
           data-testid="chat-subtitle"
           className="flex w-full min-w-0 items-center justify-center gap-1.5 text-xs text-zinc-500"

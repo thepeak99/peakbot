@@ -259,3 +259,67 @@ describe("ChatHeader — H1–H6", () => {
     ]);
   });
 });
+
+// ─── Phone title-row logo ─────────────────────────────────────────────────
+//
+// Locked: the title area is a `data-testid="chat-title-row"` row holding the
+// decorative `<img src="/logo_shifu.png" alt="">` (h-5 w-5) plus the existing
+// truncating `h1[data-testid="chat-title"]`. The logo is decoration: it must
+// not leak text into the h1, and it must not displace the back button from
+// the header's first position. `ChatList`'s intentional no-logo contract is
+// separate and is NOT touched here.
+
+describe("ChatHeader — phone title-row logo", () => {
+  it("the title row pairs the logo (alt='', h-5 w-5) with the truncating title", async () => {
+    const el = await render({ title: "Fix the WS relay" });
+    const header = el.querySelector("header");
+    expect(header, "a header element renders").not.toBeNull();
+
+    const row = el.querySelector<HTMLElement>('[data-testid="chat-title-row"]');
+    expect(row, "the title row must render").not.toBeNull();
+    expect(header!.contains(row), "the title row lives inside the header").toBe(true);
+
+    const img = row!.querySelector("img");
+    expect(img, "the logo renders inside the title row").not.toBeNull();
+    expect(img!.getAttribute("src")).toBe("/logo_shifu.png");
+    expect(img!.getAttribute("alt"), "the logo is decorative").toBe("");
+    expect(img!.classList.contains("h-5"), "logo height is h-5").toBe(true);
+    expect(img!.classList.contains("w-5"), "logo width is w-5").toBe(true);
+
+    const title = row!.querySelector<HTMLElement>('[data-testid="chat-title"]');
+    expect(title, "the existing chat-title h1 stays inside the row").not.toBeNull();
+    expect(title!.tagName).toBe("H1");
+    expect(title!.textContent).toBe("Fix the WS relay");
+    expect(title!.classList.contains("truncate"), "the title still truncates").toBe(true);
+
+    expect(
+      el.querySelectorAll('img[src="/logo_shifu.png"]'),
+      "exactly one logo in the header",
+    ).toHaveLength(1);
+  });
+
+  it("a long title still truncates and the h1 holds only the title text", async () => {
+    const long = "A very long conversation title that should ellipsize on a phone screen";
+    const el = await render({ title: long });
+    const h1 = el.querySelector<HTMLElement>('[data-testid="chat-title"]');
+    expect(h1, "the title h1 renders").not.toBeNull();
+    expect(h1!.textContent, "no logo alt text or decoration leaks into the title").toBe(long);
+    expect(h1!.querySelector("img"), "the logo is a sibling, not inside the h1").toBeNull();
+    expect(h1!.classList.contains("truncate")).toBe(true);
+  });
+
+  it("the back button remains the header's first element with its name and callback", async () => {
+    const onBack = vi.fn();
+    const el = await render({ onBack });
+    const header = el.querySelector("header")!;
+    const first = header.firstElementChild as HTMLElement | null;
+    expect(first, "the header has a first element").not.toBeNull();
+    expect(first!.getAttribute("data-testid"), "back button is still first").toBe("chat-back");
+    expect(first!.getAttribute("aria-label")).toBe("Back to chats");
+
+    await act(async () => {
+      first!.click();
+    });
+    expect(onBack).toHaveBeenCalledTimes(1);
+  });
+});

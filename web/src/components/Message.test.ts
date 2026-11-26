@@ -1,7 +1,8 @@
-import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, createElement } from "react";
 import { createRoot } from "react-dom/client";
 import { Message, sameMessage } from "./Message";
+import { localeClock } from "../dates";
 import type { AttachmentView, ChatMessage } from "../types";
 
 // A canonical full message. Every test below mutates exactly one field off this
@@ -147,6 +148,17 @@ beforeAll(() => {
 
 afterEach(() => {
   document.body.innerHTML = "";
+});
+
+// Desktop copy buttons use the shared CopyButton, which calls
+// navigator.clipboard.writeText. Install a deterministic mock per test.
+let writeText: ReturnType<typeof vi.fn>;
+beforeEach(() => {
+  writeText = vi.fn(() => Promise.resolve());
+  Object.defineProperty(navigator, "clipboard", {
+    value: { writeText },
+    configurable: true,
+  });
 });
 
 /** Render a message into a fresh container; returns the container and an
@@ -581,6 +593,191 @@ describe("attachment rendering (T13)", () => {
       ).toHaveLength(1);
     } finally {
       await unmount();
+    }
+  });
+});
+
+// ─── Desktop message copy + role attribution ──────────────────────────────
+//
+// Contract: every nonempty desktop card carries exactly one icon-only
+// `aria-label="Copy message"` button, inside the existing right-hand
+// card-header meta cluster and ordered BEFORE the clock. It copies
+// `message.content` raw (markdown source included). Whitespace-only content
+// gets no button. Desktop code fences keep their current pre-only rendering,
+// so there is no `Copy code` button here (that stays a phone affordance).
+// Role attribution must stay single: one role label, one 🧩 lane chip.
+
+const DESK_AT = 1732000000000;
+
+function copyMessageButtons(el: HTMLElement): HTMLButtonElement[] {
+  return Array.from(el.querySelectorAll<HTMLButtonElement>('button[aria-label="Copy message"]'));
+}
+
+function copyCodeButtons(el: HTMLElement): HTMLButtonElement[] {
+  return Array.from(el.querySelectorAll<HTMLButtonElement>('button[aria-label="Copy code"]'));
+}
+
+/** The card-header clock (a plain span, unlike the phone's tappable button). */
+function clockSpan(el: HTMLElement): HTMLElement | null {
+  return (
+    Array.from(el.querySelectorAll<HTMLElement>("span")).find(
+      (s) => s.textContent === localeClock(DESK_AT),
+    ) ?? null
+  );
+}
+
+function occurrences(text: string, needle: string): number {
+  return text.split(needle).length - 1;
+}
+
+async function clickCopy(btn: HTMLButtonElement): Promise<void> {
+  await act(async () => {
+    btn.click();
+  });
+}
+
+describe("Message — desktop copy message", () => {
+  it("agent card: one copy button in the meta cluster, before the clock, writing raw markdown", async () => {
+    const content = "## heading\n\n**bold** and `code`";
+    const { el, unmount } = await renderMessage({ ...full(), content });
+    try {
+      const copies = copyMessageButtons(el);
+      expect(copies, "exactly one Copy message button").toHaveLength(1);
+
+      const clock = clockSpan(el);
+      expect(clock, "the card-header clock renders").not.toBeNull();
+      const cluster = clock!.parentElement!;
+      expect(copies[0].parentElement, "the copy button lives in the clock's cluster").toBe(cluster);
+
+      const members = [...cluster.children];
+      expect(
+        members.indexOf(copies[0]),
+        "the copy button comes before the clock in the meta cluster",
+      ).toBeLessThan(members.indexOf(clock!));
+
+      await clickCopy(copies[0]);
+      expect(writeText, "raw markdown source, not rendered text").toHaveBeenCalledWith(content);
+      expect(writeText).not.toHaveBeenCalledWith("bold and code");
+    } finally {
+      await unmount();
+    }
+  });
+
+  it("user card: one copy button writing the raw user text", async () => {
+    const content = "  hi **there**  ";
+    const { el, unmount } = await renderMessage({ ...full(), role: "user", content });
+    try {
+      const copies = copyMessageButtons(el);
+      expect(copies, "exactly one Copy message button").toHaveLength(1);
+      await clickCopy(copies[0]);
+      expect(writeText).toHaveBeenCalledWith(content);
+    } finally {
+      await unmount();
+    }
+  });
+
+  it("system + summary cards: one copy button each writing the raw banner text", async () => {
+    for (const role of ["system", "summary"] as const) {
+      const content = `${role} banner\nsecond line`;
+      const { el, unmount } = await renderMessage({ ...full(), role, content });
+      try {
+        const copies = copyMessageButtons(el);
+        expect(copies, `exactly one Copy message button for role=${role}`).toHaveLength(1);
+        await clickCopy(copies[0]);
+        expect(writeText, `raw text for role=${role}`).toHaveBeenCalledWith(content);
+      } finally {
+        await unmount();
+        writeText.mockClear();
+      }
+    }
+  });
+
+  it("toolCall and toolResult cards: one copy button each writing the full content", async () => {
+    for (const role of ["toolCall", "toolResult"] as const) {
+      const content = "first line\nsecond line with more detail";
+      const { el, unmount } = await renderMessage({
+        ...full(),
+        role,
+        toolName: "bash",
+        content,
+      });
+      try {
+        const copies = copyMessageButtons(el);
+        expect(copies, `exactly one Copy message button for role=${role}`).toHaveLength(1);
+        await clickCopy(copies[0]);
+        expect(writeText, `full content for role=${role}`).toHaveBeenCalledWith(content);
+      } finally {
+        await unmount();
+        writeText.mockClear();
+      }
+    }
+  });
+
+  it("whitespace-only content gets NO copy button (user and agent)", async () => {
+    for (const role of ["user", "agent"] as const) {
+      const { el, unmount } = await renderMessage({
+        ...full(),
+        role,
+        content: "   \n\t  ",
+      });
+      try {
+        expect(copyMessageButtons(el), `no Copy message button for role=${role}`).toHaveLength(0);
+      } finally {
+        await unmount();
+      }
+    }
+  });
+
+  it("a fenced message keeps desktop pre-only rendering: one Copy message, no Copy code", async () => {
+    const content = "```rust\nlet x = 42;\n```";
+    const { el, unmount } = await renderMessage({ ...full(), content });
+    try {
+      expect(copyCodeButtons(el), "desktop fences have no Copy code button").toHaveLength(0);
+      const copies = copyMessageButtons(el);
+      expect(copies, "one Copy message button").toHaveLength(1);
+      expect(el.querySelector("pre"), "the fence still renders as a plain <pre>").not.toBeNull();
+
+      await clickCopy(copies[0]);
+      expect(writeText).toHaveBeenCalledWith(content);
+    } finally {
+      await unmount();
+    }
+  });
+});
+
+describe("Message — desktop role attribution stays single", () => {
+  it("agent card: one 'Shifu' label and one 🧩 lane chip", async () => {
+    const { el, unmount } = await renderMessage({
+      ...full(),
+      content: "done digging",
+      subAgentRole: "researcher",
+    });
+    try {
+      const text = el.textContent ?? "";
+      expect(occurrences(text, "Shifu"), "the role label renders once").toBe(1);
+      expect(occurrences(text, "🧩 researcher"), "the lane chip renders once").toBe(1);
+    } finally {
+      await unmount();
+    }
+  });
+
+  it("tool cards: one role label and one 🧩 lane chip, for toolCall and toolResult", async () => {
+    for (const role of ["toolCall", "toolResult"] as const) {
+      const label = role === "toolCall" ? "Tool call" : "Tool result";
+      const { el, unmount } = await renderMessage({
+        ...full(),
+        role,
+        toolName: "bash",
+        content: "ok",
+        subAgentRole: "researcher",
+      });
+      try {
+        const text = el.textContent ?? "";
+        expect(occurrences(text, label), `one '${label}' label`).toBe(1);
+        expect(occurrences(text, "🧩 researcher"), `one lane chip for role=${role}`).toBe(1);
+      } finally {
+        await unmount();
+      }
     }
   });
 });

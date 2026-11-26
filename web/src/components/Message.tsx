@@ -16,6 +16,7 @@ import { Lightbox } from "./Lightbox";
 import { MTAG } from "./phoneUi";
 import { firstLine } from "../transcriptRows";
 import { formatClock, formatFull, localeClock } from "../dates";
+import { CopyButton } from "./CopyButton";
 
 // Per-role visual treatment. Mirrors the TUI's role glyphs/colours so the
 // web transcript reads the same way (src/ui/app_state.rs MessageRole +
@@ -205,47 +206,55 @@ function ChatMarkdown({ phone = false, content }: { phone?: boolean; content: st
   );
 }
 
-const COPY_ICON = (
-  <svg aria-hidden width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-    <rect x="9" y="9" width="11" height="11" rx="2" />
-    <path d="M5 15V6a2 2 0 0 1 2-2h9" />
-  </svg>
-);
-const CHECK_ICON = (
-  <svg aria-hidden width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-    <path d="M5 12l5 5 9-10" />
-  </svg>
-);
-
 // Fence wrapper: language header + Copy button around the highlighted <pre>.
-// Styled by the `.md-phone .code-*` rules in index.css.
+// Styled by the `.md-phone .code-*` rules in index.css. The copy affordance is
+// the shared `CopyButton` (label "Copy code"), which reads the rendered text
+// from the <pre> ref at click time.
 function CodeBlock({ node, children, ...rest }: ComponentProps<"pre"> & ExtraProps) {
   const ref = useRef<HTMLPreElement>(null);
-  const [copied, setCopied] = useState(false);
   const codeClass = node?.children[0]?.type === "element" ? node.children[0].properties.className : undefined;
   const lang =
     (Array.isArray(codeClass) ? codeClass.map(String).find((c) => c.startsWith("language-")) : undefined)?.slice(9) ?? "code";
-  const copy = () => {
-    // Swallow clipboard errors (insecure context / denied), like FilesPanel.
-    navigator.clipboard
-      ?.writeText(ref.current?.textContent ?? "")
-      ?.then(() => {
-        setCopied(true);
-        setTimeout(() => setCopied(false), 1500);
-      })
-      .catch(() => {});
-  };
   return (
     <div className="code-block">
       <div className="code-hdr">
         <span>{lang}</span>
-        <button type="button" aria-label="Copy code" onClick={copy}>
-          {copied ? CHECK_ICON : COPY_ICON}
-        </button>
+        <CopyButton
+          getText={() => ref.current?.textContent ?? ""}
+          label="Copy code"
+          className="text-zinc-500 hover:text-zinc-300"
+        />
       </div>
       <pre ref={ref} {...rest}>
         {children}
       </pre>
+    </div>
+  );
+}
+
+// One shared predicate for the message-copy affordance: whitespace-only bodies
+// (e.g. a tool row with an empty result) get no button.
+function hasText(content: string): boolean {
+  return content.trim() !== "";
+}
+
+// Phone-only meta row under a message: hosts the optional Copy message button
+// beside the existing tappable time. The row owns the horizontal alignment
+// (self-start/self-end) so MessageTime itself stays alignment-free.
+function PhoneMeta({ message, end }: { message: ChatMessage; end: boolean }) {
+  return (
+    <div
+      data-testid="phone-meta"
+      className={`mt-1 flex items-center gap-1.5 ${end ? "self-end" : "self-start"}`}
+    >
+      {hasText(message.content) && (
+        <CopyButton
+          getText={() => message.content}
+          label="Copy message"
+          className="text-zinc-500 hover:text-zinc-300"
+        />
+      )}
+      <MessageTime at={message.at} />
     </div>
   );
 }
@@ -269,6 +278,11 @@ function ToolRow({ message }: { message: ChatMessage }) {
         <span className="shrink-0 font-mono text-[12.5px] text-zinc-300">
           {message.toolName ?? (call ? "tool" : "result")}
         </span>
+        {message.subAgentRole && (
+          <span data-testid="tool-agent-role" className={`${MTAG} max-w-[45%] truncate`}>
+            🧩 {message.subAgentRole}
+          </span>
+        )}
         <span className="min-w-0 flex-1 truncate">{firstLine(message.content)}</span>
         <svg
           aria-hidden
@@ -297,21 +311,22 @@ function ToolRow({ message }: { message: ChatMessage }) {
           )}
         </div>
       )}
-      <MessageTime at={message.at} end={false} />
+      <PhoneMeta message={message} end={false} />
     </div>
   );
 }
 
 // Tap toggles HH:MM <-> the full date; local state, so a row scrolled out of
-// the virtualizer overscan resets to the short form.
-function MessageTime({ at, end }: { at: number; end: boolean }) {
+// the virtualizer overscan resets to the short form. Alignment and the row
+// spacing belong to the `PhoneMeta` wrapper, not this button.
+function MessageTime({ at }: { at: number }) {
   const [full, setFull] = useState(false);
   return (
     <button
       type="button"
       aria-expanded={full}
       onClick={() => setFull((f) => !f)}
-      className={`mt-1 rounded-[5px] px-1 text-[10px] tabular-nums text-zinc-500 hover:text-zinc-300 ${end ? "self-end" : "self-start"}`}
+      className="rounded-[5px] px-1 text-[10px] tabular-nums text-zinc-500 hover:text-zinc-300"
     >
       {full ? formatFull(at) : formatClock(at)}
     </button>
@@ -327,7 +342,7 @@ function PhoneMessage({ message }: { message: ChatMessage }) {
         <div className="max-w-[88%] whitespace-pre-wrap break-words rounded-[18px_18px_6px_18px] bg-zinc-800 px-3.5 py-2.5 text-[15px] leading-[1.4] text-zinc-100">
           {message.content}
         </div>
-        <MessageTime at={message.at} end />
+        <PhoneMeta message={message} end />
       </div>
     );
   }
@@ -345,12 +360,12 @@ function PhoneMessage({ message }: { message: ChatMessage }) {
       {message.thinking && message.thinking.length > 0 && (
         <ThinkingBlocks blocks={message.thinking} />
       )}
-      {message.content.trim() !== "" && (
+      {hasText(message.content) && (
         <div className={`markdown-body md-phone max-w-[96%] break-words ${prose}`}>
           <ChatMarkdown phone content={message.content} />
         </div>
       )}
-      <MessageTime at={message.at} end={role === "system"} />
+      <PhoneMeta message={message} end={role === "system"} />
     </div>
   );
 }
@@ -384,7 +399,16 @@ function MessageView({ message, phone = false }: { message: ChatMessage; phone?:
             🧩 {message.subAgentRole}
           </span>
         )}
-        <span className="ml-auto tabular-nums text-zinc-600">{localeClock(message.at)}</span>
+        <div className="ml-auto flex items-center gap-2">
+          {hasText(message.content) && (
+            <CopyButton
+              getText={() => message.content}
+              label="Copy message"
+              className="text-zinc-500 hover:text-zinc-300"
+            />
+          )}
+          <span className="tabular-nums text-zinc-600">{localeClock(message.at)}</span>
+        </div>
       </div>
       {message.thinking && message.thinking.length > 0 && (
         <ThinkingBlocks blocks={message.thinking} />
