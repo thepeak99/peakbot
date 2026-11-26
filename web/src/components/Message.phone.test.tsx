@@ -232,6 +232,12 @@ describe("Message — phone (phone: true)", () => {
       });
       expect(writeText, "copying writes the code text").toHaveBeenCalledTimes(1);
       expect(writeText).toHaveBeenCalledWith("let x = 42;\n");
+
+      // No whole-message copy button on the phone either.
+      expect(
+        el.querySelector('button[aria-label="Copy message"]'),
+        "zero whole-message copy buttons on the phone",
+      ).toBeNull();
     } finally {
       await unmount();
     }
@@ -246,6 +252,69 @@ describe("Message — phone (phone: true)", () => {
     try {
       expect(el.querySelector(".hljs-addition"), "added lines are marked").not.toBeNull();
       expect(el.querySelector(".hljs-deletion"), "removed lines are marked").not.toBeNull();
+    } finally {
+      await unmount();
+    }
+  });
+
+  it("user message: zero 'Copy message' buttons", async () => {
+    const { el, unmount } = await renderPhone(
+      msg({ role: "user", content: "hi there" }),
+    );
+    try {
+      expect(
+        el.querySelectorAll('button[aria-label="Copy message"]'),
+        "user rows have no whole-message copy",
+      ).toHaveLength(0);
+    } finally {
+      await unmount();
+    }
+  });
+
+  it("collapsed toolCall: zero 'Copy message' buttons", async () => {
+    const { el, unmount } = await renderPhone(
+      msg({ role: "toolCall", toolName: "file_read", content: "Read /etc/hosts" }),
+    );
+    try {
+      expect(
+        el.querySelectorAll('button[aria-label="Copy message"]'),
+        "collapsed toolCall rows have no whole-message copy",
+      ).toHaveLength(0);
+    } finally {
+      await unmount();
+    }
+  });
+
+  it("collapsed toolResult: zero 'Copy message' buttons", async () => {
+    const { el, unmount } = await renderPhone(
+      msg({ role: "toolResult", toolName: "bash", content: "ok" }),
+    );
+    try {
+      expect(
+        el.querySelectorAll('button[aria-label="Copy message"]'),
+        "collapsed toolResult rows have no whole-message copy",
+      ).toHaveLength(0);
+    } finally {
+      await unmount();
+    }
+  });
+
+  it("expanded toolResult with fenced code: one 'Copy code', zero 'Copy message'", async () => {
+    const content = "```bash\necho hello\n```";
+    const { el, unmount } = await renderPhone(
+      msg({ role: "toolResult", toolName: "bash", content }),
+    );
+    try {
+      await expandToolRow(el);
+
+      expect(
+        el.querySelectorAll('button[aria-label="Copy code"]'),
+        "exactly one Copy code button for the fenced result",
+      ).toHaveLength(1);
+      expect(
+        el.querySelectorAll('button[aria-label="Copy message"]'),
+        "zero whole-message copy buttons",
+      ).toHaveLength(0);
     } finally {
       await unmount();
     }
@@ -555,6 +624,92 @@ describe("Message — phone tool-row image rendering", () => {
       expect(el.querySelector("code"), "toolCall body must not interpret markdown code").toBeNull();
       expect(el.textContent).toContain("**bold**");
       expect(el.textContent).toContain("`code`");
+    } finally {
+      await unmount();
+    }
+  });
+});
+
+// ─── Mobile tool attribution ──────────────────────────────────────────────
+//
+// ToolRow shows `🧩 <subAgentRole>` exactly once inside its collapsed toggle
+// button (both toolCall and toolResult), tagged data-testid="tool-agent-role".
+// No chip when subAgentRole is absent. Focus filtering is not involved here:
+// rows are rendered directly with focus mode off.
+
+/** The collapsed tool row's toggle. Selected by aria-expanded + a chevron svg
+ * so the MessageTime button (also aria-expanded) is never picked up. */
+function toolRowButton(el: HTMLElement): HTMLButtonElement | null {
+  return (
+    Array.from(el.querySelectorAll<HTMLButtonElement>("button")).find(
+      (b) => b.getAttribute("aria-expanded") === "false" && b.querySelector("svg"),
+    ) ?? null
+  );
+}
+
+function roleChips(el: HTMLElement): HTMLElement[] {
+  return Array.from(el.querySelectorAll<HTMLElement>('[data-testid="tool-agent-role"]'));
+}
+
+describe("Message — phone tool attribution", () => {
+  it("toolCall: one '🧩 researcher' chip inside the collapsed row button", async () => {
+    const { el, unmount } = await renderPhone(
+      msg({ role: "toolCall", toolName: "web_search", content: "query", subAgentRole: "researcher" }),
+    );
+    try {
+      const row = toolRowButton(el);
+      expect(row, "the collapsed tool row button renders").not.toBeNull();
+
+      const chips = roleChips(el);
+      expect(chips, "exactly one tool-agent-role chip").toHaveLength(1);
+      expect(row!.contains(chips[0]), "the chip lives inside the collapsed row button").toBe(true);
+      expect(chips[0].textContent?.trim()).toBe("🧩 researcher");
+      expect((el.textContent ?? "").split("🧩 researcher")).toHaveLength(2);
+    } finally {
+      await unmount();
+    }
+  });
+
+  it("toolResult: one '🧩 researcher' chip inside the collapsed row button", async () => {
+    const { el, unmount } = await renderPhone(
+      msg({ role: "toolResult", toolName: "bash", content: "ok", subAgentRole: "researcher" }),
+    );
+    try {
+      const row = toolRowButton(el);
+      expect(row, "the collapsed tool row button renders").not.toBeNull();
+
+      const chips = roleChips(el);
+      expect(chips, "exactly one tool-agent-role chip").toHaveLength(1);
+      expect(row!.contains(chips[0]), "the chip lives inside the collapsed row button").toBe(true);
+      expect(chips[0].textContent?.trim()).toBe("🧩 researcher");
+    } finally {
+      await unmount();
+    }
+  });
+
+  it("no chip when subAgentRole is absent (both tool roles)", async () => {
+    for (const role of ["toolCall", "toolResult"] as const) {
+      const { el, unmount } = await renderPhone(
+        msg({ role, toolName: "bash", content: "ok" }),
+      );
+      try {
+        expect(roleChips(el), `no tool-agent-role chip for role=${role}`).toHaveLength(0);
+        expect(el.textContent ?? "").not.toContain("🧩");
+      } finally {
+        await unmount();
+      }
+    }
+  });
+
+  it("a sub-agent prose message still labels its lane exactly once", async () => {
+    const { el, unmount } = await renderPhone(
+      msg({ content: "done digging", subAgentRole: "researcher" }),
+    );
+    try {
+      expect(
+        (el.textContent ?? "").split("🧩 researcher"),
+        "the existing prose lane tag renders once, not duplicated by the tool chip",
+      ).toHaveLength(2);
     } finally {
       await unmount();
     }
