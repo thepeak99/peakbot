@@ -1,6 +1,6 @@
 // Desktop conversation tabs (issue #373): glue between the pure tab store
 // (`convoTabs.ts`), the one shared WebSocket (`useAgent`) and the outside
-// world (localStorage, the window's keyboard, the conversations poll).
+// world (localStorage, the window's keyboard, list refreshes).
 //
 // The tab bar is a thin view over the socket's single binding. The user picks
 // the active tab (-> `switchConvo`); the server tells us which conversation
@@ -33,9 +33,6 @@ import { loadTabs, saveTabs } from "./tabsPersistence";
 import { tabShortcut } from "./tabShortcuts";
 import { profileFromUrl, setConvoInUrl } from "./state";
 import type { AgentConnection } from "./useAgent";
-
-/** How often background tabs' running state is refreshed (only with >1 tab). */
-const POLL_MS = 4000;
 
 function safeStorage(): Storage | null {
   try {
@@ -169,16 +166,48 @@ export function useConvoTabs(
     if (tabs && storage) saveTabs(storage, tabs);
   }, [tabs]);
 
-  // Poll for background turns, only when there is a background to watch.
-  const multi = (tabs?.tabs.length ?? 0) > 1;
-  const { connected } = agent;
+  // ─── Event-driven list refresh (design §4/§5) ──────────────────────────
+  // The desktop tab bar and conversation surface are always up, so the "list
+  // surface is live" gate is "more than one tab open" (a single tab is the
+  // plain one-conversation view the desktop shares with the browser). The
+  // three refresh triggers mirror useMobileChats: socket reconnect, app
+  // foreground, and the attached turn ending. No timers.
+  const multiRef = useRef((tabs?.tabs.length ?? 0) > 1);
   useEffect(() => {
-    if (!enabled || !connected || !multi) return;
-    const id = window.setInterval(() => {
-      agentRef.current.send({ type: "request_conversations" });
-    }, POLL_MS);
-    return () => window.clearInterval(id);
-  }, [enabled, connected, multi]);
+    multiRef.current = (tabs?.tabs.length ?? 0) > 1;
+  });
+  const sendList = useCallback(() => {
+    agentRef.current.send({ type: "request_conversations" });
+  }, []);
+
+  // A connect/reconnect edge refreshes the list only while it is live.
+  const wasConnected = useRef(agent.connected);
+  useEffect(() => {
+    if (!enabled) return;
+    const edge = agent.connected && !wasConnected.current;
+    wasConnected.current = agent.connected;
+    if (edge && multiRef.current) sendList();
+  }, [enabled, agent.connected, sendList]);
+
+  // A visible list refreshes when the app returns to the foreground.
+  useEffect(() => {
+    if (!enabled) return;
+    const onVisible = () => {
+      if (document.hidden || !multiRef.current) return;
+      sendList();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [enabled, sendList]);
+
+  // A visible list refreshes when the attached conversation's turn ends.
+  const wasRunning = useRef(activeRunning);
+  useEffect(() => {
+    if (!enabled) return;
+    const ended = wasRunning.current && !activeRunning;
+    wasRunning.current = activeRunning;
+    if (ended && multiRef.current) sendList();
+  }, [enabled, activeRunning, sendList]);
 
   // Keyboard shortcuts (capture phase, so focused inputs can't swallow them).
   useEffect(() => {

@@ -17,6 +17,7 @@ use tokio_tungstenite::tungstenite::Message as TMsg;
 use super::{Client, Directory, WsStream};
 use crate::config::resolve::ProfileInfo;
 use crate::ui::app_state::AppState;
+use crate::ui::delta::AttachCursor;
 use crate::ui::outbound::{Disconnected, OutboundTx};
 use crate::ui::web::images::rewrite_markdown_images;
 use crate::ui::web::refuse;
@@ -79,6 +80,9 @@ pub fn classify_inbound(text: &str, view: &LocalView) -> InboundDisposition {
         | InboundMessage::ListDir { .. }
         | InboundMessage::RequestRecentDirs => D::Forward,
         InboundMessage::Attach { .. } => D::Ignore,
+        // Additive anchor move: the remote validates it (same cursor rules);
+        // an old remote ignores the unknown frame type.
+        InboundMessage::SyncAnchor { .. } => D::Forward,
         InboundMessage::Select { profile, agent, .. } => {
             if profile != view.name {
                 return D::Refuse(CHIP_REFUSAL.to_string());
@@ -178,6 +182,7 @@ pub async fn run<L, E>(
     view: LocalView,
     convo: Option<String>,
     agent: Option<String>,
+    since: Option<AttachCursor>,
 ) where
     L: futures::Stream<Item = Result<Message, E>> + Unpin,
 {
@@ -197,6 +202,9 @@ pub async fn run<L, E>(
     }
     if let Some(a) = view.target_agent.clone().or(agent) {
         attach["agent"] = a.into();
+    }
+    if let Some(cursor) = since {
+        attach["since"] = serde_json::json!(cursor);
     }
     if remote_tx
         .send(TMsg::Text(attach.to_string().into()))
@@ -387,9 +395,15 @@ fn outbound(text: &str, view: &LocalView, out_tx: &OutboundTx) -> Result<(), Dis
         }
     };
     match msg {
-        OutboundMessage::State { state } => {
+        OutboundMessage::State {
+            state,
+            messages_from,
+        } => {
             let state = localize_state(Arc::unwrap_or_clone(state), view);
-            out_tx.publish_state(Arc::new(state))
+            match messages_from {
+                Some(n) => out_tx.publish_state_delta(Arc::new(state), n),
+                None => out_tx.publish_state(Arc::new(state)),
+            }
         }
         // Never solicited (§6.3 rows 11/12), and `ready` is the handshake's.
         OutboundMessage::ConversationsList { .. } | OutboundMessage::Ready { .. } => Ok(()),

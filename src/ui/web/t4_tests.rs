@@ -726,6 +726,106 @@ async fn list_conversations_is_empty_array_when_nothing_is_saved() {
     assert_eq!(body["items"], json!([]));
 }
 
+// ── Shared-cache stage 1: ?limit= ────────────────────────────────────────────
+// The conversations endpoint now accepts an optional ?limit=N to bound the
+// list response. Limit applies AFTER updated_at-desc sorting. Absent limit
+// preserves today's unlimited response. Old servers ignoring the query param
+// remain supported (the client just gets back everything).
+
+#[tokio::test]
+async fn list_with_limit_returns_at_most_n_items_sorted_desc() {
+    let h = harness(LOCAL_YAML, None);
+    seed(&h, None, "oldest", None, 1);
+    seed(&h, None, "middle", None, 2);
+    seed(&h, None, "newest", Some("dev"), 3);
+    let addr = spawn_api(&h).await;
+
+    // ?limit=1 → only the newest
+    let resp = client()
+        .get(format!("http://{addr}/api/conversations?limit=1"))
+        .header("cookie", cookie())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    let items = body["items"].as_array().expect("`items` array");
+    assert_eq!(items.len(), 1, "limit=1 returns exactly one row: {body}");
+    assert_eq!(items[0]["name"], "newest", "the most recent row");
+
+    // ?limit=2 → newest and middle
+    let resp = client()
+        .get(format!("http://{addr}/api/conversations?limit=2"))
+        .header("cookie", cookie())
+        .send()
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    let items = body["items"].as_array().expect("`items` array");
+    assert_eq!(items.len(), 2, "limit=2 returns two rows: {body}");
+    assert_eq!(items[0]["name"], "newest", "newest first");
+    assert_eq!(items[1]["name"], "middle", "middle second");
+}
+
+#[tokio::test]
+async fn list_with_limit_0_returns_empty() {
+    let h = harness(LOCAL_YAML, None);
+    seed(&h, None, "has items", None, 1);
+    let addr = spawn_api(&h).await;
+
+    let resp = client()
+        .get(format!("http://{addr}/api/conversations?limit=0"))
+        .header("cookie", cookie())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    let items = body["items"].as_array().expect("`items` array");
+    assert_eq!(items.len(), 0, "limit=0 returns empty list: {body}");
+}
+
+#[tokio::test]
+async fn list_with_limit_larger_than_total_returns_all() {
+    let h = harness(LOCAL_YAML, None);
+    seed(&h, None, "one", None, 1);
+    seed(&h, None, "two", None, 2);
+    let addr = spawn_api(&h).await;
+
+    let resp = client()
+        .get(format!("http://{addr}/api/conversations?limit=100"))
+        .header("cookie", cookie())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    let items = body["items"].as_array().expect("`items` array");
+    assert_eq!(items.len(), 2, "limit=100 with 2 items returns 2: {body}");
+}
+
+#[tokio::test]
+async fn list_with_malformed_limit_returns_400() {
+    let h = harness(LOCAL_YAML, None);
+    seed(&h, None, "has items", None, 1);
+    let addr = spawn_api(&h).await;
+
+    for bad in ["abc", "-1"] {
+        let resp = client()
+            .get(format!("http://{addr}/api/conversations?limit={bad}"))
+            .header("cookie", cookie())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            400,
+            "malformed limit `{bad}` must be a 400, got {}",
+            resp.status()
+        );
+    }
+}
+
 // ═══ Part B3 — POST /api/conversations/{convo}/kill (§6.2) ═════════════
 
 fn kill_url(addr: std::net::SocketAddr, convo: &str) -> String {

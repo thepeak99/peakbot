@@ -87,6 +87,13 @@ export function ChatList({
     () => deriveMachines(catalog, machineStatus, cloudDevices),
     [catalog, machineStatus, cloudDevices],
   );
+  // Origins whose list snapshot is a retained cache copy (the machine did not
+  // answer this refresh). Local (id null) is always online, so it never lands
+  // here. The row is marked stale iff its origin is offline.
+  const offlineMachines = useMemo(
+    () => new Set(machines.filter((m) => !m.online).map((m) => m.id)),
+    [machines],
+  );
   const machineUi = machines.length >= 2;
   const filter = resolveFilter(stored, machines);
   const selectedMachine =
@@ -316,6 +323,7 @@ export function ChatList({
                 now={now}
                 catalog={catalog}
                 machineTag={showTags ? machineName(machineOf(catalog, r.chat.profile ?? null), cloudDevices) : undefined}
+                cached={offlineMachines.has(machineOf(catalog, r.chat.profile ?? null))}
                 isUnread={unread.has(r.chat.id)}
                 onOpen={onOpen}
               />
@@ -449,6 +457,7 @@ function Row({
   now,
   catalog,
   machineTag,
+  cached,
   isUnread,
   onOpen,
 }: {
@@ -457,6 +466,8 @@ function Row({
   catalog: CatalogProfile[];
   /** The machine's display name in All mode; absent = no tag. */
   machineTag?: string;
+  /** True when this row comes from an offline origin's retained cache. */
+  cached: boolean;
   isUnread: boolean;
   onOpen(convo: string, profile: string | null): void;
 }) {
@@ -518,6 +529,19 @@ function Row({
           {machineTag !== undefined && (
             <span data-testid="chat-machine-tag" className={`ml-1.5 ${MTAG}`}>
               {machineTag}
+            </span>
+          )}
+          {cached && (
+            // Not live: this origin did not answer, so the row is a retained
+            // cache snapshot. The label spells it out for assistive tech while
+            // the amber badge carries the visual cue.
+            <span
+              data-testid="chat-cached"
+              aria-label="cached (offline)"
+              title="Cached copy — machine offline"
+              className="ml-1.5 shrink-0 rounded-[5px] bg-amber-500/10 px-[5px] text-[10.5px] leading-4 text-amber-400"
+            >
+              cached
             </span>
           )}
           {rel && <span className="shrink-0">&nbsp;·&nbsp;{rel}</span>}

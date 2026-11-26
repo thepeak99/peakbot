@@ -465,47 +465,140 @@ describe("useMobileChats — navigation (N1–N13)", () => {
 
 // ─── P: polling, fold, save, refused-resume ───────────────────────────────
 
-describe("useMobileChats — polling and activity (P1–P6)", () => {
-  it("P1: the connect edge sends once, then every 4 s while connected", async () => {
+describe("useMobileChats — polling and activity (P1–P13)", () => {
+  it("P1: no interval-driven polling before or after the connect edge", async () => {
     useIntervalFakes();
     const agent = makeAgent({ connected: false, convo: null });
     await renderHook(agent, vi.fn());
 
     await act(async () => {
-      vi.advanceTimersByTime(8000);
+      vi.advanceTimersByTime(16000); // four 4s intervals' worth of time
     });
     expect(agent.send, "no polling while disconnected").not.toHaveBeenCalledWith({
       type: "request_conversations",
     });
 
-    agent.send.mockClear();
+    // Connect while off the list: the shared refresh path does not fire here
+    // (P9). The old 4s interval must not exist either.
     agent.connected = true;
     await rerender(agent, vi.fn());
-    expect(agent.send, "the connect edge sends once").toHaveBeenCalledTimes(1);
-    expect(agent.send).toHaveBeenCalledWith({ type: "request_conversations" });
     agent.send.mockClear();
 
     await act(async () => {
-      vi.advanceTimersByTime(4000);
+      vi.advanceTimersByTime(16000);
     });
-    expect(agent.send).toHaveBeenCalledTimes(1);
-    await act(async () => {
-      vi.advanceTimersByTime(4000);
-    });
-    expect(agent.send).toHaveBeenCalledTimes(2);
+    expect(
+      agent.send,
+      "no interval-driven polling after the connect edge",
+    ).not.toHaveBeenCalledWith({ type: "request_conversations" });
   });
 
-  it("P2: a hidden page sends nothing on a tick", async () => {
-    useIntervalFakes();
-    const agent = makeAgent({ connected: true, convo: null });
+  it("P7: cold boot into chat sends ZERO list requests even when connected", async () => {
+    const agent = makeAgent({ connected: true, convo: "c1" });
+    await renderHook(agent, vi.fn());
+    expect(
+      agent.send,
+      "cold boot into a chat must not list",
+    ).not.toHaveBeenCalledWith({ type: "request_conversations" });
+  });
+
+  it("P8: a socket reconnect WHILE the list is visible refreshes once", async () => {
+    const agent = makeAgent({ connected: true, convo: "c1" });
+    await renderHook(agent, vi.fn());
+    await toChats();
+    agent.send.mockClear();
+
+    // Socket drops, then reconnects while the list is on screen.
+    agent.connected = false;
+    await rerender(agent, vi.fn());
+    agent.connected = true;
+    await rerender(agent, vi.fn());
+
+    expect(agent.send, "reconnect while list visible refreshes").toHaveBeenCalledWith({
+      type: "request_conversations",
+    });
+  });
+
+  it("P9: a socket reconnect while NOT on the list sends ZERO list requests", async () => {
+    const agent = makeAgent({ connected: true, convo: "c1" });
     await renderHook(agent, vi.fn());
     agent.send.mockClear();
 
-    Object.defineProperty(document, "hidden", { value: true, configurable: true });
-    await act(async () => {
-      vi.advanceTimersByTime(8000);
+    agent.connected = false;
+    await rerender(agent, vi.fn());
+    agent.connected = true;
+    await rerender(agent, vi.fn());
+
+    expect(
+      agent.send,
+      "reconnect off the list must not list",
+    ).not.toHaveBeenCalledWith({ type: "request_conversations" });
+  });
+
+  it("P10: the attached turn ending while the list is visible refreshes once", async () => {
+    const agent = makeAgent({
+      connected: true,
+      convo: "c1",
+      state: { is_running: true },
     });
-    expect(agent.send).not.toHaveBeenCalledWith({ type: "request_conversations" });
+    await renderHook(agent, vi.fn());
+    await toChats();
+    agent.send.mockClear();
+
+    agent.state = { is_running: false };
+    await rerender(agent, vi.fn());
+
+    expect(agent.send, "turn end while list visible refreshes").toHaveBeenCalledWith({
+      type: "request_conversations",
+    });
+  });
+
+  it("P11: opening another chat while on the list sends no list request", async () => {
+    const agent = makeAgent({ connected: true, convo: "c1" });
+    await renderHook(agent, vi.fn());
+    await toChats();
+    agent.send.mockClear();
+
+    await act(async () => {
+      A().open("c2", null);
+    });
+    expect(
+      agent.send,
+      "opening a chat must not list",
+    ).not.toHaveBeenCalledWith({ type: "request_conversations" });
+  });
+
+  it("P12: returning to the foreground WHILE the list is visible refreshes once", async () => {
+    const agent = makeAgent({ connected: true, convo: "c1" });
+    await renderHook(agent, vi.fn());
+    await toChats();
+    agent.send.mockClear();
+
+    // The app's established foreground signal (useAgent also listens here).
+    Object.defineProperty(document, "hidden", { value: false, configurable: true });
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+
+    expect(agent.send, "foreground while list visible refreshes").toHaveBeenCalledWith({
+      type: "request_conversations",
+    });
+  });
+
+  it("P13: returning to the foreground while NOT on the list sends ZERO list requests", async () => {
+    const agent = makeAgent({ connected: true, convo: "c1" });
+    await renderHook(agent, vi.fn());
+    agent.send.mockClear();
+
+    Object.defineProperty(document, "hidden", { value: false, configurable: true });
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+
+    expect(
+      agent.send,
+      "foreground off the list must not list",
+    ).not.toHaveBeenCalledWith({ type: "request_conversations" });
   });
 
   it("P3: each new list is folded against the viewed chat; loaded flips true", async () => {

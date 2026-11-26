@@ -270,6 +270,22 @@ impl Message {
     }
 }
 
+/// Largest integer JavaScript can represent exactly. The epoch crosses the
+/// wire as a JSON number and is compared by the SPA, so a full `u64` would be
+/// silently rounded and every cursor would fail validation.
+pub(crate) const MAX_JS_SAFE_EPOCH: u64 = (1u64 << 53) - 1;
+
+/// A non-zero, JS-safe lineage token. Random (`uuid` v4) rather than a counter
+/// so two conversations created on different devices can never collide.
+fn fresh_history_epoch() -> u64 {
+    loop {
+        let epoch = (Uuid::new_v4().as_u128() as u64) & MAX_JS_SAFE_EPOCH;
+        if epoch != 0 {
+            return epoch;
+        }
+    }
+}
+
 /// A complete conversation with metadata.
 ///
 /// **Stable identity:** `(provider_name, model)` is the persisted
@@ -281,6 +297,12 @@ impl Message {
 pub struct Conversation {
     /// Unique identifier for this conversation
     pub id: Uuid,
+    /// Durable lineage token for delta cursors. Minted fresh on create and
+    /// replaced on every wholesale message rewrite (compaction, clear, load
+    /// adopts the loaded one). Normal appends never change it. `0` is the
+    /// legacy-file default and can never be minted.
+    #[serde(default)]
+    pub history_epoch: u64,
     /// Human-readable name for the conversation (set at creation time)
     pub name: String,
     /// Auto-generated short title for the conversation (set after first response).
@@ -357,6 +379,7 @@ impl Conversation {
         let now = Utc::now();
         Conversation {
             id: Uuid::new_v4(),
+            history_epoch: fresh_history_epoch(),
             name,
             title: None,
             title_provisional: false,
@@ -444,6 +467,20 @@ impl Conversation {
     pub fn rename(&mut self, name: String) {
         self.name = name;
         self.updated_at = Utc::now();
+    }
+
+    /// Break lineage after a wholesale message rewrite. Always lands a value
+    /// different from the current one, so a pre-rewrite cursor can never
+    /// validate against the rewritten history.
+    pub(crate) fn bump_history_epoch(&mut self) {
+        let previous = self.history_epoch;
+        loop {
+            let next = fresh_history_epoch();
+            if next != previous {
+                self.history_epoch = next;
+                return;
+            }
+        }
     }
 
     /// Stamp the LLM-free opening-message title. No-op if a title already exists.

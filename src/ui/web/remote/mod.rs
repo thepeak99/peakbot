@@ -49,6 +49,10 @@ pub(super) mod listing;
 pub(super) mod proxy;
 pub(super) mod relay;
 
+/// How many rows one origin may contribute: the `?limit=` the direct client
+/// and the Cloud `List` op request, and the merged list's defensive cap.
+pub(crate) const CONVERSATION_LIST_LIMIT: usize = 100;
+
 // Every remote test drives a config `remote:` profile, which every
 // edition parses — the relay runs in the Local edition too.
 #[cfg(test)]
@@ -992,15 +996,15 @@ impl DirectClient {
         }
     }
 
-    /// `GET /api/conversations` — the remote's local rows (T4 shape).
+    /// `GET /api/conversations?limit=100` — the remote's local rows (T4
+    /// shape). Old remotes ignore the query and still answer in full.
     pub(crate) async fn list(&self) -> Result<Vec<ConversationSummaryWire>, RemoteError> {
         #[derive(Deserialize)]
         struct Items {
             items: Vec<ConversationSummaryWire>,
         }
-        let body = self
-            .call(self.http.get(self.url("api/conversations")))
-            .await?;
+        let path = format!("api/conversations?limit={CONVERSATION_LIST_LIMIT}");
+        let body = self.call(self.http.get(self.url(&path))).await?;
         let parsed: Items = serde_json::from_str(&body).map_err(|e| {
             self.peer
                 .down(format!("unexpected reply to GET /api/conversations: {e}"))
